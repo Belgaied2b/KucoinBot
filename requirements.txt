@@ -5,3 +5,4 @@ pandas==2.2.2
 matplotlib==3.5.3
 pandas_ta==0.3.14b0
 ccxt==4.4.78
+numpy==1.23.5
