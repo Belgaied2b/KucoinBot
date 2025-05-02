@@ -1,5 +1,3 @@
-# plot_signal.py
-
 import matplotlib.pyplot as plt
 
 def generate_trade_chart(df, symbol, entry, sl, tp, filename):
