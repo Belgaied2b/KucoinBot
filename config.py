@@ -1,5 +1,4 @@
-# config.py
+import os
 
-TOKEN = "TON_TOKEN_TELEGRAM"
-CHAT_ID = "TON_CHAT_ID"
-
+TOKEN = os.getenv("TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
