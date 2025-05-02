@@ -24,11 +24,11 @@ async def run_test_analysis():
         df["macd"] = macd["MACD_12_26_9"]
         df["macd_signal"] = macd["MACDs_12_26_9"]
         last = df.iloc[-1]
-
-        if last["rsi"] > 70 and last["macd"] < last["macd_signal"]:
-            return "SHORT"
-        elif last["rsi"] < 30 and last["macd"] > last["macd_signal"]:
-            return "LONG"
+        
+if last["rsi"] < 40 and last["macd"] > last["macd_signal"]:
+    return "LONG"
+elif last["rsi"] > 60 and last["macd"] < last["macd_signal"]:
+    return "SHORT"
         return None
 
     results = []
