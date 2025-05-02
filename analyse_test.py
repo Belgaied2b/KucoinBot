@@ -7,7 +7,7 @@ async def run_test_analysis():
     exchange = ccxt.kucoinfutures()
     markets = exchange.load_markets()
 
-    # ✅ Détection des vrais contrats PERP USDT (linéaires)
+    # ✅ Détection des vrais contrats PERP linéaires USDT
     symbols = [s for s in markets if markets[s].get("contract") and markets[s].get("linear")]
     print(f"📉 Nombre de PERP détectés : {len(symbols)}")
 
@@ -25,6 +25,12 @@ async def run_test_analysis():
     def analyze(symbol, df):
         df["rsi"] = ta.rsi(df["close"], length=14)
         macd = ta.macd(df["close"])
+
+        # ✅ Sécurité : vérifier si MACD est valide
+        if macd is None or macd.empty or "MACD_12_26_9" not in macd or "MACDs_12_26_9" not in macd:
+            print(f"⚠️ MACD indisponible pour {symbol}")
+            return None
+
         df["macd"] = macd["MACD_12_26_9"]
         df["macd_signal"] = macd["MACDs_12_26_9"]
         last = df.dropna().iloc[-1]
@@ -39,7 +45,7 @@ async def run_test_analysis():
 
     results = []
 
-    for symbol in symbols[:30]:
+    for symbol in symbols[:30]:  # ← toujours limité à 30 paires
         df = fetch_ohlcv(symbol)
         if df is not None and not df.empty:
             signal = analyze(symbol, df)
