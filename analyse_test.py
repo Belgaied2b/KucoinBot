@@ -6,8 +6,13 @@ async def run_test_analysis():
     print("🚀 Début du scan test")
     exchange = ccxt.kucoinfutures()
     markets = exchange.load_markets()
-    
-    # Liste des paires PERP
+
+    # 🔍 Affiche tous les symboles disponibles
+    print("🔍 Tous les symboles retournés par KuCoin Futures :")
+    for symbol in markets.keys():
+        print(symbol)
+
+    # Ici le filtre est temporairement désactivé
     symbols = [s for s in markets if s.endswith(':USDTM')]
     print(f"📉 Nombre de PERP détectés : {len(symbols)}")
 
