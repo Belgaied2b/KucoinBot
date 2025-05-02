@@ -1,5 +1,3 @@
-# main.py
-
 import logging
 import threading
 from flask import Flask
@@ -12,7 +10,6 @@ from config import TOKEN
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Flask app pour keep-alive (Railway)
 app = Flask(__name__)
 
 @app.route('/')
@@ -22,10 +19,8 @@ def home():
 def run_flask():
     app.run(host='0.0.0.0', port=3000)
 
-# Bot Telegram
 application = Application.builder().token(TOKEN).build()
 
-# Scan toutes les 10 minutes
 scheduler = BackgroundScheduler()
 scheduler.add_job(
     scan_and_send_signals,
