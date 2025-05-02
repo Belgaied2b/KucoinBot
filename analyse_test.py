@@ -23,17 +23,18 @@ async def run_test_analysis():
         macd = ta.macd(df["close"])
         df["macd"] = macd["MACD_12_26_9"]
         df["macd_signal"] = macd["MACDs_12_26_9"]
-        last = df.iloc[-1]
-        
-if last["rsi"] < 40 and last["macd"] > last["macd_signal"]:
-    return "LONG"
-elif last["rsi"] > 60 and last["macd"] < last["macd_signal"]:
-    return "SHORT"
+        last = df.dropna().iloc[-1]
+
+        # Conditions assouplies
+        if last["rsi"] < 40 and last["macd"] > last["macd_signal"]:
+            return "LONG"
+        elif last["rsi"] > 60 and last["macd"] < last["macd_signal"]:
+            return "SHORT"
         return None
 
     results = []
 
-    for symbol in symbols[:30]:
+    for symbol in symbols[:30]:  # Analyse 30 paires PERP
         df = fetch_ohlcv(symbol)
         if df is not None:
             signal = analyze(df)
