@@ -7,13 +7,8 @@ async def run_test_analysis():
     exchange = ccxt.kucoinfutures()
     markets = exchange.load_markets()
 
-    # 🔍 Affiche tous les symboles disponibles
-    print("🔍 Tous les symboles retournés par KuCoin Futures :")
-    for symbol in markets.keys():
-        print(symbol)
-
-    # Ici le filtre est temporairement désactivé
-    symbols = [s for s in markets if s.endswith(':USDTM')]
+    # ✅ Détection des vrais contrats PERP USDT (linéaires)
+    symbols = [s for s in markets if markets[s].get("contract") and markets[s].get("linear")]
     print(f"📉 Nombre de PERP détectés : {len(symbols)}")
 
     def fetch_ohlcv(symbol, timeframe="4h", limit=100):
@@ -34,7 +29,7 @@ async def run_test_analysis():
         df["macd_signal"] = macd["MACDs_12_26_9"]
         last = df.dropna().iloc[-1]
 
-        print(f"🔎 {symbol.replace(':USDTM','')}: RSI={last['rsi']:.2f} | MACD={last['macd']:.5f} | Signal={last['macd_signal']:.5f}")
+        print(f"🔎 {symbol}: RSI={last['rsi']:.2f} | MACD={last['macd']:.5f} | Signal={last['macd_signal']:.5f}")
 
         if last["rsi"] < 40 and last["macd"] > last["macd_signal"]:
             return "LONG"
@@ -49,7 +44,7 @@ async def run_test_analysis():
         if df is not None and not df.empty:
             signal = analyze(symbol, df)
             if signal:
-                results.append((symbol.replace(":USDTM", ""), signal))
+                results.append((symbol.replace(":USDT", "").replace("/USDT", ""), signal))
         else:
             print(f"⚠️ Données vides ou None pour {symbol}")
 
