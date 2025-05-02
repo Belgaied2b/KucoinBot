@@ -1,5 +1,3 @@
-# analyse_test.py
-
 import ccxt
 import pandas as pd
 import pandas_ta as ta
@@ -11,6 +9,7 @@ async def run_test_analysis():
     symbols = [s for s in markets if s.endswith(':USDTM')]
 
     def fetch_ohlcv(symbol, timeframe="4h", limit=100):
+        print(f"→ fetch {symbol}")
         try:
             ohlcv = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
             df = pd.DataFrame(ohlcv, columns=["timestamp", "open", "high", "low", "close", "volume"])
@@ -38,12 +37,13 @@ async def run_test_analysis():
     results = []
 
     for symbol in symbols[:30]:
-        print(f"📊 Analyse de {symbol}")
         df = fetch_ohlcv(symbol)
-        if df is not None:
+        if df is not None and not df.empty:
             signal = analyze(symbol, df)
             if signal:
                 results.append((symbol.replace(":USDTM", ""), signal))
+        else:
+            print(f"⚠️ Données vides ou None pour {symbol}")
 
     print("✅ Scan terminé")
     return results
