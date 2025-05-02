@@ -1,12 +1,9 @@
-# scanner.py
-
-import ccxt
+import ccxt.async_support as ccxt
 import pandas as pd
 import pandas_ta as ta
 from plot_signal import generate_trade_chart
 from config import CHAT_ID
 import os
-import datetime
 
 exchange = ccxt.kucoinfutures()
 
@@ -27,12 +24,12 @@ async def scan_and_send_signals(bot):
             entry = signal_data['entry']
             sl = signal_data['sl']
             tp = signal_data['tp']
+
             precision = 4
             entry_str = f"{entry:.{precision}f}"
             sl_str = f"{sl:.{precision}f}"
             tp_str = f"{tp:.{precision}f}"
 
-            # Générer le graphique
             filename = f"chart_{symbol.replace('/', '_')}.png"
             generate_trade_chart(df, symbol, entry, sl, tp, filename)
 
@@ -61,24 +58,21 @@ def analyze(df):
     last = df.dropna().iloc[-1]
     price = last["close"]
 
-    # Fibo
     high = df["close"].max()
     low = df["close"].min()
     fib_0618 = high - (high - low) * 0.618
     fib_0382 = high - (high - low) * 0.382
     in_zone = fib_0618 <= price <= fib_0382
 
-    # Long
     if last["rsi"] < 45 and last["macd"] > last["macd_signal"] and in_zone:
         sl = df["low"].tail(5).min()
-        entry = price * 0.995  # entrée idéale sous le prix
+        entry = price * 0.995
         tp = entry + 2 * (entry - sl)
         return {"direction": "LONG", "entry": entry, "sl": sl, "tp": tp}
 
-    # Short
     if last["rsi"] > 55 and last["macd"] < last["macd_signal"] and in_zone:
         sl = df["high"].tail(5).max()
-        entry = price * 1.005  # entrée idéale au-dessus du prix
+        entry = price * 1.005
         tp = entry - 2 * (sl - entry)
         return {"direction": "SHORT", "entry": entry, "sl": sl, "tp": tp}
 
