@@ -1,8 +1,7 @@
-flask==2.2.5
-python-telegram-bot[job-queue]==20.3
-httpx~=0.24.0
-pandas==2.2.2
-matplotlib==3.5.3
-pandas_ta==0.3.14b0
-ccxt==4.4.78
-numpy==1.23.5
+ccxt
+pandas
+pandas-ta
+matplotlib
+python-telegram-bot==20.3
+apscheduler
+flask
