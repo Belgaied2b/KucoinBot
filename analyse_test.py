@@ -7,7 +7,7 @@ async def run_test_analysis():
     exchange = ccxt.kucoinfutures()
     markets = exchange.load_markets()
 
-    # ✅ Détection des vrais contrats PERP linéaires USDT
+    # ✅ Détection des contrats PERP linéaires
     symbols = [s for s in markets if markets[s].get("contract") and markets[s].get("linear")]
     print(f"📉 Nombre de PERP détectés : {len(symbols)}")
 
@@ -36,27 +36,28 @@ async def run_test_analysis():
         last = df.dropna().iloc[-1]
         price = last["close"]
 
-        # 📏 Calcul retracement Fibonacci sur les 100 dernières bougies
+        # 📏 Calcul retracement Fibonacci
         high = df["close"].max()
         low = df["close"].min()
-
         fib_0618 = high - (high - low) * 0.618
         fib_05 = high - (high - low) * 0.5
         fib_0382 = high - (high - low) * 0.382
 
         print(f"🔎 {symbol}: RSI={last['rsi']:.2f} | MACD={last['macd']:.5f} | Signal={last['macd_signal']:.5f} | Close={price:.5f} | Fibo=({fib_0618:.5f}-{fib_05:.5f}-{fib_0382:.5f})")
 
-        # ✅ Conditions combinées RSI + MACD + zone Fibo
-        if last["rsi"] < 40 and last["macd"] > last["macd_signal"] and fib_0618 <= price <= fib_05:
+        # ✅ Conditions élargies RSI + MACD + Fibo zone
+        in_fibo_zone = fib_0618 <= price <= fib_0382
+
+        if last["rsi"] < 45 and last["macd"] > last["macd_signal"] and in_fibo_zone:
             return "LONG"
-        elif last["rsi"] > 60 and last["macd"] < last["macd_signal"] and fib_05 <= price <= fib_0382:
+        elif last["rsi"] > 55 and last["macd"] < last["macd_signal"] and in_fibo_zone:
             return "SHORT"
 
         return None
 
     results = []
 
-    for symbol in symbols[:30]:  # ← scanne 30 PERP
+    for symbol in symbols[:30]:  # ← toujours 30 PERP pour test rapide
         df = fetch_ohlcv(symbol)
         if df is not None and not df.empty:
             signal = analyze(symbol, df)
