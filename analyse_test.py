@@ -1,5 +1,3 @@
-# analyse_test.py
-
 import ccxt
 import pandas as pd
 import pandas_ta as ta
@@ -16,16 +14,18 @@ async def run_test_analysis():
             df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
             return df
         except Exception:
+            print(f"Erreur fetch {symbol}")
             return None
 
-    def analyze(df):
+    def analyze(symbol, df):
         df["rsi"] = ta.rsi(df["close"], length=14)
         macd = ta.macd(df["close"])
         df["macd"] = macd["MACD_12_26_9"]
         df["macd_signal"] = macd["MACDs_12_26_9"]
         last = df.dropna().iloc[-1]
 
-        # Conditions assouplies
+        print(f"{symbol.replace(':USDTM','')}: RSI={last['rsi']:.2f} | MACD={last['macd']:.5f} | Signal={last['macd_signal']:.5f}")
+
         if last["rsi"] < 40 and last["macd"] > last["macd_signal"]:
             return "LONG"
         elif last["rsi"] > 60 and last["macd"] < last["macd_signal"]:
@@ -34,10 +34,10 @@ async def run_test_analysis():
 
     results = []
 
-    for symbol in symbols[:30]:  # Analyse 30 paires PERP
+    for symbol in symbols[:30]:
         df = fetch_ohlcv(symbol)
         if df is not None:
-            signal = analyze(df)
+            signal = analyze(symbol, df)
             if signal:
                 results.append((symbol.replace(":USDTM", ""), signal))
 
