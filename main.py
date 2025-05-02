@@ -27,9 +27,14 @@ def run_flask():
 application = Application.builder().token(TOKEN).build()
 
 # Planificateur pour exécuter scan_and_send_signals automatiquement
-scheduler = BackgroundScheduler()
-scheduler.add_job(scan_and_send_signals, 'interval', hours=1, args=[application.bot])
-scheduler.start()
+scheduler.add_job(
+    scan_and_send_signals,
+    trigger='interval',
+    minutes=10,
+    args=[application.bot],
+    max_instances=1,       # ← NE LANCE PAS UN NOUVEAU SCAN SI LE PRÉCÉDENT TOURNE ENCORE
+    coalesce=True,         # ← SAUTE les exécutions en retard (évite d’empiler)
+)
 
 # Fonction pour démarrer le bot Telegram
 def run_bot():
