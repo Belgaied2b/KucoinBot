@@ -6,41 +6,42 @@ from flask import Flask
 from telegram.ext import Application
 from apscheduler.schedulers.background import BackgroundScheduler
 from scanner import scan_and_send_signals
-from config import TOKEN, CHAT_ID
+from config import TOKEN
 
-# Configuration du logging
+# Logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Serveur Flask pour garder le bot en vie
+# Flask app pour keep-alive
 app = Flask(__name__)
 
 @app.route('/')
 def home():
     return "Bot is running!"
 
-# Fonction pour démarrer le serveur Flask
 def run_flask():
     app.run(host='0.0.0.0', port=3000)
 
-# Initialisation de l'application Telegram
+# Application Telegram
 application = Application.builder().token(TOKEN).build()
 
-# Planificateur pour exécuter scan_and_send_signals automatiquement
+# Planification du scan toutes les 10 minutes
+scheduler = BackgroundScheduler()
 scheduler.add_job(
     scan_and_send_signals,
     trigger='interval',
     minutes=10,
     args=[application.bot],
-    max_instances=1,       # ← NE LANCE PAS UN NOUVEAU SCAN SI LE PRÉCÉDENT TOURNE ENCORE
-    coalesce=True,         # ← SAUTE les exécutions en retard (évite d’empiler)
+    max_instances=1,
+    coalesce=True
 )
+scheduler.start()
 
-# Fonction pour démarrer le bot Telegram
+# Lancer le bot Telegram
 def run_bot():
     application.run_polling()
 
-# Lancement combiné Flask + Bot dans deux threads séparés
+# Démarrage : Flask + bot Telegram en parallèle
 if __name__ == '__main__':
     threading.Thread(target=run_flask).start()
     run_bot()
