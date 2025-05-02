@@ -6,7 +6,10 @@ async def run_test_analysis():
     print("🚀 Début du scan test")
     exchange = ccxt.kucoinfutures()
     markets = exchange.load_markets()
+    
+    # Liste des paires PERP
     symbols = [s for s in markets if s.endswith(':USDTM')]
+    print(f"📉 Nombre de PERP détectés : {len(symbols)}")
 
     def fetch_ohlcv(symbol, timeframe="4h", limit=100):
         print(f"→ fetch {symbol}")
