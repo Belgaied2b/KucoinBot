@@ -2,7 +2,6 @@ import pandas_ta as ta
 import numpy as np
 
 def analyze_market(symbol, df):
-    # Indicateurs
     rsi = ta.rsi(df["close"], length=14)
     macd = ta.macd(df["close"])
 
@@ -17,29 +16,21 @@ def analyze_market(symbol, df):
     last_macd = df["macd"].iloc[-1]
     last_signal = df["signal"].iloc[-1]
 
-    # ✅ RSI élargi : 42–58 (zone de neutralité élargie)
-    if last_rsi < 42 or last_rsi > 58:
+    # ✅ RSI élargi : 40–60
+    if last_rsi < 40 or last_rsi > 60:
         return None
 
-    # ✅ MACD : croisement haussier seulement
-    if last_macd < last_signal:
+    # ✅ MACD : autorisé si proche du signal (pré-croisement)
+    if last_macd < last_signal - 0.001:
         return None
 
-    # Récupération de la zone de swing
+    # ✅ Fibo : on utilise directement le niveau 50% (entrée plus fréquente)
     recent_low = df["low"].iloc[-20:-1].min()
     recent_high = df["high"].iloc[-20:-1].max()
-
-    # ✅ Entrée Fibo 61.8 % ou 50 % (si amplitude trop serrée)
-    fib_range = recent_high - recent_low
-    if fib_range < 0.01 * recent_high:  # Si trop serré (<1%)
-        fib_level = 0.5  # Fallback à 50 %
-    else:
-        fib_level = 0.618
-
-    fib_entry = recent_low + fib_range * fib_level
+    fib_entry = recent_low + (recent_high - recent_low) * 0.5
     entry = round(fib_entry, 4)
 
-    # TP / SL pro
+    # SL / TP pro
     sl = round(recent_low, 4)
     tp = round(entry + (entry - sl) * 2, 4)
 
