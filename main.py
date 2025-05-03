@@ -1,12 +1,14 @@
-# main.py
-
 import logging
 import os
 import threading
 
 from flask import Flask
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+)
 
 from scanner import scan_and_send_signals
 from analyse_stats import compute_stats
@@ -19,16 +21,16 @@ CHAT_ID = os.environ["CHAT_ID"]
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Flask app for keep-alive
+# Flask keep-alive
 app = Flask(__name__)
 
 @app.route("/")
 def home():
     return "Bot is running!"
 
-# --- Stats logging job ---
+# --- Job de logging des stats ---
 async def log_stats(context: ContextTypes.DEFAULT_TYPE):
-    # Silence les logs verbeux
+    # On baisse le niveau des logs verbeux pour ne voir que WARNING+
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("kucoin_utils").setLevel(logging.WARNING)
 
@@ -43,19 +45,17 @@ async def log_stats(context: ContextTypes.DEFAULT_TYPE):
         df_means.to_string(index=False)
     )
 
-# /scan_test : déclenche un scan et envoie les signaux (graphes + alertes)
+# --- Commandes utilisateur ---
 async def scan_test_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info("✅ Commande /scan_test reçue")
     await update.message.reply_text("Scan en cours…")
     await scan_and_send_signals(context.bot)
 
-# /scan_graph : envoi des signaux anticipés
 async def scan_graph_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info("✅ Commande /scan_graph reçue")
     await update.message.reply_text("🚀 Envoi des signaux anticipés…")
     await scan_and_send_signals(context.bot)
 
-# Scan automatique toutes les 10 minutes
 async def scheduled_scan(context: ContextTypes.DEFAULT_TYPE):
     logger.info("⏰ JobQueue déclenché — scan automatique")
     await scan_and_send_signals(context.bot)
@@ -63,23 +63,24 @@ async def scheduled_scan(context: ContextTypes.DEFAULT_TYPE):
 def main():
     application = Application.builder().token(TOKEN).build()
 
-    # Handlers Telegram
+    # Register handlers
     application.add_handler(CommandHandler("scan_test", scan_test_command))
     application.add_handler(CommandHandler("scan_graph", scan_graph_command))
 
-    # Planification jobs
-    # 1) Stats une seule fois 5s après démarrage
-    application.job_queue.run_once(log_stats, when=5)
-    # 2) Scan automatique répété toutes les 600s (10 min), premier run immédiat
+    # 1) Stats : run_once(callback, delay_seconds)
+    application.job_queue.run_once(log_stats, 5)
+
+    # 2) Scan auto toutes les 10 minutes : run_repeating(callback, interval_seconds, first_delay)
     application.job_queue.run_repeating(scheduled_scan, interval=600, first=1)
 
-    # Keep-alive Flask en arrière-plan
+    # Keep-alive Flask in background
     threading.Thread(
-        target=lambda: app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 3000))),
+        target=lambda: app.run(host="0.0.0.0",
+                               port=int(os.environ.get("PORT", 3000))),
         daemon=True
     ).start()
 
-    logger.info("🚀 Bot démarré — scan auto toutes les 10 min, stats loggées après 5s")
+    logger.info("🚀 Bot démarré — stats loggées après 5s, scan auto toutes les 10 min")
     application.run_polling()
 
 if __name__ == "__main__":
