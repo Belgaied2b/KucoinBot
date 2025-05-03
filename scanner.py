@@ -1,107 +1,55 @@
-import ccxt
-import pandas as pd
-import pandas_ta as ta
-import datetime
-import httpx
 import os
-from telegram.constants import ParseMode
+import time
+import pandas as pd
+import requests
+import matplotlib.pyplot as plt
+from kucoin_utils import get_all_symbols_from_kucoin
+from analysis import analyze_symbol
 from graph import generate_trade_graph
-
-exchange = ccxt.kucoin()
+from telegram import Bot
 
 CHAT_ID = os.getenv("CHAT_ID")
+TOKEN = os.getenv("TOKEN")
+bot = Bot(token=TOKEN)
 
-def get_perp_symbols():
-    markets = exchange.load_markets()
-    return [m for m in markets if markets[m]['type'] == 'future' and 'USDT' in m]
+def scan_and_send_signals():
+    print("🚀 Début du scan automatique")
+    symbols = get_all_symbols_from_kucoin()
+    contracts = [s for s in symbols if "USDT:USDT" in s and "PERP" in s]
+    print(f"📉 Nombre de PERP détectés : {len(contracts)}")
 
-def fetch_ohlcv(symbol):
-    try:
-        data = exchange.fetch_ohlcv(symbol, timeframe='4h', limit=100)
-        df = pd.DataFrame(data, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-        return df
-    except Exception as e:
-        print(f"Erreur fetch_ohlcv {symbol} : {e}")
-        return None
-
-def add_indicators(df):
-    df["rsi"] = ta.rsi(df["close"], length=14)
-    macd = ta.macd(df["close"])
-    if macd is not None:
-        df["macd"] = macd["MACD_12_26_9"]
-        df["signal"] = macd["MACDs_12_26_9"]
-    return df
-
-def analyze(df, symbol):
-    rsi = df["rsi"].iloc[-1]
-    macd = df["macd"].iloc[-1]
-    signal = df["signal"].iloc[-1]
-    close = df["close"].iloc[-1]
-    high = df["high"].iloc[-20:].max()
-    low = df["low"].iloc[-20:].min()
-    fib_0618 = low + 0.618 * (high - low)
-
-    if 40 < rsi < 60 and macd > signal and close > fib_0618:
-        direction = "LONG"
-        sl = low * 0.995
-        tp = close * 1.02
-        return {
-            "symbol": symbol,
-            "direction": direction,
-            "entry": close,
-            "sl": sl,
-            "tp": tp,
-            "rsi": rsi,
-            "macd": macd,
-            "signal": signal
-        }
-    return None
-
-async def scan_and_send_signals(bot):
-    symbols = get_perp_symbols()
-    print(f"⏱ Début scan auto ({len(symbols)} PERP)")
-    for symbol in symbols:
-        df = fetch_ohlcv(symbol)
-        if df is None or df.empty:
-            continue
-        df = add_indicators(df)
-        signal = analyze(df, symbol)
-        if signal:
-            chart_path = generate_trade_graph(df, signal)
-            caption = (
-                f"📈 <b>{signal['symbol']}</b> - {signal['direction']}\n"
-                f"🎯 Entrée : <code>{signal['entry']:.4f}</code>\n"
-                f"📍 SL : <code>{signal['sl']:.4f}</code>\n"
-                f"🏁 TP : <code>{signal['tp']:.4f}</code>\n"
-                f"📊 RSI : {signal['rsi']:.2f} | MACD : {signal['macd']:.2f}"
-            )
-            with open(chart_path, "rb") as img:
-                await bot.send_photo(chat_id=CHAT_ID, photo=img, caption=caption, parse_mode=ParseMode.HTML)
-    print("✅ Scan terminé")
-
-# 🔧 Test manuel via /scan_test
-async def run_test_scan(update, context):
-    print("✅ Commande /scan_test reçue")
-    print("🚀 Début du scan test")
-
-    symbols = get_perp_symbols()
-    print(f"📉 Nombre de PERP détectés : {len(symbols)}")
-
-    for symbol in symbols:
-        print(f"→ fetch {symbol}")
+    for symbol in contracts:
         try:
             df = fetch_ohlcv(symbol)
-            if df is None or df.empty:
-                print(f"⚠️ Aucune donnée pour {symbol}")
+            if df is None or len(df) < 100:
                 continue
 
-            df = add_indicators(df)
-            result = analyze(df, symbol)
+            signal = analyze_symbol(symbol, df)
+            if signal:
+                fig = generate_trade_graph(symbol, df, signal)
+                image_path = f"{symbol.replace('/', '_')}.png"
+                fig.savefig(image_path)
+                bot.send_photo(chat_id=CHAT_ID, photo=open(image_path, "rb"), caption=signal["message"])
+                plt.close(fig)
+                os.remove(image_path)
 
-            if result:
-                print(f"✅ Signal détecté : {result['direction']} sur {symbol}")
         except Exception as e:
-            print(f"❌ Erreur avec {symbol} : {e}")
+            print(f"Erreur avec {symbol}: {e}")
 
-    print("✅ Scan test terminé")
+    print("✅ Scan automatique terminé")
+
+def fetch_ohlcv(symbol):
+    url = f"https://api.kucoin.com/api/v1/market/candles?type=4hour&symbol={symbol.replace(':', '-')}"
+    try:
+        response = requests.get(url)
+        data = response.json()["data"]
+        if not data:
+            return None
+        df = pd.DataFrame(data, columns=["time", "open", "close", "high", "low", "volume", "turnover"])
+        df = df.iloc[::-1]
+        df[["open", "close", "high", "low", "volume"]] = df[["open", "close", "high", "low", "volume"]].astype(float)
+        df["time"] = pd.to_datetime(df["time"], unit="s")
+        return df
+    except Exception as e:
+        print(f"Erreur récupération OHLCV {symbol}: {e}")
+        return None
