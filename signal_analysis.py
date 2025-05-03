@@ -1,62 +1,93 @@
 import pandas_ta as ta
+import numpy as np
+import math
+import logging
 
-def is_in_OTE_zone(entry_price, low, high):
-    fib_618 = low + 0.618 * (high - low)
-    fib_786 = low + 0.786 * (high - low)
-    return fib_786 <= entry_price <= fib_618
+logger = logging.getLogger(__name__)
 
-def detect_fvg(df):
-    fvg_zones = []
-    for i in range(2, len(df)):
-        high2 = df['high'].iloc[i - 2]
-        low0 = df['low'].iloc[i]
-        if high2 < low0:
-            fvg_zones.append((high2, low0))
-    return fvg_zones
+def _format_price(price: float) -> str:
+    """
+    Formatte le prix pour afficher toujours les décimales significatives.
+    """
+    if price == 0:
+        return "0"
+    exp = math.floor(math.log10(price))
+    decimals = 4 if exp >= -4 else abs(exp) + 2
+    return f"{price:.{decimals}f}"
 
-def analyze_market(symbol, df):
-    rsi = ta.rsi(df["close"], length=14)
-    macd = ta.macd(df["close"])
-    if rsi is None or macd is None:
+def detect_fvg(df) -> bool:
+    """
+    Détecte un Fair Value Gap bullish sur H4 :
+    cherche une bougie i où low[i+1] > high[i].
+    """
+    for i in range(len(df) - 1):
+        if df["low"].iloc[i+1] > df["high"].iloc[i]:
+            return True
+    return False
+
+def analyze_market(symbol: str, df) -> dict | None:
+    """
+    Renvoie {symbol, entry, sl, tp} si un signal LONG est détecté,
+    sinon None.
+    Critères :
+      1) FVG bullish présent
+      2) RSI entre 40 et 60
+      3) MACD quasi-croisement (tolérance 0.002)
+      4) Volume ≥ 1.1 × moyenne 20 barres
+      5) Dernière bougie haussière
+      6) Pullback Fib 61.8 % pour entrée
+      7) SL au low, TP à 2× distance SL→entry
+    """
+    # 1) Au moins un FVG bullish
+    if not detect_fvg(df):
+        logger.info(f"{symbol} → pas de FVG détecté")
         return None
 
-    df["rsi"] = rsi
-    df["macd"] = macd["MACD_12_26_9"]
-    df["signal"] = macd["MACDs_12_26_9"]
+    # 2) Calcul des indicateurs
+    df["rsi"]    = ta.rsi(df["close"], length=14)
+    macd_vals    = ta.macd(df["close"])
+    df["macd"]   = macd_vals["MACD_12_26_9"]
+    df["signal"] = macd_vals["MACDs_12_26_9"]
 
-    last_rsi = df["rsi"].iloc[-1]
-    last_macd = df["macd"].iloc[-1]
+    last_rsi    = df["rsi"].iloc[-1]
+    last_macd   = df["macd"].iloc[-1]
     last_signal = df["signal"].iloc[-1]
+    last_vol    = df["volume"].iloc[-1]
+    avg_vol     = df["volume"].iloc[-21:-1].mean()
+    last_open   = df["open"].iloc[-1]
+    last_close  = df["close"].iloc[-1]
 
+    # 3) RSI 40–60
     if last_rsi < 40 or last_rsi > 60:
         return None
-    if last_macd < last_signal - 0.001:
+
+    # 4) MACD quasi-croisement (MACD >= signal − 0.002)
+    if last_macd < last_signal - 0.002:
         return None
 
-    recent_low = df["low"].iloc[-21:-1].min()
-    recent_high = df["high"].iloc[-21:-1].max()
-    entry = round(recent_low + 0.5 * (recent_high - recent_low), 6)
-
-    # Vérifier la zone OTE
-    if not is_in_OTE_zone(entry, recent_low, recent_high):
+    # 5) Volume : dernier bar ≥ 1.1 × volume moyen
+    if last_vol < 1.1 * avg_vol:
         return None
 
-    # Vérifier s'il y a une FVG couvrant cette entrée
-    fvg_zones = detect_fvg(df)
-    matching_fvg = [zone for zone in fvg_zones if zone[0] <= entry <= zone[1]]
-    if not matching_fvg:
+    # 6) Bougie haussière
+    if last_close <= last_open:
         return None
 
-    sl = round(recent_low, 6)
-    tp = round(entry + (entry - sl) * 2, 6)
+    # 7) Pullback Fib 61.8 %
+    recent_low  = df["low"].iloc[-20:-1].min()
+    recent_high = df["high"].iloc[-20:-1].max()
+    entry_raw   = recent_low + (recent_high - recent_low) * 0.618
+    sl_raw      = recent_low
+    tp_raw      = entry_raw + (entry_raw - sl_raw) * 2
+
+    # 8) Formatage des prix
+    entry = _format_price(entry_raw)
+    sl    = _format_price(sl_raw)
+    tp    = _format_price(tp_raw)
 
     return {
         "symbol": symbol,
         "entry": entry,
-        "sl": sl,
-        "tp": tp,
-        "fvg_zone": matching_fvg[0],
-        "ote_zone": (round(recent_low + 0.786 * (recent_high - recent_low), 6),
-                     round(recent_low + 0.618 * (recent_high - recent_low), 6)),
-        "active": False
+        "sl":    sl,
+        "tp":    tp
     }
