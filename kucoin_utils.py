@@ -43,9 +43,11 @@ def fetch_klines(symbol, interval="4hour", limit=150):
         raise ValueError(f"{symbol} → format inattendu: {len(first)} colonnes")
 
     df = pd.DataFrame(raw, columns=cols)
-    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="s")
+    # <<< CORRECTION ICI : timestamp en millisecondes >>>
+    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
     df.set_index("timestamp", inplace=True)
     df = df.astype(float)
+
     time.sleep(0.2)
     logger.info(f"✅ {symbol} : {len(df)} bougies 4H récupérées")
     return df
