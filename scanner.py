@@ -29,8 +29,10 @@ async def run_test_scan(bot: Bot):
     symbols = get_kucoin_perps()
     logger.info(f"🔍 {len(symbols)} PERP détectés")
     for symbol in symbols:
+        logger.info(f"🔎 PERP détecté : {symbol}")
         try:
             if not is_valid_granularity(symbol):
+                logger.info(f"⛔ {symbol} ignoré (granularité non supportée)")
                 continue
             df = fetch_klines(symbol)
             result = analyze_market(symbol, df)
