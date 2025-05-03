@@ -1,54 +1,61 @@
-from kucoin_futures.client import Market
+import httpx
 import pandas as pd
 import time
 import logging
 
 logger = logging.getLogger(__name__)
-
-# Initialise le client Futures
-client = Market(url='https://api-futures.kucoin.com')
-logger.info("✅ API KuCoin Futures initialisée (kucoin-futures-python)")
+BASE_URL = "https://api-futures.kucoin.com"
 
 def get_kucoin_perps():
     """
-    Récupère la liste des symboles PERP en USDT.
+    Récupère la liste des symboles PERP USDT via l'endpoint public /contracts/active.
     """
-    try:
-        contracts = client.get_contracts_list()
-        usdt = [c['symbol'] for c in contracts if c.get('quoteCurrency') == 'USDT']
-        logger.info(f"📊 {len(usdt)} PERP en USDT trouvés.")
-        return usdt
-    except Exception as e:
-        logger.error(f"❌ Erreur récupération PERP : {e}")
+    url = f"{BASE_URL}/api/v1/contracts/active"
+    resp = httpx.get(url)
+    resp.raise_for_status()
+    data = resp.json()
+    # Vérifie le code de succès
+    if data.get("code") not in ("200000", None):
+        logger.error(f"❌ get_kucoin_perps → code={data['code']} msg={data.get('msg')}")
         return []
+    contracts = data.get("data", [])
+    perps = [c["symbol"] for c in contracts if c.get("quoteCurrency") == "USDT"]
+    logger.info(f"📊 {len(perps)} PERP USDT récupérés")
+    return perps
 
 def fetch_klines(symbol, interval="4hour", limit=150):
     """
-    Récupère les bougies en 4 H (granularity=240 minutes) pour le symbol donné.
+    Récupère les bougies 4H (granularity=240 minutes) pour un symbol donné.
     """
-    # mapping interval -> minutes attendu par l'API
-    _INTERVALS = {"4hour": 240}
-    minutes = _INTERVALS.get(interval, 240)
+    # mapping interval → minutes (API Futures attend des minutes)
+    granularity_map = {"4hour": 240}
+    minutes = granularity_map[interval]
 
-    try:
-        logger.info(f"📥 Requête 4H → {symbol} (granularity={minutes} min, limit={limit})")
-        # Appel au wrapper officiel
-        raw = client.get_kline_data(symbol=symbol, granularity=minutes)
-        if not raw:
-            raise ValueError("Aucune donnée retournée par l'API")
-        # raw est une liste de listes [ts, open, high, low, close, vol, turnover, ...]
-        df = pd.DataFrame(raw, columns=[
-            "timestamp", "open", "high", "low", "close", "volume", "turnover"
-        ])
-        # Conversion du timestamp Unix (en secondes) en datetime
-        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="s")
-        df.set_index("timestamp", inplace=True)
-        df = df.astype(float)
-        # Pause pour ne pas trop solliciter l'API
-        time.sleep(0.2)
-        logger.info(f"✅ {symbol} : {len(df)} bougies 4H récupérées")
-        return df
-    except Exception as e:
-        logger.error(f"❌ {symbol} → Erreur récupération 4H : {e}")
-        # remonte l'erreur pour permettre à scanner.py de la logger aussi
-        raise
+    url = f"{BASE_URL}/api/v1/kline/query"
+    params = {"symbol": symbol, "granularity": minutes, "limit": limit}
+
+    resp = httpx.get(url, params=params)
+    resp.raise_for_status()
+    data = resp.json()
+
+    # L’API répond toujours code 200000 pour OK
+    if data.get("code") != "200000":
+        raise ValueError(f"{symbol} → code={data.get('code')} msg={data.get('msg')}")
+
+    raw = data.get("data", [])
+    if not raw:
+        raise ValueError(f"{symbol} → pas de données 4H disponibles")
+
+    # Construire le DataFrame
+    df = pd.DataFrame(raw, columns=[
+        "timestamp", "open", "high", "low", "close", "volume", "turnover"
+    ])
+    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="s")
+    df.set_index("timestamp", inplace=True)
+    df = df.astype(float)
+
+    # Pause pour respecter le rate-limit
+    time.sleep(0.2)
+
+    logger.info(f"✅ {symbol} : {len(df)} bougies 4H récupérées")
+    return df
