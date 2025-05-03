@@ -1,67 +1,26 @@
-# signal_analysis.py
-
 import pandas as pd
 import pandas_ta as ta
+from plot_signal import generate_trade_graph
 
-def analyze_market(symbol, df):
-    if df is None or len(df) < 50:
+async def analyze_market(bot, symbol, df):
+    df['rsi'] = ta.rsi(df['close'], length=14)
+    macd = ta.macd(df['close'])
+    if macd is not None:
+        df['macd'] = macd['MACD_12_26_9']
+        df['signal'] = macd['MACDs_12_26_9']
+    else:
         return None
 
-    df["rsi"] = ta.rsi(df["close"], length=14)
-    macd = ta.macd(df["close"])
-    if macd is None or "MACD_12_26_9" not in macd or "MACDs_12_26_9" not in macd:
+    if df['rsi'].iloc[-1] < 40 or df['rsi'].iloc[-1] > 60:
         return None
-    df["macd"] = macd["MACD_12_26_9"]
-    df["macd_signal"] = macd["MACDs_12_26_9"]
 
-    rsi = df["rsi"].iloc[-1]
-    macd_val = df["macd"].iloc[-1]
-    macd_signal = df["macd_signal"].iloc[-1]
-    close = df["close"].iloc[-1]
+    if df['macd'].iloc[-1] > df['signal'].iloc[-1] and df['macd'].iloc[-2] < df['signal'].iloc[-2]:
+        entry = df['close'].iloc[-1]
+        sl = df['low'].iloc[-20:-1].min()  # SL sous support
+        tp = entry * 1.03
+        image = generate_trade_graph(df, entry, sl, tp, symbol)
 
-    # Fibo (niveau 0.236, 0.382, 0.5)
-    recent_lows = df["low"].rolling(window=20).min()
-    recent_highs = df["high"].rolling(window=20).max()
-    low = recent_lows.iloc[-1]
-    high = recent_highs.iloc[-1]
-    fibo_236 = low + 0.236 * (high - low)
-    fibo_382 = low + 0.382 * (high - low)
-    fibo_500 = low + 0.5 * (high - low)
-
-    # Conditions de signal LONG
-    if (
-        40 < rsi < 60 and
-        macd_val > macd_signal and
-        close >= fibo_382 and close <= fibo_500
-    ):
-        sl = round(low * 0.995, 4)  # SL sous support
-        tp = round(close * 1.03, 4)
-        entry = round(close * 0.9975, 4)
-        return {
-            "symbol": symbol,
-            "side": "LONG",
-            "entry": entry,
-            "sl": sl,
-            "tp": tp,
-            "message": f"🚀 LONG {symbol}\n🎯 Entrée: {entry}\n📉 SL: {sl}\n📈 TP: {tp}"
-        }
-
-    # Conditions de signal SHORT
-    if (
-        40 < rsi < 60 and
-        macd_val < macd_signal and
-        close <= fibo_382 and close >= fibo_236
-    ):
-        sl = round(high * 1.005, 4)
-        tp = round(close * 0.97, 4)
-        entry = round(close * 1.0025, 4)
-        return {
-            "symbol": symbol,
-            "side": "SHORT",
-            "entry": entry,
-            "sl": sl,
-            "tp": tp,
-            "message": f"🔥 SHORT {symbol}\n🎯 Entrée: {entry}\n📉 SL: {sl}\n📈 TP: {tp}"
-        }
+        message = f"🔔 Signal LONG détecté sur {symbol}\n\n🎯 Entrée : {entry:.4f}\n🛡️ SL : {sl:.4f}\n💰 TP : {tp:.4f}"
+        return image, message
 
     return None
