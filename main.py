@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 
 # Flask app pour keep-alive
 app = Flask(__name__)
+
 @app.route("/")
 def home():
     return "Bot is running!"
@@ -30,9 +31,9 @@ async def scan_test_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for msg in results:
             await update.message.reply_text(msg)
     else:
-        await update.message.reply_text("✅ Scan terminé
+        await update.message.reply_text("""✅ Scan terminé
 
-🧠 Aucun signal détecté.")
+🧠 Aucun signal détecté.""")
 
 # Application Telegram
 application = Application.builder().token(TOKEN).build()
