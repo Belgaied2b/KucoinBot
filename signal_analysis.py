@@ -1,86 +1,71 @@
+# signal_analysis.py
+
 import pandas_ta as ta
-import math
 
-def _format_price(price: float) -> str:
-    if price == 0:
-        return "0"
-    exp = math.floor(math.log10(price))
-    decimals = 4 if exp >= -4 else abs(exp) + 2
-    return f"{price:.{decimals}f}"
+def is_in_OTE_zone(entry_price, low, high):
+    fib_618 = low + 0.618 * (high - low)
+    fib_786 = low + 0.786 * (high - low)
+    return fib_786 <= entry_price <= fib_618
 
-def analyze_market(symbol: str, df) -> dict | None:
-    """
-    Détecte un signal LONG ou SHORT sur un timeframe H4.
-    Renvoie dict {
-        side: "LONG" | "SHORT",
-        symbol, entry, sl, tp
-    } ou None si aucun signal.
-    Critères :
-      • RSI 40–60
-      • MACD quasi-croisement (tolérance ±0.002)
-      • Volume ≥ 1.1× moyenne 20 barres
-      • Bougie haussière (LONG) ou baissière (SHORT)
-      • Pullback Fib 61,8 % pour entrée
-      • SL au swing, TP à 2× distance SL→entry
-    """
-    # 1) RSI + MACD + Signal
-    df["rsi"]    = ta.rsi(df["close"], length=14)
-    macd_vals    = ta.macd(df["close"])
-    df["macd"]   = macd_vals["MACD_12_26_9"]
-    df["signal"] = macd_vals["MACDs_12_26_9"]
+def detect_fvg(df):
+    fvg_zones = []
+    for i in range(2, len(df)):
+        high_prev2 = df['high'].iat[i - 2]
+        low_curr   = df['low'].iat[i]
+        if high_prev2 < low_curr:
+            fvg_zones.append((high_prev2, low_curr))
+    return fvg_zones
 
-    last_rsi    = df["rsi"].iloc[-1]
-    last_macd   = df["macd"].iloc[-1]
-    last_sig    = df["signal"].iloc[-1]
-    last_vol    = df["volume"].iloc[-1]
-    avg_vol     = df["volume"].iloc[-21:-1].mean()
-    last_open   = df["open"].iloc[-1]
-    last_close  = df["close"].iloc[-1]
+def analyze_market(symbol, df):
+    # Calcul des indicateurs
+    rsi  = ta.rsi(df['close'], length=14)
+    macd = ta.macd(df['close'])
+    if rsi is None or macd is None:
+        return None
 
-    # 2) RSI 40–60
+    df['rsi']    = rsi
+    df['macd']   = macd['MACD_12_26_9']
+    df['signal'] = macd['MACDs_12_26_9']
+
+    # Conditions RSI / MACD
+    last_rsi    = df['rsi'].iat[-1]
+    last_macd   = df['macd'].iat[-1]
+    last_signal = df['signal'].iat[-1]
     if last_rsi < 40 or last_rsi > 60:
         return None
-
-    # 3) MACD quasi-croisement : |MACD − signal| ≤ 0.002
-    if abs(last_macd - last_sig) > 0.002:
+    if last_macd < last_signal - 0.001:
         return None
 
-    # 4) Volume ≥ 1.1× moyenne
-    if last_vol < 1.1 * avg_vol:
+    # Détermination du dernier swing pour tracer Fibo
+    swing_low  = df['low'].iloc[-21:-1].min()
+    swing_high = df['high'].iloc[-21:-1].max()
+    entry      = round(swing_low + 0.5 * (swing_high - swing_low), 6)
+
+    # Filtre OTE
+    if not is_in_OTE_zone(entry, swing_low, swing_high):
         return None
 
-    # 5) Détermination du swing H4
-    swing_low   = df["low"].iloc[-20:-1].min()
-    swing_high  = df["high"].iloc[-20:-1].max()
-    diff        = swing_high - swing_low
-
-    # 6) Cas LONG
-    if last_close > last_open:
-        entry_raw = swing_low + diff * 0.618
-        sl_raw    = swing_low
-        tp_raw    = entry_raw + (entry_raw - sl_raw) * 2
-        side      = "LONG"
-
-    # 7) Cas SHORT
-    elif last_close < last_open:
-        entry_raw = swing_high - diff * 0.618
-        sl_raw    = swing_high
-        tp_raw    = entry_raw - (sl_raw - entry_raw) * 2
-        side      = "SHORT"
-
-    # 8) Ni bullish ni bearish
-    else:
+    # Filtre FVG
+    fvg_zones = detect_fvg(df)
+    matching  = [z for z in fvg_zones if z[0] <= entry <= z[1]]
+    if not matching:
         return None
 
-    # 9) Formatage des prix
-    entry = _format_price(entry_raw)
-    sl    = _format_price(sl_raw)
-    tp    = _format_price(tp_raw)
+    # Calcul SL / TP
+    sl = round(swing_low, 6)
+    tp = round(entry + (entry - sl) * 2, 6)
+
+    ote_zone = (
+        round(swing_low + 0.786 * (swing_high - swing_low), 6),
+        round(swing_low + 0.618 * (swing_high - swing_low), 6)
+    )
 
     return {
-        "side":   side,
-        "symbol": symbol,
-        "entry":  entry,
-        "sl":     sl,
-        "tp":     tp
+        'symbol':    symbol,
+        'entry':     entry,
+        'sl':        sl,
+        'tp':        tp,
+        'ote_zone':  ote_zone,
+        'fvg_zone':  matching[0],
+        'active':    False
     }
