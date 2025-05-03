@@ -1,38 +1,39 @@
-# scanner.py
-
-import asyncio
-from telegram import InputFile
+import logging
 from kucoin_utils import get_kucoin_perps, fetch_klines
 from signal_analysis import analyze_market
-from plot_signal import generate_trade_graph
+from telegram import InputFile
+from io import BytesIO
 
 async def scan_and_send_signals(bot):
-    print("🔍 [AutoScan] Début du scan des PERP KuCoin...")
-    results = await analyze_market(bot)
-    print("✅ [AutoScan] Scan terminé.")
-    if results:
-        for signal in results:
-            buffer = generate_trade_graph(signal["dataframe"], signal)
-            if buffer:
-                await bot.send_photo(
-                    chat_id=signal["chat_id"],
-                    photo=InputFile(buffer, filename="trade.png"),
-                    caption=signal["message"]
-                )
-    else:
-        print("❌ [AutoScan] Aucun signal détecté.")
+    logging.info("🚀 Début du scan auto")
+    symbols = await get_kucoin_perps()
+    logging.info(f"📉 Nombre de PERP détectés : {len(symbols)}")
+
+    for symbol in symbols:
+        df = await fetch_klines(symbol)
+        if df is None:
+            continue
+
+        result = await analyze_market(bot, symbol, df)
+        if result:
+            buffer, message = result
+            await bot.send_photo(chat_id=os.environ["CHAT_ID"], photo=InputFile(buffer), caption=message)
+
+    logging.info("✅ Scan auto terminé")
 
 async def run_test_scan(bot):
-    print("🚀 Début du scan test")
-    results = await analyze_market(bot)
-    print(f"📉 Nombre de PERP détectés : {len(results)}" if results else "📉 Aucun signal détecté.")
-    if results:
-        for signal in results:
-            buffer = generate_trade_graph(signal["dataframe"], signal)
-            if buffer:
-                await bot.send_photo(
-                    chat_id=signal["chat_id"],
-                    photo=InputFile(buffer, filename="trade.png"),
-                    caption=signal["message"]
-                )
-    print("✅ Scan test terminé")
+    logging.info("🚀 Scan test déclenché")
+    symbols = await get_kucoin_perps()
+    logging.info(f"📉 Nombre de PERP détectés : {len(symbols)}")
+
+    for symbol in symbols[:5]:  # test sur 5 paires
+        df = await fetch_klines(symbol)
+        if df is None:
+            continue
+
+        result = await analyze_market(bot, symbol, df)
+        if result:
+            buffer, message = result
+            await bot.send_photo(chat_id=os.environ["CHAT_ID"], photo=InputFile(buffer), caption=message)
+
+    logging.info("✅ Scan test terminé")
