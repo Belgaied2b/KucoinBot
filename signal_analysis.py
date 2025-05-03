@@ -1,26 +1,22 @@
-import pandas as pd
 import pandas_ta as ta
-from plot_signal import generate_trade_graph
 
-async def analyze_market(bot, symbol, df):
-    df['rsi'] = ta.rsi(df['close'], length=14)
-    macd = ta.macd(df['close'])
-    if macd is not None:
-        df['macd'] = macd['MACD_12_26_9']
-        df['signal'] = macd['MACDs_12_26_9']
-    else:
-        return None
+def analyze_market(symbol, df):
+    df["rsi"] = ta.rsi(df["close"], length=14)
+    macd = ta.macd(df["close"])
+    df["macd"] = macd["MACD_12_26_9"]
+    df["signal"] = macd["MACDs_12_26_9"]
 
-    if df['rsi'].iloc[-1] < 40 or df['rsi'].iloc[-1] > 60:
-        return None
+    rsi = df["rsi"].iloc[-1]
+    macd_val = df["macd"].iloc[-1]
+    signal_val = df["signal"].iloc[-1]
 
-    if df['macd'].iloc[-1] > df['signal'].iloc[-1] and df['macd'].iloc[-2] < df['signal'].iloc[-2]:
-        entry = df['close'].iloc[-1]
-        sl = df['low'].iloc[-20:-1].min()  # SL sous support
-        tp = entry * 1.03
-        image = generate_trade_graph(df, entry, sl, tp, symbol)
-
-        message = f"🔔 Signal LONG détecté sur {symbol}\n\n🎯 Entrée : {entry:.4f}\n🛡️ SL : {sl:.4f}\n💰 TP : {tp:.4f}"
-        return image, message
-
+    # Conditions swing
+    if 40 < rsi < 60 and macd_val > signal_val:
+        entry = round(df["close"].iloc[-1] * 0.995, 4)
+        tp = round(entry * 1.03, 4)
+        sl = round(entry * 0.97, 4)
+        return {
+            "message": f"<b>{symbol}</b>\n🎯 Entrée: <code>{entry}</code>\n📈 TP: <code>{tp}</code>\n🛡 SL: <code>{sl}</code>",
+            "graph_path": generate_trade_graph(symbol, df, entry, tp, sl)
+        }
     return None
