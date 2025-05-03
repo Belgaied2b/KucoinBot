@@ -15,14 +15,14 @@ CHAT_ID = os.environ["CHAT_ID"]
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Flask app pour keep-alive
+# Flask keep-alive
 app = Flask(__name__)
 
 @app.route("/")
 def home():
     return "Bot is running!"
 
-# Commande test
+# Commande Telegram
 async def scan_test_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info("✅ Commande /scan_test reçue")
     await update.message.reply_text("🚀 Début du scan test")
@@ -33,20 +33,23 @@ async def scan_test_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("""✅ Scan terminé\n\n🧠 Aucun signal détecté.""")
 
-# Lancer le bot dans un thread
+# Lancer Flask dans un thread
+def run_flask():
+    app.run(host="0.0.0.0", port=3000)
+
+# Lancer le bot Telegram dans le thread principal
 def run_bot():
     application = Application.builder().token(TOKEN).build()
     application.add_handler(CommandHandler("scan_test", scan_test_command))
 
-    # Planificateur
+    # Scheduler
     scheduler = BackgroundScheduler()
     scheduler.add_job(scan_and_send_signals, "interval", minutes=10, args=[application.bot])
     scheduler.start()
     logger.info("🚀 Bot démarré avec scan automatique toutes les 10 minutes")
 
-    # Lancement polling (bloquant)
     application.run_polling()
 
 if __name__ == "__main__":
-    threading.Thread(target=lambda: app.run(host="0.0.0.0", port=3000)).start()
-    threading.Thread(target=run_bot).start()
+    threading.Thread(target=run_flask).start()
+    run_bot()
