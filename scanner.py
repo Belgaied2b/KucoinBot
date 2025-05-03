@@ -1,55 +1,52 @@
 import os
-import time
 import pandas as pd
-import requests
-import matplotlib.pyplot as plt
-from kucoin_utils import get_all_symbols_from_kucoin
+import logging
+from telegram import InputFile
+from kucoin_utils import get_kucoin_perps, fetch_klines
 from analysis import analyze_symbol
-from graph import generate_trade_graph
-from telegram import Bot
+from plot_signal import generate_trade_graph
+from config import CHAT_ID
 
-CHAT_ID = os.getenv("CHAT_ID")
-TOKEN = os.getenv("TOKEN")
-bot = Bot(token=TOKEN)
+# Logger
+logger = logging.getLogger(__name__)
 
-def scan_and_send_signals():
+async def scan_and_send_signals(bot):
     print("🚀 Début du scan automatique")
-    symbols = get_all_symbols_from_kucoin()
-    contracts = [s for s in symbols if "USDT:USDT" in s and "PERP" in s]
-    print(f"📉 Nombre de PERP détectés : {len(contracts)}")
 
-    for symbol in contracts:
-        try:
-            df = fetch_ohlcv(symbol)
-            if df is None or len(df) < 100:
+    try:
+        perps = get_kucoin_perps()
+        print(f"📉 Nombre de PERP détectés : {len(perps)}")
+
+        for symbol in perps:
+            df = fetch_klines(symbol)
+            if df is None or df.empty:
                 continue
 
             signal = analyze_symbol(symbol, df)
             if signal:
-                fig = generate_trade_graph(symbol, df, signal)
-                image_path = f"{symbol.replace('/', '_')}.png"
-                fig.savefig(image_path)
-                bot.send_photo(chat_id=CHAT_ID, photo=open(image_path, "rb"), caption=signal["message"])
-                plt.close(fig)
+                print(f"✅ Signal détecté : {symbol}")
+
+                image_path = generate_trade_graph(
+                    df,
+                    signal["entry"],
+                    signal["sl"],
+                    signal["tp"],
+                    signal["side"],
+                    symbol
+                )
+
+                caption = (
+                    f"📈 *{symbol}* - *{signal['side'].upper()}*\n"
+                    f"🎯 Entrée : `{signal['entry']:.4f}`\n"
+                    f"🛑 SL : `{signal['sl']:.4f}`\n"
+                    f"🎯 TP : `{signal['tp']:.4f}`"
+                )
+
+                with open(image_path, 'rb') as img:
+                    await bot.send_photo(chat_id=CHAT_ID, photo=InputFile(img), caption=caption, parse_mode='Markdown')
+
                 os.remove(image_path)
-
-        except Exception as e:
-            print(f"Erreur avec {symbol}: {e}")
-
-    print("✅ Scan automatique terminé")
-
-def fetch_ohlcv(symbol):
-    url = f"https://api.kucoin.com/api/v1/market/candles?type=4hour&symbol={symbol.replace(':', '-')}"
-    try:
-        response = requests.get(url)
-        data = response.json()["data"]
-        if not data:
-            return None
-        df = pd.DataFrame(data, columns=["time", "open", "close", "high", "low", "volume", "turnover"])
-        df = df.iloc[::-1]
-        df[["open", "close", "high", "low", "volume"]] = df[["open", "close", "high", "low", "volume"]].astype(float)
-        df["time"] = pd.to_datetime(df["time"], unit="s")
-        return df
     except Exception as e:
-        print(f"Erreur récupération OHLCV {symbol}: {e}")
-        return None
+        logger.error(f"Erreur pendant le scan : {e}")
+
+    print("✅ Scan terminé")
