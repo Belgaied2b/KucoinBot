@@ -1,52 +1,51 @@
-import os
-import pandas as pd
-import logging
-from telegram import InputFile
-from kucoin_utils import get_kucoin_perps, fetch_klines
-from analysis import analyze_symbol
-from plot_signal import generate_trade_graph
-from config import CHAT_ID
+# scanner.py
 
-# Logger
+import logging
+from kucoin_utils import get_kucoin_perps, fetch_klines
+from signal_analysis import analyze_market
+from plot_signal import generate_trade_graph
+from telegram import InputFile
+
 logger = logging.getLogger(__name__)
 
 async def scan_and_send_signals(bot):
-    print("🚀 Début du scan automatique")
+    print("📡 Scan automatique démarré")
+    symbols = get_kucoin_perps()
+    print(f"🔍 Analyse de {len(symbols)} contrats PERP...")
 
-    try:
-        perps = get_kucoin_perps()
-        print(f"📉 Nombre de PERP détectés : {len(perps)}")
+    for symbol in symbols:
+        df = fetch_klines(symbol)
+        if df is None:
+            continue
+        signal = analyze_market(symbol, df)
+        if signal:
+            image_path = generate_trade_graph(df, signal)
+            await bot.send_photo(
+                chat_id=CHAT_ID,
+                photo=InputFile(image_path),
+                caption=signal["message"]
+            )
 
-        for symbol in perps:
-            df = fetch_klines(symbol)
-            if df is None or df.empty:
-                continue
+    print("✅ Scan automatique terminé")
 
-            signal = analyze_symbol(symbol, df)
-            if signal:
-                print(f"✅ Signal détecté : {symbol}")
+async def run_test_scan(bot):
+    print("📡 Scan test démarré")
+    symbols = get_kucoin_perps()
+    print(f"🔍 Analyse de {len(symbols)} contrats PERP...")
 
-                image_path = generate_trade_graph(
-                    df,
-                    signal["entry"],
-                    signal["sl"],
-                    signal["tp"],
-                    signal["side"],
-                    symbol
-                )
+    count = 0
+    for symbol in symbols:
+        df = fetch_klines(symbol)
+        if df is None:
+            continue
+        signal = analyze_market(symbol, df)
+        if signal:
+            count += 1
+            image_path = generate_trade_graph(df, signal)
+            await bot.send_photo(
+                chat_id=CHAT_ID,
+                photo=InputFile(image_path),
+                caption=signal["message"]
+            )
 
-                caption = (
-                    f"📈 *{symbol}* - *{signal['side'].upper()}*\n"
-                    f"🎯 Entrée : `{signal['entry']:.4f}`\n"
-                    f"🛑 SL : `{signal['sl']:.4f}`\n"
-                    f"🎯 TP : `{signal['tp']:.4f}`"
-                )
-
-                with open(image_path, 'rb') as img:
-                    await bot.send_photo(chat_id=CHAT_ID, photo=InputFile(img), caption=caption, parse_mode='Markdown')
-
-                os.remove(image_path)
-    except Exception as e:
-        logger.error(f"Erreur pendant le scan : {e}")
-
-    print("✅ Scan terminé")
+    print(f"✅ Scan test terminé — {count} signal(s) détecté(s)")
