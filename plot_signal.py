@@ -1,26 +1,17 @@
-# plot_signal.py
-
 import matplotlib.pyplot as plt
-import io
+from io import BytesIO
 
-def generate_trade_graph(df, signal):
-    try:
-        fig, ax = plt.subplots(figsize=(10, 5))
-        df["close"].plot(ax=ax, label="Prix", linewidth=1)
+def generate_trade_graph(df, entry, sl, tp, symbol):
+    plt.figure(figsize=(10, 5))
+    plt.plot(df['close'], label='Close Price')
+    plt.axhline(entry, color='blue', linestyle='--', label='Entrée')
+    plt.axhline(sl, color='red', linestyle='--', label='SL')
+    plt.axhline(tp, color='green', linestyle='--', label='TP')
+    plt.title(f"Signal sur {symbol}")
+    plt.legend()
 
-        ax.axhline(signal["entry"], color="blue", linestyle="--", label="Entrée")
-        ax.axhline(signal["tp"], color="green", linestyle="--", label="TP")
-        ax.axhline(signal["sl"], color="red", linestyle="--", label="SL")
-
-        ax.set_title(f"{signal['symbol']} - {signal['side']}")
-        ax.set_ylabel("Prix")
-        ax.legend()
-
-        buffer = io.BytesIO()
-        plt.savefig(buffer, format="png")
-        buffer.seek(0)
-        plt.close()
-        return buffer
-    except Exception as e:
-        print(f"Erreur création graphique: {e}")
-        return None
+    buffer = BytesIO()
+    plt.savefig(buffer, format='png')
+    buffer.seek(0)
+    plt.close()
+    return buffer
