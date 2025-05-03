@@ -21,14 +21,10 @@ def analyze_market(symbol, df):
     tp = round(price + (price - sl) * 2, 4)
 
     msg = (
-        f"📈 {symbol}
-"
-        f"RSI: {df['rsi'].iloc[-1]:.2f}
-"
-        f"MACD: {df['macd'].iloc[-1]:.4f} > {df['signal'].iloc[-1]:.4f}
-"
-        f"Entrée: {price:.4f}
-"
+        f"📈 {symbol}\n"
+        f"RSI: {df['rsi'].iloc[-1]:.2f}\n"
+        f"MACD: {df['macd'].iloc[-1]:.4f} > {df['signal'].iloc[-1]:.4f}\n"
+        f"Entrée: {price:.4f}\n"
         f"TP: {tp:.4f} | SL: {sl:.4f}"
     )
     return msg
