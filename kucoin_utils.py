@@ -1,36 +1,47 @@
+# kucoin_utils.py
+
 import httpx
-import pandas as pd
 import time
 
-BASE_URL = "https://api.kucoin.com"
+KUCOIN_BASE_URL = "https://api.kucoin.com"
 
-def get_kucoin_perps():
-    url = f"{BASE_URL}/api/v1/contracts/active"
-    response = httpx.get(url)
-    response.raise_for_status()
-    data = response.json()
-    return [d["symbol"] for d in data["data"] if d["symbol"].endswith("USDTM")]
+async def get_kucoin_perps():
+    url = f"{KUCOIN_BASE_URL}/api/v1/contracts/active"
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.get(url, timeout=10)
+            data = r.json()
+            return [item["symbol"] for item in data["data"] if item["symbol"].endswith("USDTM")]
+    except Exception as e:
+        print(f"Erreur récupération PERP KuCoin : {e}")
+        return []
 
-def fetch_klines(symbol, interval="4hour", limit=100):
-    url = f"{BASE_URL}/api/v1/market/candles"
+async def fetch_klines(symbol, interval="4h", limit=100):
+    url = f"{KUCOIN_BASE_URL}/api/v1/kline/query"
     params = {
         "symbol": symbol,
-        "type": interval,
+        "granularity": 14400,
         "limit": limit
     }
     try:
-        response = httpx.get(url, params=params)
-        response.raise_for_status()
-        data = response.json()
-        if "data" not in data:
-            return None
-        df = pd.DataFrame(data["data"], columns=[
-            "time", "open", "close", "high", "low", "volume", "turnover"
-        ])
-        df = df.iloc[::-1].copy()
-        df["time"] = pd.to_datetime(df["time"], unit='ms')
-        df[["open", "close", "high", "low", "volume"]] = df[["open", "close", "high", "low", "volume"]].astype(float)
-        return df
+        async with httpx.AsyncClient() as client:
+            r = await client.get(url, params=params, timeout=10)
+            data = r.json()
+            if "data" not in data or not data["data"]:
+                return None
+            # Format: [timestamp, open, close, high, low, volume, turnover]
+            df = [
+                {
+                    "timestamp": int(candle[0]),
+                    "open": float(candle[1]),
+                    "close": float(candle[2]),
+                    "high": float(candle[3]),
+                    "low": float(candle[4]),
+                    "volume": float(candle[5])
+                }
+                for candle in data["data"]
+            ]
+            return df[::-1]  # plus récents à la fin
     except Exception as e:
-        print(f"Erreur fetch_klines pour {symbol}: {e}")
+        print(f"Erreur fetch klines {symbol} : {e}")
         return None
