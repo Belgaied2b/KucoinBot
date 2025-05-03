@@ -1,16 +1,18 @@
+# main.py
+
 import logging
 import threading
 from flask import Flask
 from telegram.ext import Application, CommandHandler
 from apscheduler.schedulers.background import BackgroundScheduler
 from scanner import scan_and_send_signals, run_test_scan
-import os
+from config import TOKEN, CHAT_ID
 
 # Logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Flask pour keep-alive
+# Flask app pour keep-alive
 app = Flask(__name__)
 
 @app.route('/')
@@ -20,14 +22,17 @@ def home():
 def run_flask():
     app.run(host='0.0.0.0', port=3000)
 
-# Bot Telegram
-TOKEN = os.getenv("TOKEN")
+# Application Telegram
 application = Application.builder().token(TOKEN).build()
 
-# Commande /scan_test
-application.add_handler(CommandHandler("scan_test", run_test_scan))
+# Handler pour /scan_test
+async def scan_test_command(update, context):
+    await update.message.reply_text("✅ Commande /scan_test reçue\n🚀 Début du scan test")
+    await run_test_scan(context.bot)
 
-# Planification du scan auto toutes les 10 minutes
+application.add_handler(CommandHandler("scan_test", scan_test_command))
+
+# Planification du scan toutes les 10 minutes
 scheduler = BackgroundScheduler()
 scheduler.add_job(
     scan_and_send_signals,
@@ -38,12 +43,13 @@ scheduler.add_job(
     coalesce=True
 )
 scheduler.start()
-print("🚀 Bot démarré avec scan automatique toutes les 10 minutes")
 
-# Démarrage parallèle
+# Lancer le bot Telegram
 def run_bot():
+    print("🚀 Bot démarré avec scan automatique toutes les 10 minutes")
     application.run_polling()
 
+# Démarrage : Flask + bot Telegram en parallèle
 if __name__ == '__main__':
     threading.Thread(target=run_flask).start()
     run_bot()
