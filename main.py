@@ -38,9 +38,11 @@ scheduler.add_job(
 )
 scheduler.start()
 
-# Async runner pour le bot Telegram dans un thread
+# ✅ Asyncio-safe thread runner
 def run_bot():
-    asyncio.run(application.run_polling())
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(application.run_polling())
 
 # Main
 if __name__ == '__main__':
