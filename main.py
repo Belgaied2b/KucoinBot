@@ -2,6 +2,7 @@
 
 import logging
 import threading
+import asyncio
 from flask import Flask
 from telegram.ext import Application
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -12,7 +13,7 @@ from config import TOKEN
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Flask app pour keep-alive Railway
+# Flask app
 app = Flask(__name__)
 
 @app.route('/')
@@ -22,10 +23,10 @@ def home():
 def run_flask():
     app.run(host='0.0.0.0', port=3000)
 
-# Application Telegram
+# Bot Telegram
 application = Application.builder().token(TOKEN).build()
 
-# Planification du scan toutes les 10 minutes
+# Tâche répétée : scan toutes les 10 min
 scheduler = BackgroundScheduler()
 scheduler.add_job(
     scan_and_send_signals,
@@ -37,11 +38,11 @@ scheduler.add_job(
 )
 scheduler.start()
 
-# Lancer le bot Telegram dans un thread séparé
+# Async runner pour le bot Telegram dans un thread
 def run_bot():
-    application.run_polling()
+    asyncio.run(application.run_polling())
 
-# Lancer le tout
+# Main
 if __name__ == '__main__':
     print("🚀 Bot démarré avec scan automatique toutes les 10 minutes", flush=True)
     threading.Thread(target=run_flask).start()
