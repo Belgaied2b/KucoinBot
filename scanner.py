@@ -27,14 +27,12 @@ async def scan_and_send_signals(bot: Bot):
                     "tp": tp
                 })
                 await bot.send_photo(chat_id=os.environ["CHAT_ID"], photo=InputFile(buf))
-                await bot.send_message(chat_id=os.environ["CHAT_ID"], text=signal)
         except Exception as e:
             logger.error(f"Erreur {symbol} : {e}")
     logger.info("✅ Scan automatique terminé")
 
 async def run_test_scan(bot: Bot):
     logger.info("🚀 Scan test lancé")
-    messages = []
     symbols = get_kucoin_perps()
     logger.info(f"🔍 {len(symbols)} PERP détectés")
     for symbol in symbols[:20]:
@@ -53,8 +51,6 @@ async def run_test_scan(bot: Bot):
                     "tp": tp
                 })
                 await bot.send_photo(chat_id=os.environ["CHAT_ID"], photo=InputFile(buf))
-                await bot.send_message(chat_id=os.environ["CHAT_ID"], text=signal)
         except Exception as e:
             logger.error(f"Erreur {symbol} : {e}")
     logger.info("✅ Scan test terminé")
-    return messages
