@@ -1,7 +1,7 @@
 python-telegram-bot==20.6
 apscheduler
 flask
-kucoin-futures
+kucoin-python
 pandas
 pandas_ta
 matplotlib
