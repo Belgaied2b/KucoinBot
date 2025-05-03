@@ -1,9 +1,7 @@
-python-telegram-bot==20.6
-httpx==0.25.2
-flask==3.1.0
-apscheduler==3.11.0
-matplotlib==3.8.3
-pandas==2.2.2
-numpy==1.26.4
-kucoin-python==1.0.11
-pandas-ta==0.3.14b0
+python-telegram-bot==20.7
+httpx
+flask
+pandas
+pandas_ta
+matplotlib
+apscheduler
