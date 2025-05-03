@@ -1,20 +1,16 @@
-import os
 import logging
+import asyncio
 import threading
 from flask import Flask
 from telegram.ext import Application, CommandHandler
-from apscheduler.schedulers.background import BackgroundScheduler
 from scanner import scan_and_send_signals, run_test_scan
+from config import TOKEN
 
 # Logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Token & Chat ID depuis Railway
-TOKEN = os.environ.get("TOKEN")
-CHAT_ID = os.environ.get("CHAT_ID")
-
-# Flask app (pour Railway)
+# Flask pour keep-alive
 app = Flask(__name__)
 
 @app.route('/')
@@ -24,25 +20,30 @@ def home():
 def run_flask():
     app.run(host='0.0.0.0', port=3000)
 
-# Commande /scan_test
+# Fonction principale async
+async def run_bot():
+    application = Application.builder().token(TOKEN).build()
+
+    # Supprimer tout webhook existant (anti-conflit)
+    await application.bot.delete_webhook(drop_pending_updates=True)
+
+    # Commande de test
+    application.add_handler(CommandHandler("scan_test", scan_test_command))
+
+    # Démarrage
+    logger.info("🚀 Bot démarré avec scan automatique toutes les 10 minutes")
+    await application.initialize()
+    await application.start()
+    await application.updater.start_polling()
+    await application.updater.idle()
+
+# Callback de commande test
 async def scan_test_command(update, context):
     await update.message.reply_text("✅ Commande /scan_test reçue\n\n🚀 Début du scan test")
     await run_test_scan(context.bot)
-
-# App Telegram
-application = Application.builder().token(TOKEN).build()
-application.add_handler(CommandHandler("scan_test", scan_test_command))
-
-# Planificateur
-scheduler = BackgroundScheduler()
-scheduler.add_job(scan_and_send_signals, 'interval', minutes=10, args=[application.bot])
-scheduler.start()
+    await update.message.reply_text("✅ Scan test terminé")
 
 # Lancement
-def run_bot():
-    logger.info("🚀 Bot démarré avec scan automatique toutes les 10 minutes")
-    application.run_polling()
-
 if __name__ == '__main__':
     threading.Thread(target=run_flask).start()
-    run_bot()
+    asyncio.run(run_bot())
