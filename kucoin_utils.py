@@ -1,4 +1,4 @@
-from kucoin.client import Market
+from kucoin_futures.client import Market
 import pandas as pd
 import time
 
