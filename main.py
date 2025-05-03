@@ -1,6 +1,6 @@
-import asyncio
 import logging
 import os
+import threading
 from flask import Flask
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
@@ -31,25 +31,22 @@ async def scan_test_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for msg in results:
             await update.message.reply_text(msg)
     else:
-        await update.message.reply_text("""✅ Scan terminé
+        await update.message.reply_text("""✅ Scan terminé\n\n🧠 Aucun signal détecté.""")
 
-🧠 Aucun signal détecté.""")
+# Lancer le bot dans un thread
+def run_bot():
+    application = Application.builder().token(TOKEN).build()
+    application.add_handler(CommandHandler("scan_test", scan_test_command))
 
-# Application Telegram
-application = Application.builder().token(TOKEN).build()
-application.add_handler(CommandHandler("scan_test", scan_test_command))
+    # Planificateur
+    scheduler = BackgroundScheduler()
+    scheduler.add_job(scan_and_send_signals, "interval", minutes=10, args=[application.bot])
+    scheduler.start()
+    logger.info("🚀 Bot démarré avec scan automatique toutes les 10 minutes")
 
-# Tâche planifiée toutes les 10 min
-scheduler = BackgroundScheduler()
-scheduler.add_job(scan_and_send_signals, "interval", minutes=10, args=[application.bot])
-scheduler.start()
-logger.info("🚀 Bot démarré avec scan automatique toutes les 10 minutes")
-
-# Lancer le bot
-async def run_bot():
-    await application.run_polling()
+    # Lancement polling (bloquant)
+    application.run_polling()
 
 if __name__ == "__main__":
-    import threading
     threading.Thread(target=lambda: app.run(host="0.0.0.0", port=3000)).start()
-    asyncio.run(run_bot())
+    threading.Thread(target=run_bot).start()
