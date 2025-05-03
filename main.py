@@ -1,23 +1,16 @@
-# main.py
-
-import os
 import logging
 import threading
-import asyncio
 from flask import Flask
-from telegram.ext import Application
+from telegram.ext import Application, CommandHandler
 from apscheduler.schedulers.background import BackgroundScheduler
-from scanner import scan_and_send_signals
+from scanner import scan_and_send_signals, run_test_scan
+import os
 
 # Logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Récupérer les variables Railway
-TOKEN = os.environ.get("TOKEN")
-CHAT_ID = os.environ.get("CHAT_ID")
-
-# Flask app pour keep-alive
+# Flask pour keep-alive
 app = Flask(__name__)
 
 @app.route('/')
@@ -27,26 +20,30 @@ def home():
 def run_flask():
     app.run(host='0.0.0.0', port=3000)
 
-# Initialisation du bot Telegram
+# Bot Telegram
+TOKEN = os.getenv("TOKEN")
 application = Application.builder().token(TOKEN).build()
 
-# Planification du scan toutes les 10 minutes avec gestion async correcte
+# Commande /scan_test
+application.add_handler(CommandHandler("scan_test", run_test_scan))
+
+# Planification du scan auto toutes les 10 minutes
 scheduler = BackgroundScheduler()
 scheduler.add_job(
-    lambda: asyncio.create_task(scan_and_send_signals(application.bot)),
+    scan_and_send_signals,
     trigger='interval',
     minutes=10,
+    args=[application.bot],
     max_instances=1,
     coalesce=True
 )
 scheduler.start()
 print("🚀 Bot démarré avec scan automatique toutes les 10 minutes")
 
-# Lancer le bot Telegram
+# Démarrage parallèle
 def run_bot():
-    asyncio.run(application.run_polling())
+    application.run_polling()
 
-# Démarrage Flask + bot Telegram en parallèle
 if __name__ == '__main__':
     threading.Thread(target=run_flask).start()
     run_bot()
