@@ -6,4 +6,3 @@ pandas
 pandas_ta
 matplotlib
 apscheduler
-kucoin-futures-python
