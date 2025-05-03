@@ -11,7 +11,10 @@ async def scan_and_send_signals(bot):
     print("🚀 Début du scan")
     markets = await exchange.load_markets()
     symbols = [s for s in markets if markets[s].get("contract") and markets[s].get("linear")]
-    print(f"📊 {len(symbols)} PERP détectés")
+    
+    print(f"📉 Nombre de PERP détectés : {len(symbols)}")
+
+    signal_count = 0
 
     for symbol in symbols:
         df = await fetch_ohlcv(symbol)
@@ -20,6 +23,7 @@ async def scan_and_send_signals(bot):
 
         signal_data = analyze(df)
         if signal_data:
+            signal_count += 1
             direction = signal_data['direction']
             entry = signal_data['entry']
             sl = signal_data['sl']
@@ -37,6 +41,8 @@ async def scan_and_send_signals(bot):
             await bot.send_photo(chat_id=CHAT_ID, photo=open(filename, 'rb'), caption=msg)
             os.remove(filename)
 
+    print(f"✅ Scan terminé — {signal_count} signal(s) détecté(s)")
+
 async def fetch_ohlcv(symbol, timeframe="4h", limit=100):
     try:
         ohlcv = await exchange.fetch_ohlcv(symbol, timeframe, limit)
@@ -44,7 +50,7 @@ async def fetch_ohlcv(symbol, timeframe="4h", limit=100):
         df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
         return df
     except Exception as e:
-        print(f"Erreur fetch {symbol}: {e}")
+        print(f"❌ Erreur fetch {symbol}: {e}")
         return None
 
 def analyze(df):
