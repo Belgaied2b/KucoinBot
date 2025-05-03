@@ -8,11 +8,11 @@ import os
 exchange = ccxt.kucoinfutures()
 
 async def scan_and_send_signals(bot):
-    print("🚀 Début du scan")
+    print("🚀 Début du scan", flush=True)
     markets = await exchange.load_markets()
     symbols = [s for s in markets if markets[s].get("contract") and markets[s].get("linear")]
     
-    print(f"📉 Nombre de PERP détectés : {len(symbols)}")
+    print(f"📉 Nombre de PERP détectés : {len(symbols)}", flush=True)
 
     signal_count = 0
 
@@ -41,7 +41,7 @@ async def scan_and_send_signals(bot):
             await bot.send_photo(chat_id=CHAT_ID, photo=open(filename, 'rb'), caption=msg)
             os.remove(filename)
 
-    print(f"✅ Scan terminé — {signal_count} signal(s) détecté(s)")
+    print(f"✅ Scan terminé — {signal_count} signal(s) détecté(s)", flush=True)
 
 async def fetch_ohlcv(symbol, timeframe="4h", limit=100):
     try:
@@ -50,7 +50,7 @@ async def fetch_ohlcv(symbol, timeframe="4h", limit=100):
         df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
         return df
     except Exception as e:
-        print(f"❌ Erreur fetch {symbol}: {e}")
+        print(f"❌ Erreur fetch {symbol}: {e}", flush=True)
         return None
 
 def analyze(df):
