@@ -1,17 +1,15 @@
 import matplotlib.pyplot as plt
-from io import BytesIO
+import os
 
-def generate_trade_graph(df, entry, sl, tp, symbol):
-    plt.figure(figsize=(10, 5))
-    plt.plot(df['close'], label='Close Price')
+def generate_trade_graph(symbol, df, entry, tp, sl):
+    plt.figure()
+    df["close"].plot(label="Close Price", linewidth=1.5)
     plt.axhline(entry, color='blue', linestyle='--', label='Entrée')
-    plt.axhline(sl, color='red', linestyle='--', label='SL')
     plt.axhline(tp, color='green', linestyle='--', label='TP')
-    plt.title(f"Signal sur {symbol}")
+    plt.axhline(sl, color='red', linestyle='--', label='SL')
+    plt.title(symbol)
     plt.legend()
-
-    buffer = BytesIO()
-    plt.savefig(buffer, format='png')
-    buffer.seek(0)
+    path = f"{symbol.replace('/', '_')}_trade.png"
+    plt.savefig(path)
     plt.close()
-    return buffer
+    return path
