@@ -1,52 +1,62 @@
-import logging
 import os
-from kucoin_utils import get_kucoin_perps, fetch_klines
+import logging
+from telegram import InputFile
+from kucoin_utils import fetch_klines
 from signal_analysis import analyze_market
 from plot_signal import generate_trade_graph
-from telegram import Bot, InputFile
 
 logger = logging.getLogger(__name__)
 
-async def scan_and_send_signals(bot: Bot):
-    logger.info("🚀 Scan automatique lancé")
-    symbols = get_kucoin_perps()
-    logger.info(f"🔍 {len(symbols)} PERP détectés")
-    for symbol in symbols:
-        try:
-            logger.info(f"🔎 Analyse de {symbol}...")
-            df = fetch_klines(symbol)
-            result = analyze_market(symbol, df)
-            if result:
-                buf = generate_trade_graph(symbol, df, result)
-                await bot.send_photo(chat_id=os.environ["CHAT_ID"], photo=InputFile(buf))
-                logger.info(f"📈 SIGNAL détecté et envoyé pour {symbol}")
-            else:
-                # Log valeurs RSI / MACD
-                rsi = df["rsi"].iloc[-1] if "rsi" in df.columns else None
-                macd = df["macd"].iloc[-1] if "macd" in df.columns else None
-                signal = df["signal"].iloc[-1] if "signal" in df.columns else None
-                logger.info(f"❌ {symbol} → Aucun signal | RSI: {rsi:.2f} | MACD: {macd:.4f} | Signal: {signal:.4f}")
-        except Exception as e:
-            logger.error(f"❌ Erreur avec {symbol} : {e}")
-    logger.info("✅ Scan automatique terminé")
+# Mémoire temporaire pour suivre les signaux actifs
+active_signals = {}
 
-async def run_test_scan(bot: Bot):
-    logger.info("🚀 Scan test lancé")
+async def scan_and_send_signals(bot):
+    from kucoin_utils import get_kucoin_perps
     symbols = get_kucoin_perps()
-    logger.info(f"🔍 {len(symbols)} PERP détectés")
     for symbol in symbols:
-        logger.info(f"🔎 Test de {symbol}...")
         try:
             df = fetch_klines(symbol)
             result = analyze_market(symbol, df)
-            if result:
-                logger.info(f"[SIGNAL] {symbol} - Entrée : {result['entry']} | SL : {result['sl']} | TP : {result['tp']}")
-            else:
-                # Log valeurs RSI / MACD pour debug
-                rsi = df["rsi"].iloc[-1] if "rsi" in df.columns else None
-                macd = df["macd"].iloc[-1] if "macd" in df.columns else None
-                signal = df["signal"].iloc[-1] if "signal" in df.columns else None
-                logger.info(f"❌ {symbol} → Aucun signal | RSI: {rsi:.2f} | MACD: {macd:.4f} | Signal: {signal:.4f}")
+            if not result:
+                continue
+
+            # Prévisualisation envoyée
+            if symbol not in active_signals:
+                buf = generate_trade_graph(symbol, df, result)
+                input_file = InputFile(buf, filename=f"{symbol}.png")
+                ote_zone = result["ote_zone"]
+                fvg_zone = result["fvg_zone"]
+                await bot.send_photo(
+                    chat_id=os.environ["CHAT_ID"],
+                    photo=input_file,
+                    caption=(
+                        f"🧠 *Signal anticipé* pour {symbol}\n"
+                        f"Entrée idéale : `{result['entry']}`\n"
+                        f"SL : `{result['sl']}` | TP : `{result['tp']}`\n"
+                        f"Zone OTE : {ote_zone}\n"
+                        f"Zone FVG : {fvg_zone}\n"
+                        f"⚠️ Le prix n'est *pas encore* dans la zone."
+                    ),
+                    parse_mode='Markdown'
+                )
+                active_signals[symbol] = result
+
+            # Vérifie si le prix actuel est dans la zone
+            current_price = df["close"].iloc[-1]
+            if (not result["active"] and
+                result["ote_zone"][0] <= current_price <= result["ote_zone"][1] and
+                result["fvg_zone"][0] <= current_price <= result["fvg_zone"][1]):
+                result["active"] = True
+                await bot.send_message(
+                    chat_id=os.environ["CHAT_ID"],
+                    text=(
+                        f"🚨 *ALERTE URGENTE* 🚨\n"
+                        f"Le prix de {symbol} est entré dans la *zone idéale* !\n"
+                        f"🎯 Entrée : `{result['entry']}`\n"
+                        f"SL : `{result['sl']}` | TP : `{result['tp']}`"
+                    ),
+                    parse_mode='Markdown'
+                )
+
         except Exception as e:
-            logger.error(f"❌ Erreur avec {symbol} : {e}")
-    logger.info("✅ Scan test terminé")
+            logger.error(f"❌ Erreur sur {symbol} : {e}")
