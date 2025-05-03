@@ -6,23 +6,22 @@ def generate_trade_graph(symbol, df, signal):
     """
     Génère un graphique 4 H enrichi :
       - Courbe du prix de clôture
-      - Lignes Entrée / SL / TP en pointillés
+      - Lignes Entrée (bleu), TP (vert), SL (rouge) en pointillés
       - Annotation du prix actuel avec flèche
       - Grille et formatage des dates améliorés
     """
-    # Création de la figure et des axes
     fig, ax = plt.subplots(figsize=(10, 5))
 
     # Trace du prix de clôture
     ax.plot(df.index, df["close"], label="Prix de clôture")
 
-    # Lignes Entrée, SL, TP
+    # Lignes Entrée, TP, SL avec couleurs
     entry_price = float(signal["entry"])
     tp_price    = float(signal["tp"])
     sl_price    = float(signal["sl"])
-    ax.axhline(entry_price, linestyle="--", label=f"Entrée {signal['entry']}")
-    ax.axhline(tp_price,    linestyle="--", label=f"TP     {signal['tp']}")
-    ax.axhline(sl_price,    linestyle="--", label=f"SL     {signal['sl']}")
+    ax.axhline(entry_price, color="blue", linestyle="--", label=f"Entrée {signal['entry']}")
+    ax.axhline(tp_price,    color="green", linestyle="--", label=f"TP     {signal['tp']}")
+    ax.axhline(sl_price,    color="red", linestyle="--", label=f"SL     {signal['sl']}")
 
     # Annotation du prix courant
     current_price = df["close"].iloc[-1]
