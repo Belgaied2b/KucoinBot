@@ -1,47 +1,26 @@
-# kucoin_utils.py
-
 import httpx
-import time
-
-KUCOIN_BASE_URL = "https://api.kucoin.com"
+import pandas as pd
 
 async def get_kucoin_perps():
-    url = f"{KUCOIN_BASE_URL}/api/v1/contracts/active"
-    try:
-        async with httpx.AsyncClient() as client:
-            r = await client.get(url, timeout=10)
-            data = r.json()
-            return [item["symbol"] for item in data["data"] if item["symbol"].endswith("USDTM")]
-    except Exception as e:
-        print(f"Erreur récupération PERP KuCoin : {e}")
-        return []
+    url = "https://api.kucoin.com/api/v1/contracts/active"
+    async with httpx.AsyncClient() as client:
+        r = await client.get(url)
+        data = r.json()
+        return [x["symbol"] for x in data["data"] if x["symbol"].endswith("USDTM")]
 
-async def fetch_klines(symbol, interval="4h", limit=100):
-    url = f"{KUCOIN_BASE_URL}/api/v1/kline/query"
-    params = {
-        "symbol": symbol,
-        "granularity": 14400,
-        "limit": limit
-    }
-    try:
-        async with httpx.AsyncClient() as client:
-            r = await client.get(url, params=params, timeout=10)
-            data = r.json()
-            if "data" not in data or not data["data"]:
-                return None
-            # Format: [timestamp, open, close, high, low, volume, turnover]
-            df = [
-                {
-                    "timestamp": int(candle[0]),
-                    "open": float(candle[1]),
-                    "close": float(candle[2]),
-                    "high": float(candle[3]),
-                    "low": float(candle[4]),
-                    "volume": float(candle[5])
-                }
-                for candle in data["data"]
-            ]
-            return df[::-1]  # plus récents à la fin
-    except Exception as e:
-        print(f"Erreur fetch klines {symbol} : {e}")
-        return None
+async def fetch_klines(symbol, interval="4hour", limit=100):
+    url = f"https://api.kucoin.com/api/v1/kline/query?symbol={symbol}&granularity=14400"
+    async with httpx.AsyncClient() as client:
+        r = await client.get(url)
+        if r.status_code != 200:
+            return None
+        data = r.json().get("data", [])
+        if not data:
+            return None
+
+        df = pd.DataFrame(data, columns=[
+            "timestamp", "open", "high", "low", "close", "volume", "turnover"])
+        df["timestamp"] = pd.to_datetime(df["timestamp"], unit='s')
+        df.set_index("timestamp", inplace=True)
+        df = df.astype(float)
+        return df
