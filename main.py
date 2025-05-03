@@ -1,19 +1,19 @@
 # main.py
 
 import logging
-import asyncio
 import threading
+import asyncio
 from flask import Flask
 from telegram.ext import Application, CommandHandler
 from apscheduler.schedulers.background import BackgroundScheduler
 from scanner import scan_and_send_signals, run_test_scan
-import os
+from config import TOKEN
 
-# Logging
+# Logger
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Flask app (pour Railway)
+# Flask app pour le keep-alive
 app = Flask(__name__)
 
 @app.route('/')
@@ -23,36 +23,40 @@ def home():
 def run_flask():
     app.run(host='0.0.0.0', port=3000)
 
-# Token et ID depuis les variables Railway
-TOKEN = os.getenv("TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")
-
 # Application Telegram
 application = Application.builder().token(TOKEN).build()
 
 # Commande test
 async def scan_test_command(update, context):
-    await update.message.reply_text("✅ Commande /scan_test reçue\n🚀 Début du scan test")
+    await update.message.reply_text("✅ Commande /scan_test reçue\n\n🚀 Début du scan test")
     results = await run_test_scan(context.bot)
-    if not results:
-        await update.message.reply_text("📉 Aucun signal détecté.")
+    if results:
+        await update.message.reply_text(f"🧠 Résultats:\n\n" + "\n\n".join(results))
     else:
-        for res in results:
-            await context.bot.send_photo(chat_id=CHAT_ID, photo=open(res, "rb"))
+        await update.message.reply_text("✅ Scan test terminé\n\nAucun signal détecté.")
 
 application.add_handler(CommandHandler("scan_test", scan_test_command))
 
-# Tâche automatique toutes les 10 minutes
+# Planification automatique toutes les 10 minutes
 scheduler = BackgroundScheduler()
-scheduler.add_job(scan_and_send_signals, trigger='interval', minutes=10, args=[application.bot])
+scheduler.add_job(
+    scan_and_send_signals,
+    trigger='interval',
+    minutes=10,
+    args=[application.bot],
+    max_instances=1,
+    coalesce=True
+)
 scheduler.start()
+logger.info("🚀 Bot démarré avec scan automatique toutes les 10 minutes")
 
-# Démarrer le bot Telegram
+# Lancer le bot Telegram
 async def run_bot():
     await application.run_polling()
 
-# Lancer Flask + bot
+# Exécution
 if __name__ == '__main__':
-    logger.info("🚀 Bot démarré avec scan automatique toutes les 10 minutes")
     threading.Thread(target=run_flask).start()
-    asyncio.run(run_bot())
+    loop = asyncio.get_event_loop()
+    loop.create_task(run_bot())
+    loop.run_forever()
