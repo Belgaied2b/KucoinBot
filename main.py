@@ -24,20 +24,17 @@ def run_flask():
 async def run_bot():
     application = Application.builder().token(TOKEN).build()
 
-    # Supprimer tout webhook existant (anti-conflit)
+    # Supprimer le webhook en cas de conflit
     await application.bot.delete_webhook(drop_pending_updates=True)
 
-    # Commande de test
+    # Ajout de la commande /scan_test
     application.add_handler(CommandHandler("scan_test", scan_test_command))
 
-    # Démarrage
+    # Démarrage propre
     logger.info("🚀 Bot démarré avec scan automatique toutes les 10 minutes")
-    await application.initialize()
-    await application.start()
-    await application.updater.start_polling()
-    await application.updater.idle()
+    await application.run_polling()
 
-# Callback de commande test
+# Callback /scan_test
 async def scan_test_command(update, context):
     await update.message.reply_text("✅ Commande /scan_test reçue\n\n🚀 Début du scan test")
     await run_test_scan(context.bot)
