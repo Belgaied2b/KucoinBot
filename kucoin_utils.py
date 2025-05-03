@@ -6,7 +6,7 @@ import time
 client = Market(url='https://api-futures.kucoin.com')
 
 def get_kucoin_perps():
-    markets = client.get_symbols()
+    markets = client.get_symbol_list()
     return [m['symbol'] for m in markets if m['quoteCurrency'] == 'USDT']
 
 def fetch_klines(symbol, interval="4hour", limit=150):
