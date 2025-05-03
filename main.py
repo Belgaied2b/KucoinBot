@@ -1,7 +1,8 @@
+# main.py
+
 import logging
 import os
 import threading
-
 from flask import Flask
 from telegram import Update
 from telegram.ext import (
@@ -30,7 +31,7 @@ def home():
 
 # --- Job de logging des stats ---
 async def log_stats(context: ContextTypes.DEFAULT_TYPE):
-    # On baisse le niveau des logs verbeux pour ne voir que WARNING+
+    # Silence les logs verbeux
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("kucoin_utils").setLevel(logging.WARNING)
 
@@ -67,20 +68,20 @@ def main():
     application.add_handler(CommandHandler("scan_test", scan_test_command))
     application.add_handler(CommandHandler("scan_graph", scan_graph_command))
 
-    # 1) Stats : run_once(callback, delay_seconds)
-    application.job_queue.run_once(log_stats, 5)
+    # 1) Planification du log_stats chaque heure, première exécution après 5s
+    application.job_queue.run_repeating(log_stats, interval=3600, first=5)
 
-    # 2) Scan auto toutes les 10 minutes : run_repeating(callback, interval_seconds, first_delay)
+    # 2) Scan auto toutes les 10 minutes, première exécution après 1s
     application.job_queue.run_repeating(scheduled_scan, interval=600, first=1)
 
-    # Keep-alive Flask in background
+    # Keep-alive Flask en background
     threading.Thread(
         target=lambda: app.run(host="0.0.0.0",
                                port=int(os.environ.get("PORT", 3000))),
         daemon=True
     ).start()
 
-    logger.info("🚀 Bot démarré — stats loggées après 5s, scan auto toutes les 10 min")
+    logger.info("🚀 Bot démarré — stats loggées toutes les heures (premier run à +5s), scan auto toutes les 10 min")
     application.run_polling()
 
 if __name__ == "__main__":
