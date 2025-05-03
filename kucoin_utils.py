@@ -1,26 +1,18 @@
-import httpx
+from kucoin.client import Market
 import pandas as pd
 
-async def get_kucoin_perps():
-    url = "https://api.kucoin.com/api/v1/contracts/active"
-    async with httpx.AsyncClient() as client:
-        r = await client.get(url)
-        data = r.json()
-        return [x["symbol"] for x in data["data"] if x["symbol"].endswith("USDTM")]
+client = Market(url='https://api.kucoin.com')
 
-async def fetch_klines(symbol, interval="4hour", limit=100):
-    url = f"https://api.kucoin.com/api/v1/kline/query?symbol={symbol}&granularity=14400"
-    async with httpx.AsyncClient() as client:
-        r = await client.get(url)
-        if r.status_code != 200:
-            return None
-        data = r.json().get("data", [])
-        if not data:
-            return None
+def get_kucoin_perps():
+    data = client.get_contract_symbols()
+    return [d['symbol'] for d in data if d['symbol'].endswith('USDTM')]
 
-        df = pd.DataFrame(data, columns=[
-            "timestamp", "open", "high", "low", "close", "volume", "turnover"])
-        df["timestamp"] = pd.to_datetime(df["timestamp"], unit='s')
-        df.set_index("timestamp", inplace=True)
-        df = df.astype(float)
-        return df
+def fetch_klines(symbol):
+    raw = client.get_kline_data(symbol, '4hour', 200)
+    df = pd.DataFrame(raw, columns=[
+        "timestamp", "open", "close", "high", "low", "volume", "turnover"
+    ])
+    df = df.astype(float)
+    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='s')
+    df.set_index('timestamp', inplace=True)
+    return df
