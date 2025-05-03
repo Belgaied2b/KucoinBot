@@ -9,8 +9,8 @@ logger = logging.getLogger(__name__)
 
 async def scan_and_send_signals(bot: Bot):
     """
-    Scan automatique : récupère tous les PERP et envoie un graphique
-    pour chaque signal LONG ou SHORT détecté.
+    Scan automatique : récupère tous les PERP, applique l'analyse,
+    et envoie un graphique pour chaque signal LONG ou SHORT détecté.
     """
     logger.info("🚀 Scan automatique lancé")
     symbols = get_kucoin_perps()
@@ -44,3 +44,32 @@ async def scan_and_send_signals(bot: Bot):
             logger.error(f"❌ Erreur sur {symbol} : {e}")
 
     logger.info("✅ Scan automatique terminé")
+
+
+async def run_test_scan(bot: Bot):
+    """
+    Scan de test : récupère tous les PERP, applique l'analyse,
+    et renvoie une liste de messages (sans envoi Telegram) pour te permettre
+    de vérifier rapidement ce qui passe ou non.
+    """
+    logger.info("🚀 Scan test lancé")
+    symbols = get_kucoin_perps()
+    logger.info(f"🔍 {len(symbols)} PERP détectés")
+    messages = []
+
+    for symbol in symbols:
+        try:
+            df     = fetch_klines(symbol)
+            result = analyze_market(symbol, df)
+            if result:
+                messages.append(
+                    f"[SIGNAL] {symbol} – {result['side']} | "
+                    f"Entrée: {result['entry']} | SL: {result['sl']} | TP: {result['tp']}"
+                )
+            else:
+                messages.append(f"❌ {symbol} – Aucun signal")
+        except Exception as e:
+            logger.error(f"❌ Erreur sur {symbol} : {e}")
+
+    logger.info("✅ Scan test terminé")
+    return messages
