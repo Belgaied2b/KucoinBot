@@ -3,6 +3,7 @@
 import logging
 import os
 import threading
+
 from flask import Flask
 from telegram import Update
 from telegram.ext import (
@@ -22,7 +23,7 @@ CHAT_ID = os.environ["CHAT_ID"]
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Flask keep-alive
+# Flask pour keep-alive
 app = Flask(__name__)
 
 @app.route("/")
@@ -31,7 +32,7 @@ def home():
 
 # --- Job de logging des stats ---
 async def log_stats(context: ContextTypes.DEFAULT_TYPE):
-    # Silence les logs verbeux
+    # Silence les logs bruyants
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("kucoin_utils").setLevel(logging.WARNING)
 
@@ -46,7 +47,7 @@ async def log_stats(context: ContextTypes.DEFAULT_TYPE):
         df_means.to_string(index=False)
     )
 
-# --- Commandes utilisateur ---
+# --- Commandes Telegram ---
 async def scan_test_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.info("✅ Commande /scan_test reçue")
     await update.message.reply_text("Scan en cours…")
@@ -64,24 +65,29 @@ async def scheduled_scan(context: ContextTypes.DEFAULT_TYPE):
 def main():
     application = Application.builder().token(TOKEN).build()
 
-    # Register handlers
+    # Enregistrement des handlers
     application.add_handler(CommandHandler("scan_test", scan_test_command))
     application.add_handler(CommandHandler("scan_graph", scan_graph_command))
 
-    # 1) Planification du log_stats chaque heure, première exécution après 5s
-    application.job_queue.run_repeating(log_stats, interval=3600, first=5)
+    # 1) Planification initiale des stats (une seule exécution à +5s)
+    application.job_queue.run_once(log_stats, when=5)
 
-    # 2) Scan auto toutes les 10 minutes, première exécution après 1s
+    # 2) Planification récurrente des stats (toutes les heures, première à +3605s)
+    application.job_queue.run_repeating(log_stats, interval=3600, first=3605)
+
+    # 3) Scan auto toutes les 10 minutes (première exécution à +1s)
     application.job_queue.run_repeating(scheduled_scan, interval=600, first=1)
 
-    # Keep-alive Flask en background
+    # Keep-alive Flask en arrière-plan
     threading.Thread(
-        target=lambda: app.run(host="0.0.0.0",
-                               port=int(os.environ.get("PORT", 3000))),
+        target=lambda: app.run(
+            host="0.0.0.0",
+            port=int(os.environ.get("PORT", 3000))
+        ),
         daemon=True
     ).start()
 
-    logger.info("🚀 Bot démarré — stats loggées toutes les heures (premier run à +5s), scan auto toutes les 10 min")
+    logger.info("🚀 Bot démarré — stats logs 5s après start, puis chaque heure; scan toutes les 10min")
     application.run_polling()
 
 if __name__ == "__main__":
