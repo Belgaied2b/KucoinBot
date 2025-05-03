@@ -17,23 +17,29 @@ def analyze_market(symbol, df):
     last_macd = df["macd"].iloc[-1]
     last_signal = df["signal"].iloc[-1]
 
-    # ✅ Condition pro : RSI neutre (zone de recharge)
-    if last_rsi < 45 or last_rsi > 55:
+    # ✅ RSI élargi : 42–58 (zone de neutralité élargie)
+    if last_rsi < 42 or last_rsi > 58:
         return None
 
-    # ✅ MACD haussier (et idéalement sous 0)
-    if last_macd < last_signal or last_macd > 0:
+    # ✅ MACD : croisement haussier seulement
+    if last_macd < last_signal:
         return None
 
-    # Récupération zone de swing
+    # Récupération de la zone de swing
     recent_low = df["low"].iloc[-20:-1].min()
     recent_high = df["high"].iloc[-20:-1].max()
 
-    # ✅ Entrée Fibo 61.8 % (pullback optimal)
-    fib_618 = recent_low + (recent_high - recent_low) * 0.618
-    entry = round(fib_618, 4)
+    # ✅ Entrée Fibo 61.8 % ou 50 % (si amplitude trop serrée)
+    fib_range = recent_high - recent_low
+    if fib_range < 0.01 * recent_high:  # Si trop serré (<1%)
+        fib_level = 0.5  # Fallback à 50 %
+    else:
+        fib_level = 0.618
 
-    # TP et SL pro
+    fib_entry = recent_low + fib_range * fib_level
+    entry = round(fib_entry, 4)
+
+    # TP / SL pro
     sl = round(recent_low, 4)
     tp = round(entry + (entry - sl) * 2, 4)
 
