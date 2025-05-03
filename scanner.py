@@ -1,21 +1,17 @@
+# scanner.py
+
 import os
 import logging
-from telegram import Bot, InputFile
+from telegram import InputFile
 from kucoin_utils import get_kucoin_perps, fetch_klines
 from signal_analysis import analyze_market
 from plot_signal import generate_trade_graph
 
 logger = logging.getLogger(__name__)
+active_signals = {}
 
-async def scan_and_send_signals(bot: Bot):
-    """
-    Scan automatique : récupère tous les PERP, applique l'analyse,
-    et envoie un graphique pour chaque signal LONG ou SHORT détecté.
-    """
-    logger.info("🚀 Scan automatique lancé")
+async def scan_and_send_signals(bot):
     symbols = get_kucoin_perps()
-    logger.info(f"🔍 {len(symbols)} PERP détectés")
-
     for symbol in symbols:
         try:
             df     = fetch_klines(symbol)
@@ -23,53 +19,44 @@ async def scan_and_send_signals(bot: Bot):
             if not result:
                 continue
 
-            # Génère et envoie le graphique
-            buf = generate_trade_graph(symbol, df, result)
-            photo = InputFile(buf, filename=f"{symbol}.png")
+            # 1) Signal anticipé : envoi du graphique
+            if symbol not in active_signals:
+                buf       = generate_trade_graph(symbol, df, result)
+                input_file = InputFile(buf, filename=f'{symbol}.png')
+                ote_low, ote_high = result['ote_zone']
+                fvg_low, fvg_high = result['fvg_zone']
 
-            caption = (
-                f"📊 *Signal {result['side']}* pour {symbol}\n"
-                f"🎯 Entrée : `{result['entry']}`\n"
-                f"🔻 SL : `{result['sl']}` | 🔺 TP : `{result['tp']}`"
-            )
-            await bot.send_photo(
-                chat_id=os.environ["CHAT_ID"],
-                photo=photo,
-                caption=caption,
-                parse_mode="Markdown"
-            )
-            logger.info(f"📈 SIGNAL envoyé pour {symbol} ({result['side']})")
-
-        except Exception as e:
-            logger.error(f"❌ Erreur sur {symbol} : {e}")
-
-    logger.info("✅ Scan automatique terminé")
-
-
-async def run_test_scan(bot: Bot):
-    """
-    Scan de test : récupère tous les PERP, applique l'analyse,
-    et renvoie une liste de messages (sans envoi Telegram) pour te permettre
-    de vérifier rapidement ce qui passe ou non.
-    """
-    logger.info("🚀 Scan test lancé")
-    symbols = get_kucoin_perps()
-    logger.info(f"🔍 {len(symbols)} PERP détectés")
-    messages = []
-
-    for symbol in symbols:
-        try:
-            df     = fetch_klines(symbol)
-            result = analyze_market(symbol, df)
-            if result:
-                messages.append(
-                    f"[SIGNAL] {symbol} – {result['side']} | "
-                    f"Entrée: {result['entry']} | SL: {result['sl']} | TP: {result['tp']}"
+                await bot.send_photo(
+                    chat_id=os.environ['CHAT_ID'],
+                    photo=input_file,
+                    caption=(
+                        f"🧠 *Signal anticipé* pour {symbol}\n"
+                        f"Entrée : `{result['entry']}` | SL : `{result['sl']}` | TP : `{result['tp']}`\n"
+                        f"Zone OTE : {result['ote_zone']} | Zone FVG : {result['fvg_zone']}\n"
+                        f"⚠️ Le prix n'est *pas encore* dans la zone."
+                    ),
+                    parse_mode='Markdown'
                 )
-            else:
-                messages.append(f"❌ {symbol} – Aucun signal")
+                active_signals[symbol] = result
+
+            # 2) Alerte urgente : quand prix entre dans la zone
+            price = df['close'].iat[-1]
+            ote_low, ote_high = result['ote_zone']
+            fvg_low, fvg_high = result['fvg_zone']
+
+            if (not result['active']
+                and ote_low <= price <= ote_high
+                and fvg_low <= price <= fvg_high):
+                result['active'] = True
+                await bot.send_message(
+                    chat_id=os.environ['CHAT_ID'],
+                    text=(
+                        f"🚨 *ALERTE URGENTE* 🚨\n"
+                        f"{symbol} est **ENTRÉ** dans la zone idéale !\n"
+                        f"🎯 Entrée : `{result['entry']}` | SL : `{result['sl']}` | TP : `{result['tp']}`"
+                    ),
+                    parse_mode='Markdown'
+                )
+
         except Exception as e:
             logger.error(f"❌ Erreur sur {symbol} : {e}")
-
-    logger.info("✅ Scan test terminé")
-    return messages
