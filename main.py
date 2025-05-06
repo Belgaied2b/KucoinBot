@@ -1,17 +1,18 @@
+# main.py
+
 import logging
 import os
 import threading
+import asyncio
+
 from flask import Flask
+from apscheduler.schedulers.background import BackgroundScheduler
 from telegram.ext import ApplicationBuilder, CommandHandler
+
 from scanner import scan_and_send_signals
 from analyse_stats import compute_stats
-from apscheduler.schedulers.background import BackgroundScheduler
 
-# Configuration
-TOKEN   = os.environ["TOKEN"]
-CHAT_ID = os.environ["CHAT_ID"]
-
-# Logging
+# ─────────── Logging ───────────
 logging.basicConfig(
     level    = logging.INFO,
     format   = "%(asctime)s %(levelname)s %(message)s",
@@ -20,31 +21,38 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 def main():
-    # Flask pour keep-alive (Heroku, etc.)
+    # ─── Config Telegram ───
+    TOKEN   = os.environ["TOKEN"]
+    CHAT_ID = os.environ["CHAT_ID"]
+
+    # ─── Flask pour keep-alive (Heroku, etc.) ───
     app = Flask(__name__)
 
-    # Bot Telegram
+    # ─── Bot Telegram ───
     application = ApplicationBuilder().token(TOKEN).build()
 
     # /stats command
     async def stats_handler(update, context):
-        stats_text = compute_stats()
-        await context.bot.send_message(
-            chat_id=CHAT_ID,
-            text=stats_text,
-            parse_mode="Markdown"
-        )
+        text = compute_stats()
+        await context.bot.send_message(chat_id=CHAT_ID, text=text, parse_mode="Markdown")
     application.add_handler(CommandHandler("stats", stats_handler))
 
-    # Scheduler : on lance le scan toutes les 1 min
+    # ─── Scheduler : toutes les 1 min on lance le scan ───
+    loop = asyncio.get_event_loop()
     scheduler = BackgroundScheduler()
     scheduler.add_job(
-        lambda: application.create_task(scan_and_send_signals(application.bot)),
-        "interval", minutes=1
+        lambda: asyncio.run_coroutine_threadsafe(
+            scan_and_send_signals(application.bot),
+            loop
+        ),
+        "interval",
+        minutes=1,
+        id="crypto_scan"
     )
     scheduler.start()
+    logger.info("Scheduler démarré — scan toutes les 1 min")
 
-    # Lancement du web-server en arrière-plan
+    # ─── Démarrage du web-server en arrière-plan ───
     threading.Thread(
         target=lambda: app.run(
             host="0.0.0.0",
@@ -53,7 +61,7 @@ def main():
         daemon=True
     ).start()
 
-    logger.info("🚀 Bot démarré — scan+stats auto toutes les 1 min")
+    logger.info("🚀 Bot démarré — en attente de commandes et de scans")
     application.run_polling()
 
 if __name__ == "__main__":
