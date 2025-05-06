@@ -1,8 +1,26 @@
+# requirements.txt
+
+# Fondamentaux
 numpy==1.24.3
+pandas
+matplotlib
+
+# Bot Telegram
 python-telegram-bot==20.7
 httpx
+
+# Web / WebSocket / Asyncio
 flask
-pandas
-pandas_ta
-matplotlib
 apscheduler
+aiohttp>=3.8.1
+
+# Indicateurs techniques
+pandas_ta
+ta>=0.10.1
+
+# Exchange APIs & streaming
+ccxt>=2.6.67
+ccxtpro>=1.0.0
+
+# Backtesting
+backtrader>=1.9.74.123
