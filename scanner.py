@@ -1,74 +1,89 @@
-# scanner.py
-
-import os
-import logging
-from telegram import InputFile
-from kucoin_utils import get_kucoin_perps, fetch_klines
+import time
+from kucoin_utils import fetch_ohlcv, send_telegram
 from signal_analysis import analyze_market
-from plot_signal import generate_trade_graph
 
-logger = logging.getLogger(__name__)
+# Seuil d'anticipation (en %)
+ANTICIPATION_THRESHOLD = 0.003  # 0,3%
 
-# Enregistrements pour éviter les doublons
-sent_anticipation = set()
-sent_alert        = set()
-
-async def scan_and_send_signals(bot):
-    symbols = get_kucoin_perps()
-    logger.info(f"🔍 {len(symbols)} PERP détectés")
-
+def scan_symbols():
+    symbols = [
+        # Ajoute ici tes symboles favoris
+        "BTC-USDT",
+        "ETH-USDT",
+        "XRP-USDT",
+        # etc.
+    ]
     for symbol in symbols:
-        try:
-            df     = fetch_klines(symbol)
-            result = analyze_market(symbol, df)
+        df = fetch_ohlcv(symbol)
+        last_price = df["close"].iloc[-1]
 
-            # Si plus de signal, on réinitialise
-            if not result:
-                sent_anticipation.discard(symbol)
-                sent_alert.discard(symbol)
-                continue
+        # ——— GESTION DES LONG ———
+        result_long = analyze_market(symbol, df, side="long")
+        if result_long:
+            el_min = result_long["entry_min"]
+            el_max = result_long["entry_max"]
 
-            # 1) Signal anticipé (graphique)  
-            if symbol not in sent_anticipation:
-                buf = generate_trade_graph(symbol, df, result)
-                photo = InputFile(buf, filename=f"{symbol}.png")
-                ote_low, ote_high = result['ote_zone']
-                fvg_low, fvg_high = result['fvg_zone']
-
-                await bot.send_photo(
-                    chat_id=os.environ["CHAT_ID"],
-                    photo=photo,
-                    caption=(
-                        f"🧠 *Signal anticipé* pour {symbol}\n"
-                        f"Entrée : `{result['entry']}` | SL : `{result['sl']}` | TP : `{result['tp']}`\n"
-                        f"Zone OTE : {result['ote_zone']} | Zone FVG : {result['fvg_zone']}\n"
-                        f"⚠️ Le prix n'est *pas encore* dans la zone."
-                    ),
-                    parse_mode="Markdown"
+            # 1) Anticipation LONG
+            if el_min * (1 - ANTICIPATION_THRESHOLD) <= last_price < el_min:
+                send_telegram(
+                    f"⏳ Anticipation LONG {symbol}\n"
+                    f"Le prix s'approche de la zone : {el_min:.4f} → {el_max:.4f}\n"
+                    f"Prix actuel : {last_price:.4f}"
                 )
-                sent_anticipation.add(symbol)
-                logger.info(f"📊 Anticipation envoyée pour {symbol}")
 
-            # 2) Alerte urgente  
-            price = df["close"].iat[-1]
-            ote_low, ote_high = result['ote_zone']
-            fvg_low, fvg_high = result['fvg_zone']
-
-            if (symbol not in sent_alert
-                and ote_low <= price <= ote_high
-                and fvg_low <= price <= fvg_high):
-
-                await bot.send_message(
-                    chat_id=os.environ["CHAT_ID"],
-                    text=(
-                        f"🚨 *ALERTE URGENTE* 🚨\n"
-                        f"{symbol} est **ENTRÉ** dans la zone idéale !\n"
-                        f"🎯 Entrée : `{result['entry']}` | SL : `{result['sl']}` | TP : `{result['tp']}`"
-                    ),
-                    parse_mode="Markdown"
+            # 2) Zone LONG atteinte
+            if el_min <= last_price <= el_max:
+                send_telegram(
+                    f"🚨 Zone de LONG atteinte {symbol}\n"
+                    f"Entrée possible entre {el_min:.4f} et {el_max:.4f}\n"
+                    f"Prix actuel : {last_price:.4f}"
                 )
-                sent_alert.add(symbol)
-                logger.info(f"🚨 Alerte urgente envoyée pour {symbol}")
 
-        except Exception as e:
-            logger.error(f"❌ Erreur sur {symbol} : {e}")
+            # 3) Signal LONG final (avec SL/TP)
+            send_telegram(
+                f"🟢 LONG {symbol}\n"
+                f"Entry : {result_long['entry_price']:.4f}\n"
+                f"SL    : {result_long['stop_loss']:.4f}\n"
+                f"TP1   : {result_long['tp1']:.4f}\n"
+                f"TP2   : {result_long['tp2']:.4f}"
+            )
+
+        # ——— GESTION DES SHORT ———
+        result_short = analyze_market(symbol, df, side="short")
+        if result_short:
+            es_max = result_short["entry_max"]
+            es_min = result_short["entry_min"]
+
+            # 1) Anticipation SHORT
+            if es_max <= last_price <= es_max * (1 + ANTICIPATION_THRESHOLD):
+                send_telegram(
+                    f"⏳ Anticipation SHORT {symbol}\n"
+                    f"Le prix s'approche de la zone : {es_max:.4f} → {es_min:.4f}\n"
+                    f"Prix actuel : {last_price:.4f}"
+                )
+
+            # 2) Zone SHORT atteinte
+            if es_max >= last_price >= es_min:
+                send_telegram(
+                    f"🚨 Zone de SHORT atteinte {symbol}\n"
+                    f"Entrée possible entre {es_max:.4f} et {es_min:.4f}\n"
+                    f"Prix actuel : {last_price:.4f}"
+                )
+
+            # 3) Signal SHORT final (avec SL/TP)
+            send_telegram(
+                f"🔻 SHORT {symbol}\n"
+                f"Entry : {result_short['entry_price']:.4f}\n"
+                f"SL    : {result_short['stop_loss']:.4f}\n"
+                f"TP1   : {result_short['tp1']:.4f}\n"
+                f"TP2   : {result_short['tp2']:.4f}"
+            )
+
+        # Pause pour respecter les limites d'API
+        time.sleep(1)
+
+if __name__ == "__main__":
+    while True:
+        scan_symbols()
+        # Attendre 1 minute avant le prochain scan
+        time.sleep(60)
