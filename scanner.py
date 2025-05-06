@@ -2,19 +2,19 @@
 
 import os
 import logging
-from telegram import InputFile
 
+from telegram import InputFile
 from kucoin_utils import get_kucoin_perps, fetch_klines
 from signal_analysis  import analyze_market
 from plot_signal      import generate_trade_graph
 from indicators       import compute_rsi, compute_macd
 
-# Seuil d’anticipation en % autour de l’entrée
+# Anticipation ±0.3%
 ANTICIPATION_THRESHOLD = 0.003
 
 logger = logging.getLogger(__name__)
 
-# Pour éviter de renvoyer plusieurs fois la même alerte
+# État pour éviter les doublons
 sent_anticipation = set()
 sent_zone        = set()
 sent_alert       = set()
@@ -24,24 +24,24 @@ async def scan_and_send_signals(bot):
     total   = len(symbols)
     logger.info(f"🔍 Démarrage du scan — {total} contracts détectés")
 
-    accepted_long  = 0
-    accepted_short = 0
+    accepted_long = 0
+    accepted_short= 0
 
     for symbol in symbols:
         try:
-            # ─── Récup OHLCV & indicateurs
+            # ─── Récup OHLCV + Indicateurs ───
             df         = fetch_klines(symbol)
             last_price = df["close"].iat[-1]
             rsi        = compute_rsi(df["close"], 14).iat[-1]
             macd_line, sig_line, _ = compute_macd(df["close"])
-            macd_val, sig_val     = macd_line.iat[-1], sig_line.iat[-1]
+            macd_val, sig_val = macd_line.iat[-1], sig_line.iat[-1]
 
             logger.info(
-                f"{symbol} → prix={last_price:.4f}, RSI={rsi:.2f}, "
+                f"{symbol} → price={last_price:.4f}, RSI={rsi:.2f}, "
                 f"MACD={macd_val:.6f}, SIG={sig_val:.6f}"
             )
 
-            # ─── SCAN LONG ───
+            # ─── Test LONG ───
             res_l = analyze_market(symbol, df, side="long")
             if res_l:
                 accepted_long += 1
@@ -53,14 +53,14 @@ async def scan_and_send_signals(bot):
                     res_l["tp2"],
                 )
                 logger.info(
-                    f"{symbol} LONG OK zone [{emn:.4f}-{emx:.4f}]  "
+                    f"{symbol} LONG OK zone [{emn:.4f}-{emx:.4f}] "
                     f"entry={ep:.4f}, SL={sl:.4f}, TP1={tp1:.4f}, TP2={tp2:.4f}"
                 )
 
-                # 1) Anticipation
+                # 1) Anticipation LONG
                 if emn*(1-ANTICIPATION_THRESHOLD) <= last_price < emn:
-                    logger.info(f"{symbol} ⏳ anticipation LONG à {last_price:.4f}")
                     if symbol not in sent_anticipation:
+                        logger.info(f"{symbol} ⏳ anticipation LONG à {last_price:.4f}")
                         await bot.send_message(
                             chat_id=os.environ["CHAT_ID"],
                             text=(
@@ -73,15 +73,15 @@ async def scan_and_send_signals(bot):
                 else:
                     sent_anticipation.discard(symbol)
 
-                # 2) Zone atteinte
+                # 2) Zone LONG atteinte
                 if emn <= last_price <= emx:
-                    logger.info(f"{symbol} 🚨 zone LONG atteinte à {last_price:.4f}")
                     if symbol not in sent_zone:
+                        logger.info(f"{symbol} 🚨 zone LONG atteinte à {last_price:.4f}")
                         await bot.send_message(
                             chat_id=os.environ["CHAT_ID"],
                             text=(
                                 f"🚨 Zone LONG atteinte {symbol}\n"
-                                f"Entrée possible : {emn:.4f}–{emx:.4f}\n"
+                                f"Entrée : {emn:.4f}–{emx:.4f}\n"
                                 f"Prix actuel : {last_price:.4f}"
                             )
                         )
@@ -89,12 +89,14 @@ async def scan_and_send_signals(bot):
                 else:
                     sent_zone.discard(symbol)
 
-                # 3) Signal final + graph
+                # 3) Signal final LONG + graph
                 if symbol not in sent_alert:
-                    buf = generate_trade_graph(symbol, df, {
-                        "entry": ep, "sl": sl, "tp": tp1,
-                        "fvg_zone": (res_l["entry_min"], res_l["entry_max"])
-                    })
+                    buf = generate_trade_graph(
+                        symbol,
+                        df,
+                        {"entry": ep, "sl": sl, "tp": tp1,
+                         "fvg_zone": (emn, emx)}
+                    )
                     await bot.send_document(
                         chat_id=os.environ["CHAT_ID"],
                         document=InputFile(buf, filename="signal_long.png"),
@@ -108,12 +110,12 @@ async def scan_and_send_signals(bot):
                     )
                     sent_alert.add(symbol)
             else:
-                # on réinitialise les états si plus de signal
+                # reset état
                 sent_anticipation.discard(symbol)
                 sent_zone.discard(symbol)
                 sent_alert.discard(symbol)
 
-            # ─── SCAN SHORT ───
+            # ─── Test SHORT ───
             res_s = analyze_market(symbol, df, side="short")
             if res_s:
                 accepted_short += 1
@@ -125,15 +127,14 @@ async def scan_and_send_signals(bot):
                     res_s["tp2"],
                 )
                 logger.info(
-                    f"{symbol} SHORT OK zone [{smx:.4f}-{smn:.4f}]  "
+                    f"{symbol} SHORT OK zone [{smx:.4f}-{smn:.4f}] "
                     f"entry={ep:.4f}, SL={sl:.4f}, TP1={tp1:.4f}, TP2={tp2:.4f}"
                 )
 
                 # 1) Anticipation SHORT
                 if smx <= last_price <= smx*(1+ANTICIPATION_THRESHOLD):
-                    logger.info(f"{symbol} ⏳ anticipation SHORT à {last_price:.4f}")
-                    key = f"short-anticip-{symbol}"
                     if symbol not in sent_anticipation:
+                        logger.info(f"{symbol} ⏳ anticipation SHORT à {last_price:.4f}")
                         await bot.send_message(
                             chat_id=os.environ["CHAT_ID"],
                             text=(
@@ -148,13 +149,13 @@ async def scan_and_send_signals(bot):
 
                 # 2) Zone SHORT atteinte
                 if smx >= last_price >= smn:
-                    logger.info(f"{symbol} 🚨 zone SHORT atteinte à {last_price:.4f}")
                     if symbol not in sent_zone:
+                        logger.info(f"{symbol} 🚨 zone SHORT atteinte à {last_price:.4f}")
                         await bot.send_message(
                             chat_id=os.environ["CHAT_ID"],
                             text=(
                                 f"🚨 Zone SHORT atteinte {symbol}\n"
-                                f"Entrée possible : {smx:.4f}–{smn:.4f}\n"
+                                f"Entrée : {smx:.4f}–{smn:.4f}\n"
                                 f"Prix actuel : {last_price:.4f}"
                             )
                         )
@@ -162,12 +163,14 @@ async def scan_and_send_signals(bot):
                 else:
                     sent_zone.discard(symbol)
 
-                # 3) Signal final + graph
+                # 3) Signal final SHORT + graph
                 if symbol not in sent_alert:
-                    buf = generate_trade_graph(symbol, df, {
-                        "entry": ep, "sl": sl, "tp": tp1,
-                        "fvg_zone": (res_s["entry_max"], res_s["entry_min"])
-                    })
+                    buf = generate_trade_graph(
+                        symbol,
+                        df,
+                        {"entry": ep, "sl": sl, "tp": tp1,
+                         "fvg_zone": (smx, smn)}
+                    )
                     await bot.send_document(
                         chat_id=os.environ["CHAT_ID"],
                         document=InputFile(buf, filename="signal_short.png"),
@@ -180,7 +183,6 @@ async def scan_and_send_signals(bot):
                         )
                     )
                     sent_alert.add(symbol)
-
             else:
                 sent_anticipation.discard(symbol)
                 sent_zone.discard(symbol)
@@ -190,10 +192,9 @@ async def scan_and_send_signals(bot):
             logger.error(f"❌ Erreur sur {symbol} : {e}")
 
     # ─── Récapitulatif ───
-    pct_long  = accepted_long  / total * 100 if total else 0
-    pct_short = accepted_short / total * 100 if total else 0
+    pct_l = accepted_long  / total * 100 if total else 0
+    pct_s = accepted_short / total * 100 if total else 0
     logger.info(
-        "📊 Résumé scan : "
-        f"LONGs acceptés {accepted_long}/{total} ({pct_long:.1f}%), "
-        f"SHORTs acceptés {accepted_short}/{total} ({pct_short:.1f}%)"
+        f"📊 Résumé scan : LONG {accepted_long}/{total} ({pct_l:.1f}%), "
+        f"SHORT {accepted_short}/{total} ({pct_s:.1f}%)"
     )
