@@ -1,77 +1,111 @@
 # signal_analysis.py
 
-import pandas_ta as ta
+import pandas as pd
+import numpy as np
+from indicators import compute_rsi, compute_macd, compute_atr
 
-def is_in_OTE_zone(entry_price, low, high):
+def detect_fvg(df: pd.DataFrame) -> bool:
     """
-    Renvoie (bool, fib618, fib786) si entry_price est entre 61.8% et 78.6% du swing.
+    Renvoie True si on trouve au moins un Fair Value Gap haussier
+    (High[i-2] < Low[i]) dans les dernières bougies.
     """
-    fib618 = low + 0.618 * (high - low)
-    fib786 = low + 0.786 * (high - low)
-    return (fib618 <= entry_price <= fib786), fib618, fib786
-
-def detect_fvg(df):
-    """
-    Retourne la liste des zones FVG (haussières) sous forme de tuples (high_prev2, low_curr).
-    """
-    zones = []
+    lows  = df['low'].values
+    highs = df['high'].values
     for i in range(2, len(df)):
-        h2 = df['high'].iat[i - 2]
-        l0 = df['low'].iat[i]
-        if h2 < l0:
-            zones.append((h2, l0))
-    return zones
+        if highs[i-2] < lows[i]:
+            return True
+    return False
 
-def analyze_market(symbol, df):
+def detect_fvg_short(df: pd.DataFrame) -> bool:
     """
-    Analyse le marché pour RSI(14), MACD(12,26,9), zone OTE et zone FVG.
-    Retourne dict {symbol, entry, sl, tp, ote_zone, fvg_zone, active} ou None.
+    Renvoie True si on trouve au moins un Fair Value Gap baissier
+    (Low[i-2] > High[i]) dans les dernières bougies.
     """
-    # 1) indicateurs
-    rsi    = ta.rsi(df['close'], length=14)
-    macd   = ta.macd(df['close'])
-    if rsi is None or macd is None:
+    lows  = df['low'].values
+    highs = df['high'].values
+    for i in range(2, len(df)):
+        if lows[i-2] > highs[i]:
+            return True
+    return False
+
+def analyze_market(symbol: str, df: pd.DataFrame, side: str = "long"):
+    """
+    Détecte une configuration long ou short selon `side`.
+    Retourne un dict avec keys :
+      entry_min, entry_max, entry_price, stop_loss, tp1, tp2
+    ou None si pas de signal.
+    """
+    # --- 1) Swing high/low sur les N dernières bougies ---
+    window = 20
+    if len(df) < window:
         return None
-    last_rsi    = rsi.iat[-1]
-    last_macd   = macd['MACD_12_26_9'].iat[-1]
-    last_signal = macd['MACDs_12_26_9'].iat[-1]
+    swing_high = df['high'].rolling(window).max().iloc[-2]
+    swing_low  = df['low'].rolling(window).min().iloc[-2]
 
-    # Filtre RSI étendu : 30 ≤ RSI ≤ 70
-    if last_rsi < 30 or last_rsi > 70:
-        return None
-    # Filtre MACD : MACD ≥ signal – 0.001
-    if last_macd < last_signal - 0.001:
-        return None
+    # --- 2) Bornes Fibonacci adaptées ---
+    if side == "long":
+        fib_min = swing_low  + 0.618 * (swing_high - swing_low)
+        fib_max = swing_low  + 0.786 * (swing_high - swing_low)
+    else:  # short
+        fib_max = swing_high - 0.618 * (swing_high - swing_low)
+        fib_min = swing_high - 0.786 * (swing_high - swing_low)
 
-    # 2) swing (20 bougies avant la dernière)
-    swing_low  = df['low'].iloc[-21:-1].min()
-    swing_high = df['high'].iloc[-21:-1].max()
+    entry_min, entry_max = fib_min, fib_max
+    last_price = df['close'].iloc[-1]
 
-    # 3) entrée au Fibo 61.8%
-    entry = swing_low + 0.618 * (swing_high - swing_low)
+    # --- 3) Filtre de tendance : MM50 vs MM200 ---
+    ma50  = df['close'].rolling(50).mean().iloc[-1]
+    ma200 = df['close'].rolling(200).mean().iloc[-1]
+    if side == "long":
+        if not (ma50 > ma200 and last_price > ma200):
+            return None
+    else:
+        if not (ma50 < ma200 and last_price < ma200):
+            return None
 
-    # 4) zone OTE
-    ote_ok, fib618, fib786 = is_in_OTE_zone(entry, swing_low, swing_high)
-    if not ote_ok:
-        return None
+    # --- 4) Filtres RSI & MACD ---
+    rsi = compute_rsi(df['close'], 14).iloc[-1]
+    macd, signal_line, _ = compute_macd(df['close'])
+    macd_val   = macd.iloc[-1]
+    signal_val = signal_line.iloc[-1]
 
-    # 5) zone FVG
-    fvg_zones = detect_fvg(df)
-    matching = next(((l,h) for l,h in fvg_zones if l <= entry <= h), None)
-    if matching is None:
-        return None
-    fvg_low, fvg_high = matching
+    if side == "long":
+        if not (rsi < 30 and macd_val > signal_val):
+            return None
+    else:
+        if not (rsi > 70 and macd_val < signal_val):
+            return None
 
-    # 6) SL / TP (RR 1:2)
-    sl = swing_low
-    tp = entry + (entry - sl) * 2
+    # --- 5) Filtre Fair Value Gap ---
+    if side == "long":
+        if not detect_fvg(df):
+            return None
+    else:
+        if not detect_fvg_short(df):
+            return None
+
+    # --- 6) Calcul SL, TP1, TP2 (basé sur ATR) ---
+    atr         = compute_atr(df, 14).iloc[-1]
+    buffer_atr  = atr * 0.2
+
+    if side == "long":
+        entry_price = entry_min
+        stop_loss   = swing_low - buffer_atr
+        rr          = entry_price - stop_loss
+        tp1         = entry_price + rr * 1
+        tp2         = entry_price + rr * 2
+    else:
+        entry_price = entry_max
+        stop_loss   = swing_high + buffer_atr
+        rr          = stop_loss - entry_price
+        tp1         = entry_price - rr * 1
+        tp2         = entry_price - rr * 2
 
     return {
-        'symbol':   symbol,
-        'entry':    round(entry,    6),
-        'sl':       round(sl,       6),
-        'tp':       round(tp,       6),
-        'ote_zone': (round(fib618,  6), round(fib786,  6)),
-        'fvg_zone': (round(fvg_low, 6), round(fvg_high, 6)),
-        'active':   False
+        "entry_min":   float(entry_min),
+        "entry_max":   float(entry_max),
+        "entry_price": float(entry_price),
+        "stop_loss":   float(stop_loss),
+        "tp1":         float(tp1),
+        "tp2":         float(tp2),
     }
