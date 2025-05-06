@@ -5,41 +5,46 @@ import logging
 import httpx
 
 from telegram import InputFile
-from kucoin_utils   import BASE_URL, get_kucoin_perps, fetch_klines, get_account_balance
+from kucoin_utils    import BASE_URL, get_kucoin_perps, fetch_klines, get_account_balance
 from signal_analysis import analyze_market
 from plot_signal     import generate_trade_graph
 from indicators      import compute_rsi, compute_macd, compute_atr
 
-# Seuil d’anticipation en % autour de l’entrée
-ANTICIPATION_THRESHOLD = 0.003
-# Seuil d’imbalance pour orderbook (20% de différence)
-IMB_THRESHOLD         = 0.2
-# Confirmation multi‐TF : intervalle haut pour confirmer (ici "4hour")
-HIGH_TF               = "4hour"
+# Paramètres
+ANTICIPATION_THRESHOLD = 0.003  # 0.3%
+IMB_THRESHOLD          = 0.2    # 20% d’écart bids/asks
+HIGH_TF                = "4hour"
+RISK_PCT               = 0.01   # 1% du capital
 
 logger = logging.getLogger(__name__)
 
+# États anti‐doublons
 sent_anticipation = set()
-sent_zone        = set()
-sent_alert       = set()
+sent_zone         = set()
+sent_alert        = set()
 
 def get_orderbook_imbalance(symbol: str) -> str | None:
     """
-    Récupère le snapshot Level2 KuCoin et renvoie 'buy' si bids > asks*(1+th),
-    'sell' si asks > bids*(1+th), sinon None.
+    Récupère le snapshot Level2 KuCoin Futures et renvoie :
+    - 'buy' si bids > asks*(1+threshold)
+    - 'sell' si asks > bids*(1+threshold)
+    - None sinon, ou si erreur
     """
-    url = f"{BASE_URL}/api/v1/level2/depth"
-    resp = httpx.get(url, params={"symbol": symbol, "limit": 20})
-    resp.raise_for_status()
-    data = resp.json().get("data", {})
-    bids = data.get("bids", [])
-    asks = data.get("asks", [])
-    bid_vol = sum(float(b[1]) for b in bids[:10])
-    ask_vol = sum(float(a[1]) for a in asks[:10])
-    if bid_vol > ask_vol * (1 + IMB_THRESHOLD):
-        return "buy"
-    if ask_vol > bid_vol * (1 + IMB_THRESHOLD):
-        return "sell"
+    try:
+        url = f"{BASE_URL}/api/v1/level2/snapshot"
+        resp = httpx.get(url, params={"symbol": symbol, "limit": 20}, timeout=5)
+        resp.raise_for_status()
+        data = resp.json().get("data", {})
+        bids = data.get("bids", [])[:10]
+        asks = data.get("asks", [])[:10]
+        bid_vol = sum(float(b[1]) for b in bids)
+        ask_vol = sum(float(a[1]) for a in asks)
+        if bid_vol > ask_vol * (1 + IMB_THRESHOLD):
+            return "buy"
+        if ask_vol > bid_vol * (1 + IMB_THRESHOLD):
+            return "sell"
+    except Exception as e:
+        logger.warning(f"{symbol} orderbook imbalance error, filter désactivé: {e}")
     return None
 
 async def scan_and_send_signals(bot):
@@ -52,7 +57,7 @@ async def scan_and_send_signals(bot):
 
     for symbol in symbols:
         try:
-            # ─── 1) Récup OHLCV minute + indicateurs ───
+            # 1) OHLCV minute + indicateurs
             df_low     = fetch_klines(symbol, interval="1min", limit=200)
             last_price = df_low["close"].iat[-1]
             rsi        = compute_rsi(df_low["close"], 14).iat[-1]
@@ -64,62 +69,61 @@ async def scan_and_send_signals(bot):
                 f"MACD={macd_val:.6f}, SIG={sig_val:.6f}"
             )
 
-            # ─── 2) Filtre Orderbook / Imbalance ───
+            # 2) Orderbook imbalance (si disponible)
             imb = get_orderbook_imbalance(symbol)
             logger.info(f"{symbol} orderbook imbalance: {imb}")
-            if imb is None:
-                logger.info(f"{symbol} skip (pas d’imbalance assez forte)")
-                continue
 
-            # ─── 3) Confirmation multi‐TF ───
+            # 3) Confirmation multi‐TF (4h)
             df_high = fetch_klines(symbol, interval=HIGH_TF, limit=50)
-            if not analyze_market(symbol, df_high, side="long") and not analyze_market(symbol, df_high, side="short"):
+            if not (
+                analyze_market(symbol, df_high, side="long") or
+                analyze_market(symbol, df_high, side="short")
+            ):
                 logger.info(f"{symbol} skip (pas de signal sur {HIGH_TF})")
                 continue
 
-            # ─── 4) Calcul ATR + taille de position ───
-            atr = compute_atr(df_low["high"], df_low["low"], df_low["close"], 14).iat[-1]
-            bal = get_account_balance(symbol)
-            risk_amt = bal * 0.01  # 1% du capital
-            # (Taille sera recalculée par position)
+            # 4) Calcul ATR + sizing
+            atr      = compute_atr(df_low["high"], df_low["low"], df_low["close"], 14).iat[-1]
+            bal      = get_account_balance(symbol)
+            risk_amt = bal * RISK_PCT
             logger.info(f"{symbol} ATR={atr:.4f}, capital={bal:.2f}, risk_amt={risk_amt:.2f}")
 
-            # ─── 5) Test LONG ───
+            # ─── SCAN LONG ───
             res_l = analyze_market(symbol, df_low, side="long")
-            if res_l and imb == "buy":
+            # On passe LONG si signal ok ET (imb is None OU imb == 'buy')
+            if res_l and (imb is None or imb == "buy"):
                 accepted_long += 1
                 emn, emx = res_l["entry_min"], res_l["entry_max"]
                 ep, sl, tp1, tp2 = (
-                    res_l["entry_price"],
-                    res_l["stop_loss"],
-                    res_l["tp1"],
-                    res_l["tp2"],
+                    res_l["entry_price"], res_l["stop_loss"],
+                    res_l["tp1"], res_l["tp2"]
                 )
-                # calc size = risk_amt / (entry - sl)
                 size = risk_amt / (ep - sl)
                 logger.info(
                     f"{symbol} LONG OK zone [{emn:.4f}-{emx:.4f}] entry={ep:.4f}, "
                     f"SL={sl:.4f}, TP1={tp1:.4f}, TP2={tp2:.4f}, size={size:.4f}"
                 )
 
-                # 5.1) Anticipation LONG
-                if emn * (1 - ANTICIPATION_THRESHOLD) <= last_price < emn:
+                # 4.1) Anticipation LONG
+                if emn*(1-ANTICIPATION_THRESHOLD) <= last_price < emn:
                     if symbol not in sent_anticipation:
+                        logger.info(f"{symbol} ⏳ anticipation LONG à {last_price:.4f}")
                         await bot.send_message(
                             chat_id=os.environ["CHAT_ID"],
                             text=(
                                 f"⏳ Anticipation LONG {symbol}\n"
-                                f"Zone {emn:.4f}→{emx:.4f}\n"
-                                f"Prix {last_price:.4f}"
+                                f"Zone {emn:.4f} → {emx:.4f}\n"
+                                f"Prix : {last_price:.4f}"
                             )
                         )
                         sent_anticipation.add(symbol)
                 else:
                     sent_anticipation.discard(symbol)
 
-                # 5.2) Zone LONG atteinte
+                # 4.2) Zone LONG atteinte
                 if emn <= last_price <= emx:
                     if symbol not in sent_zone:
+                        logger.info(f"{symbol} 🚨 zone LONG atteinte à {last_price:.4f}")
                         await bot.send_message(
                             chat_id=os.environ["CHAT_ID"],
                             text=(
@@ -132,11 +136,11 @@ async def scan_and_send_signals(bot):
                 else:
                     sent_zone.discard(symbol)
 
-                # 5.3) Signal final + graph
+                # 4.3) Signal final LONG + graph
                 if symbol not in sent_alert:
                     buf = generate_trade_graph(
                         symbol, df_low,
-                        {"entry": ep, "sl": sl, "tp": tp1, "fvg_zone": (emn, emx)}
+                        {"entry":ep, "sl":sl, "tp":tp1, "fvg_zone":(emn,emx)}
                     )
                     await bot.send_document(
                         chat_id=os.environ["CHAT_ID"],
@@ -156,16 +160,14 @@ async def scan_and_send_signals(bot):
                 sent_zone.discard(symbol)
                 sent_alert.discard(symbol)
 
-            # ─── 6) Test SHORT ───
+            # ─── SCAN SHORT ───
             res_s = analyze_market(symbol, df_low, side="short")
-            if res_s and imb == "sell":
+            if res_s and (imb is None or imb == "sell"):
                 accepted_short += 1
                 smx, smn = res_s["entry_max"], res_s["entry_min"]
                 ep, sl, tp1, tp2 = (
-                    res_s["entry_price"],
-                    res_s["stop_loss"],
-                    res_s["tp1"],
-                    res_s["tp2"],
+                    res_s["entry_price"], res_s["stop_loss"],
+                    res_s["tp1"], res_s["tp2"]
                 )
                 size = risk_amt / (sl - ep)
                 logger.info(
@@ -173,24 +175,26 @@ async def scan_and_send_signals(bot):
                     f"SL={sl:.4f}, TP1={tp1:.4f}, TP2={tp2:.4f}, size={size:.4f}"
                 )
 
-                # 6.1) Anticipation SHORT
-                if smx <= last_price <= smx * (1 + ANTICIPATION_THRESHOLD):
+                # 5.1) Anticipation SHORT
+                if smx <= last_price <= smx*(1+ANTICIPATION_THRESHOLD):
                     if symbol not in sent_anticipation:
+                        logger.info(f"{symbol} ⏳ anticipation SHORT à {last_price:.4f}")
                         await bot.send_message(
                             chat_id=os.environ["CHAT_ID"],
                             text=(
                                 f"⏳ Anticipation SHORT {symbol}\n"
-                                f"Zone {smx:.4f}→{smn:.4f}\n"
-                                f"Prix {last_price:.4f}"
+                                f"Zone {smx:.4f} → {smn:.4f}\n"
+                                f"Prix : {last_price:.4f}"
                             )
                         )
                         sent_anticipation.add(symbol)
                 else:
                     sent_anticipation.discard(symbol)
 
-                # 6.2) Zone SHORT atteinte
+                # 5.2) Zone SHORT atteinte
                 if smx >= last_price >= smn:
                     if symbol not in sent_zone:
+                        logger.info(f"{symbol} 🚨 zone SHORT atteinte à {last_price:.4f}")
                         await bot.send_message(
                             chat_id=os.environ["CHAT_ID"],
                             text=(
@@ -203,11 +207,11 @@ async def scan_and_send_signals(bot):
                 else:
                     sent_zone.discard(symbol)
 
-                # 6.3) Signal final + graph
+                # 5.3) Signal final SHORT + graph
                 if symbol not in sent_alert:
                     buf = generate_trade_graph(
                         symbol, df_low,
-                        {"entry": ep, "sl": sl, "tp": tp1, "fvg_zone": (smx, smn)}
+                        {"entry":ep, "sl":sl, "tp":tp1, "fvg_zone":(smx,smn)}
                     )
                     await bot.send_document(
                         chat_id=os.environ["CHAT_ID"],
@@ -230,7 +234,7 @@ async def scan_and_send_signals(bot):
         except Exception as e:
             logger.error(f"❌ Erreur sur {symbol} : {e}")
 
-    # ─── Récapitulatif ───
+    # Récapitulatif final
     pct_l = accepted_long  / total * 100 if total else 0
     pct_s = accepted_short / total * 100 if total else 0
     logger.info(
