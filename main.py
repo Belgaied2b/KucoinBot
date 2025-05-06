@@ -1,104 +1,72 @@
-import logging
-import os
-import threading
-from flask import Flask
-from telegram import Update
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    ContextTypes,
-)
+# main.py
+import asyncio
+import pandas as pd
+from data_stream import DataStream
+from multi_exchange import ExchangeAggregator
+from multi_tf import confirm_multi_tf
+from orderbook_utils import detect_imbalance
+from signal_analysis import analyze_market
+from risk_manager import calculate_position_size
+from alert_manager import AlertManager
+from chart_generator import generate_signal_chart
+from kucoin_utils import send_telegram, get_account_balance
 
-from scanner import scan_and_send_signals
-from analyse_stats import compute_stats
+# Config
+EXCHANGES = ['binanceusdm', 'bybit']  # ccxt.pro class names
+SYMBOLS   = ['BTC/USDT', 'ETH/USDT']
+TF_LOW    = '1m'
+TF_HIGH   = '15m'
+RISK_PCT  = 0.01
 
-# Configuration
-TOKEN   = os.environ["TOKEN"]
-CHAT_ID = os.environ["CHAT_ID"]
+alert_mgr = AlertManager(cooldown=300)
 
-# Logger
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+async def handle_update(event_type, ex, symbol, data):
+    # 1) Reconstruction du DF low TF / high TF
+    #    (on agrège multi-exchange puis on resample pour high TF)
+    df_low = ExchangeAggregator(ds).get_ohlcv_df(symbol)
+    if df_low is None or len(df_low) < 50:
+        return
+    df_low = df_low.copy()
+    df_high = df_low.resample(TF_HIGH).agg({
+        'open':'first','high':'max','low':'min','close':'last','volume':'sum'
+    }).dropna()
 
-# Flask keep-alive
-app = Flask(__name__)
-@app.route("/")
-def home():
-    return "Bot is running!"
+    # 2) Détection signal long et short low TF
+    for side in ('long','short'):
+        res_low = analyze_market(symbol, df_low, side=side)
+        if not res_low:
+            continue
 
-# --- Commandes Telegram ---
-async def scan_test_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.info("✅ Commande /scan_test reçue")
-    await update.message.reply_text("Scan en cours…")
-    await scan_and_send_signals(context.bot)
+        # 3) Confirmation sur high TF
+        if not confirm_multi_tf(symbol, df_low, df_high, side):
+            continue
 
-async def scan_graph_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    logger.info("✅ Commande /scan_graph reçue")
-    await update.message.reply_text("🚀 Envoi des signaux anticipés…")
-    await scan_and_send_signals(context.bot)
+        # 4) Filtre orderbook
+        obs = ExchangeAggregator(ds).get_orderbook(symbol)
+        imb = detect_imbalance(obs)
+        if (side=='long' and imb!='buy') or (side=='short' and imb!='sell'):
+            continue
 
-# --- Job principal : scan + stats ---
-async def scheduled_scan(context: ContextTypes.DEFAULT_TYPE):
-    logger.info("⏰ Début du job — scan automatique")
-    await scan_and_send_signals(context.bot)
+        # 5) Size dynamique
+        bal = get_account_balance(symbol)
+        size = calculate_position_size(bal, RISK_PCT, res_low['stop_loss'] - res_low['entry_price'] if side=='long' else res_low['entry_price']-res_low['stop_loss'])
 
-    # **Juste après le scan**, on calcule et logge les stats
-    # Baisse le bruit des logs API
-    logging.getLogger("httpx").setLevel(logging.WARNING)
-    logging.getLogger("kucoin_utils").setLevel(logging.WARNING)
+        # 6) Anti-spam
+        key_base = (symbol, side, round(res_low['entry_price'], 4))
+        for alert_type in ('anticipation','zone','signal'):
+            key = key_base + (alert_type,)
+            if not alert_mgr.can_send(key):
+                continue
 
-    df_stats, df_means = compute_stats(limit=50)
+            # 7) Génération du chart en Base64
+            img_b64 = generate_signal_chart(df_low, res_low['entry_min'], res_low['entry_max'], symbol, TF_LOW)
+            caption = f"🔔 {alert_type.upper()} {side.upper()} {symbol}\nEntry zone: {res_low['entry_min']:.4f}-{res_low['entry_max']:.4f}\nPrix actuel: {df_low['close'].iloc[-1]:.4f}\nSize: {size:.4f}"
+            send_telegram(caption, image_b64=img_b64)
 
-    # Log détaillé (extrait)
-    logger.warning(
-        "🔢 Stats détaillées (20 premières lignes):\n%s",
-        df_stats.to_string(index=False, max_rows=20)
-    )
-    # Log des moyennes
-    logger.warning(
-        "📊 Moyennes (Signal vs No-Signal):\n%s",
-        df_means.to_string(index=False)
-    )
-
-    # Taux de passage / blocage
-    pass_rates  = df_stats[['rsi_ok','macd_ok','ote_ok','fvg_ok']].mean()
-    block_rates = 1 - pass_rates
-    blocker     = block_rates.idxmax()
-    blocker_pct = block_rates[blocker] * 100
-
-    logger.warning(
-        "❌ Indicateur qui bloque le plus de signaux : %s (%.2f%% de rejets)",
-        blocker, blocker_pct
-    )
-    logger.warning(
-        "✅ Taux de passage : RSI %.2f%%, MACD %.2f%%, OTE %.2f%%, FVG %.2f%%",
-        pass_rates['rsi_ok']*100,
-        pass_rates['macd_ok']*100,
-        pass_rates['ote_ok']*100,
-        pass_rates['fvg_ok']*100
-    )
-
-def main():
-    application = ApplicationBuilder().token(TOKEN).build()
-
-    # Handlers
-    application.add_handler(CommandHandler("scan_test",  scan_test_command))
-    application.add_handler(CommandHandler("scan_graph", scan_graph_command))
-
-    # Scan + stats toutes les 10 minutes (premier run 5s après démarrage)
-    application.job_queue.run_repeating(scheduled_scan, interval=600, first=5)
-
-    # Flask keep-alive en arrière-plan
-    threading.Thread(
-        target=lambda: app.run(
-            host="0.0.0.0",
-            port=int(os.environ.get("PORT", 3000))
-        ),
-        daemon=True
-    ).start()
-
-    logger.info("🚀 Bot démarré — scan+stats auto toutes les 10 min")
-    application.run_polling()
+async def main():
+    global ds
+    ds = DataStream(EXCHANGES, SYMBOLS, TF_LOW)
+    await ds.start(handle_update)
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
