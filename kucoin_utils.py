@@ -1,5 +1,4 @@
 ### kucoin_utils.py
-python
 import pandas as pd
 import requests
 
