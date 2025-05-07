@@ -1,5 +1,5 @@
 ### main.py
-```python
+python
 import os
 import logging
 from telegram.ext import Application, CommandHandler
@@ -26,4 +26,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-```
