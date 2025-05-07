@@ -106,17 +106,17 @@ async def scan_and_send_signals(bot):
                 logger.info(f"{symbol} skip trend: ma50={ma50:.4f}, ma200={ma200:.4f}")
                 continue
 
-            # 6) RSI & MACD (seuils existants)
+            # 6) RSI & MACD (seuils ajustés 45/55)
             rsi = compute_rsi(df_low["close"], 14).iat[-1]
             macd_line, sig_line, _ = compute_macd(df_low["close"])
             macd_val = macd_line.iat[-1]
             sig_val  = sig_line.iat[-1]
-            cond_long  = (rsi < 40 and macd_val > 0) or (rsi < 30 and macd_val > sig_val)
-            cond_short = (rsi > 60 and macd_val < 0) or (rsi > 70 and macd_val < sig_val)
+            cond_long  = (rsi < 45 and macd_val > sig_val)
+            cond_short = (rsi > 55 and macd_val < sig_val)
             if not (cond_long or cond_short):
                 cnt_rsmacd += 1
                 logger.info(
-                    f"{symbol} skip RSI/MACD: RSI={rsi:.1f}, MACD={macd_val:.4f}"
+                    f"{symbol} skip RSI/MACD (45/55): RSI={rsi:.1f}, MACD={macd_val:.4f}, SIG={sig_val:.4f}"
                 )
                 continue
 
@@ -134,8 +134,8 @@ async def scan_and_send_signals(bot):
             df_high = fetch_klines(symbol, interval=HIGH_TF, limit=50)
             logger.info(f"{symbol} → {len(df_high)} bougies {HIGH_TF} récupérées")
             confirmed = (
-                analyze_market(symbol, df_high, side="long") or
-                analyze_market(symbol, df_high, side="short")
+                analyze_market(symbol, df_high, side="long")
+                or analyze_market(symbol, df_high, side="short")
             )
             if not confirmed:
                 logger.info(f"{symbol} skip multi-TF ({HIGH_TF})")
@@ -154,7 +154,7 @@ async def scan_and_send_signals(bot):
                     res_l["tp1"], res_l["tp2"]
                 )
                 size = risk_amt / (ep - sl)
-                # → envoi anticipation / zone / signal comme avant
+                # → envoyer anticipation / zone / signal (inchangé)
 
             # ─── SCAN SHORT ───
             res_s = analyze_market(symbol, df_low, side="short")
