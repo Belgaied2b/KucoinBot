@@ -1,5 +1,4 @@
 ### graph.py
-python
 import matplotlib.pyplot as plt
 
 def plot_signal_graph(df, entry, sl, tp, direction):
