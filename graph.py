@@ -1,5 +1,5 @@
 ### graph.py
-```python
+python
 import matplotlib.pyplot as plt
 
 def plot_signal_graph(df, entry, sl, tp, direction):
@@ -12,4 +12,3 @@ def plot_signal_graph(df, entry, sl, tp, direction):
     ax.set_title(f"Signal {direction.upper()}")
     ax.legend()
     return fig
-```
