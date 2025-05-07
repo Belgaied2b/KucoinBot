@@ -63,17 +63,17 @@ def analyze_market(symbol: str, df: pd.DataFrame, side: str = "long"):
         if not (ma50 < ma200 and last_price < ma200):
             return None
 
-    # --- 4) Filtres RSI & MACD ---
+    # --- 4) Filtres RSI & MACD (seuils élargis 40/60) ---
     rsi = compute_rsi(df['close'], 14).iloc[-1]
     macd, signal_line, _ = compute_macd(df['close'])
     macd_val   = macd.iloc[-1]
     signal_val = signal_line.iloc[-1]
 
     if side == "long":
-        if not (rsi < 30 and macd_val > signal_val):
+        if not (rsi < 40 and macd_val > signal_val):
             return None
     else:
-        if not (rsi > 70 and macd_val < signal_val):
+        if not (rsi > 60 and macd_val < signal_val):
             return None
 
     # --- 5) Filtre Fair Value Gap ---
@@ -85,8 +85,8 @@ def analyze_market(symbol: str, df: pd.DataFrame, side: str = "long"):
             return None
 
     # --- 6) Calcul SL, TP1, TP2 (basé sur ATR) ---
-    atr         = compute_atr(df, 14).iloc[-1]
-    buffer_atr  = atr * 0.2
+    atr        = compute_atr(df, 14).iloc[-1]
+    buffer_atr = atr * 0.2
 
     if side == "long":
         entry_price = entry_min
