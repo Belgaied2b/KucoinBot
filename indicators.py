@@ -1,5 +1,5 @@
 ### indicators.py
-```python
+python
 import pandas as pd
 
 def compute_rsi(close, length=14):
@@ -27,4 +27,3 @@ def compute_atr(df, period=14):
         (low - prev_close).abs()
     ], axis=1).max(axis=1)
     return tr.rolling(window=period).mean()
-```
