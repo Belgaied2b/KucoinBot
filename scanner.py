@@ -36,7 +36,7 @@ async def scan_and_send_signals(bot, chat_id):
             if status is None:
                 continue
 
-            # 📬 Construction du message Telegram
+            # 📬 Message Telegram
             msg = f"{symbol} - Signal {status.upper()} ({direction.upper()})\n"
 
             if status == "confirmé":
@@ -50,14 +50,17 @@ async def scan_and_send_signals(bot, chat_id):
                 msg += (
                     "\n📊 RSI + MACD alignés ✅"
                     "\n⏳ Prix pas encore dans la zone OTE + FVG"
-                    f"\n🔵 Entrée idéale : {round(entry, 2)}"
-                    f"\n🛑 SL (prévision) : {round(sl, 2)}"
-                    f"\n🎯 TP (prévision) : {round(tp, 2)}"
-                    "\n🧠 Ordre limite possible (à surveiller)"
                 )
+                if entry and sl and tp:
+                    msg += (
+                        f"\n🔵 Entrée idéale : {round(entry, 2)}"
+                        f"\n🛑 SL (prévision) : {round(sl, 2)}"
+                        f"\n🎯 TP (prévision) : {round(tp, 2)}"
+                    )
+                msg += "\n🧠 Ordre limite possible (à surveiller)"
 
             # 📉 Génération du graphique
-            fig = plot_signal_graph(df_4h, entry, sl, tp if status == "confirmé" else None, direction)
+            fig = plot_signal_graph(df_4h, entry or 0, sl, tp if status == "confirmé" else None, direction)
             if fig:
                 buf = BytesIO()
                 fig.savefig(buf, format='png')
