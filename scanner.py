@@ -1,50 +1,26 @@
-# scanner.py
+### scanner.py
+```python
+from kucoin_utils import fetch_klines
+from signal_analysis import analyze_signal
+from graph import plot_signal_graph
+from io import BytesIO
 
-import os
-import logging
-from telegram import InputFile
-from kucoin_utils import get_kucoin_perps, fetch_klines
-from signal_analysis import analyze_market
-from plot_signal import generate_trade_graph
+SYMBOLS = ["BTCUSDTM", "ETHUSDTM"]
 
-logger = logging.getLogger(__name__)
-
-sent_anticipation = set()
-sent_alert = set()
-
-async def scan_and_send_signals(bot):
-    symbols = get_kucoin_perps()
-    logger.info(f"🔍 {len(symbols)} PERP détectés")
-
-    for symbol in symbols:
-        try:
-            df = fetch_klines(symbol)
-            logger.info(f"🔎 Analyse de {symbol} en cours...")
-            result = analyze_market(symbol, df)
-
-            if not result:
-                sent_anticipation.discard(symbol)
-                sent_alert.discard(symbol)
-                continue
-
-            if symbol not in sent_anticipation:
-                buf = generate_trade_graph(symbol, df, result)
-                photo = InputFile(buf, filename=f"{symbol}.png")
-                ote_low, ote_high = result['ote_zone']
-                fvg_low, fvg_high = result['fvg_zone']
-
-                await bot.send_photo(
-                    chat_id=os.environ["CHAT_ID"],
-                    photo=photo,
-                    caption=(
-                        f"🧠 *Signal anticipé* pour {symbol}\n"
-                        f"Entrée : `{result['entry']}` | SL : `{result['sl']}` | TP : `{result['tp']}`\n"
-                        f"OTE zone : {ote_low:.4f} – {ote_high:.4f}\n"
-                        f"FVG zone : {fvg_low:.4f} – {fvg_high:.4f}"
-                    ),
-                    parse_mode='Markdown'
-                )
-                sent_anticipation.add(symbol)
-
-        except Exception as e:
-            logger.error(f"Erreur analyse {symbol} : {e}")
+async def scan_and_send_signals(bot, chat_id):
+    for symbol in SYMBOLS:
+        df_1h = fetch_klines(symbol, interval="1h")
+        df_4h = fetch_klines(symbol, interval="4h")
+        for direction in ["long", "short"]:
+            status, entry, sl, tp = analyze_signal(df_1h, df_4h, direction)
+            if status:
+                msg = f"{symbol} - Signal {status.upper()} ({direction})"
+                if status == "confirmé":
+                    fig = plot_signal_graph(df_4h, entry, sl, tp, direction)
+                    buf = BytesIO()
+                    fig.savefig(buf, format='png')
+                    buf.seek(0)
+                    await bot.send_photo(chat_id=chat_id, photo=buf, caption=msg)
+                else:
+                    await bot.send_message(chat_id=chat_id, text=msg)
+```
