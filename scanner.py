@@ -1,5 +1,5 @@
 ### scanner.py
-```python
+python
 from kucoin_utils import fetch_klines
 from signal_analysis import analyze_signal
 from graph import plot_signal_graph
@@ -23,4 +23,4 @@ async def scan_and_send_signals(bot, chat_id):
                     await bot.send_photo(chat_id=chat_id, photo=buf, caption=msg)
                 else:
                     await bot.send_message(chat_id=chat_id, text=msg)
-```
+
