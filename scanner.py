@@ -1,8 +1,12 @@
 import requests
+import json
+import os
 from kucoin_utils import fetch_klines
 from signal_analysis import analyze_signal
 from graph import plot_signal_graph
 from io import BytesIO
+
+SIGNAL_LOG = "sent_signals.json"
 
 def get_perp_symbols():
     url = "https://api-futures.kucoin.com/api/v1/contracts/active"
@@ -16,9 +20,20 @@ def get_perp_symbols():
         print(f"❌ Erreur récupération des PERP : {e}")
         return []
 
+def load_sent_signals():
+    if not os.path.exists(SIGNAL_LOG):
+        return set()
+    with open(SIGNAL_LOG, "r") as f:
+        return set(json.load(f))
+
+def save_sent_signal(signal_set):
+    with open(SIGNAL_LOG, "w") as f:
+        json.dump(list(signal_set), f)
+
 async def scan_and_send_signals(bot, chat_id):
     print(f"🔁 Lancement du scan global PERP KuCoin...")
     symbols = get_perp_symbols()
+    sent = load_sent_signals()
 
     for symbol in symbols:
         print(f"\n🔍 Analyse de {symbol}...")
@@ -32,40 +47,41 @@ async def scan_and_send_signals(bot, chat_id):
 
         for direction in ["long", "short"]:
             status, entry, sl, tp = analyze_signal(df_1h, df_4h, direction)
+            signal_id = f"{symbol}_{direction}_{status}"
 
-            if status is None:
+            if status is None or signal_id in sent:
                 continue
 
-            # 📬 Message Telegram
+            # Message Telegram
             msg = f"{symbol} - Signal {status.upper()} ({direction.upper()})\n"
 
             if status == "confirmé":
                 msg += (
-                    f"\n🔵 Entrée idéale : {round(entry, 2)}"
-                    f"\n🛑 SL : {round(sl, 2)}"
-                    f"\n🎯 TP : {round(tp, 2)}"
+                    f"\n🔵 Entrée idéale : {round(entry, 4)}"
+                    f"\n🛑 SL : {round(sl, 4)}"
+                    f"\n🎯 TP : {round(tp, 4)}"
                     "\n📈 Signal confirmé avec conditions complètes."
                 )
             elif status == "anticipé":
                 msg += (
                     "\n📊 RSI + MACD alignés ✅"
                     "\n⏳ Prix pas encore dans la zone OTE + FVG"
+                    f"\n🔵 Entrée idéale : {round(entry, 4)}"
+                    f"\n🛑 SL (prévision) : {round(sl, 4)}"
+                    f"\n🎯 TP (prévision) : {round(tp, 4)}"
+                    "\n🧠 Ordre limite possible (à surveiller)"
                 )
-                if entry and sl and tp:
-                    msg += (
-                        f"\n🔵 Entrée idéale : {round(entry, 2)}"
-                        f"\n🛑 SL (prévision) : {round(sl, 2)}"
-                        f"\n🎯 TP (prévision) : {round(tp, 2)}"
-                    )
-                msg += "\n🧠 Ordre limite possible (à surveiller)"
 
-            # 📉 Génération du graphique
-            fig = plot_signal_graph(df_4h, entry or 0, sl, tp if status == "confirmé" else None, direction)
+            # Génération graphique complet même pour anticipé
+            fig = plot_signal_graph(df_4h, entry, sl, tp, direction)
             if fig:
                 buf = BytesIO()
                 fig.savefig(buf, format='png')
                 buf.seek(0)
                 await bot.send_photo(chat_id=chat_id, photo=buf, caption=msg)
                 print(f"📤 Signal envoyé : {symbol} ({status})")
+                sent.add(signal_id)
             else:
                 await bot.send_message(chat_id=chat_id, text=msg + " (graphique non généré)")
+
+    save_sent_signal(sent)
