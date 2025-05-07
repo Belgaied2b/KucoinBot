@@ -1,4 +1,3 @@
-### main.py
 import os
 import logging
 from telegram.ext import Application, CommandHandler
@@ -7,7 +6,8 @@ from scanner import scan_and_send_signals
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+# ⚙️ Lecture des variables d'environnement avec tes noms exacts
+BOT_TOKEN = os.getenv("TOKEN")
 CHAT_ID = int(os.getenv("CHAT_ID"))
 
 async def start(update, context):
