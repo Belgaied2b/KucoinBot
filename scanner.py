@@ -36,18 +36,33 @@ async def scan_and_send_signals(bot, chat_id):
             if status is None:
                 continue
 
-            msg = f"{symbol} - Signal {status.upper()} ({direction})"
+            # 📬 Construction du message Telegram
+            msg = f"{symbol} - Signal {status.upper()} ({direction.upper()})\n"
 
             if status == "confirmé":
-                fig = plot_signal_graph(df_4h, entry, sl, tp, direction)
-                if fig:
-                    buf = BytesIO()
-                    fig.savefig(buf, format='png')
-                    buf.seek(0)
-                    await bot.send_photo(chat_id=chat_id, photo=buf, caption=msg)
-                    print(f"📤 Signal envoyé : {msg}")
-                else:
-                    await bot.send_message(chat_id=chat_id, text=msg + " (graphique non généré)")
+                msg += (
+                    f"\n🔵 Entrée idéale : {round(entry, 2)}"
+                    f"\n🛑 SL : {round(sl, 2)}"
+                    f"\n🎯 TP : {round(tp, 2)}"
+                    "\n📈 Signal confirmé avec conditions complètes."
+                )
+            elif status == "anticipé":
+                msg += (
+                    "\n📊 RSI + MACD alignés ✅"
+                    "\n⏳ Prix pas encore dans la zone OTE + FVG"
+                    f"\n🔵 Entrée idéale : {round(entry, 2)}"
+                    f"\n🛑 SL (prévision) : {round(sl, 2)}"
+                    f"\n🎯 TP (prévision) : {round(tp, 2)}"
+                    "\n🧠 Ordre limite possible (à surveiller)"
+                )
+
+            # 📉 Génération du graphique
+            fig = plot_signal_graph(df_4h, entry, sl, tp if status == "confirmé" else None, direction)
+            if fig:
+                buf = BytesIO()
+                fig.savefig(buf, format='png')
+                buf.seek(0)
+                await bot.send_photo(chat_id=chat_id, photo=buf, caption=msg)
+                print(f"📤 Signal envoyé : {symbol} ({status})")
             else:
-                await bot.send_message(chat_id=chat_id, text=msg)
-                print(f"📤 Signal anticipé envoyé : {msg}")
+                await bot.send_message(chat_id=chat_id, text=msg + " (graphique non généré)")
