@@ -1,22 +1,33 @@
+import requests
 from kucoin_utils import fetch_klines
 from signal_analysis import analyze_signal
 from graph import plot_signal_graph
 from io import BytesIO
 
-# Liste des paires à scanner
-SYMBOLS = ["BTCUSDTM", "ETHUSDTM"]
+def get_perp_symbols():
+    url = "https://api-futures.kucoin.com/api/v1/contracts/active"
+    try:
+        response = requests.get(url)
+        data = response.json()["data"]
+        symbols = [s["symbol"] for s in data if s["symbol"].endswith("USDTM")]
+        print(f"🔁 {len(symbols)} PERP détectés")
+        return symbols
+    except Exception as e:
+        print(f"❌ Erreur récupération des PERP : {e}")
+        return []
 
 async def scan_and_send_signals(bot, chat_id):
-    print(f"🔁 Lancement du scan...")
+    print(f"🔁 Lancement du scan global PERP KuCoin...")
+    symbols = get_perp_symbols()
 
-    for symbol in SYMBOLS:
+    for symbol in symbols:
         print(f"\n🔍 Analyse de {symbol}...")
 
         df_1h = fetch_klines(symbol, interval="1h")
         df_4h = fetch_klines(symbol, interval="4h")
 
         if df_1h.empty or df_4h.empty:
-            print(f"⚠️ {symbol} — Données 1H ou 4H manquantes. Scan ignoré.")
+            print(f"⚠️ {symbol} — Données manquantes. Ignoré.")
             continue
 
         for direction in ["long", "short"]:
