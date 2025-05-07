@@ -1,5 +1,4 @@
 ### signal_analysis.py
-python
 import pandas as pd
 from indicators import compute_rsi, compute_macd, compute_atr
 
