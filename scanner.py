@@ -80,8 +80,8 @@ async def scan_and_send_signals(bot, chat_id):
                     "\n🧠 Ordre limite possible (à surveiller)"
                 )
 
-            # 📉 Graphique
-            fig = plot_signal_graph(df_4h, entry, sl, tp, direction)
+            # 📉 Génération du graphique avec couleur selon le statut
+            fig = plot_signal_graph(df_4h, entry, sl, tp, direction, status=status)
             if fig:
                 buf = BytesIO()
                 fig.savefig(buf, format='png')
