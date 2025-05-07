@@ -33,7 +33,7 @@ def analyze_market(symbol, df):
     last_macd   = macd['MACD_12_26_9'].iat[-1]
     last_signal = macd['MACDs_12_26_9'].iat[-1]
 
-    if last_rsi < 30 or last_rsi > 70:
+    if last_rsi < 40 or last_rsi > 60:
         logger.info(f"{symbol} [4H] rejet RSI={last_rsi:.1f}")
         return None
     if last_macd < last_signal:
