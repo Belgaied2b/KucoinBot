@@ -11,12 +11,12 @@ from plot_signal     import generate_trade_graph
 from indicators      import compute_rsi, compute_macd, compute_atr
 
 # ─────────── Paramètres ───────────
-LOW_TF                 = "15min"
-HIGH_TF                = "4hour"
-WINDOW                 = 20
-ANTICIPATION_THRESHOLD = 0.003
-IMB_THRESHOLD          = 0.2
-RISK_PCT               = 0.01
+LOW_TF                 = "1hour"   # timeframe bas pour détection (1 h)
+HIGH_TF                = "4hour"   # timeframe pour confirmation (4 h)
+WINDOW                 = 20        # swing high/low sur WINDOW bougies de LOW_TF
+ANTICIPATION_THRESHOLD = 0.003     # 0.3 %
+IMB_THRESHOLD          = 0.2       # 20 % imbalance
+RISK_PCT               = 0.01      # 1 % du capital
 
 #── Paramètres FibO élargi + ATR buffer ──
 FIBO_LOWER = 0.50   # 50 %
@@ -25,11 +25,13 @@ ATR_BUFFER = 0.5    # buffer = 0.5 ATR
 
 logger = logging.getLogger(__name__)
 
+# États anti‐doublons
 sent_anticipation = set()
 sent_zone         = set()
 sent_alert        = set()
 
 def get_orderbook_imbalance(symbol: str) -> str | None:
+    """Snapshot Level2 KuCoin Futures."""
     try:
         url  = f"{BASE_URL}/api/v1/level2/snapshot"
         resp = httpx.get(url, params={"symbol": symbol, "limit": 20}, timeout=5)
@@ -50,36 +52,38 @@ def get_orderbook_imbalance(symbol: str) -> str | None:
 async def scan_and_send_signals(bot):
     symbols = get_kucoin_perps()
     total   = len(symbols)
-    logger.info(f"🔍 Démarrage du scan — {total} symbols (LOW_TF={LOW_TF})")
+    logger.info(f"🔍 Démarrage du scan — {total} symbols (LOW_TF={LOW_TF}, HIGH_TF={HIGH_TF})")
 
+    # Compteurs de rejet par filtre
     cnt_len      = 0
     cnt_fibo_ote = 0
     cnt_trend    = 0
     cnt_rsmacd   = 0
     cnt_fvg      = 0
-    accepted_l   = 0
-    accepted_s   = 0
+
+    # Compteurs de signaux acceptés
+    accepted_l = 0
+    accepted_s = 0
 
     for symbol in symbols:
         try:
-            # 1) Bougies LOW_TF
+            # 1) Bougies LOW_TF (1 h)
             df_low = fetch_klines(symbol, interval=LOW_TF, limit=200)
             if len(df_low) < WINDOW:
                 cnt_len += 1
                 logger.info(f"{symbol} skip length ({len(df_low)}<{WINDOW})")
                 continue
-
             last_price = df_low["close"].iat[-1]
 
             # 2) Swing high/low
             swing_high = df_low["high"].rolling(WINDOW).max().iat[-2]
             swing_low  = df_low["low"].rolling(WINDOW).min().iat[-2]
 
-            # 3) Calcul ATR + buffer
+            # 3) Calcul ATR + buffer de tolérance
             atr = compute_atr(df_low["high"], df_low["low"], df_low["close"], 14).iat[-1]
             tol = atr * ATR_BUFFER
 
-            # 4) FibO/OTE élargi + buffer ATR
+            # 4) Zone FibO/OTE élargie + buffer ATR
             fib_min = swing_low + FIBO_LOWER * (swing_high - swing_low)
             fib_max = swing_low + FIBO_UPPER * (swing_high - swing_low)
             if not (fib_min - tol <= last_price <= fib_max + tol):
@@ -90,7 +94,7 @@ async def scan_and_send_signals(bot):
                 )
                 continue
 
-            # 5) Trend MA50/MA200
+            # 5) Trend filter (MA50 vs MA200)
             ma50  = df_low["close"].rolling(50).mean().iat[-1]
             ma200 = df_low["close"].rolling(200).mean().iat[-1]
             trend_long  = ma50 > ma200 and last_price > ma200
@@ -110,7 +114,8 @@ async def scan_and_send_signals(bot):
             if not (cond_long or cond_short):
                 cnt_rsmacd += 1
                 logger.info(
-                    f"{symbol} skip RSI/MACD: RSI={rsi:.1f}, MACD={macd_val:.4f}, SIG={sig_val:.4f}"
+                    f"{symbol} skip RSI/MACD: RSI={rsi:.1f}, "
+                    f"MACD={macd_val:.4f}, SIG={sig_val:.4f}"
                 )
                 continue
 
@@ -120,11 +125,11 @@ async def scan_and_send_signals(bot):
                 logger.info(f"{symbol} skip FVG")
                 continue
 
-            # 8) Orderbook (non-bloquant)
+            # 8) Orderbook imbalance (non bloquant)
             imb = get_orderbook_imbalance(symbol)
             logger.info(f"{symbol} orderbook imbalance: {imb}")
 
-            # 9) Confirmation multi-TF
+            # 9) Confirmation multi‐TF (4 h)
             df_high = fetch_klines(symbol, interval=HIGH_TF, limit=50)
             logger.info(f"{symbol} → {len(df_high)} bougies {HIGH_TF} récupérées")
             confirmed = (
@@ -132,14 +137,14 @@ async def scan_and_send_signals(bot):
                 analyze_market(symbol, df_high, side="short")
             )
             if not confirmed:
-                logger.info(f"{symbol} skip multi-TF ({HIGH_TF})")
+                logger.info(f"{symbol} skip multi‐TF ({HIGH_TF})")
                 continue
 
-            # 10) Position sizing (1% risque)
+            # 10) Calcul sizing (1 % de risque)
             bal      = get_account_balance(symbol)
             risk_amt = bal * RISK_PCT
 
-            # –– SCAN LONG
+            # ─── SCAN LONG ───
             res_l = analyze_market(symbol, df_low, side="long")
             if res_l and (imb is None or imb == "buy"):
                 accepted_l += 1
@@ -148,18 +153,18 @@ async def scan_and_send_signals(bot):
                     res_l["tp1"], res_l["tp2"]
                 )
                 size = risk_amt / (ep - sl)
-                # … (alertes anticipation/zone/signal comme avant) …
+                # → envoyer anticipation / zone / signal (inchangé)
 
-            # –– SCAN SHORT
+            # ─── SCAN SHORT ───
             res_s = analyze_market(symbol, df_low, side="short")
             if res_s and (imb is None or imb == "sell"):
                 accepted_s += 1
-                # … (idem pour short) …
+                # → pareil pour le short
 
         except Exception as e:
             logger.error(f"❌ Erreur sur {symbol} : {e}")
 
-    # Récapitulatif
+    # ─── Récapitulatif par filtre ───
     logger.info("📊 **RÉCAPITULATIF FILTRAGE**")
     logger.info(f"• Total symbols    : {total}")
     logger.info(f"• Rejet length     : {cnt_len} ({cnt_len/total*100:.1f}%)")
