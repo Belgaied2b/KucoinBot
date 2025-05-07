@@ -1,5 +1,4 @@
 ### main.py
-python
 import os
 import logging
 from telegram.ext import Application, CommandHandler
