@@ -2,6 +2,7 @@
 
 import pandas_ta as ta
 import logging
+
 logger = logging.getLogger(__name__)
 
 def is_in_OTE_zone(entry_price, low, high):
@@ -40,26 +41,29 @@ def analyze_market(symbol, df):
         logger.info(f"{symbol} [4H] rejet MACD={last_macd:.4f} < signal={last_signal:.4f}")
         return None
 
-    high = df['high'].rolling(20).max().iat[-2]
-    low  = df['low'].rolling(20).min().iat[-2]
-    price = df['close'].iat[-1]
+    high = float(df['high'].rolling(20).max().iat[-2])
+    low  = float(df['low'].rolling(20).min().iat[-2])
+    price = float(df['close'].iat[-1])
 
     in_ote, fib618, fib786 = is_in_OTE_zone(price, low, high)
     if not in_ote:
-        logger.info(f"{symbol} [4H] rejet OTE: price={price} hors zone [{fib618:.4f}-{fib786:.4f}]")
+        logger.info(f"{symbol} [4H] rejet OTE: price={price:.2f} ∉ [{fib618:.2f}, {fib786:.2f}]")
         return None
 
     fvg_zones = detect_fvg(df)
-    if not fvg_zones:
-        logger.info(f"{symbol} [4H] rejet: aucun FVG détecté")
+    valid_zones = [(fvg_low, fvg_high) for fvg_low, fvg_high in fvg_zones if fvg_low <= price <= fvg_high]
+    if not valid_zones:
+        logger.info(f"{symbol} [4H] rejet: aucun FVG actif")
         return None
 
+    logger.info(f"{symbol} [4H] ✅ Signal détecté")
     return {
-        "symbol": symbol,
-        "entry": round(fib618, 5),
-        "sl": round(low * 0.99, 5),
-        "tp": round(fib786 * 1.02, 5),
-        "ote_zone": (round(fib618, 5), round(fib786, 5)),
-        "fvg_zone": fvg_zones[-1],
-        "active": True
+        'symbol': symbol,
+        'rsi': last_rsi,
+        'macd': last_macd,
+        'macd_signal': last_signal,
+        'ote_zone': (fib618, fib786),
+        'fvg_zone': valid_zones[-1],
+        'price': price,
+        'direction': 'long'
     }
