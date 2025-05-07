@@ -1,5 +1,4 @@
 ### scanner.py
-python
 from kucoin_utils import fetch_klines
 from signal_analysis import analyze_signal
 from graph import plot_signal_graph
