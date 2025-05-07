@@ -18,8 +18,6 @@ def analyze_signal(df_1h, df_4h, direction="long"):
     last_signal = signal_line.iloc[-1]
     last_atr = atr.iloc[-1]
 
-    print(f"[🧪] {direction.upper()} | Price={price:.2f} | RSI={last_rsi:.2f} | MACD={last_macd:.4f} | Signal={last_signal:.4f}")
-
     if direction == "long":
         fib618 = low + 0.618 * (high - low)
         fib786 = low + 0.786 * (high - low)
@@ -39,6 +37,7 @@ def analyze_signal(df_1h, df_4h, direction="long"):
         tp = entry - 1.618 * (high - entry)
         context_ok = last_rsi > 65 and last_macd < last_signal * 1.1
 
+    print(f"[🧪] {direction.upper()} | Price={price:.2f} | RSI={last_rsi:.2f} | MACD={last_macd:.4f} | Signal={last_signal:.4f}")
     print(f"↪️ OTE={in_ote} | FVG={fvg_valid} | Contexte OK={context_ok}")
 
     if context_ok and in_ote and fvg_valid:
@@ -46,7 +45,7 @@ def analyze_signal(df_1h, df_4h, direction="long"):
         return "confirmé", entry, sl, tp
     elif context_ok:
         print(f"🧠 Signal ANTICIPÉ ({direction})")
-        return "anticipé", None, None, None
+        return "anticipé", entry, sl, tp
 
     print(f"❌ Aucun signal ({direction})")
     return None, None, None, None
