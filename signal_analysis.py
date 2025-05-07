@@ -26,7 +26,11 @@ def analyze_signal(df_1h, df_4h, direction="long"):
         entry = fib618
         sl = low - last_atr
         tp = entry + 1.618 * (entry - low)
-        context_ok = 40 < last_rsi < 70 and last_macd > last_signal * 1.05
+        context_ok = (
+            45 < last_rsi < 65
+            and last_macd > last_signal * 1.07
+            and last_signal > 0
+        )
 
     else:  # SHORT
         fib618 = high - 0.618 * (high - low)
@@ -36,7 +40,11 @@ def analyze_signal(df_1h, df_4h, direction="long"):
         entry = fib618
         sl = high + last_atr
         tp = entry - 1.618 * (high - entry)
-        context_ok = last_rsi > 70 and last_macd < last_signal * 0.95
+        context_ok = (
+            last_rsi > 75
+            and last_macd < last_signal * 0.93
+            and last_signal < 0
+        )
 
     print(f"[🧪] {direction.upper()} | Price={price:.4f} | RSI={last_rsi:.2f} | MACD={last_macd:.4f} | Signal={last_signal:.4f}")
     print(f"↪️ OTE={in_ote} | FVG={fvg_valid} | Contexte OK={context_ok}")
