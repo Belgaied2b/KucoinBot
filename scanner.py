@@ -8,6 +8,14 @@ from io import BytesIO
 
 SIGNAL_LOG = "sent_signals.json"
 
+def format_price(value):
+    if value >= 100:
+        return round(value, 2)
+    elif value >= 1:
+        return round(value, 4)
+    else:
+        return round(value, 8)
+
 def get_perp_symbols():
     url = "https://api-futures.kucoin.com/api/v1/contracts/active"
     try:
@@ -52,27 +60,27 @@ async def scan_and_send_signals(bot, chat_id):
             if status is None or signal_id in sent:
                 continue
 
-            # Message Telegram
+            # 📨 Message Telegram
             msg = f"{symbol} - Signal {status.upper()} ({direction.upper()})\n"
 
             if status == "confirmé":
                 msg += (
-                    f"\n🔵 Entrée idéale : {round(entry, 4)}"
-                    f"\n🛑 SL : {round(sl, 4)}"
-                    f"\n🎯 TP : {round(tp, 4)}"
+                    f"\n🔵 Entrée idéale : {format_price(entry)}"
+                    f"\n🛑 SL : {format_price(sl)}"
+                    f"\n🎯 TP : {format_price(tp)}"
                     "\n📈 Signal confirmé avec conditions complètes."
                 )
             elif status == "anticipé":
                 msg += (
                     "\n📊 RSI + MACD alignés ✅"
                     "\n⏳ Prix pas encore dans la zone OTE + FVG"
-                    f"\n🔵 Entrée idéale : {round(entry, 4)}"
-                    f"\n🛑 SL (prévision) : {round(sl, 4)}"
-                    f"\n🎯 TP (prévision) : {round(tp, 4)}"
+                    f"\n🔵 Entrée idéale : {format_price(entry)}"
+                    f"\n🛑 SL (prévision) : {format_price(sl)}"
+                    f"\n🎯 TP (prévision) : {format_price(tp)}"
                     "\n🧠 Ordre limite possible (à surveiller)"
                 )
 
-            # Génération graphique complet même pour anticipé
+            # 📉 Graphique
             fig = plot_signal_graph(df_4h, entry, sl, tp, direction)
             if fig:
                 buf = BytesIO()
