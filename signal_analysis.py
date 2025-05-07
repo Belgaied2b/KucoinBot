@@ -1,5 +1,5 @@
 ### signal_analysis.py
-```python
+python
 import pandas as pd
 from indicators import compute_rsi, compute_macd, compute_atr
 
@@ -40,4 +40,3 @@ def analyze_signal(df_1h, df_4h, direction="long"):
     elif context_ok:
         return "anticipé", None, None, None
     return None, None, None, None
-```
