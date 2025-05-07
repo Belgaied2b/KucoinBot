@@ -3,7 +3,7 @@ from indicators import compute_rsi, compute_macd, compute_atr
 
 def analyze_signal(df_1h, df_4h, direction="long"):
     if df_1h.empty or df_4h.empty:
-        print(f"[❌] Données manquantes : 1H={len(df_1h)} | 4H={len(df_4h)}")
+        print(f"[❌] Données manquantes")
         return None, None, None, None
 
     rsi = compute_rsi(df_1h['close'])
@@ -18,7 +18,7 @@ def analyze_signal(df_1h, df_4h, direction="long"):
     last_signal = signal_line.iloc[-1]
     last_atr = atr.iloc[-1]
 
-    print(f"[🧪] Analyse {direction.upper()} — Prix: {round(price,2)} | RSI: {round(last_rsi,2)} | MACD: {round(last_macd,4)} / Signal: {round(last_signal,4)}")
+    print(f"[🧪] {direction.upper()} | Price={price:.2f} | RSI={last_rsi:.2f} | MACD={last_macd:.4f} | Signal={last_signal:.4f}")
 
     if direction == "long":
         fib618 = low + 0.618 * (high - low)
@@ -28,7 +28,7 @@ def analyze_signal(df_1h, df_4h, direction="long"):
         entry = fib618
         sl = low - last_atr
         tp = entry + 1.618 * (entry - low)
-        context_ok = 40 < last_rsi < 70 and last_macd > last_signal
+        context_ok = 30 < last_rsi < 75 and last_macd > last_signal * 0.9
     else:
         fib618 = high - 0.618 * (high - low)
         fib786 = high - 0.786 * (high - low)
@@ -37,16 +37,16 @@ def analyze_signal(df_1h, df_4h, direction="long"):
         entry = fib618
         sl = high + last_atr
         tp = entry - 1.618 * (high - entry)
-        context_ok = last_rsi > 70 and last_macd < last_signal
+        context_ok = last_rsi > 65 and last_macd < last_signal * 1.1
 
-    print(f" ↪️ OTE: {in_ote} | FVG: {fvg_valid} | Contexte OK: {context_ok}")
+    print(f"↪️ OTE={in_ote} | FVG={fvg_valid} | Contexte OK={context_ok}")
 
     if context_ok and in_ote and fvg_valid:
-        print(f"✅ Signal {direction.upper()} CONFIRMÉ")
+        print(f"✅ Signal CONFIRMÉ ({direction})")
         return "confirmé", entry, sl, tp
     elif context_ok:
-        print(f"🧠 Signal {direction.upper()} ANTICIPÉ (hors OTE/FVG)")
+        print(f"🧠 Signal ANTICIPÉ ({direction})")
         return "anticipé", None, None, None
 
-    print(f"❌ Aucun signal {direction.upper()} — Conditions non remplies")
+    print(f"❌ Aucun signal ({direction})")
     return None, None, None, None
