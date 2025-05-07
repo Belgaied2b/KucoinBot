@@ -11,12 +11,16 @@ from plot_signal     import generate_trade_graph
 from indicators      import compute_rsi, compute_macd, compute_atr
 
 # ─────────── Paramètres ───────────
-LOW_TF                 = "15min"   # timeframe bas
-HIGH_TF                = "4hour"   # confirmation multi‐TF
-WINDOW                 = 20        # swing high/low sur 20 périodes de LOW_TF
+LOW_TF                 = "15min"   # timeframe bas pour détection
+HIGH_TF                = "4hour"   # timeframe pour confirmation
+WINDOW                 = 20        # swing high/low sur WINDOW bougies de LOW_TF
 ANTICIPATION_THRESHOLD = 0.003     # 0.3%
 IMB_THRESHOLD          = 0.2       # 20% imbalance
 RISK_PCT               = 0.01      # 1% du capital
+
+#── Paramètres FibO élargi ──
+FIBO_LOWER = 0.55   # 55 %
+FIBO_UPPER = 0.786  # 78,6 %
 
 logger = logging.getLogger(__name__)
 
@@ -47,22 +51,22 @@ def get_orderbook_imbalance(symbol: str) -> str | None:
 async def scan_and_send_signals(bot):
     symbols = get_kucoin_perps()
     total   = len(symbols)
-    logger.info(f"🔍 Démarrage du scan — {total} contracts détectés")
+    logger.info(f"🔍 Démarrage du scan — {total} contracts détectés (LOW_TF={LOW_TF})")
 
     # Compteurs de rejet par filtre
     cnt_len      = 0  # trop peu de données
     cnt_fibo_ote = 0  # hors zone Fibonacci/OTE
-    cnt_trend    = 0  # tendance MM50/MM200
+    cnt_trend    = 0  # tendance MA50/MA200
     cnt_rsmacd   = 0  # RSI & MACD
-    cnt_fvg      = 0  # absence de Fair Value Gap
+    cnt_fvg      = 0  # absence de FVG
 
-    # Compteurs d’acceptation
+    # Compteurs de signaux acceptés
     accepted_l = 0
     accepted_s = 0
 
     for symbol in symbols:
         try:
-            # 1) Récupère les bougies en LOW_TF
+            # 1) Fetch LOW_TF candles
             df_low = fetch_klines(symbol, interval=LOW_TF, limit=200)
             if len(df_low) < WINDOW:
                 cnt_len += 1
@@ -71,17 +75,17 @@ async def scan_and_send_signals(bot):
 
             last_price = df_low["close"].iat[-1]
 
-            # 2) Swing high/low
+            # 2) Swing high/low sur WINDOW périodes
             swing_high = df_low["high"].rolling(WINDOW).max().iat[-2]
             swing_low  = df_low["low"].rolling(WINDOW).min().iat[-2]
 
-            # 3) Fibonacci zone (OTE)
-            fib_min = swing_low + 0.618 * (swing_high - swing_low)
-            fib_max = swing_low + 0.786 * (swing_high - swing_low)
+            # 3) Fibonacci zone (55–78,6 %)
+            fib_min = swing_low + FIBO_LOWER * (swing_high - swing_low)
+            fib_max = swing_low + FIBO_UPPER * (swing_high - swing_low)
             if not (fib_min <= last_price <= fib_max):
                 cnt_fibo_ote += 1
                 logger.info(
-                    f"{symbol} skip Fibo/OTE: price={last_price:.4f} hors "
+                    f"{symbol} skip Fibo/OTE 55–78,6%: price={last_price:.4f} hors "
                     f"[{fib_min:.4f}-{fib_max:.4f}]"
                 )
                 continue
@@ -125,21 +129,23 @@ async def scan_and_send_signals(bot):
             imb = get_orderbook_imbalance(symbol)
             logger.info(f"{symbol} orderbook imbalance: {imb}")
 
-            # 8) Confirmation multi‐TF (HIGH_TF)
+            # 8) Confirmation multi‐TF (4 h)
             df_high = fetch_klines(symbol, interval=HIGH_TF, limit=50)
-            high_signal = (
+            logger.info(f"{symbol} → {len(df_high)} bougies {HIGH_TF} récupérées")
+            confirmed = (
                 analyze_market(symbol, df_high, side="long") or
                 analyze_market(symbol, df_high, side="short")
             )
-            if not high_signal:
+            if not confirmed:
                 logger.info(
                     f"{symbol} skip multi‐TF (pas de signal sur {HIGH_TF})"
                 )
                 continue
 
             # 9) Calcul ATR & sizing
-            atr      = compute_atr(df_low["high"], df_low["low"],
-                                   df_low["close"], 14).iat[-1]
+            atr      = compute_atr(
+                df_low["high"], df_low["low"], df_low["close"], 14
+            ).iat[-1]
             bal      = get_account_balance(symbol)
             risk_amt = bal * RISK_PCT
             logger.info(
@@ -163,8 +169,8 @@ async def scan_and_send_signals(bot):
                             chat_id=os.environ["CHAT_ID"],
                             text=(
                                 f"⏳ Anticipation LONG {symbol}\n"
-                                f"Zone {fib_min:.4f} → {fib_max:.4f}\n"
-                                f"Prix actuel : {last_price:.4f}"
+                                f"Zone {fib_min:.4f}→{fib_max:.4f}\n"
+                                f"Prix {last_price:.4f}"
                             )
                         )
                         sent_anticipation.add(symbol)
@@ -178,8 +184,8 @@ async def scan_and_send_signals(bot):
                             chat_id=os.environ["CHAT_ID"],
                             text=(
                                 f"🚨 Zone LONG atteinte {symbol}\n"
-                                f"Entrée : {fib_min:.4f}–{fib_max:.4f}\n"
-                                f"Prix actuel : {last_price:.4f}"
+                                f"Entrée {fib_min:.4f}–{fib_max:.4f}\n"
+                                f"Prix {last_price:.4f}"
                             )
                         )
                         sent_zone.add(symbol)
@@ -202,7 +208,7 @@ async def scan_and_send_signals(bot):
                             f"SL    : {sl:.4f}\n"
                             f"TP1   : {tp1:.4f}\n"
                             f"TP2   : {tp2:.4f}\n"
-                            f"Taille: {size:.4f}"
+                            f"Taille : {size:.4f}"
                         )
                     )
                     sent_alert.add(symbol)
@@ -228,8 +234,8 @@ async def scan_and_send_signals(bot):
                             chat_id=os.environ["CHAT_ID"],
                             text=(
                                 f"⏳ Anticipation SHORT {symbol}\n"
-                                f"Zone {fib_max:.4f} → {fib_min:.4f}\n"
-                                f"Prix actuel : {last_price:.4f}"
+                                f"Zone {fib_max:.4f}→{fib_min:.4f}\n"
+                                f"Prix {last_price:.4f}"
                             )
                         )
                         sent_anticipation.add(symbol)
@@ -243,8 +249,8 @@ async def scan_and_send_signals(bot):
                             chat_id=os.environ["CHAT_ID"],
                             text=(
                                 f"🚨 Zone SHORT atteinte {symbol}\n"
-                                f"Entrée : {fib_max:.4f}–{fib_min:.4f}\n"
-                                f"Prix actuel : {last_price:.4f}"
+                                f"Entrée {fib_max:.4f}–{fib_min:.4f}\n"
+                                f"Prix {last_price:.4f}"
                             )
                         )
                         sent_zone.add(symbol)
@@ -255,7 +261,7 @@ async def scan_and_send_signals(bot):
                 if symbol not in sent_alert:
                     buf = generate_trade_graph(
                         symbol, df_low,
-                        {"entry": res_s["entry_price"], "sl": sl, "tp": tp1,
+                        {"entry": ep, "sl": sl, "tp": tp1,
                          "fvg_zone": (res_s["entry_max"], res_s["entry_min"])}
                     )
                     await bot.send_document(
@@ -267,7 +273,7 @@ async def scan_and_send_signals(bot):
                             f"SL    : {sl:.4f}\n"
                             f"TP1   : {tp1:.4f}\n"
                             f"TP2   : {tp2:.4f}\n"
-                            f"Taille: {size:.4f}"
+                            f"Taille : {size:.4f}"
                         )
                     )
                     sent_alert.add(symbol)
@@ -282,10 +288,10 @@ async def scan_and_send_signals(bot):
     # ─── Récapitulatif par filtre ───────────
     logger.info("📊 **RÉCAPITULATIF FILTRAGE**")
     logger.info(f"• Total symbols      : {total}")
-    logger.info(f"• Rejet longueur      : {cnt_len} ({cnt_len/total*100:.1f}%)")
-    logger.info(f"• Rejet Fibo/OTE      : {cnt_fibo_ote} ({cnt_fibo_ote/total*100:.1f}%)")
-    logger.info(f"• Rejet trend         : {cnt_trend} ({cnt_trend/total*100:.1f}%)")
-    logger.info(f"• Rejet RSI/MACD      : {cnt_rsmacd} ({cnt_rsmacd/total*100:.1f}%)")
-    logger.info(f"• Rejet FVG           : {cnt_fvg} ({cnt_fvg/total*100:.1f}%)")
-    logger.info(f"• LONGs acceptés      : {accepted_l} ({accepted_l/total*100:.1f}%)")
-    logger.info(f"• SHORTs acceptés     : {accepted_s} ({accepted_s/total*100:.1f}%)")
+    logger.info(f"• Rejet longueur      : {cnt_len}      ({cnt_len/total*100:.1f}%)")
+    logger.info(f"• Rejet Fibo/OTE      : {cnt_fibo_ote}      ({cnt_fibo_ote/total*100:.1f}%)")
+    logger.info(f"• Rejet trend         : {cnt_trend}     ({cnt_trend/total*100:.1f}%)")
+    logger.info(f"• Rejet RSI/MACD      : {cnt_rsmacd}   ({cnt_rsmacd/total*100:.1f}%)")
+    logger.info(f"• Rejet FVG           : {cnt_fvg}       ({cnt_fvg/total*100:.1f}%)")
+    logger.info(f"• LONGs acceptés      : {accepted_l}    ({accepted_l/total*100:.1f}%)")
+    logger.info(f"• SHORTs acceptés     : {accepted_s}    ({accepted_s/total*100:.1f}%)")
