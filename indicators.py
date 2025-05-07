@@ -1,4 +1,3 @@
-### indicators.py
 import pandas as pd
 
 def compute_rsi(close, length=14):
@@ -20,9 +19,11 @@ def compute_atr(df, period=14):
     low = df['low']
     close = df['close']
     prev_close = close.shift(1)
+
     tr = pd.concat([
-        (high - low),
+        high - low,
         (high - prev_close).abs(),
         (low - prev_close).abs()
     ], axis=1).max(axis=1)
+
     return tr.rolling(window=period).mean()
