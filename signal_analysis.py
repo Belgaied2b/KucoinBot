@@ -1,8 +1,10 @@
-### signal_analysis.py
 import pandas as pd
 from indicators import compute_rsi, compute_macd, compute_atr
 
 def analyze_signal(df_1h, df_4h, direction="long"):
+    if df_1h.empty or df_4h.empty:
+        return None, None, None, None
+
     rsi = compute_rsi(df_1h['close'])
     macd_line, signal_line = compute_macd(df_1h['close'])
     atr = compute_atr(df_4h)
