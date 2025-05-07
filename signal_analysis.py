@@ -3,6 +3,7 @@ from indicators import compute_rsi, compute_macd, compute_atr
 
 def analyze_signal(df_1h, df_4h, direction="long"):
     if df_1h.empty or df_4h.empty:
+        print(f"[❌] Données manquantes : 1H={len(df_1h)} | 4H={len(df_4h)}")
         return None, None, None, None
 
     rsi = compute_rsi(df_1h['close'])
@@ -16,6 +17,8 @@ def analyze_signal(df_1h, df_4h, direction="long"):
     last_macd = macd_line.iloc[-1]
     last_signal = signal_line.iloc[-1]
     last_atr = atr.iloc[-1]
+
+    print(f"[🧪] Analyse {direction.upper()} — Prix: {round(price,2)} | RSI: {round(last_rsi,2)} | MACD: {round(last_macd,4)} / Signal: {round(last_signal,4)}")
 
     if direction == "long":
         fib618 = low + 0.618 * (high - low)
@@ -36,8 +39,14 @@ def analyze_signal(df_1h, df_4h, direction="long"):
         tp = entry - 1.618 * (high - entry)
         context_ok = last_rsi > 70 and last_macd < last_signal
 
+    print(f" ↪️ OTE: {in_ote} | FVG: {fvg_valid} | Contexte OK: {context_ok}")
+
     if context_ok and in_ote and fvg_valid:
+        print(f"✅ Signal {direction.upper()} CONFIRMÉ")
         return "confirmé", entry, sl, tp
     elif context_ok:
+        print(f"🧠 Signal {direction.upper()} ANTICIPÉ (hors OTE/FVG)")
         return "anticipé", None, None, None
+
+    print(f"❌ Aucun signal {direction.upper()} — Conditions non remplies")
     return None, None, None, None
