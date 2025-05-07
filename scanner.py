@@ -18,14 +18,16 @@ ANTICIPATION_THRESHOLD = 0.003     # 0.3 %
 IMB_THRESHOLD          = 0.2       # 20 % imbalance
 RISK_PCT               = 0.01      # 1 % du capital
 
-#── Paramètres FibO élargi + ATR buffer ──
-FIBO_LOWER = 0.50   # 50 %
-FIBO_UPPER = 0.85   # 85 %
+#── Seul le filtre Fibonacci/OTE est assoupli ──
+FIBO_LOWER = 0.382  # 38,2 %
+FIBO_UPPER = 0.886  # 88,6 %
+
+# On conserve le buffer ATR existant
 ATR_BUFFER = 0.5    # buffer = 0.5 ATR
 
 logger = logging.getLogger(__name__)
 
-# États anti‐doublons
+# États anti-doublons
 sent_anticipation = set()
 sent_zone         = set()
 sent_alert        = set()
@@ -52,7 +54,7 @@ def get_orderbook_imbalance(symbol: str) -> str | None:
 async def scan_and_send_signals(bot):
     symbols = get_kucoin_perps()
     total   = len(symbols)
-    logger.info(f"🔍 Démarrage du scan — {total} symbols (LOW_TF={LOW_TF}, HIGH_TF={HIGH_TF})")
+    logger.info(f"🔍 Démarrage du scan — {total} symbols (LOW_TF={LOW_TF})")
 
     # Compteurs de rejet par filtre
     cnt_len      = 0
@@ -67,7 +69,7 @@ async def scan_and_send_signals(bot):
 
     for symbol in symbols:
         try:
-            # 1) Bougies LOW_TF (1 h)
+            # 1) Bougies LOW_TF
             df_low = fetch_klines(symbol, interval=LOW_TF, limit=200)
             if len(df_low) < WINDOW:
                 cnt_len += 1
@@ -79,11 +81,11 @@ async def scan_and_send_signals(bot):
             swing_high = df_low["high"].rolling(WINDOW).max().iat[-2]
             swing_low  = df_low["low"].rolling(WINDOW).min().iat[-2]
 
-            # 3) Calcul ATR + buffer de tolérance
+            # 3) Calcul ATR + buffer
             atr = compute_atr(df_low["high"], df_low["low"], df_low["close"], 14).iat[-1]
             tol = atr * ATR_BUFFER
 
-            # 4) Zone FibO/OTE élargie + buffer ATR
+            # 4) Fibonacci/OTE 38,2–88,6 % + buffer ATR
             fib_min = swing_low + FIBO_LOWER * (swing_high - swing_low)
             fib_max = swing_low + FIBO_UPPER * (swing_high - swing_low)
             if not (fib_min - tol <= last_price <= fib_max + tol):
@@ -94,7 +96,7 @@ async def scan_and_send_signals(bot):
                 )
                 continue
 
-            # 5) Trend filter (MA50 vs MA200)
+            # 5) Filtre de tendance (MA50 vs MA200)
             ma50  = df_low["close"].rolling(50).mean().iat[-1]
             ma200 = df_low["close"].rolling(200).mean().iat[-1]
             trend_long  = ma50 > ma200 and last_price > ma200
@@ -104,16 +106,17 @@ async def scan_and_send_signals(bot):
                 logger.info(f"{symbol} skip trend: ma50={ma50:.4f}, ma200={ma200:.4f}")
                 continue
 
-            # 6) RSI & MACD (seuils allégés : 40/60 et MACD simple)
+            # 6) RSI & MACD (seuils existants)
             rsi = compute_rsi(df_low["close"], 14).iat[-1]
             macd_line, sig_line, _ = compute_macd(df_low["close"])
             macd_val = macd_line.iat[-1]
-            cond_long  = (rsi < 40) and (macd_val > 0)
-            cond_short = (rsi > 60) and (macd_val < 0)
+            sig_val  = sig_line.iat[-1]
+            cond_long  = (rsi < 40 and macd_val > 0) or (rsi < 30 and macd_val > sig_val)
+            cond_short = (rsi > 60 and macd_val < 0) or (rsi > 70 and macd_val < sig_val)
             if not (cond_long or cond_short):
                 cnt_rsmacd += 1
                 logger.info(
-                    f"{symbol} skip RSI/MACD (40/60): RSI={rsi:.1f}, MACD={macd_val:.4f}"
+                    f"{symbol} skip RSI/MACD: RSI={rsi:.1f}, MACD={macd_val:.4f}"
                 )
                 continue
 
@@ -127,7 +130,7 @@ async def scan_and_send_signals(bot):
             imb = get_orderbook_imbalance(symbol)
             logger.info(f"{symbol} orderbook imbalance: {imb}")
 
-            # 9) Confirmation multi‐TF (4 h)
+            # 9) Confirmation multi-TF (4 h)
             df_high = fetch_klines(symbol, interval=HIGH_TF, limit=50)
             logger.info(f"{symbol} → {len(df_high)} bougies {HIGH_TF} récupérées")
             confirmed = (
@@ -135,7 +138,7 @@ async def scan_and_send_signals(bot):
                 analyze_market(symbol, df_high, side="short")
             )
             if not confirmed:
-                logger.info(f"{symbol} skip multi‐TF ({HIGH_TF})")
+                logger.info(f"{symbol} skip multi-TF ({HIGH_TF})")
                 continue
 
             # 10) Calcul sizing (1 % de risque)
@@ -151,7 +154,7 @@ async def scan_and_send_signals(bot):
                     res_l["tp1"], res_l["tp2"]
                 )
                 size = risk_amt / (ep - sl)
-                # → envoyer anticipation / zone / signal (inchangé)
+                # → envoi anticipation / zone / signal comme avant
 
             # ─── SCAN SHORT ───
             res_s = analyze_market(symbol, df_low, side="short")
@@ -162,13 +165,13 @@ async def scan_and_send_signals(bot):
         except Exception as e:
             logger.error(f"❌ Erreur sur {symbol} : {e}")
 
-    # Récapitulatif
+    # ─── Récapitulatif par filtre ───
     logger.info("📊 **RÉCAPITULATIF FILTRAGE**")
     logger.info(f"• Total symbols    : {total}")
-    logger.info(f"• Rejet length     : {cnt_len}       ({cnt_len/total*100:.1f}%)")
-    logger.info(f"• Rejet OTE+tol    : {cnt_fibo_ote} ({cnt_fibo_ote/total*100:.1f}%)")
-    logger.info(f"• Rejet trend      : {cnt_trend}    ({cnt_trend/total*100:.1f}%)")
+    logger.info(f"• Rejet length     : {cnt_len}      ({cnt_len/total*100:.1f}%)")
+    logger.info(f"• Rejet OTE+tol    : {cnt_fibo_ote}  ({cnt_fibo_ote/total*100:.1f}%)")
+    logger.info(f"• Rejet trend      : {cnt_trend}     ({cnt_trend/total*100:.1f}%)")
     logger.info(f"• Rejet RSI/MACD   : {cnt_rsmacd}   ({cnt_rsmacd/total*100:.1f}%)")
-    logger.info(f"• Rejet FVG        : {cnt_fvg}      ({cnt_fvg/total*100:.1f}%)")
+    logger.info(f"• Rejet FVG        : {cnt_fvg}       ({cnt_fvg/total*100:.1f}%)")
     logger.info(f"• LONGs acceptés   : {accepted_l}   ({accepted_l/total*100:.1f}%)")
     logger.info(f"• SHORTs acceptés  : {accepted_s}   ({accepted_s/total*100:.1f}%)")
