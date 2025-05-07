@@ -104,18 +104,16 @@ async def scan_and_send_signals(bot):
                 logger.info(f"{symbol} skip trend: ma50={ma50:.4f}, ma200={ma200:.4f}")
                 continue
 
-            # 6) RSI & MACD
+            # 6) RSI & MACD (seuils allégés : 40/60 et MACD simple)
             rsi = compute_rsi(df_low["close"], 14).iat[-1]
             macd_line, sig_line, _ = compute_macd(df_low["close"])
             macd_val = macd_line.iat[-1]
-            sig_val  = sig_line.iat[-1]
-            cond_long  = rsi < 30 and macd_val > sig_val
-            cond_short = rsi > 70 and macd_val < sig_val
+            cond_long  = (rsi < 40) and (macd_val > 0)
+            cond_short = (rsi > 60) and (macd_val < 0)
             if not (cond_long or cond_short):
                 cnt_rsmacd += 1
                 logger.info(
-                    f"{symbol} skip RSI/MACD: RSI={rsi:.1f}, "
-                    f"MACD={macd_val:.4f}, SIG={sig_val:.4f}"
+                    f"{symbol} skip RSI/MACD (40/60): RSI={rsi:.1f}, MACD={macd_val:.4f}"
                 )
                 continue
 
@@ -159,18 +157,18 @@ async def scan_and_send_signals(bot):
             res_s = analyze_market(symbol, df_low, side="short")
             if res_s and (imb is None or imb == "sell"):
                 accepted_s += 1
-                # → pareil pour le short
+                # → idem pour le short
 
         except Exception as e:
             logger.error(f"❌ Erreur sur {symbol} : {e}")
 
-    # ─── Récapitulatif par filtre ───
+    # Récapitulatif
     logger.info("📊 **RÉCAPITULATIF FILTRAGE**")
     logger.info(f"• Total symbols    : {total}")
-    logger.info(f"• Rejet length     : {cnt_len} ({cnt_len/total*100:.1f}%)")
+    logger.info(f"• Rejet length     : {cnt_len}       ({cnt_len/total*100:.1f}%)")
     logger.info(f"• Rejet OTE+tol    : {cnt_fibo_ote} ({cnt_fibo_ote/total*100:.1f}%)")
-    logger.info(f"• Rejet trend      : {cnt_trend} ({cnt_trend/total*100:.1f}%)")
-    logger.info(f"• Rejet RSI/MACD   : {cnt_rsmacd} ({cnt_rsmacd/total*100:.1f}%)")
-    logger.info(f"• Rejet FVG        : {cnt_fvg} ({cnt_fvg/total*100:.1f}%)")
-    logger.info(f"• LONGs acceptés   : {accepted_l} ({accepted_l/total*100:.1f}%)")
-    logger.info(f"• SHORTs acceptés  : {accepted_s} ({accepted_s/total*100:.1f}%)")
+    logger.info(f"• Rejet trend      : {cnt_trend}    ({cnt_trend/total*100:.1f}%)")
+    logger.info(f"• Rejet RSI/MACD   : {cnt_rsmacd}   ({cnt_rsmacd/total*100:.1f}%)")
+    logger.info(f"• Rejet FVG        : {cnt_fvg}      ({cnt_fvg/total*100:.1f}%)")
+    logger.info(f"• LONGs acceptés   : {accepted_l}   ({accepted_l/total*100:.1f}%)")
+    logger.info(f"• SHORTs acceptés  : {accepted_s}   ({accepted_s/total*100:.1f}%)")
