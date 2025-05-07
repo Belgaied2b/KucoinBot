@@ -1,5 +1,4 @@
 ### indicators.py
-python
 import pandas as pd
 
 def compute_rsi(close, length=14):
