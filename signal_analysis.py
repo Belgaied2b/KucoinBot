@@ -13,6 +13,8 @@ def analyze_signal(df_1h, df_4h, direction="long"):
     price = df_4h['close'].iloc[-1]
     high = df_4h['high'].rolling(20).max().iloc[-2]
     low = df_4h['low'].rolling(20).min().iloc[-2]
+    ma200 = df_4h['close'].rolling(200).mean().iloc[-1]
+
     last_rsi = rsi.iloc[-1]
     last_macd = macd_line.iloc[-1]
     last_signal = signal_line.iloc[-1]
@@ -26,10 +28,12 @@ def analyze_signal(df_1h, df_4h, direction="long"):
         entry = fib618
         sl = low - last_atr
         tp = entry + 1.618 * (entry - low)
+
         context_ok = (
-            45 < last_rsi < 65
-            and last_macd > last_signal * 1.07
-            and last_signal > 0
+            48 < last_rsi < 62 and
+            last_macd > last_signal * 1.10 and
+            last_macd > 0 and last_signal > 0 and
+            price > ma200
         )
 
     else:  # SHORT
@@ -40,14 +44,16 @@ def analyze_signal(df_1h, df_4h, direction="long"):
         entry = fib618
         sl = high + last_atr
         tp = entry - 1.618 * (high - entry)
+
         context_ok = (
-            last_rsi > 75
-            and last_macd < last_signal * 0.93
-            and last_signal < 0
+            last_rsi > 78 and
+            last_macd < last_signal * 0.90 and
+            last_macd < 0 and last_signal < 0 and
+            price < ma200
         )
 
     print(f"[🧪] {direction.upper()} | Price={price:.4f} | RSI={last_rsi:.2f} | MACD={last_macd:.4f} | Signal={last_signal:.4f}")
-    print(f"↪️ OTE={in_ote} | FVG={fvg_valid} | Contexte OK={context_ok}")
+    print(f"↪️ OTE={in_ote} | FVG={fvg_valid} | MA200 OK={'YES' if (price > ma200 if direction=='long' else price < ma200) else 'NO'} | Context OK={context_ok}")
 
     if context_ok and in_ote and fvg_valid:
         print(f"✅ Signal CONFIRMÉ ({direction})")
