@@ -1,97 +1,65 @@
-import pandas as pd
-import logging
-from indicators import compute_rsi, compute_macd, compute_atr
+# signal_analysis.py
 
+import pandas_ta as ta
+import logging
 logger = logging.getLogger(__name__)
 
-FIBO_LOWER = 0.382
-FIBO_UPPER = 0.886
-RSI_LONG = 45
-RSI_SHORT = 55
-WINDOW = 20
+def is_in_OTE_zone(entry_price, low, high):
+    fib618 = low + 0.618 * (high - low)
+    fib786 = low + 0.786 * (high - low)
+    return (fib618 <= entry_price <= fib786), fib618, fib786
 
-def detect_fvg(df: pd.DataFrame) -> bool:
-    lows, highs = df['low'].values, df['high'].values
+def detect_fvg(df):
+    zones = []
     for i in range(2, len(df)):
-        if highs[i-2] < lows[i]:
-            return True
-    return False
+        h2 = df['high'].iat[i - 2]
+        l0 = df['low'].iat[i]
+        if h2 < l0:
+            zones.append((h2, l0))
+    return zones
 
-def detect_fvg_short(df: pd.DataFrame) -> bool:
-    lows, highs = df['low'].values, df['high'].values
-    for i in range(2, len(df)):
-        if lows[i-2] > highs[i]:
-            return True
-    return False
-
-def analyze_market(symbol: str, df: pd.DataFrame, side: str = "long"):
-    if len(df) < WINDOW:
-        logger.info(f"{symbol} [4H] rejet length ({len(df)}<{WINDOW})")
+def analyze_market(symbol, df):
+    rsi = ta.rsi(df['close'], length=14)
+    if rsi is None or rsi.isna().all():
+        logger.info(f"{symbol} [4H] rejet: RSI non calculable")
         return None
 
-    price = df['close'].iloc[-1]
-    swing_high = df['high'].rolling(WINDOW).max().iloc[-2]
-    swing_low  = df['low'].rolling(WINDOW).min().iloc[-2]
-
-    if side == "long":
-        fib_min = swing_low + FIBO_LOWER * (swing_high - swing_low)
-        fib_max = swing_low + FIBO_UPPER * (swing_high - swing_low)
-    else:
-        fib_max = swing_high - FIBO_LOWER * (swing_high - swing_low)
-        fib_min = swing_high - FIBO_UPPER * (swing_high - swing_low)
-
-    if not (fib_min <= price <= fib_max):
-        logger.info(f"{symbol} [4H] rejet OTE : price={price:.4f} hors zone [{fib_min:.4f}-{fib_max:.4f}]")
+    macd = ta.macd(df['close'])
+    if macd is None or macd.isna().all():
+        logger.info(f"{symbol} [4H] rejet: MACD non calculable")
         return None
 
-    ma50 = df['close'].rolling(50).mean().iloc[-1]
-    ma200 = df['close'].rolling(200).mean().iloc[-1]
+    last_rsi    = rsi.iat[-1]
+    last_macd   = macd['MACD_12_26_9'].iat[-1]
+    last_signal = macd['MACDs_12_26_9'].iat[-1]
 
-    if side == "long" and not (ma50 > ma200 and price > ma200):
-        logger.info(f"{symbol} [4H] rejet trend LONG : ma50={ma50:.4f}, ma200={ma200:.4f}")
+    if last_rsi < 30 or last_rsi > 70:
+        logger.info(f"{symbol} [4H] rejet RSI={last_rsi:.1f}")
         return None
-    if side == "short" and not (ma50 < ma200 and price < ma200):
-        logger.info(f"{symbol} [4H] rejet trend SHORT : ma50={ma50:.4f}, ma200={ma200:.4f}")
-        return None
-
-    rsi = compute_rsi(df['close'], 14).iloc[-1]
-    macd, signal, _ = compute_macd(df['close'])
-    macd_val = macd.iloc[-1]
-    sig_val = signal.iloc[-1]
-
-    if side == "long" and not (rsi < RSI_LONG and macd_val > sig_val):
-        logger.info(f"{symbol} [4H] rejet RSI/MACD LONG : RSI={rsi:.1f}, MACD={macd_val:.4f}, SIG={sig_val:.4f}")
-        return None
-    if side == "short" and not (rsi > RSI_SHORT and macd_val < sig_val):
-        logger.info(f"{symbol} [4H] rejet RSI/MACD SHORT : RSI={rsi:.1f}, MACD={macd_val:.4f}, SIG={sig_val:.4f}")
+    if last_macd < last_signal:
+        logger.info(f"{symbol} [4H] rejet MACD={last_macd:.4f} < signal={last_signal:.4f}")
         return None
 
-    if side == "long" and not detect_fvg(df):
-        logger.info(f"{symbol} [4H] rejet FVG LONG")
-        return None
-    if side == "short" and not detect_fvg_short(df):
-        logger.info(f"{symbol} [4H] rejet FVG SHORT")
+    high = df['high'].rolling(20).max().iat[-2]
+    low  = df['low'].rolling(20).min().iat[-2]
+    price = df['close'].iat[-1]
+
+    in_ote, fib618, fib786 = is_in_OTE_zone(price, low, high)
+    if not in_ote:
+        logger.info(f"{symbol} [4H] rejet OTE: price={price} hors zone [{fib618:.4f}-{fib786:.4f}]")
         return None
 
-    atr = compute_atr(df, 14).iloc[-1]
-    buffer = atr * 0.2
-
-    if side == "long":
-        entry = fib_min
-        stop_loss = swing_low - buffer
-        rr = entry - stop_loss
-        tp1, tp2 = entry + rr, entry + 2 * rr
-    else:
-        entry = fib_max
-        stop_loss = swing_high + buffer
-        rr = stop_loss - entry
-        tp1, tp2 = entry - rr, entry - 2 * rr
+    fvg_zones = detect_fvg(df)
+    if not fvg_zones:
+        logger.info(f"{symbol} [4H] rejet: aucun FVG détecté")
+        return None
 
     return {
-        "entry_min": float(fib_min),
-        "entry_max": float(fib_max),
-        "entry_price": float(entry),
-        "stop_loss": float(stop_loss),
-        "tp1": float(tp1),
-        "tp2": float(tp2),
+        "symbol": symbol,
+        "entry": round(fib618, 5),
+        "sl": round(low * 0.99, 5),
+        "tp": round(fib786 * 1.02, 5),
+        "ote_zone": (round(fib618, 5), round(fib786, 5)),
+        "fvg_zone": fvg_zones[-1],
+        "active": True
     }
