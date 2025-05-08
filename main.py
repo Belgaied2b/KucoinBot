@@ -4,8 +4,6 @@ import asyncio
 from telegram.ext import Application, CommandHandler
 from apscheduler.schedulers.background import BackgroundScheduler
 from scanner import scan_and_send_signals
-from telegram.request import HTTPXRequest
-import httpx
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -31,10 +29,7 @@ def job_scan():
 def main():
     global app
 
-    # ✅ Timeout Telegram étendu (compatibilité vérifiée)
-    request = HTTPXRequest(http_version="1.1", timeout=httpx.Timeout(30.0, connect=10.0))
-
-    app = Application.builder().token(BOT_TOKEN).request(request).post_init(post_init).build()
+    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("scan", scan))
