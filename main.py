@@ -31,9 +31,8 @@ def job_scan():
 def main():
     global app
 
-    # HTTPX client avec timeout étendu
-    httpx_client = httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=10.0))
-    request = HTTPXRequest(httpx_client=httpx_client)
+    # ✅ Timeout Telegram étendu (compatibilité vérifiée)
+    request = HTTPXRequest(http_version="1.1", timeout=httpx.Timeout(30.0, connect=10.0))
 
     app = Application.builder().token(BOT_TOKEN).request(request).post_init(post_init).build()
 
