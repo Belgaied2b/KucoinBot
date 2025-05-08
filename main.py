@@ -4,6 +4,8 @@ import asyncio
 from telegram.ext import Application, CommandHandler
 from apscheduler.schedulers.background import BackgroundScheduler
 from scanner import scan_and_send_signals
+from telegram.request import HTTPXRequest
+import httpx
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -28,13 +30,18 @@ def job_scan():
 
 def main():
     global app
-    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
+
+    # HTTPX client avec timeout étendu
+    httpx_client = httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=10.0))
+    request = HTTPXRequest(httpx_client=httpx_client)
+
+    app = Application.builder().token(BOT_TOKEN).request(request).post_init(post_init).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("scan", scan))
 
     scheduler = BackgroundScheduler(timezone="UTC")
-    scheduler.add_job(job_scan, 'interval', minutes=10)  # ⏱️ Toutes les 10 minutes
+    scheduler.add_job(job_scan, 'interval', minutes=10)
     scheduler.start()
 
     logger.info("🚀 Bot lancé avec scan auto toutes les 10 minutes + scan immédiat")
