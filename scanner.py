@@ -79,19 +79,25 @@ async def scan_and_send_signals(bot, chat_id):
                     "\n🧠 Ordre limite possible (à surveiller)"
                 )
 
-            # 📉 Génération graphique sécurisé
+            # Envoi avec double try/except sécurisé
             fig = plot_signal_graph(df_4h, entry, sl, tp, direction, status=status)
             if fig:
                 buf = BytesIO()
-                fig.savefig(buf, format='png', dpi=100)  # compression pour éviter timeout
+                fig.savefig(buf, format='png', dpi=100)
                 buf.seek(0)
                 try:
                     await bot.send_photo(chat_id=chat_id, photo=buf, caption=msg)
                 except Exception as e:
                     print(f"[❌] Erreur envoi image : {e}")
-                    await bot.send_message(chat_id=chat_id, text=msg + "\n(⚠️ Image non envoyée)")
+                    try:
+                        await bot.send_message(chat_id=chat_id, text=msg + "\n(⚠️ Image non envoyée)")
+                    except Exception as e2:
+                        print(f"[❌] Erreur fallback texte : {e2}")
             else:
-                await bot.send_message(chat_id=chat_id, text=msg + "\n(⚠️ Graphique non généré)")
+                try:
+                    await bot.send_message(chat_id=chat_id, text=msg + "\n(⚠️ Graphique non généré)")
+                except Exception as e3:
+                    print(f"[❌] Erreur envoi texte brut : {e3}")
 
             sent.add(signal_id)
 
