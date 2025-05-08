@@ -60,7 +60,6 @@ async def scan_and_send_signals(bot, chat_id):
             if status is None or signal_id in sent:
                 continue
 
-            # 📨 Message Telegram
             msg = f"{symbol} - Signal {status.upper()} ({direction.upper()})\n"
 
             if status == "confirmé":
@@ -80,16 +79,20 @@ async def scan_and_send_signals(bot, chat_id):
                     "\n🧠 Ordre limite possible (à surveiller)"
                 )
 
-            # 📉 Génération du graphique avec couleur selon le statut
+            # 📉 Génération graphique sécurisé
             fig = plot_signal_graph(df_4h, entry, sl, tp, direction, status=status)
             if fig:
                 buf = BytesIO()
-                fig.savefig(buf, format='png')
+                fig.savefig(buf, format='png', dpi=100)  # compression pour éviter timeout
                 buf.seek(0)
-                await bot.send_photo(chat_id=chat_id, photo=buf, caption=msg)
-                print(f"📤 Signal envoyé : {symbol} ({status})")
-                sent.add(signal_id)
+                try:
+                    await bot.send_photo(chat_id=chat_id, photo=buf, caption=msg)
+                except Exception as e:
+                    print(f"[❌] Erreur envoi image : {e}")
+                    await bot.send_message(chat_id=chat_id, text=msg + "\n(⚠️ Image non envoyée)")
             else:
-                await bot.send_message(chat_id=chat_id, text=msg + " (graphique non généré)")
+                await bot.send_message(chat_id=chat_id, text=msg + "\n(⚠️ Graphique non généré)")
+
+            sent.add(signal_id)
 
     save_sent_signal(sent)
