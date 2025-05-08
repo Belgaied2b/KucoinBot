@@ -17,12 +17,12 @@ async def start(update, context):
 async def scan(update, context):
     await scan_and_send_signals(context.bot, CHAT_ID)
 
-# 🔁 Appelé automatiquement juste après le démarrage de run_polling()
+# Scan immédiat au démarrage
 async def post_init(application):
     logger.info("🔥 Scan immédiat au démarrage")
     await scan_and_send_signals(application.bot, CHAT_ID)
 
-# 🔁 Pour le scheduler
+# Scan programmé toutes les 10 minutes
 def job_scan():
     asyncio.run(scan_and_send_signals(app.bot, CHAT_ID))
 
@@ -34,10 +34,10 @@ def main():
     app.add_handler(CommandHandler("scan", scan))
 
     scheduler = BackgroundScheduler(timezone="UTC")
-    scheduler.add_job(job_scan, 'interval', minutes=5)
+    scheduler.add_job(job_scan, 'interval', minutes=10)  # ⏱️ Toutes les 10 minutes
     scheduler.start()
 
-    logger.info("🚀 Bot lancé avec scan auto toutes les 5 min + scan immédiat")
+    logger.info("🚀 Bot lancé avec scan auto toutes les 10 minutes + scan immédiat")
     app.run_polling()
 
 if __name__ == "__main__":
