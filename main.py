@@ -22,13 +22,22 @@ async def post_init(application):
     logger.info("🔥 Scan immédiat au démarrage")
     await scan_and_send_signals(application.bot, CHAT_ID)
 
-# Scan programmé toutes les 10 minutes
+# ✅ Scan programmé toutes les 10 minutes, avec protection event loop
 def job_scan():
-    asyncio.run(scan_and_send_signals(app.bot, CHAT_ID))
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+    if loop.is_closed():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+    loop.create_task(scan_and_send_signals(app.bot, CHAT_ID))
 
 def main():
     global app
-
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
 
     app.add_handler(CommandHandler("start", start))
