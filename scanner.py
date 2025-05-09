@@ -54,9 +54,13 @@ async def scan_and_send_signals(bot, chat_id):
             continue
 
         for direction in ["long", "short"]:
-            status, entry, sl, tp = analyze_signal(df_1h, df_4h, direction)
-            signal_id = f"{symbol}_{direction}_{status}"
+            try:
+                status, entry, sl, tp = analyze_signal(df_1h, df_4h, direction)
+            except Exception as e:
+                print(f"[❌] Erreur analyse {symbol} ({direction}) : {e}")
+                continue
 
+            signal_id = f"{symbol}_{direction}_{status}"
             if status is None or signal_id in sent:
                 continue
 
@@ -79,7 +83,6 @@ async def scan_and_send_signals(bot, chat_id):
                     "\n🧠 Ordre limite possible (à surveiller)"
                 )
 
-            # Envoi avec double try/except sécurisé
             fig = plot_signal_graph(df_4h, entry, sl, tp, direction, status=status)
             if fig:
                 buf = BytesIO()
