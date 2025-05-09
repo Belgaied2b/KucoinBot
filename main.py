@@ -1,6 +1,7 @@
 import os
 import logging
 import asyncio
+import threading
 from telegram.ext import Application, CommandHandler
 from apscheduler.schedulers.background import BackgroundScheduler
 from scanner import scan_and_send_signals
@@ -17,24 +18,22 @@ async def start(update, context):
 async def scan(update, context):
     await scan_and_send_signals(context.bot, CHAT_ID)
 
-# Scan immédiat au démarrage
+# 🔁 Scan immédiat au démarrage
 async def post_init(application):
     logger.info("🔥 Scan immédiat au démarrage")
     await scan_and_send_signals(application.bot, CHAT_ID)
 
-# ✅ Scan programmé toutes les 10 minutes, avec protection event loop
+# ✅ Scan automatique toutes les 10 minutes dans un thread
 def job_scan():
-    try:
-        loop = asyncio.get_event_loop()
-    except RuntimeError:
+    async def wrapper():
+        await scan_and_send_signals(app.bot, CHAT_ID)
+
+    def runner():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
+        loop.run_until_complete(wrapper())
 
-    if loop.is_closed():
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-
-    loop.create_task(scan_and_send_signals(app.bot, CHAT_ID))
+    threading.Thread(target=runner).start()
 
 def main():
     global app
