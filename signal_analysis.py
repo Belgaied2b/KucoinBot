@@ -28,13 +28,7 @@ def analyze_signal(df_1h, df_4h=None, direction="long", test_mode=False):
         entry = fib618
         sl = round(low - last_atr, 6)
         tp = round(entry + 2.5 * last_atr, 6)
-
-        # 🔄 Filtres allégés
-        context_ok = (
-            40 < last_rsi < 70 and
-            last_macd > last_signal * 0.98 and
-            price > ma200
-        )
+        ma_ok = price > ma200
     else:
         fib618 = high - 0.618 * (high - low)
         fib786 = high - 0.786 * (high - low)
@@ -43,17 +37,23 @@ def analyze_signal(df_1h, df_4h=None, direction="long", test_mode=False):
         entry = fib618
         sl = round(high + last_atr, 6)
         tp = round(entry - 2.5 * last_atr, 6)
+        ma_ok = price < ma200
 
-        context_ok = (
-            last_rsi > 70 and
-            last_macd < last_signal * 1.02 and
-            price < ma200
-        )
+    print(f"[🧠] {direction.upper()} | Price={price:.4f} | RSI={last_rsi:.2f} | MACD={last_macd:.4f} | Signal={last_signal:.4f}")
+    print(f"↪️ OTE={in_ote} | FVG={fvg_valid} | MA200 OK={'YES' if ma_ok else 'NO'}")
 
-    print(f"[🧪] {direction.upper()} | Price={price:.4f} | RSI={last_rsi:.2f} | MACD={last_macd:.4f} | Signal={last_signal:.4f}")
-    print(f"↪️ OTE={in_ote} | FVG={fvg_valid} | MA200 OK={'YES' if (price > ma200 if direction=='long' else price < ma200) else 'NO'} | Context OK={context_ok}")
+    # Obligatoire : BOS + COS
+    structure_ok = df_1h['close'].iloc[-1] > df_1h['high'].iloc[-5:-1].max()  # BOS
+    higher_lows = df_1h['low'].iloc[-6] < df_1h['low'].iloc[-4] < df_1h['low'].iloc[-2]
+    higher_highs = df_1h['high'].iloc[-6] < df_1h['high'].iloc[-4] < df_1h['high'].iloc[-2]
+    cos = higher_lows and higher_highs if direction == "long" else False  # inverser pour short si besoin
 
-    if context_ok and in_ote and fvg_valid:
+    if not structure_ok or not cos:
+        print(f"[🔁] Structure non valide : COS={cos} BOS={structure_ok}")
+        return None
+
+    if in_ote and fvg_valid:
+        print(f"[🎯] Signal confirmé – repli détecté dans OTE + FVG")
         return {
             "symbol": df_1h.name if hasattr(df_1h, "name") else "UNKNOWN",
             "type": "CONFIRMÉ",
@@ -63,20 +63,19 @@ def analyze_signal(df_1h, df_4h=None, direction="long", test_mode=False):
             "tp": tp,
             "ote_zone": (round(fib786, 6), round(fib618, 6)),
             "fvg_zone": (round(high, 6), round(price, 6)),
-            "comment": "Signal confirmé avec contexte élargi"
+            "comment": "🎯 Signal confirmé – entrée idéale après repli"
         }
 
-    if test_mode and in_ote and fvg_valid:
+    else:
+        print(f"[⏳] Signal anticipé – BOS + COS OK, attendre repli")
         return {
             "symbol": df_1h.name if hasattr(df_1h, "name") else "UNKNOWN",
-            "type": "TEST",
+            "type": "ANTICIPÉ",
             "direction": direction.upper(),
             "entry": round(entry, 6),
             "sl": sl,
             "tp": tp,
             "ote_zone": (round(fib786, 6), round(fib618, 6)),
             "fvg_zone": (round(high, 6), round(price, 6)),
-            "comment": "⚠️ Signal TEST (contexte souple)"
+            "comment": "⏳ Structure confirmée – attendre repli OTE/FVG"
         }
-
-    return None
