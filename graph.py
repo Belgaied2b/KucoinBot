@@ -1,59 +1,49 @@
 import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import pandas as pd
 
-def plot_signal_graph(df, entry, sl, tp, direction, status="confirmé", show_ote=True, show_fvg=True):
-    try:
-        df = df[-100:]
-        prices = df['close'].values
+def generate_chart(df, signal):
+    df = df.tail(100).copy()
+    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+    df.set_index('timestamp', inplace=True)
 
-        fig, ax = plt.subplots(figsize=(10, 5))
-        ax.plot(prices, label='Prix 4H', linewidth=2)
+    fig, ax = plt.subplots(figsize=(10, 5))
+    width = 0.0005 * (df.index[-1] - df.index[0]).total_seconds()
 
-        # OTE zone
-        high = df['high'].rolling(20).max().iloc[-2]
-        low = df['low'].rolling(20).min().iloc[-2]
+    for i in range(len(df)):
+        color = 'green' if df['close'].iloc[i] >= df['open'].iloc[i] else 'red'
+        ax.plot([df.index[i], df.index[i]], [df['low'].iloc[i], df['high'].iloc[i]], color=color, linewidth=0.5)
+        ax.add_patch(plt.Rectangle(
+            (df.index[i], min(df['open'].iloc[i], df['close'].iloc[i])),
+            width,
+            abs(df['close'].iloc[i] - df['open'].iloc[i]),
+            color=color
+        ))
 
-        if show_ote:
-            if direction == "long":
-                fib618 = low + 0.618 * (high - low)
-                fib786 = low + 0.786 * (high - low)
-                ax.axhspan(fib618, fib786, color='blue', alpha=0.2, label='Zone OTE')
-            else:
-                fib618 = high - 0.618 * (high - low)
-                fib786 = high - 0.786 * (high - low)
-                ax.axhspan(fib786, fib618, color='red', alpha=0.2, label='Zone OTE')
+    # Zones OTE & FVG (si elles existent dans le signal)
+    if 'ote_zone' in signal:
+        ax.axhspan(signal['ote_zone'][1], signal['ote_zone'][0], color='blue', alpha=0.2, label='OTE')
+    if 'fvg_zone' in signal:
+        ax.axhspan(signal['fvg_zone'][1], signal['fvg_zone'][0], color='orange', alpha=0.2, label='FVG')
 
-        # FVG zone approximative
-        if show_fvg:
-            fvg_low = df['low'].min() - 0.003 * df['low'].min()
-            fvg_high = df['high'].max() + 0.003 * df['high'].max()
-            ax.axhspan(fvg_low, fvg_high, color='orange', alpha=0.1, label='Zone FVG')
+    # Niveaux SL, TP, Entry
+    ax.axhline(signal['entry'], color='blue', linestyle='--', linewidth=1, label='Entrée')
+    ax.axhline(signal['sl'], color='red', linestyle='--', linewidth=1, label='SL')
+    ax.axhline(signal['tp'], color='green', linestyle='--', linewidth=1, label='TP')
 
-        # Entry / SL / TP
-        if entry is not None:
-            ax.axhline(entry, color='blue', linestyle='--', label=f'Entrée ({entry:.6f})')
-        if sl is not None:
-            ax.axhline(sl, color='red', linestyle='--', label=f'SL ({sl:.6f})')
-        if tp is not None:
-            ax.axhline(tp, color='green', linestyle='--', label=f'TP ({tp:.6f})')
+    # Direction visuelle
+    y_start = signal['entry']
+    y_end = signal['tp'] if signal['direction'] == "LONG" else signal['sl']
+    ax.annotate('', xy=(df.index[-1], y_end), xytext=(df.index[-1], y_start),
+                arrowprops=dict(facecolor='blue', shrink=0.05, width=2, headwidth=8))
 
-        # Flèche direction
-        arrow_y = entry if entry else prices[-1]
-        ax.annotate('⬆️' if direction == "long" else '⬇️',
-                    xy=(len(prices) - 1, arrow_y),
-                    fontsize=14)
+    ax.set_title(f"{signal['symbol']} - {signal['type']} ({signal['direction']})")
+    ax.legend()
+    ax.xaxis.set_major_formatter(mdates.DateFormatter('%m-%d %H:%M'))
+    plt.xticks(rotation=45)
+    plt.tight_layout()
 
-        # 🎨 Titre coloré selon le statut
-        title_color = 'green' if status == "confirmé" else 'blue'
-        ax.set_title(f"Signal {status.upper()} ({direction.upper()})", color=title_color)
-
-        ax.set_xlabel("Bougies 4H")
-        ax.set_ylabel("Prix")
-        ax.grid(True)
-        ax.legend()
-        plt.tight_layout()
-
-        return fig
-
-    except Exception as e:
-        print(f"[GRAPH ERROR] {e}")
-        return None
+    filename = f"chart_{signal['symbol'].replace('/', '_')}.png"
+    plt.savefig(filename)
+    plt.close()
+    return filename
