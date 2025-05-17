@@ -42,16 +42,15 @@ def analyze_signal(df_1h, df_4h=None, direction="long", test_mode=False):
     print(f"[🧠] {direction.upper()} | Price={price:.4f} | RSI={last_rsi:.2f} | MACD={last_macd:.4f} | Signal={last_signal:.4f}")
     print(f"↪️ OTE={in_ote} | FVG={fvg_valid} | MA200 OK={'YES' if ma_ok else 'NO'}")
 
-    # ✅ COS souple
-    recent_lows = df_1h['low'].iloc[-7:-1]
-    recent_highs = df_1h['high'].iloc[-7:-1]
+    # ✅ COS robuste : 2 creux + 2 sommets croissants
+    lows = df_1h['low'].iloc[-9:]
+    highs = df_1h['high'].iloc[-9:]
     cos = (
-        recent_lows.min() == recent_lows.iloc[0] and
-        recent_lows.iloc[-1] > recent_lows.iloc[0] and
-        recent_highs.iloc[-1] > recent_highs.iloc[0]
+        lows.iloc[0] < lows.iloc[3] < lows.iloc[6] and
+        highs.iloc[0] < highs.iloc[3] < highs.iloc[6]
     )
 
-    # ✅ BOS
+    # ✅ BOS : cassure du plus haut récent
     recent_high = df_1h['high'].iloc[-5:-1].max()
     structure_ok = price > recent_high
 
