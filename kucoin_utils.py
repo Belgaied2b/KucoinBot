@@ -1,14 +1,18 @@
+import ccxt
 import pandas as pd
-import requests
 
-def fetch_klines(symbol, interval="1h", limit=150):
-    granularity = {"1h": 60, "4h": 240}[interval]
-    url = "https://api-futures.kucoin.com/api/v1/kline/query"
-    params = {"symbol": symbol, "granularity": granularity, "limit": limit}
-    response = requests.get(url, params=params)
-    data = response.json()["data"]
+exchange = ccxt.kucoin()
 
-    # KuCoin retourne 6 colonnes : [timestamp, open, close, high, low, volume]
-    df = pd.DataFrame(data, columns=["timestamp", "open", "close", "high", "low", "volume"])
-    df = df.astype(float)
-    return df[["open", "high", "low", "close", "volume"]]
+def fetch_symbols():
+    markets = exchange.load_markets()
+    symbols = [s for s in markets if "USDT:USDT" in s and "PERP" in s]
+    return symbols
+
+def fetch_klines(symbol, interval='1h', limit=200):
+    try:
+        ohlcv = exchange.fetch_ohlcv(symbol, timeframe=interval, limit=limit)
+        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        return df
+    except Exception as e:
+        print(f"[{symbol}] ⚠️ Erreur fetch_klines : {e}")
+        return None
