@@ -4,11 +4,18 @@ import pandas as pd
 
 def generate_chart(df, signal):
     df = df.tail(100).copy()
-    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+
+    # ✅ Si déjà converti dans kucoin_utils, on ne reconvertit pas ici
+    if not pd.api.types.is_datetime64_any_dtype(df['timestamp']):
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+
     df.set_index('timestamp', inplace=True)
 
     fig, ax = plt.subplots(figsize=(10, 5))
-    width = 0.0005 * (df.index[-1] - df.index[0]).total_seconds()
+
+    # ✅ Correction : width basé sur timedelta (ex : 10% d'une heure)
+    total_seconds = (df.index[-1] - df.index[0]).total_seconds()
+    width = pd.Timedelta(seconds=total_seconds / len(df) * 0.6)
 
     for i in range(len(df)):
         color = 'green' if df['close'].iloc[i] >= df['open'].iloc[i] else 'red'
@@ -31,7 +38,7 @@ def generate_chart(df, signal):
     ax.axhline(signal['sl'], color='red', linestyle='--', linewidth=1, label='SL')
     ax.axhline(signal['tp'], color='green', linestyle='--', linewidth=1, label='TP')
 
-    # Direction visuelle
+    # Direction visuelle (flèche)
     y_start = signal['entry']
     y_end = signal['tp'] if signal['direction'] == "LONG" else signal['sl']
     ax.annotate('', xy=(df.index[-1], y_end), xytext=(df.index[-1], y_start),
