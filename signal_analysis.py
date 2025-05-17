@@ -1,7 +1,7 @@
 import pandas as pd
 from indicators import compute_rsi, compute_macd, compute_atr
 
-def analyze_signal(df_1h, df_4h=None, direction="long"):
+def analyze_signal(df_1h, df_4h=None, direction="long", test_mode=False):
     if df_1h.empty:
         print(f"[❌] Données manquantes pour analyse.")
         return None
@@ -29,10 +29,10 @@ def analyze_signal(df_1h, df_4h=None, direction="long"):
         sl = round(low - last_atr, 6)
         tp = round(entry + 2.5 * last_atr, 6)
 
+        # 🔄 Filtres allégés
         context_ok = (
-            48 < last_rsi < 62 and
-            last_macd > last_signal * 1.05 and
-            last_macd > 0 and last_signal > 0 and
+            40 < last_rsi < 70 and
+            last_macd > last_signal * 0.98 and
             price > ma200
         )
     else:
@@ -45,9 +45,8 @@ def analyze_signal(df_1h, df_4h=None, direction="long"):
         tp = round(entry - 2.5 * last_atr, 6)
 
         context_ok = (
-            last_rsi > 78 and
-            last_macd < last_signal * 0.95 and
-            last_macd < 0 and last_signal < 0 and
+            last_rsi > 70 and
+            last_macd < last_signal * 1.02 and
             price < ma200
         )
 
@@ -64,7 +63,20 @@ def analyze_signal(df_1h, df_4h=None, direction="long"):
             "tp": tp,
             "ote_zone": (round(fib786, 6), round(fib618, 6)),
             "fvg_zone": (round(high, 6), round(price, 6)),
-            "comment": "Signal confirmé avec contexte aligné"
+            "comment": "Signal confirmé avec contexte élargi"
+        }
+
+    if test_mode and in_ote and fvg_valid:
+        return {
+            "symbol": df_1h.name if hasattr(df_1h, "name") else "UNKNOWN",
+            "type": "TEST",
+            "direction": direction.upper(),
+            "entry": round(entry, 6),
+            "sl": sl,
+            "tp": tp,
+            "ote_zone": (round(fib786, 6), round(fib618, 6)),
+            "fvg_zone": (round(high, 6), round(price, 6)),
+            "comment": "⚠️ Signal TEST (contexte souple)"
         }
 
     return None
