@@ -14,11 +14,11 @@ def fetch_klines(symbol, interval="1h", limit=150):
     response = requests.get(url, params=params)
     data = response.json()["data"]
 
-    # Ajoute toutes les colonnes y compris timestamp
+    # Chargement des données avec les bonnes colonnes
     df = pd.DataFrame(data, columns=["timestamp", "open", "close", "high", "low", "volume"])
     df = df.astype(float)
 
-    # Convertit timestamp en datetime (facultatif mais utile pour les graphes)
-    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="s")
+    # ✅ Correction : conversion du timestamp en datetime
+    df["timestamp"] = pd.to_datetime(df["timestamp"].astype("int64"), unit="s")
 
     return df[["timestamp", "open", "high", "low", "close", "volume"]]
