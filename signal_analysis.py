@@ -42,13 +42,20 @@ def analyze_signal(df_1h, df_4h=None, direction="long", test_mode=False):
     print(f"[🧠] {direction.upper()} | Price={price:.4f} | RSI={last_rsi:.2f} | MACD={last_macd:.4f} | Signal={last_signal:.4f}")
     print(f"↪️ OTE={in_ote} | FVG={fvg_valid} | MA200 OK={'YES' if ma_ok else 'NO'}")
 
-    # Obligatoire : BOS + COS
-    structure_ok = df_1h['close'].iloc[-1] > df_1h['high'].iloc[-5:-1].max()  # BOS
-    higher_lows = df_1h['low'].iloc[-6] < df_1h['low'].iloc[-4] < df_1h['low'].iloc[-2]
-    higher_highs = df_1h['high'].iloc[-6] < df_1h['high'].iloc[-4] < df_1h['high'].iloc[-2]
-    cos = higher_lows and higher_highs if direction == "long" else False  # inverser pour short si besoin
+    # ✅ COS souple
+    recent_lows = df_1h['low'].iloc[-7:-1]
+    recent_highs = df_1h['high'].iloc[-7:-1]
+    cos = (
+        recent_lows.min() == recent_lows.iloc[0] and
+        recent_lows.iloc[-1] > recent_lows.iloc[0] and
+        recent_highs.iloc[-1] > recent_highs.iloc[0]
+    )
 
-    if not structure_ok or not cos:
+    # ✅ BOS
+    recent_high = df_1h['high'].iloc[-5:-1].max()
+    structure_ok = price > recent_high
+
+    if not cos or not structure_ok:
         print(f"[🔁] Structure non valide : COS={cos} BOS={structure_ok}")
         return None
 
