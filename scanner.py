@@ -8,7 +8,6 @@ from signal_analysis import analyze_signal
 from graph import generate_chart
 from indicators import compute_rsi as rsi, compute_macd as macd, compute_atr
 
-# Chargement des signaux déjà envoyés
 if os.path.exists("sent_signals.json"):
     with open("sent_signals.json", "r") as f:
         sent_signals = json.load(f)
@@ -20,10 +19,14 @@ def is_bos_valid(df):
     current_close = df['close'].iloc[-1]
     return current_close > recent_high
 
+# ✅ COS robuste (3 points croissants)
 def is_cos_valid(df):
-    higher_lows = df['low'].iloc[-6] < df['low'].iloc[-4] < df['low'].iloc[-2]
-    higher_highs = df['high'].iloc[-6] < df['high'].iloc[-4] < df['high'].iloc[-2]
-    return higher_lows and higher_highs
+    lows = df['low'].iloc[-9:]
+    highs = df['high'].iloc[-9:]
+    return (
+        lows.iloc[0] < lows.iloc[3] < lows.iloc[6] and
+        highs.iloc[0] < highs.iloc[3] < highs.iloc[6]
+    )
 
 def is_btc_favorable():
     try:
@@ -74,6 +77,7 @@ async def scan_and_send_signals(bot, chat_id):
                 print(f"[{symbol}] ❌ Signal bloqué : BOS non validé\n")
                 continue
 
+            df.name = symbol
             signal = analyze_signal(df, direction="long")
 
             if signal:
