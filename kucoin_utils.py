@@ -14,11 +14,18 @@ def fetch_klines(symbol, interval="1h", limit=150):
     response = requests.get(url, params=params)
     data = response.json()["data"]
 
-    # Chargement des données avec les bonnes colonnes
     df = pd.DataFrame(data, columns=["timestamp", "open", "close", "high", "low", "volume"])
     df = df.astype(float)
 
-    # ✅ Correction : conversion du timestamp en datetime
-    df["timestamp"] = pd.to_datetime(df["timestamp"].astype("int64"), unit="s")
+    # ✅ Détection automatique de l'unité du timestamp
+    sample_ts = df["timestamp"].iloc[0]
+    if sample_ts > 1e12:
+        unit = "ms"
+    elif sample_ts > 1e10:
+        unit = "s"  # valeur normale
+    else:
+        unit = "s"  # fallback
+
+    df["timestamp"] = pd.to_datetime(df["timestamp"].astype("int64"), unit=unit)
 
     return df[["timestamp", "open", "high", "low", "close", "volume"]]
