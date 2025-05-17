@@ -4,4 +4,3 @@ pandas
 requests
 numpy
 apscheduler
-ccxt
