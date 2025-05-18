@@ -23,7 +23,7 @@ async def check_active_signals_and_update(bot: Bot, chat_id: int):
     signals = load_signals()
     updated = {}
 
-    for signal_id, timestamp in signals.items():
+    for signal_id, meta in signals.items():
         try:
             symbol, _ = signal_id.split("-")
             df = fetch_klines(symbol, interval='1h', limit=200)
@@ -38,10 +38,9 @@ async def check_active_signals_and_update(bot: Bot, chat_id: int):
                 await bot.send_message(chat_id, f"❌ [{symbol}] Signal annulé – structure non valide ou SL touché.")
                 continue
 
-            # Identique ? => rien à faire
-            old_entry = round(float(signals[signal_id].get("entry", 0)), 6)
-            old_tp = round(float(signals[signal_id].get("tp", 0)), 6)
-            old_sl = round(float(signals[signal_id].get("sl", 0)), 6)
+            old_entry = float(meta.get("entry", 0))
+            old_tp = float(meta.get("tp", 0))
+            old_sl = float(meta.get("sl", 0))
 
             changed = (
                 abs(new_signal["entry"] - old_entry) > 0.001 or
@@ -53,9 +52,9 @@ async def check_active_signals_and_update(bot: Bot, chat_id: int):
                 message = f"""
 🔄 [{symbol}] Signal mis à jour
 
-🎯 Nouvelle entrée : {new_signal['entry']}
-📈 TP : {new_signal['tp']}
-🛑 SL : {new_signal['sl']}
+🎯 Nouvelle entrée : {new_signal['entry']:.6f}
+📈 TP : {new_signal['tp']:.6f}
+🛑 SL : {new_signal['sl']:.6f}
 💬 {new_signal['comment']}
 """.strip()
                 await bot.send_message(chat_id, message)
@@ -68,7 +67,7 @@ async def check_active_signals_and_update(bot: Bot, chat_id: int):
                 }
 
             else:
-                updated[signal_id] = signals[signal_id]
+                updated[signal_id] = meta
 
         except Exception as e:
             print(f"[{signal_id}] ⚠️ Erreur dans la mise à jour : {e}")
