@@ -2,7 +2,6 @@
 
 import os
 import json
-import pandas as pd
 from datetime import datetime
 from kucoin_utils import fetch_symbols, fetch_klines
 from signal_analysis import analyze_signal
@@ -64,50 +63,45 @@ async def scan_and_send_signals(bot, chat_id):
             bos = is_bos_valid(df)
             btc_ok = is_btc_favorable()
 
-            print(f"[{symbol}] 🔍 Price={price:.6f} | RSI={last_rsi} | MACD={last_macd} | SIGNAL={last_signal} | MA200={last_ma200} | ATR={atr}")
+            print(f"[{symbol}] 🔍 Price={price:.8f} | RSI={last_rsi} | MACD={last_macd} | SIGNAL={last_signal} | MA200={last_ma200} | ATR={atr}")
             print(f"↪️ COS={'✅' if cos else '❌'}  BOS={'✅' if bos else '❌'}  BTC={'✅' if btc_ok else '❌'}")
 
             if not btc_ok or not cos or not bos:
-                print(f"[{symbol}] ❌ Signal bloqué (condition non remplie)\n")
                 continue
 
             df.name = symbol
             signal = analyze_signal(df, direction="long")
 
-            if signal:
-                print(f"[{symbol}] ✅ Signal analysé avec succès.")
-                print(f"📌 Entry={signal['entry']} | SL={signal['sl']} | TP={signal['tp']}")
+            if not signal or signal["type"] != "CONFIRMÉ":
+                continue
 
-                signal_id = f"{symbol}-{signal['type']}"
-                if signal_id in sent_signals:
-                    print(f"[{symbol}] 🔁 Signal déjà envoyé ({signal['type']})\n")
-                    continue
+            signal_id = f"{symbol}-{signal['type']}"
+            if signal_id in sent_signals:
+                continue
 
-                image_path = generate_chart(df, signal)
+            image_path = generate_chart(df, signal)
 
-                message = f"""
+            message = f"""
 {symbol} - Signal {signal['type']} ({signal['direction']})
 
-🔵 Entrée idéale : {signal['entry']:.6f}
-🛑 SL : {signal['sl']:.6f}
-🎯 TP : {signal['tp']:.6f}
+🔵 Entrée idéale : {signal['entry']:.8f}
+🛑 SL : {signal['sl']:.8f}
+🎯 TP : {signal['tp']:.8f}
 📈 {signal['comment']}
 """.strip()
 
-                await bot.send_photo(chat_id=chat_id, photo=open(image_path, 'rb'), caption=message)
+            await bot.send_photo(chat_id=chat_id, photo=open(image_path, 'rb'), caption=message)
 
-                sent_signals[signal_id] = {
-                    "entry": signal['entry'],
-                    "tp": signal['tp'],
-                    "sl": signal['sl'],
-                    "sent_at": datetime.utcnow().isoformat()
-                }
-                with open("sent_signals.json", "w") as f:
-                    json.dump(sent_signals, f, indent=2)
+            sent_signals[signal_id] = {
+                "entry": signal['entry'],
+                "tp": signal['tp'],
+                "sl": signal['sl'],
+                "sent_at": datetime.utcnow().isoformat()
+            }
+            with open("sent_signals.json", "w") as f:
+                json.dump(sent_signals, f, indent=2)
 
-                print(f"[{symbol}] ✅ Signal envoyé : {signal['type']}\n")
-            else:
-                print(f"[{symbol}] ❌ Signal rejeté après analyse (confluence insuffisante)\n")
+            print(f"[{symbol}] ✅ Signal envoyé : {signal['type']}\n")
 
         except Exception as e:
             print(f"[{symbol}] ⚠️ Erreur : {e}\n")
