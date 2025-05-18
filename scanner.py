@@ -1,5 +1,3 @@
-# scanner.py
-
 import os
 import json
 from datetime import datetime
@@ -14,18 +12,28 @@ if os.path.exists("sent_signals.json"):
 else:
     sent_signals = {}
 
+# ✅ Nouvelle version adaptative de COS
+def is_cos_valid(df):
+    """
+    Détecte un Changement de Structure (COS) haussier intelligent :
+    - En analysant les 20 dernières bougies
+    - Si le dernier plus haut casse une zone de résistance précédente
+    """
+    if len(df) < 50:
+        return False
+
+    recent_zone = df[-20:]
+    previous_zone = df[-40:-20]
+
+    prev_high = previous_zone['high'].max()
+    last_high = recent_zone['high'].iloc[-1]
+
+    return last_high > prev_high
+
 def is_bos_valid(df):
     recent_high = df['high'].iloc[-5:-1].max()
     current_close = df['close'].iloc[-1]
     return current_close > recent_high
-
-def is_cos_valid(df):
-    lows = df['low'].iloc[-9:]
-    highs = df['high'].iloc[-9:]
-    return (
-        lows.iloc[0] < lows.iloc[3] < lows.iloc[6] and
-        highs.iloc[0] < highs.iloc[3] < highs.iloc[6]
-    )
 
 def is_btc_favorable():
     try:
