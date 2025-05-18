@@ -33,30 +33,28 @@ async def check_active_signals_and_update(bot: Bot, chat_id: int):
             df.name = symbol
             new_signal = analyze_signal(df, direction="long")
 
-            # ✅ Filtrer les non-confirmés
             if not new_signal or new_signal["type"] != "CONFIRMÉ":
                 print(f"[{symbol}] ❌ Signal supprimé (non confirmé ou invalide)")
                 await bot.send_message(chat_id, f"❌ [{symbol}] Signal supprimé – non confirmé ou structure cassée.")
                 continue
 
-            # Comparaison des valeurs
             old_entry = float(meta.get("entry", 0))
             old_tp = float(meta.get("tp", 0))
             old_sl = float(meta.get("sl", 0))
 
-            changed = (
-                abs(new_signal["entry"] - old_entry) > 0.000001 or
-                abs(new_signal["tp"] - old_tp) > 0.000001 or
-                abs(new_signal["sl"] - old_sl) > 0.000001
-            )
+            entry_changed = abs(new_signal["entry"] - old_entry) > 0.000001
+            tp_changed = abs(new_signal["tp"] - old_tp) > 0.000001
+            sl_changed = abs(new_signal["sl"] - old_sl) > 0.000001
+
+            changed = entry_changed or tp_changed or sl_changed
 
             if changed:
                 message = f"""
-🔄 [{symbol}] Signal mis à jour
+🔄 [{symbol}] Signal mis à jour (CONFIRMÉ)
 
-🎯 Nouvelle entrée : {new_signal['entry']:.8f}
-📈 TP : {new_signal['tp']:.8f}
-🛑 SL : {new_signal['sl']:.8f}
+🎯 Nouvelle entrée : {new_signal['entry']:.8f} {'⬅️' if entry_changed else '✅'}
+📈 TP : {new_signal['tp']:.8f} {'⬅️' if tp_changed else '✅'}
+🛑 SL : {new_signal['sl']:.8f} {'⬅️' if sl_changed else '✅'}
 💬 {new_signal['comment']}
 """.strip()
                 await bot.send_message(chat_id, message)
