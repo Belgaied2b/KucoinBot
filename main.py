@@ -7,6 +7,11 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from scanner import scan_and_send_signals
 from signal_updater import check_active_signals_and_update
 
+# 🧹 Suppression automatique des signaux enregistrés
+if os.path.exists("sent_signals.json"):
+    os.remove("sent_signals.json")
+    print("[🧹] sent_signals.json supprimé au démarrage.")
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
