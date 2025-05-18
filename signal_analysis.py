@@ -3,7 +3,8 @@
 def analyze_signal(df, direction="long"):
     """
     Analyse technique pour valider un signal CONFIRMÉ.
-    Ne vérifie plus le COS/BOS en interne (il est validé en amont par scanner.py).
+    Repose uniquement sur les vérifications externes (COS, BOS).
+    Ajoute des logs de rejet si les conditions échouent.
     """
 
     try:
@@ -20,27 +21,28 @@ def analyze_signal(df, direction="long"):
         current_macd = macd_line.iloc[-1]
         current_signal = signal_line.iloc[-1]
 
-        # Vérifie FVG et OTE
         fvg_valid = fvg_info["valid"]
         in_ote = ote_zone["in_ote"]
-
         ma200 = df['close'].rolling(200).mean().iloc[-1]
         ma_ok = price > ma200 if direction == "long" else price < ma200
 
+        # Log préliminaire si bloqué par structure
         if not fvg_valid or not in_ote or not ma_ok:
+            print(f"[{df.name}] ❌ Rejeté : FVG={fvg_valid} | OTE={in_ote} | MA OK={ma_ok} | R:R=N/A")
             return None
 
-        # Calcule Entry/SL/TP via FVG et OTE
         entry = ote_zone["entry"]
         sl = fvg_info["sl"]
         tp = calculate_rr(entry, sl, rr_ratio=2.5, direction=direction)
 
-        # Validation du ratio
         rr = abs((tp - entry) / (entry - sl))
         if rr < 1.5:
+            print(f"[{df.name}] ❌ Rejeté : FVG=True | OTE=True | MA OK=True | R:R={rr:.2f} ❌")
             return None
 
         comment = "🎯 Signal confirmé – entrée idéale après repli"
+
+        print(f"[{df.name}] ✅ Signal validé : entry={entry:.8f} | SL={sl:.8f} | TP={tp:.8f} | R:R={rr:.2f}")
 
         return {
             "type": "CONFIRMÉ",
@@ -55,5 +57,5 @@ def analyze_signal(df, direction="long"):
         }
 
     except Exception as e:
-        print(f"⚠️ Erreur dans analyze_signal : {e}")
+        print(f"[{df.name}] ⚠️ Erreur dans analyze_signal : {e}")
         return None
