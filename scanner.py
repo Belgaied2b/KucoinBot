@@ -1,8 +1,9 @@
+# scanner.py
+
 import os
 import json
 import pandas as pd
 from datetime import datetime
-from telegram import Bot
 from kucoin_utils import fetch_symbols, fetch_klines
 from signal_analysis import analyze_signal
 from graph import generate_chart
@@ -19,7 +20,6 @@ def is_bos_valid(df):
     current_close = df['close'].iloc[-1]
     return current_close > recent_high
 
-# ✅ COS robuste (3 points croissants)
 def is_cos_valid(df):
     lows = df['low'].iloc[-9:]
     highs = df['high'].iloc[-9:]
@@ -35,7 +35,7 @@ def is_btc_favorable():
         df['macd'], df['signal'] = macd(df['close'])
         return df['rsi'].iloc[-1] > 50 and df['macd'].iloc[-1] > df['signal'].iloc[-1]
     except:
-        return True  # fail-safe BTC neutre
+        return True
 
 async def scan_and_send_signals(bot, chat_id):
     print(f"\n--- Scan lancé à {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC ---")
@@ -67,14 +67,8 @@ async def scan_and_send_signals(bot, chat_id):
             print(f"[{symbol}] 🔍 Price={price:.6f} | RSI={last_rsi} | MACD={last_macd} | SIGNAL={last_signal} | MA200={last_ma200} | ATR={atr}")
             print(f"↪️ COS={'✅' if cos else '❌'}  BOS={'✅' if bos else '❌'}  BTC={'✅' if btc_ok else '❌'}")
 
-            if not btc_ok:
-                print(f"[{symbol}] ❌ Signal bloqué : BTC pas favorable\n")
-                continue
-            if not cos:
-                print(f"[{symbol}] ❌ Signal bloqué : COS non détecté\n")
-                continue
-            if not bos:
-                print(f"[{symbol}] ❌ Signal bloqué : BOS non validé\n")
+            if not btc_ok or not cos or not bos:
+                print(f"[{symbol}] ❌ Signal bloqué (condition non remplie)\n")
                 continue
 
             df.name = symbol
@@ -83,10 +77,6 @@ async def scan_and_send_signals(bot, chat_id):
             if signal:
                 print(f"[{symbol}] ✅ Signal analysé avec succès.")
                 print(f"📌 Entry={signal['entry']} | SL={signal['sl']} | TP={signal['tp']}")
-                if 'ote_zone' in signal:
-                    print(f"🔵 OTE zone : {signal['ote_zone']}")
-                if 'fvg_zone' in signal:
-                    print(f"🟠 FVG zone : {signal['fvg_zone']}")
 
                 signal_id = f"{symbol}-{signal['type']}"
                 if signal_id in sent_signals:
@@ -98,20 +88,24 @@ async def scan_and_send_signals(bot, chat_id):
                 message = f"""
 {symbol} - Signal {signal['type']} ({signal['direction']})
 
-🔵 Entrée idéale : {signal['entry']}
-🛑 SL : {signal['sl']}
-🎯 TP : {signal['tp']}
+🔵 Entrée idéale : {signal['entry']:.6f}
+🛑 SL : {signal['sl']:.6f}
+🎯 TP : {signal['tp']:.6f}
 📈 {signal['comment']}
 """.strip()
 
                 await bot.send_photo(chat_id=chat_id, photo=open(image_path, 'rb'), caption=message)
 
-                sent_signals[signal_id] = datetime.utcnow().isoformat()
+                sent_signals[signal_id] = {
+                    "entry": signal['entry'],
+                    "tp": signal['tp'],
+                    "sl": signal['sl'],
+                    "sent_at": datetime.utcnow().isoformat()
+                }
                 with open("sent_signals.json", "w") as f:
                     json.dump(sent_signals, f, indent=2)
 
                 print(f"[{symbol}] ✅ Signal envoyé : {signal['type']}\n")
-
             else:
                 print(f"[{symbol}] ❌ Signal rejeté après analyse (confluence insuffisante)\n")
 
