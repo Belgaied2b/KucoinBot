@@ -3,8 +3,8 @@
 def analyze_signal(df, direction="long"):
     """
     Analyse technique pour valider un signal CONFIRMÉ.
-    Repose uniquement sur les vérifications externes (COS, BOS).
-    Ajoute des logs de rejet si les conditions échouent.
+    - R:R non bloquant
+    - Ajoute log terminal et commentaire Telegram si R:R < 1.5
     """
 
     try:
@@ -26,23 +26,23 @@ def analyze_signal(df, direction="long"):
         ma200 = df['close'].rolling(200).mean().iloc[-1]
         ma_ok = price > ma200 if direction == "long" else price < ma200
 
-        # Log préliminaire si bloqué par structure
-        if not fvg_valid or not in_ote or not ma_ok:
+        if not fvg_valid or not in_ote:
             print(f"[{df.name}] ❌ Rejeté : FVG={fvg_valid} | OTE={in_ote} | MA OK={ma_ok} | R:R=N/A")
             return None
 
         entry = ote_zone["entry"]
         sl = fvg_info["sl"]
         tp = calculate_rr(entry, sl, rr_ratio=2.5, direction=direction)
-
         rr = abs((tp - entry) / (entry - sl))
+
         if rr < 1.5:
-            print(f"[{df.name}] ❌ Rejeté : FVG=True | OTE=True | MA OK=True | R:R={rr:.2f} ❌")
-            return None
+            print(f"[{df.name}] ⚠️ R:R faible : {rr:.2f} (signal quand même envoyé)")
+            rr_comment = f"⚠️ R:R = {rr:.2f} (risque élevé)"
+        else:
+            print(f"[{df.name}] ✅ Signal validé : entry={entry:.8f} | SL={sl:.8f} | TP={tp:.8f} | R:R={rr:.2f}")
+            rr_comment = f"✔️ R:R = {rr:.2f}"
 
-        comment = "🎯 Signal confirmé – entrée idéale après repli"
-
-        print(f"[{df.name}] ✅ Signal validé : entry={entry:.8f} | SL={sl:.8f} | TP={tp:.8f} | R:R={rr:.2f}")
+        comment = f"🎯 Signal confirmé – entrée idéale après repli\n{rr_comment}"
 
         return {
             "type": "CONFIRMÉ",
