@@ -1,83 +1,56 @@
-import pandas as pd
-from indicators import compute_rsi, compute_macd, compute_atr
+# signal_analysis.py
 
-def analyze_signal(df_1h, df_4h=None, direction="long", test_mode=False):
-    if df_1h.empty:
-        print(f"[❌] Données manquantes pour analyse.")
+def analyze_signal(df, direction="long"):
+    from indicators import compute_rsi, compute_macd, compute_fvg, compute_ote
+    from risk_manager import calculate_rr
+    from scanner import is_cos_valid, is_bos_valid, is_btc_favorable
+
+    try:
+        rsi_series = compute_rsi(df['close'])
+        macd_line, signal_line = compute_macd(df['close'])
+
+        fvg_info = compute_fvg(df, direction)
+        ote_info = compute_ote(df, direction)
+        entry = ote_info["entry"]
+        sl = fvg_info["sl"]
+        price = df["close"].iloc[-1]
+
+        ma200 = df["close"].rolling(200).mean().iloc[-1]
+        ma_ok = price > ma200 if direction == "long" else price < ma200
+        cos = is_cos_valid(df)
+        bos = is_bos_valid(df)
+        btc_ok = is_btc_favorable()
+
+        # ❌ Rejet si l'un des critères majeurs échoue
+        if not all([fvg_info["valid"], ote_info["in_ote"], cos, bos, ma_ok, btc_ok]):
+            return None
+
+        # ✅ SL doit être défini
+        if sl is None:
+            return None
+
+        # ✅ Calcul TP
+        tp = calculate_rr(entry, sl, rr_ratio=2.5, direction=direction)
+        rr = abs((tp - entry) / (entry - sl))
+        if rr < 1.5:
+            return None
+
+        comment = f"🎯 Signal confirmé – entrée idéale après repli\n✔️ R:R = {rr:.2f}"
+
+        return {
+            "type": "CONFIRMÉ",
+            "direction": direction.upper(),
+            "entry": round(entry, 8),
+            "sl": round(sl, 8),
+            "tp": round(tp, 8),
+            "rsi": round(rsi_series.iloc[-1], 2),
+            "macd": round(macd_line.iloc[-1], 6),
+            "signal_line": round(signal_line.iloc[-1], 6),
+            "comment": comment,
+            "ote_zone": ote_info["zone"],
+            "fvg_zone": fvg_info["zone"] if "zone" in fvg_info else None
+        }
+
+    except Exception as e:
+        print(f"[{df.name}] ⚠️ Erreur dans analyze_signal : {e}")
         return None
-
-    rsi = compute_rsi(df_1h['close'])
-    macd_line, signal_line = compute_macd(df_1h['close'])
-    atr = compute_atr(df_1h)
-
-    price = df_1h['close'].iloc[-1]
-    high = df_1h['high'].rolling(20).max().iloc[-2]
-    low = df_1h['low'].rolling(20).min().iloc[-2]
-    ma200 = df_1h['close'].rolling(200).mean().iloc[-1]
-
-    last_rsi = rsi.iloc[-1]
-    last_macd = macd_line.iloc[-1]
-    last_signal = signal_line.iloc[-1]
-    last_atr = atr.iloc[-1]
-
-    if direction == "long":
-        fib618 = low + 0.618 * (high - low)
-        fib786 = low + 0.786 * (high - low)
-        in_ote = fib618 <= price <= fib786
-        fvg_valid = price <= high + 5
-        entry = round(fib618, 6)
-        sl = round(low - last_atr, 6)
-        risk = round(entry - sl, 6)
-        tp = round(entry + risk * 2.5, 6)
-        ma_ok = price > ma200
-    else:
-        fib618 = high - 0.618 * (high - low)
-        fib786 = high - 0.786 * (high - low)
-        in_ote = fib786 <= price <= fib618
-        fvg_valid = price >= low - 5
-        entry = round(fib618, 6)
-        sl = round(high + last_atr, 6)
-        risk = round(sl - entry, 6)
-        tp = round(entry - risk * 2.5, 6)
-        ma_ok = price < ma200
-
-    rr = round(abs(tp - entry) / abs(entry - sl), 2)
-
-    print(f"[🧠] {direction.upper()} | Price={price:.4f} | RSI={last_rsi:.2f} | MACD={last_macd:.4f} | Signal={last_signal:.4f}")
-    print(f"↪️ OTE={in_ote} | FVG={fvg_valid} | MA200 OK={'YES' if ma_ok else 'NO'} | R:R={rr}")
-
-    # ✅ COS robuste
-    lows = df_1h['low'].iloc[-9:]
-    highs = df_1h['high'].iloc[-9:]
-    cos = (
-        lows.iloc[0] < lows.iloc[3] < lows.iloc[6] and
-        highs.iloc[0] < highs.iloc[3] < highs.iloc[6]
-    )
-
-    # ✅ BOS
-    recent_high = df_1h['high'].iloc[-5:-1].max()
-    structure_ok = price > recent_high if direction == "long" else price < recent_high
-
-    if not cos or not structure_ok:
-        print(f"[🔁] Structure non valide : COS={cos} BOS={structure_ok}")
-        return None
-
-    signal_type = "CONFIRMÉ" if in_ote and fvg_valid else "ANTICIPÉ"
-    comment = (
-        "🎯 Signal confirmé – entrée idéale après repli"
-        if signal_type == "CONFIRMÉ"
-        else "⏳ Structure confirmée – attendre repli OTE/FVG"
-    )
-
-    return {
-        "symbol": df_1h.name if hasattr(df_1h, "name") else "UNKNOWN",
-        "type": signal_type,
-        "direction": direction.upper(),
-        "entry": entry,
-        "sl": sl,
-        "tp": tp,
-        "rr": rr,
-        "ote_zone": (round(fib786, 6), round(fib618, 6)),
-        "fvg_zone": (round(high, 6), round(price, 6)),
-        "comment": comment
-    }
