@@ -1,9 +1,8 @@
 def analyze_signal(df, direction="long"):
     """
     Analyse complète d'un signal CONFIRMÉ :
-    - Valide FVG, OTE, BOS, COS, MA200, BTC
-    - SL défini à partir de la FVG
-    - Si SL incohérent, recalculé automatiquement à -0.5% sous l'entrée
+    - FVG, OTE, BOS, COS, MA200, BTC
+    - SL issu de FVG, ajusté si incohérent
     """
 
     try:
@@ -33,16 +32,12 @@ def analyze_signal(df, direction="long"):
             print(f"[{df.name}] ❌ Rejeté (structure invalide)")
             return None
 
-        # ⚠️ Si SL incohérent → recalcul propre
+        # Recal SL si incohérent
         if (direction == "long" and sl >= entry) or (direction == "short" and sl <= entry):
             print(f"[{df.name}] ⚠️ SL incohérent. Recalcul automatique.")
-            adjustment = 0.005  # 0.5%
-            if direction == "long":
-                sl = entry - (entry * adjustment)
-            else:
-                sl = entry + (entry * adjustment)
+            adjustment = 0.005
+            sl = entry - entry * adjustment if direction == "long" else entry + entry * adjustment
 
-        # Calcul du TP
         tp = calculate_rr(entry, sl, rr_ratio=2.5, direction=direction)
         rr = abs((tp - entry) / (entry - sl))
         if rr < 1.5:
@@ -64,7 +59,8 @@ def analyze_signal(df, direction="long"):
             "signal_line": round(signal_line.iloc[-1], 6),
             "comment": comment,
             "ote_zone": ote["zone"],
-            "fvg_zone": fvg["zone"] if "zone" in fvg else None
+            "fvg_zone": fvg["zone"] if "zone" in fvg else None,
+            "symbol": df.name  # ✅ correction ici
         }
 
     except Exception as e:
