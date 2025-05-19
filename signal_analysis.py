@@ -2,14 +2,10 @@
 
 def analyze_signal(df, direction="long"):
     """
-    Analyse technique pour valider un signal CONFIRMÉ avec filtres stricts :
-    - FVG valide
-    - OTE valide
-    - BOS + COS obligatoires
-    - MA200 directionnelle
-    - BTC favorable (reçu en paramètre ou à intégrer ailleurs)
-    - R:R ≥ 1.5
-    - RSI présent mais non bloquant
+    Analyse technique pour valider un signal CONFIRMÉ.
+    - Tous les filtres doivent être au vert
+    - RSI est affiché mais non bloquant
+    - SL doit être < entrée en LONG, ou > entrée en SHORT
     """
 
     try:
@@ -22,30 +18,37 @@ def analyze_signal(df, direction="long"):
         fvg_info = compute_fvg(df, direction)
         ote_info = compute_ote(df, direction)
 
+        price = df['close'].iloc[-1]
         current_rsi = rsi_series.iloc[-1]
         current_macd = macd_line.iloc[-1]
         current_signal = signal_line.iloc[-1]
-        price = df['close'].iloc[-1]
+
+        fvg_valid = fvg_info["valid"]
+        in_ote = ote_info["in_ote"]
         ma200 = df['close'].rolling(200).mean().iloc[-1]
         ma_ok = price > ma200 if direction == "long" else price < ma200
         cos = is_cos_valid(df)
         bos = is_bos_valid(df)
         btc_ok = is_btc_favorable()
 
-        # Filtres bloquants
-        if not all([fvg_info["valid"], ote_info["in_ote"], cos, bos, ma_ok, btc_ok]):
-            print(f"[{df.name}] ❌ Rejeté : FVG={fvg_info['valid']} | OTE={ote_info['in_ote']} | COS={cos} | BOS={bos} | MA200={ma_ok} | BTC={btc_ok}")
-            return None
-
-        # SL uniquement via FVG
-        sl = fvg_info["sl"]
-        if sl is None:
-            print(f"[{df.name}] ❌ Rejeté : SL non défini (FVG invalide)")
+        if not all([fvg_valid, in_ote, cos, bos, ma_ok, btc_ok]):
+            print(f"[{df.name}] ❌ Rejeté : FVG={fvg_valid} | OTE={in_ote} | COS={cos} | BOS={bos} | MA200={ma_ok} | BTC={btc_ok}")
             return None
 
         entry = ote_info["entry"]
+        sl = fvg_info["sl"]
+        if sl is None:
+            print(f"[{df.name}] ❌ Rejeté : SL non défini")
+            return None
+
+        # 🔴 CORRECTION ICI : rejet si SL incohérent
+        if (direction == "long" and sl >= entry) or (direction == "short" and sl <= entry):
+            print(f"[{df.name}] ❌ Rejeté : SL incohérent (entry={entry:.6f}, SL={sl:.6f})")
+            return None
+
         tp = calculate_rr(entry, sl, rr_ratio=2.5, direction=direction)
         rr = abs((tp - entry) / (entry - sl))
+
         if rr < 1.5:
             print(f"[{df.name}] ❌ Rejeté : R:R = {rr:.2f} < 1.5")
             return None
