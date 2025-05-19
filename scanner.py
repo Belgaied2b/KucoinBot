@@ -6,25 +6,21 @@ from graph import generate_chart
 from indicators import compute_rsi as rsi, compute_macd as macd
 from config import CHAT_ID
 
-# Chargement des signaux déjà envoyés
 if os.path.exists("sent_signals.json"):
     with open("sent_signals.json", "r") as f:
         sent_signals = json.load(f)
 else:
     sent_signals = {}
 
-# ✅ COS réaliste : creux plus haut = continuation haussière
 def is_cos_valid(df):
     recent = df[-20:]
     return recent['low'].iloc[-1] > recent['low'].min()
 
-# BOS (breakout de structure) = close > high[-5]
 def is_bos_valid(df):
     recent_high = df['high'].iloc[-5:-1].max()
     current_close = df['close'].iloc[-1]
     return current_close > recent_high
 
-# BTC favorable = RSI > 50 et MACD haussier
 def is_btc_favorable():
     try:
         df = fetch_klines('BTC/USDT:USDT', interval='1h', limit=100)
@@ -34,7 +30,6 @@ def is_btc_favorable():
     except:
         return True
 
-# 🔁 Mise à jour des signaux envoyés
 async def update_existing_signals(bot):
     updated_signals = {}
     for signal_id, data in sent_signals.items():
@@ -72,7 +67,7 @@ async def update_existing_signals(bot):
                 "sl": new_signal["sl"],
                 "sent_at": datetime.utcnow().isoformat(),
                 "direction": direction.upper(),
-                "symbol": symbol  # ✅ correction ici
+                "symbol": symbol  # ✅ Inclus ici
             }
 
         except Exception as e:
@@ -81,7 +76,6 @@ async def update_existing_signals(bot):
     with open("sent_signals.json", "w") as f:
         json.dump(updated_signals, f, indent=2)
 
-# 📤 Scan & détection des signaux
 async def scan_and_send_signals(bot, chat_id):
     print(f"\n🔁 Scan déclenché à {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC")
     await update_existing_signals(bot)
@@ -124,7 +118,7 @@ async def scan_and_send_signals(bot, chat_id):
                     "sl": signal['sl'],
                     "sent_at": datetime.utcnow().isoformat(),
                     "direction": signal['direction'],
-                    "symbol": symbol  # ✅ correction ici aussi
+                    "symbol": symbol  # ✅ Inclus ici aussi
                 }
 
                 with open("sent_signals.json", "w") as f:
