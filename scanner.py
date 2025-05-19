@@ -12,22 +12,14 @@ if os.path.exists("sent_signals.json"):
 else:
     sent_signals = {}
 
-# ✅ Nouvelle version adaptative de COS
+# ✅ COS adaptatif
 def is_cos_valid(df):
-    """
-    Détecte un Changement de Structure (COS) haussier intelligent :
-    - En analysant les 20 dernières bougies
-    - Si le dernier plus haut casse une zone de résistance précédente
-    """
     if len(df) < 50:
         return False
-
     recent_zone = df[-20:]
     previous_zone = df[-40:-20]
-
     prev_high = previous_zone['high'].max()
     last_high = recent_zone['high'].iloc[-1]
-
     return last_high > prev_high
 
 def is_bos_valid(df):
@@ -82,6 +74,8 @@ async def scan_and_send_signals(bot, chat_id):
 
             if not signal or signal["type"] != "CONFIRMÉ":
                 continue
+
+            signal["symbol"] = symbol  # ✅ CORRECTION AJOUTÉE ICI
 
             signal_id = f"{symbol}-{signal['type']}"
             if signal_id in sent_signals:
