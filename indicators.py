@@ -26,21 +26,15 @@ def compute_atr(df, period=14):
     return atr
 
 def compute_fvg(df):
-    """
-    Détecte un Fair Value Gap (FVG) sur les 3 dernières bougies.
-    Renvoie un FVG valide si une bougie laisse un 'trou' entre le corps et l'ombre précédente.
-    """
     try:
         last = df.iloc[-1]
         prev = df.iloc[-2]
         before_prev = df.iloc[-3]
 
-        # FVG haussier : low actuel > high 2 bougies avant
         if last['low'] > before_prev['high']:
             sl = before_prev['low']
             return {"valid": True, "sl": sl}
 
-        # FVG baissier : high actuel < low 2 bougies avant
         if last['high'] < before_prev['low']:
             sl = before_prev['high']
             return {"valid": True, "sl": sl}
@@ -49,14 +43,11 @@ def compute_fvg(df):
     except:
         return {"valid": False, "sl": None}
 
-def compute_ote(df, direction="long"):
+def compute_ote(df, direction="long", tolerance=0.015):
     """
-    Calcule la zone OTE (Optimal Trade Entry) :
-    - zone entre le retracement 0.618 et 0.786 de Fibonacci
-    - pour une tendance directionnelle
+    Calcule la zone OTE avec une tolérance de ±1.5 % autour de la zone Fibo 0.618–0.786
     """
     try:
-        # On prend les 50 dernières bougies pour repérer le swing
         lookback = df[-50:]
         high = lookback['high'].max()
         low = lookback['low'].min()
@@ -64,31 +55,43 @@ def compute_ote(df, direction="long"):
         if direction == "long":
             fib618 = low + 0.618 * (high - low)
             fib786 = low + 0.786 * (high - low)
-            entry_zone = (fib786, fib618)
-            entry = (fib786 + fib618) / 2
-            price = df['close'].iloc[-1]
-            return {
-                "in_ote": fib786 <= price <= fib618,
-                "entry": entry,
-                "zone": entry_zone
-            }
-
-        else:  # short
+            min_ote = fib786 * (1 - tolerance)
+            max_ote = fib618 * (1 + tolerance)
+        else:
             fib618 = high - 0.618 * (high - low)
             fib786 = high - 0.786 * (high - low)
-            entry_zone = (fib618, fib786)
-            entry = (fib618 + fib786) / 2
-            price = df['close'].iloc[-1]
-            return {
-                "in_ote": fib618 <= price <= fib786,
-                "entry": entry,
-                "zone": entry_zone
-            }
+            min_ote = fib618 * (1 - tolerance)
+            max_ote = fib786 * (1 + tolerance)
+
+        entry = (fib618 + fib786) / 2
+        price = df['close'].iloc[-1]
+
+        return {
+            "in_ote": min_ote <= price <= max_ote,
+            "entry": entry,
+            "zone": (round(min_ote, 6), round(max_ote, 6)),
+            "price": price
+        }
 
     except Exception as e:
         print(f"⚠️ Erreur OTE : {e}")
         return {
             "in_ote": False,
             "entry": df['close'].iloc[-1],
-            "zone": (None, None)
+            "zone": (None, None),
+            "price": df['close'].iloc[-1]
         }
+
+def is_cos_valid(df):
+    if len(df) < 50:
+        return False
+    recent_zone = df[-20:]
+    previous_zone = df[-40:-20]
+    prev_high = previous_zone['high'].max()
+    last_high = recent_zone['high'].iloc[-1]
+    return last_high > prev_high
+
+def is_bos_valid(df):
+    recent_high = df['high'].iloc[-5:-1].max()
+    current_close = df['close'].iloc[-1]
+    return current_close > recent_high
