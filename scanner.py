@@ -1,5 +1,3 @@
-# scanner.py
-
 import os, json
 from datetime import datetime
 from kucoin_utils import fetch_symbols, fetch_klines
@@ -37,24 +35,27 @@ def is_btc_favorable():
 
 async def update_existing_signals(bot):
     updated_signals = {}
-    for symbol_id, data in sent_signals.items():
+    for signal_id, data in sent_signals.items():
         try:
-            symbol, _ = symbol_id.split('-')
+            symbol, direction = signal_id.split('-')
             df = fetch_klines(symbol)
             df.name = symbol
-            new_signal = analyze_signal(df, direction="long")
+            new_signal = analyze_signal(df, direction=direction.lower())
 
             if not new_signal:
-                print(f"[{symbol}] ❌ Signal invalidé – suppression")
+                print(f"[{symbol}] ❌ Signal {direction} invalidé – supprimé")
                 continue
 
-            if (
-                round(data["entry"], 6) != round(new_signal["entry"], 6) or
-                round(data["sl"], 6) != round(new_signal["sl"], 6) or
+            # Mise à jour si SL/TP/Entry changent
+            changed = any([
+                round(data["entry"], 6) != round(new_signal["entry"], 6),
+                round(data["sl"], 6) != round(new_signal["sl"], 6),
                 round(data["tp"], 6) != round(new_signal["tp"], 6)
-            ):
+            ])
+
+            if changed:
                 image_path = generate_chart(df, new_signal)
-                message = f"""♻️ Mise à jour : {symbol} - Signal CONFIRMÉ
+                message = f"""♻️ Mise à jour : {symbol} - Signal {direction.upper()}
 
 🔵 Nouvelle Entrée : {new_signal['entry']:.8f}
 🛑 SL : {new_signal['sl']:.8f}
@@ -62,45 +63,50 @@ async def update_existing_signals(bot):
 📈 {new_signal['comment']}
 """
                 await bot.send_photo(chat_id=CHAT_ID, photo=open(image_path, 'rb'), caption=message)
-                print(f"[{symbol}] 🔁 Signal mis à jour")
+                print(f"[{symbol}] 🔁 Signal {direction} mis à jour")
 
-            updated_signals[symbol_id] = {
+            updated_signals[signal_id] = {
                 "entry": new_signal["entry"],
                 "tp": new_signal["tp"],
                 "sl": new_signal["sl"],
-                "sent_at": datetime.utcnow().isoformat()
+                "sent_at": datetime.utcnow().isoformat(),
+                "direction": direction.upper(),
+                "symbol": symbol
             }
 
         except Exception as e:
-            print(f"[{symbol_id}] ⚠️ Erreur update: {e}")
+            print(f"[{signal_id}] ⚠️ Erreur update: {e}")
 
     with open("sent_signals.json", "w") as f:
         json.dump(updated_signals, f, indent=2)
 
 async def scan_and_send_signals(bot, chat_id):
-    print(f"\n--- Scan lancé à {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC ---")
+    print(f"\n🔁 Scan déclenché à {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC")
     await update_existing_signals(bot)
 
     symbols = fetch_symbols()
+    print(f"🔍 Nombre de paires analysées : {len(symbols)}\n")
+
     for symbol in symbols:
-        try:
-            df = fetch_klines(symbol)
-            if df is None or len(df) < 100:
-                continue
+        for direction in ["long", "short"]:
+            try:
+                df = fetch_klines(symbol)
+                if df is None or len(df) < 100:
+                    continue
 
-            df.name = symbol
-            signal = analyze_signal(df, direction="long")
-            if not signal or signal["type"] != "CONFIRMÉ":
-                continue
+                df.name = symbol
+                signal = analyze_signal(df, direction=direction)
+                if not signal or signal["type"] != "CONFIRMÉ":
+                    continue
 
-            signal["symbol"] = symbol
-            signal_id = f"{symbol}-CONFIRMÉ"
-            if signal_id in sent_signals:
-                continue
+                signal_id = f"{symbol}-{direction.upper()}"
+                if signal_id in sent_signals:
+                    continue
 
-            image_path = generate_chart(df, signal)
-            message = f"""
-{symbol} - Signal CONFIRMÉ ({signal['direction']})
+                image_path = generate_chart(df, signal)
+
+                message = f"""
+{symbol} - Signal {signal['type']} ({signal['direction']})
 
 🔵 Entrée idéale : {signal['entry']:.8f}
 🛑 SL : {signal['sl']:.8f}
@@ -108,18 +114,39 @@ async def scan_and_send_signals(bot, chat_id):
 📈 {signal['comment']}
 """.strip()
 
-            await bot.send_photo(chat_id=chat_id, photo=open(image_path, 'rb'), caption=message)
-            sent_signals[signal_id] = {
-                "entry": signal['entry'],
-                "tp": signal['tp'],
-                "sl": signal['sl'],
-                "sent_at": datetime.utcnow().isoformat()
-            }
+                await bot.send_photo(chat_id=chat_id, photo=open(image_path, 'rb'), caption=message)
 
-            with open("sent_signals.json", "w") as f:
-                json.dump(sent_signals, f, indent=2)
+                sent_signals[signal_id] = {
+                    "entry": signal['entry'],
+                    "tp": signal['tp'],
+                    "sl": signal['sl'],
+                    "sent_at": datetime.utcnow().isoformat(),
+                    "direction": signal['direction'],
+                    "symbol": symbol
+                }
 
-            print(f"[{symbol}] ✅ Signal envoyé")
+                with open("sent_signals.json", "w") as f:
+                    json.dump(sent_signals, f, indent=2)
 
-        except Exception as e:
-            print(f"[{symbol}] ⚠️ Erreur : {e}")
+                print(f"[{symbol}] ✅ Signal {direction.upper()} envoyé")
+
+            except Exception as e:
+                print(f"[{symbol}] ⚠️ Erreur {direction}: {e}")
+
+async def last_signal(update, context):
+    if not sent_signals:
+        await update.message.reply_text("Aucun signal enregistré pour le moment.")
+        return
+    last = sorted(sent_signals.items(), key=lambda x: x[1]["sent_at"])[-1]
+    symbol = last[1]["symbol"]
+    direction = last[1]["direction"]
+    entry = last[1]["entry"]
+    sl = last[1]["sl"]
+    tp = last[1]["tp"]
+    await update.message.reply_text(f"""
+Dernier signal : {symbol} ({direction})
+
+🔵 Entrée : {entry:.8f}
+🛑 SL : {sl:.8f}
+🎯 TP : {tp:.8f}
+""".strip())
