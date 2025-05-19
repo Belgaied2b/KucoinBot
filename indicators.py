@@ -25,28 +25,28 @@ def compute_atr(df, period=14):
     atr = tr.rolling(window=period).mean()
     return atr
 
-def compute_fvg(df):
+def compute_fvg(df, direction="long"):
     try:
         last = df.iloc[-1]
-        prev = df.iloc[-2]
         before_prev = df.iloc[-3]
 
-        if last['low'] > before_prev['high']:
-            sl = before_prev['low']
-            return {"valid": True, "sl": sl}
-
-        if last['high'] < before_prev['low']:
-            sl = before_prev['high']
-            return {"valid": True, "sl": sl}
+        if direction == "long":
+            # FVG haussier = prix saute au-dessus du précédent
+            if last['low'] > before_prev['high']:
+                sl = before_prev['low']  # SL sous le FVG
+                return {"valid": True, "sl": sl}
+        else:
+            # FVG baissier = prix saute sous le précédent
+            if last['high'] < before_prev['low']:
+                sl = before_prev['high']  # SL au-dessus du FVG
+                return {"valid": True, "sl": sl}
 
         return {"valid": False, "sl": None}
-    except:
+    except Exception as e:
+        print(f"⚠️ Erreur FVG : {e}")
         return {"valid": False, "sl": None}
 
 def compute_ote(df, direction="long", tolerance=0.015):
-    """
-    Calcule la zone OTE avec une tolérance de ±1.5 % autour de la zone Fibo 0.618–0.786
-    """
     try:
         lookback = df[-50:]
         high = lookback['high'].max()
