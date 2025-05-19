@@ -48,7 +48,6 @@ async def update_existing_signals(bot):
                 print(f"[{symbol}] ❌ Signal {direction} invalidé – supprimé")
                 continue
 
-            # Mise à jour si valeurs changées
             changed = any([
                 round(data["entry"], 6) != round(new_signal["entry"], 6),
                 round(data["sl"], 6) != round(new_signal["sl"], 6),
@@ -73,7 +72,7 @@ async def update_existing_signals(bot):
                 "sl": new_signal["sl"],
                 "sent_at": datetime.utcnow().isoformat(),
                 "direction": direction.upper(),
-                "symbol": symbol
+                "symbol": symbol  # ✅ correction ici
             }
 
         except Exception as e:
@@ -125,7 +124,7 @@ async def scan_and_send_signals(bot, chat_id):
                     "sl": signal['sl'],
                     "sent_at": datetime.utcnow().isoformat(),
                     "direction": signal['direction'],
-                    "symbol": symbol
+                    "symbol": symbol  # ✅ correction ici aussi
                 }
 
                 with open("sent_signals.json", "w") as f:
