@@ -1,11 +1,9 @@
 def analyze_signal(df, direction="long"):
     """
-    Analyse complète CONFIRMÉ :
-    - FVG, OTE, BOS, COS, MA200, BTC
-    - SL uniquement via FVG
-    - R:R > 1.5
-    - Rejet si SL incohérent (SL >= Entry en LONG)
-    - Log détail des rejets
+    Analyse complète d'un signal CONFIRMÉ :
+    - Valide FVG, OTE, BOS, COS, MA200, BTC
+    - SL défini à partir de la FVG
+    - Si SL incohérent, recalculé automatiquement à -0.5% sous l'entrée
     """
 
     try:
@@ -22,7 +20,6 @@ def analyze_signal(df, direction="long"):
         price = df['close'].iloc[-1]
         entry = ote["entry"]
         sl = fvg["sl"]
-        tp = None
 
         ma200 = df['close'].rolling(200).mean().iloc[-1]
         ma_ok = price > ma200 if direction == "long" else price < ma200
@@ -30,19 +27,22 @@ def analyze_signal(df, direction="long"):
         bos = is_bos_valid(df)
         btc_ok = is_btc_favorable()
 
-        # 🔍 Log détail
         print(f"[{df.name}] Check: FVG={fvg['valid']} | OTE={ote['in_ote']} | COS={cos} | BOS={bos} | MA200={ma_ok} | BTC={btc_ok}")
 
-        # ❌ Rejet si structure invalide
         if not all([fvg["valid"], ote["in_ote"], cos, bos, ma_ok, btc_ok]):
             print(f"[{df.name}] ❌ Rejeté (structure invalide)")
             return None
 
-        # ❌ Rejet si SL non défini ou incohérent
-        if sl is None or (direction == "long" and sl >= entry) or (direction == "short" and sl <= entry):
-            print(f"[{df.name}] ❌ Rejeté : SL incohérent (Entry={entry:.4f}, SL={sl})")
-            return None
+        # ⚠️ Si SL incohérent → recalcul propre
+        if (direction == "long" and sl >= entry) or (direction == "short" and sl <= entry):
+            print(f"[{df.name}] ⚠️ SL incohérent. Recalcul automatique.")
+            adjustment = 0.005  # 0.5%
+            if direction == "long":
+                sl = entry - (entry * adjustment)
+            else:
+                sl = entry + (entry * adjustment)
 
+        # Calcul du TP
         tp = calculate_rr(entry, sl, rr_ratio=2.5, direction=direction)
         rr = abs((tp - entry) / (entry - sl))
         if rr < 1.5:
