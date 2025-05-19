@@ -40,20 +40,20 @@ def compute_ote(df, direction="long", tolerance=0.015):
             fib786 = low + 0.786 * (high - low)
             min_ote = fib786 * (1 - tolerance)
             max_ote = fib618 * (1 + tolerance)
+            in_ote = min_ote <= df['close'].iloc[-1] <= max_ote
         else:
             fib618 = high - 0.618 * (high - low)
             fib786 = high - 0.786 * (high - low)
             min_ote = fib618 * (1 - tolerance)
             max_ote = fib786 * (1 + tolerance)
+            in_ote = max_ote <= df['close'].iloc[-1] <= min_ote
 
         entry = (fib618 + fib786) / 2
-        price = df['close'].iloc[-1]
-
         return {
-            "in_ote": min_ote <= price <= max_ote,
+            "in_ote": in_ote,
             "entry": entry,
             "zone": (round(min_ote, 6), round(max_ote, 6)),
-            "price": price
+            "price": df['close'].iloc[-1]
         }
 
     except Exception as e:
@@ -65,11 +65,6 @@ def compute_ote(df, direction="long", tolerance=0.015):
         }
 
 def compute_fvg(df, direction="long"):
-    """
-    Détecte une zone FVG (Fair Value Gap) sur les 3 dernières bougies.
-    - En LONG : gap haussier => low[0] > high[-2]
-    - En SHORT : gap baissier => high[0] < low[-2]
-    """
     try:
         if len(df) < 3:
             return {"valid": False, "sl": None, "zone": None}
