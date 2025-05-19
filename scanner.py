@@ -14,7 +14,7 @@ if os.path.exists("sent_signals.json"):
 else:
     sent_signals = {}
 
-# 🔁 COS = Change of Structure
+# ✅ COS adaptatif
 def is_cos_valid(df):
     if len(df) < 50:
         return False
@@ -24,13 +24,13 @@ def is_cos_valid(df):
     last_high = recent_zone['high'].iloc[-1]
     return last_high > prev_high
 
-# 🔁 BOS = Break of Structure
+# ✅ BOS (Break of Structure)
 def is_bos_valid(df):
     recent_high = df['high'].iloc[-5:-1].max()
     current_close = df['close'].iloc[-1]
     return current_close > recent_high
 
-# ✅ BTC favorable
+# ✅ Tendance du BTC
 def is_btc_favorable():
     try:
         df = fetch_klines('BTC/USDT:USDT', interval='1h', limit=100)
@@ -40,7 +40,7 @@ def is_btc_favorable():
     except:
         return True
 
-# 🔁 Scan complet avec validation stricte
+# ✅ Scan complet
 async def scan_and_send_signals(bot, chat_id):
     print(f"\n--- Scan lancé à {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC ---")
 
@@ -55,6 +55,7 @@ async def scan_and_send_signals(bot, chat_id):
 
             df.name = symbol
             signal = analyze_signal(df, direction="long")
+
             if not signal or signal["type"] != "CONFIRMÉ":
                 continue
 
