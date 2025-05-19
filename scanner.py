@@ -1,12 +1,12 @@
-import os
-import json
-import pandas as pd
+# scanner.py
+
+import os, json
 from datetime import datetime
-from telegram import Bot
 from kucoin_utils import fetch_symbols, fetch_klines
 from signal_analysis import analyze_signal
 from graph import generate_chart
-from indicators import compute_rsi as rsi, compute_macd as macd, compute_atr
+from indicators import compute_rsi as rsi, compute_macd as macd
+from config import CHAT_ID
 
 if os.path.exists("sent_signals.json"):
     with open("sent_signals.json", "r") as f:
@@ -14,19 +14,17 @@ if os.path.exists("sent_signals.json"):
 else:
     sent_signals = {}
 
+def is_cos_valid(df):
+    recent_zone = df[-20:]
+    previous_zone = df[-40:-20]
+    prev_high = previous_zone['high'].max()
+    last_high = recent_zone['high'].iloc[-1]
+    return last_high > prev_high
+
 def is_bos_valid(df):
     recent_high = df['high'].iloc[-5:-1].max()
     current_close = df['close'].iloc[-1]
     return current_close > recent_high
-
-# ✅ COS robuste (3 points croissants)
-def is_cos_valid(df):
-    lows = df['low'].iloc[-9:]
-    highs = df['high'].iloc[-9:]
-    return (
-        lows.iloc[0] < lows.iloc[3] < lows.iloc[6] and
-        highs.iloc[0] < highs.iloc[3] < highs.iloc[6]
-    )
 
 def is_btc_favorable():
     try:
@@ -35,85 +33,93 @@ def is_btc_favorable():
         df['macd'], df['signal'] = macd(df['close'])
         return df['rsi'].iloc[-1] > 50 and df['macd'].iloc[-1] > df['signal'].iloc[-1]
     except:
-        return True  # fail-safe BTC neutre
+        return True
+
+async def update_existing_signals(bot):
+    updated_signals = {}
+    for symbol_id, data in sent_signals.items():
+        try:
+            symbol, _ = symbol_id.split('-')
+            df = fetch_klines(symbol)
+            df.name = symbol
+            new_signal = analyze_signal(df, direction="long")
+
+            if not new_signal:
+                print(f"[{symbol}] ❌ Signal invalidé – suppression")
+                continue
+
+            if (
+                round(data["entry"], 6) != round(new_signal["entry"], 6) or
+                round(data["sl"], 6) != round(new_signal["sl"], 6) or
+                round(data["tp"], 6) != round(new_signal["tp"], 6)
+            ):
+                image_path = generate_chart(df, new_signal)
+                message = f"""♻️ Mise à jour : {symbol} - Signal CONFIRMÉ
+
+🔵 Nouvelle Entrée : {new_signal['entry']:.8f}
+🛑 SL : {new_signal['sl']:.8f}
+🎯 TP : {new_signal['tp']:.8f}
+📈 {new_signal['comment']}
+"""
+                await bot.send_photo(chat_id=CHAT_ID, photo=open(image_path, 'rb'), caption=message)
+                print(f"[{symbol}] 🔁 Signal mis à jour")
+
+            updated_signals[symbol_id] = {
+                "entry": new_signal["entry"],
+                "tp": new_signal["tp"],
+                "sl": new_signal["sl"],
+                "sent_at": datetime.utcnow().isoformat()
+            }
+
+        except Exception as e:
+            print(f"[{symbol_id}] ⚠️ Erreur update: {e}")
+
+    with open("sent_signals.json", "w") as f:
+        json.dump(updated_signals, f, indent=2)
 
 async def scan_and_send_signals(bot, chat_id):
     print(f"\n--- Scan lancé à {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC ---")
+    await update_existing_signals(bot)
 
     symbols = fetch_symbols()
-    print(f"🔍 Nombre de paires analysées : {len(symbols)}\n")
-
     for symbol in symbols:
         try:
-            df = fetch_klines(symbol, interval='1h', limit=200)
+            df = fetch_klines(symbol)
             if df is None or len(df) < 100:
-                continue
-
-            price = df['close'].iloc[-1]
-            rsi_values = rsi(df['close'])
-            macd_line, signal_line = macd(df['close'])
-            atr_series = compute_atr(df)
-            atr = round(atr_series.iloc[-1], 6)
-            ma200 = df['close'].rolling(200).mean().iloc[-1]
-            last_rsi = round(rsi_values.iloc[-1], 2)
-            last_macd = round(macd_line.iloc[-1], 6)
-            last_signal = round(signal_line.iloc[-1], 6)
-            last_ma200 = round(ma200, 6)
-
-            cos = is_cos_valid(df)
-            bos = is_bos_valid(df)
-            btc_ok = is_btc_favorable()
-
-            print(f"[{symbol}] 🔍 Price={price:.6f} | RSI={last_rsi} | MACD={last_macd} | SIGNAL={last_signal} | MA200={last_ma200} | ATR={atr}")
-            print(f"↪️ COS={'✅' if cos else '❌'}  BOS={'✅' if bos else '❌'}  BTC={'✅' if btc_ok else '❌'}")
-
-            if not btc_ok:
-                print(f"[{symbol}] ❌ Signal bloqué : BTC pas favorable\n")
-                continue
-            if not cos:
-                print(f"[{symbol}] ❌ Signal bloqué : COS non détecté\n")
-                continue
-            if not bos:
-                print(f"[{symbol}] ❌ Signal bloqué : BOS non validé\n")
                 continue
 
             df.name = symbol
             signal = analyze_signal(df, direction="long")
+            if not signal or signal["type"] != "CONFIRMÉ":
+                continue
 
-            if signal:
-                print(f"[{symbol}] ✅ Signal analysé avec succès.")
-                print(f"📌 Entry={signal['entry']} | SL={signal['sl']} | TP={signal['tp']}")
-                if 'ote_zone' in signal:
-                    print(f"🔵 OTE zone : {signal['ote_zone']}")
-                if 'fvg_zone' in signal:
-                    print(f"🟠 FVG zone : {signal['fvg_zone']}")
+            signal["symbol"] = symbol
+            signal_id = f"{symbol}-CONFIRMÉ"
+            if signal_id in sent_signals:
+                continue
 
-                signal_id = f"{symbol}-{signal['type']}"
-                if signal_id in sent_signals:
-                    print(f"[{symbol}] 🔁 Signal déjà envoyé ({signal['type']})\n")
-                    continue
+            image_path = generate_chart(df, signal)
+            message = f"""
+{symbol} - Signal CONFIRMÉ ({signal['direction']})
 
-                image_path = generate_chart(df, signal)
-
-                message = f"""
-{symbol} - Signal {signal['type']} ({signal['direction']})
-
-🔵 Entrée idéale : {signal['entry']}
-🛑 SL : {signal['sl']}
-🎯 TP : {signal['tp']}
+🔵 Entrée idéale : {signal['entry']:.8f}
+🛑 SL : {signal['sl']:.8f}
+🎯 TP : {signal['tp']:.8f}
 📈 {signal['comment']}
 """.strip()
 
-                await bot.send_photo(chat_id=chat_id, photo=open(image_path, 'rb'), caption=message)
+            await bot.send_photo(chat_id=chat_id, photo=open(image_path, 'rb'), caption=message)
+            sent_signals[signal_id] = {
+                "entry": signal['entry'],
+                "tp": signal['tp'],
+                "sl": signal['sl'],
+                "sent_at": datetime.utcnow().isoformat()
+            }
 
-                sent_signals[signal_id] = datetime.utcnow().isoformat()
-                with open("sent_signals.json", "w") as f:
-                    json.dump(sent_signals, f, indent=2)
+            with open("sent_signals.json", "w") as f:
+                json.dump(sent_signals, f, indent=2)
 
-                print(f"[{symbol}] ✅ Signal envoyé : {signal['type']}\n")
-
-            else:
-                print(f"[{symbol}] ❌ Signal rejeté après analyse (confluence insuffisante)\n")
+            print(f"[{symbol}] ✅ Signal envoyé")
 
         except Exception as e:
-            print(f"[{symbol}] ⚠️ Erreur : {e}\n")
+            print(f"[{symbol}] ⚠️ Erreur : {e}")
