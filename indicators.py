@@ -29,7 +29,7 @@ def compute_atr(df, period=14):
     atr = tr.rolling(window=period).mean()
     return atr
 
-def compute_ote(df, direction="long", tolerance=0.015):
+def compute_ote(df, direction="long", tolerance=0.020):
     try:
         lookback = df[-50:]
         high = lookback['high'].max()
