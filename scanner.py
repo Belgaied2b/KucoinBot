@@ -1,3 +1,5 @@
+# scanner.py
+
 import os
 import json
 from datetime import datetime
@@ -12,7 +14,7 @@ if os.path.exists("sent_signals.json"):
 else:
     sent_signals = {}
 
-# ✅ COS adaptatif
+# 🔁 COS = Change of Structure
 def is_cos_valid(df):
     if len(df) < 50:
         return False
@@ -22,11 +24,13 @@ def is_cos_valid(df):
     last_high = recent_zone['high'].iloc[-1]
     return last_high > prev_high
 
+# 🔁 BOS = Break of Structure
 def is_bos_valid(df):
     recent_high = df['high'].iloc[-5:-1].max()
     current_close = df['close'].iloc[-1]
     return current_close > recent_high
 
+# ✅ BTC favorable
 def is_btc_favorable():
     try:
         df = fetch_klines('BTC/USDT:USDT', interval='1h', limit=100)
@@ -36,6 +40,7 @@ def is_btc_favorable():
     except:
         return True
 
+# 🔁 Scan complet avec validation stricte
 async def scan_and_send_signals(bot, chat_id):
     print(f"\n--- Scan lancé à {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC ---")
 
@@ -48,35 +53,12 @@ async def scan_and_send_signals(bot, chat_id):
             if df is None or len(df) < 100:
                 continue
 
-            price = df['close'].iloc[-1]
-            rsi_values = rsi(df['close'])
-            macd_line, signal_line = macd(df['close'])
-            atr_series = compute_atr(df)
-            atr = round(atr_series.iloc[-1], 6)
-            ma200 = df['close'].rolling(200).mean().iloc[-1]
-            last_rsi = round(rsi_values.iloc[-1], 2)
-            last_macd = round(macd_line.iloc[-1], 6)
-            last_signal = round(signal_line.iloc[-1], 6)
-            last_ma200 = round(ma200, 6)
-
-            cos = is_cos_valid(df)
-            bos = is_bos_valid(df)
-            btc_ok = is_btc_favorable()
-
-            print(f"[{symbol}] 🔍 Price={price:.8f} | RSI={last_rsi} | MACD={last_macd} | SIGNAL={last_signal} | MA200={last_ma200} | ATR={atr}")
-            print(f"↪️ COS={'✅' if cos else '❌'}  BOS={'✅' if bos else '❌'}  BTC={'✅' if btc_ok else '❌'}")
-
-            if not btc_ok or not cos or not bos:
-                continue
-
             df.name = symbol
             signal = analyze_signal(df, direction="long")
-
             if not signal or signal["type"] != "CONFIRMÉ":
                 continue
 
-            signal["symbol"] = symbol  # ✅ CORRECTION AJOUTÉE ICI
-
+            signal["symbol"] = symbol
             signal_id = f"{symbol}-{signal['type']}"
             if signal_id in sent_signals:
                 continue
