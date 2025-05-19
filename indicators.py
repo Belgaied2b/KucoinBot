@@ -56,7 +56,7 @@ def compute_ote(df, direction="long", tolerance=0.015):
             "price": df['close'].iloc[-1]
         }
 
-    except Exception as e:
+    except Exception:
         return {
             "in_ote": False,
             "entry": df['close'].iloc[-1],
@@ -65,28 +65,35 @@ def compute_ote(df, direction="long", tolerance=0.015):
         }
 
 def compute_fvg(df, direction="long"):
+    """
+    FVG détecté sur 3 à 10 dernières bougies.
+    - LONG : low actuelle > high -i
+    - SHORT : high actuelle < low -i
+    """
     try:
-        if len(df) < 3:
+        if len(df) < 10:
             return {"valid": False, "sl": None, "zone": None}
 
-        h2 = df['high'].iloc[-3]
-        l0 = df['low'].iloc[-1]
-        l2 = df['low'].iloc[-3]
-        h0 = df['high'].iloc[-1]
+        for i in range(3, 11):
+            h_back = df['high'].iloc[-i]
+            l_back = df['low'].iloc[-i]
+            h_now = df['high'].iloc[-1]
+            l_now = df['low'].iloc[-1]
 
-        if direction == "long" and l0 > h2:
-            return {
-                "valid": True,
-                "sl": l2,
-                "zone": (h2, l0)
-            }
-        elif direction == "short" and h0 < l2:
-            return {
-                "valid": True,
-                "sl": h2,
-                "zone": (h0, l2)
-            }
+            if direction == "long" and l_now > h_back:
+                return {
+                    "valid": True,
+                    "sl": l_back,
+                    "zone": (h_back, l_now)
+                }
+            elif direction == "short" and h_now < l_back:
+                return {
+                    "valid": True,
+                    "sl": h_back,
+                    "zone": (h_now, l_back)
+                }
 
         return {"valid": False, "sl": None, "zone": None}
+
     except:
         return {"valid": False, "sl": None, "zone": None}
