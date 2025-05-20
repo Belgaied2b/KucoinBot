@@ -30,6 +30,7 @@ def is_btc_favorable():
     except:
         return True
 
+# 🔁 Vérifie les signaux envoyés, supprime ceux invalides
 async def update_existing_signals(bot):
     updated_signals = {}
     for signal_id, data in sent_signals.items():
@@ -37,38 +38,17 @@ async def update_existing_signals(bot):
             symbol, direction = signal_id.split('-')
             df = fetch_klines(symbol)
             df.name = symbol
-            new_signal = analyze_signal(df, direction=direction.lower())
+            signal = analyze_signal(df, direction=direction.lower())
 
-            if not new_signal:
+            if not signal:
+                # ❌ Signal plus valide → supprimer et notifier
                 print(f"[{symbol}] ❌ Signal {direction} invalidé – supprimé")
+                message = f"⚠️ Signal {symbol} ({direction.upper()}) retiré : structure non valide."
+                await bot.send_message(chat_id=CHAT_ID, text=message)
                 continue
 
-            changed = any([
-                round(data["entry"], 6) != round(new_signal["entry"], 6),
-                round(data["sl"], 6) != round(new_signal["sl"], 6),
-                round(data["tp"], 6) != round(new_signal["tp"], 6)
-            ])
-
-            if changed:
-                image_path = generate_chart(df, new_signal)
-                message = f"""♻️ Mise à jour : {symbol} - Signal {direction.upper()}
-
-🔵 Nouvelle Entrée : {new_signal['entry']:.8f}
-🛑 SL : {new_signal['sl']:.8f}
-🎯 TP : {new_signal['tp']:.8f}
-📈 {new_signal['comment']}
-"""
-                await bot.send_photo(chat_id=CHAT_ID, photo=open(image_path, 'rb'), caption=message)
-                print(f"[{symbol}] 🔁 Signal {direction} mis à jour")
-
-            updated_signals[signal_id] = {
-                "entry": new_signal["entry"],
-                "tp": new_signal["tp"],
-                "sl": new_signal["sl"],
-                "sent_at": datetime.utcnow().isoformat(),
-                "direction": direction.upper(),
-                "symbol": symbol  # ✅ Inclus ici
-            }
+            # ✅ Signal toujours valide → on le garde sans rien changer
+            updated_signals[signal_id] = data
 
         except Exception as e:
             print(f"[{signal_id}] ⚠️ Erreur update: {e}")
@@ -76,6 +56,7 @@ async def update_existing_signals(bot):
     with open("sent_signals.json", "w") as f:
         json.dump(updated_signals, f, indent=2)
 
+# 📤 Scan principal : détection et envoi des nouveaux signaux
 async def scan_and_send_signals(bot, chat_id):
     print(f"\n🔁 Scan déclenché à {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC")
     await update_existing_signals(bot)
@@ -97,7 +78,7 @@ async def scan_and_send_signals(bot, chat_id):
 
                 signal_id = f"{symbol}-{direction.upper()}"
                 if signal_id in sent_signals:
-                    continue
+                    continue  # déjà envoyé
 
                 image_path = generate_chart(df, signal)
 
@@ -118,7 +99,7 @@ async def scan_and_send_signals(bot, chat_id):
                     "sl": signal['sl'],
                     "sent_at": datetime.utcnow().isoformat(),
                     "direction": signal['direction'],
-                    "symbol": symbol  # ✅ Inclus ici aussi
+                    "symbol": symbol
                 }
 
                 with open("sent_signals.json", "w") as f:
