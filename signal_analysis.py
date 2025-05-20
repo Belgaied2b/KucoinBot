@@ -52,9 +52,13 @@ def analyze_signal(df, direction="long"):
         elif direction == "short" and (sl - entry) > max_sl_distance:
             sl = entry + max_sl_distance
 
-        # 🎯 Calcul TP
+        # 🎯 Calcul TP et vrai R:R
         tp = calculate_rr(entry, sl, rr_ratio=2.5, direction=direction)
-        rr = abs((tp - entry) / (entry - sl))
+        if direction == "long":
+            rr = abs((tp - entry) / (entry - sl))
+        else:
+            rr = abs((entry - tp) / (sl - entry))
+
         if rr < 1.5:
             print(f"[{df.name}] ❌ Rejeté : R:R={rr:.2f} < 1.5")
             return None
