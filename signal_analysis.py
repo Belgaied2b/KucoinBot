@@ -37,7 +37,7 @@ def analyze_signal(df, direction="long"):
             print(f"[{df.name}] ❌ Rejeté (structure invalide)")
             return None
 
-        # Recal SL si incohérent
+        # Recalcul SL si incohérent
         if (direction == 'long' and sl >= entry) or (direction == 'short' and sl <= entry):
             print(f"[{df.name}] ⚠️ SL incohérent. Recalcul automatique.")
             sl = entry - entry * 0.005 if direction == 'long' else entry + entry * 0.005
@@ -56,17 +56,18 @@ def analyze_signal(df, direction="long"):
         elif direction == 'short' and (sl - entry) > max_sl_distance:
             sl = entry + max_sl_distance
 
-        # Calcul du TP et correction du R:R
+        # Calcul du TP basé sur le RR souhaité (2.5)
         tp = calculate_rr(entry, sl, rr_ratio=2.5, direction=direction)
-        # R:R = (TP - SL) / (Entry - SL)
+
+        # Calcul correct du R:R
         if direction == 'long':
-            rr = abs((tp - sl) / (entry - sl))
+            rr = (tp - entry) / (entry - sl)
         else:
-            rr = abs((sl - tp) / (sl - entry))
+            rr = (entry - tp) / (sl - entry)
 
         # Construction du commentaire et log
         comment = f"🎯 Signal confirmé – entrée idéale après repli\n✔️ R:R = {rr:.2f}"
-        print(f"[{df.name}] ✅ Signal CONFIRMÉ : Entry={entry:.4f}, SL={sl:.4f}, TP={tp:.4f}, R:R={rr:.2f}")
+        print(f"[{df.name}] ✅ Signal CONFIRMÉ : Entry={entry:.8f}, SL={sl:.8f}, TP={tp:.8f}, R:R={rr:.2f}")
 
         return {
             'type': 'CONFIRMÉ',
