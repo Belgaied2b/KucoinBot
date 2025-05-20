@@ -6,6 +6,31 @@ from signal_analysis import analyze_signal
 from graph import generate_chart
 from config import CHAT_ID
 
+# === Fonctions de validation requises par analyze_signal ===
+def is_cos_valid(df):
+    """
+    Vérifie la validité du Change Of Structure (COS).
+    Stub : renvoie toujours True.
+    """
+    # TODO: implémenter la vraie logique de validation du COS
+    return True
+
+def is_bos_valid(df):
+    """
+    Vérifie la validité du Break Of Structure (BOS).
+    Stub : renvoie toujours True.
+    """
+    # TODO: implémenter la vraie logique de validation du BOS
+    return True
+
+def is_btc_favorable():
+    """
+    Vérifie si la tendance globale du BTC est favorable.
+    Stub : renvoie toujours True.
+    """
+    # TODO: implémenter la vraie logique de tendance BTC
+    return True
+
 # === Mémoire des signaux envoyés ===
 if os.path.exists("sent_signals.json"):
     with open("sent_signals.json", "r") as f:
@@ -46,7 +71,11 @@ async def scan_and_send_signals(bot, chat_id):
 📈 {signal['comment']}
 """.strip()
 
-                await bot.send_photo(chat_id=chat_id, photo=open(image_path, 'rb'), caption=message)
+                await bot.send_photo(
+                    chat_id=chat_id,
+                    photo=open(image_path, 'rb'),
+                    caption=message
+                )
 
                 # ✅ Mémoriser le signal
                 sent_signals[signal_id] = {
