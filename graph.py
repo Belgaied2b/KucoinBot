@@ -1,46 +1,68 @@
-# graph.py
-
 import matplotlib.pyplot as plt
-import os
-import time
+import matplotlib.dates as mdates
+import pandas as pd
 
 def generate_chart(df, signal):
-    """
-    Trace le cours et positionne Entry / SL / TP,
-    sauve la figure et la ferme pour libérer la mémoire.
-    """
-    # Récupère le symbole depuis df.name (assigné en amont dans scanner.py)
-    symbol = getattr(df, 'name', 'UNKNOWN')
+    # On ne garde que les 100 dernières barres
+    df = df.tail(100).copy()
 
-    # 1) Création de la figure
-    plt.figure()
-    plt.plot(df.index, df['close'], label='Close')
+    # Conversion timestamp → datetime si nécessaire
+    if not pd.api.types.is_datetime64_any_dtype(df['timestamp']):
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+    df.set_index('timestamp', inplace=True)
 
-    # Entry
-    plt.scatter(
-        df.index[-1],
-        signal['entry'],
-        marker='^',
-        color='blue',
-        label='Entry'
-    )
+    # Récupération du symbole
+    symbol = signal.get('symbol', getattr(df, 'name', 'UNKNOWN'))
 
-    # SL et TP
-    plt.axhline(signal['sl'], linestyle='--', label='SL')
-    plt.axhline(signal['tp'], linestyle='--', label='TP')
+    # Création figure+axes
+    fig, ax = plt.subplots(figsize=(10, 5))
 
-    # Titre et légende
-    plt.title(f"{symbol} – Signal {signal['type']} ({signal['direction']})")
-    plt.legend()
+    # Bougies (mèches + corps)
+    total_seconds = (df.index[-1] - df.index[0]).total_seconds()
+    width = pd.Timedelta(seconds=total_seconds / len(df) * 0.6)
+    for i in range(len(df)):
+        o, c = df['open'].iloc[i], df['close'].iloc[i]
+        low, high = df['low'].iloc[i], df['high'].iloc[i]
+        color = 'green' if c >= o else 'red'
+        ax.plot([df.index[i]]*2, [low, high], color=color, lw=0.5)
+        ax.add_patch(plt.Rectangle(
+            (df.index[i], min(o, c)),
+            width,
+            abs(c - o),
+            color=color
+        ))
 
-    # 2) Sauvegarde
-    out_dir = "charts"
-    os.makedirs(out_dir, exist_ok=True)
-    filename = f"{symbol}_{signal['direction']}_{int(time.time())}.png"
-    path = os.path.join(out_dir, filename)
-    plt.savefig(path)
+    # Zones OTE & FVG
+    if 'ote_zone' in signal:
+        ax.axhspan(signal['ote_zone'][1], signal['ote_zone'][0], color='blue',  alpha=0.2, label='OTE')
+    if 'fvg_zone' in signal:
+        ax.axhspan(signal['fvg_zone'][1], signal['fvg_zone'][0], color='orange',alpha=0.2, label='FVG')
 
-    # 3) Fermeture pour éviter les warnings et fuites
-    plt.close()
+    # MA200
+    if 'ma200' in signal:
+        ax.plot(df.index, [signal['ma200']]*len(df), linestyle='-', linewidth=1, label='MA200')
 
-    return path
+    # Entry, SL, TP
+    ax.axhline(signal['entry'], color='blue',  ls='--', lw=1, label='Entrée')
+    ax.axhline(signal['sl'],    color='red',   ls='--', lw=1, label='SL')
+    ax.axhline(signal['tp'],    color='green', ls='--', lw=1, label='TP')
+
+    # Flèche de direction
+    y0 = signal['entry']
+    y1 = signal['tp']    if signal['direction']=="LONG" else signal['sl']
+    ax.annotate('', xy=(df.index[-1], y1), xytext=(df.index[-1], y0),
+                arrowprops=dict(facecolor='blue', shrink=0.05, width=2, headwidth=8))
+
+    # Titre, légende, format dates
+    ax.set_title(f"{symbol} - {signal['type']} ({signal['direction']})")
+    ax.legend()
+    ax.xaxis.set_major_formatter(mdates.DateFormatter('%m-%d %H:%M'))
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+
+    # Sauvegarde + fermeture
+    filename = f"chart_{symbol.replace('/', '_')}.png"
+    plt.savefig(filename)
+    plt.close(fig)
+
+    return filename
