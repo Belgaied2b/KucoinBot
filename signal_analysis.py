@@ -37,15 +37,16 @@ def analyze_signal(df, direction="long"):
     # Logs
     print(f"[{symbol}]   Entry        : {entry:.4f}")
     print(f"[{symbol}]   OTE valid    : {in_ote}")
-    print(f"[{symbol}]   FVG valid    : {in_fvg} (optionnel)")
+    print(f"[{symbol}]   FVG valid    : {in_fvg}")
     print(f"[{symbol}]   BOS valid    : {bos_ok}")
     print(f"[{symbol}]   COS valid    : {cos_ok}")
     print(f"[{symbol}]   BTC trend    : {btc_ok}")
     print(f"[{symbol}]   MA200 trend  : {ma_ok}")
 
-    # Rejet strict si structure non validée
+    # Rejet si un filtre échoue
     checks = {
         "OTE": in_ote,
+        "FVG": in_fvg,
         "BOS": bos_ok,
         "COS": cos_ok,
         "BTC": btc_ok,
@@ -56,7 +57,7 @@ def analyze_signal(df, direction="long"):
         print(f"[{symbol}] ❌ Rejeté ({', '.join(failed)})\n")
         return None
 
-    # === SL dynamique structurel + sécurisé ===
+    # SL structurel + ajusté
     if dir_up and lows:
         sl = df['low'].iloc[lows[-1]]
     elif not dir_up and highs:
@@ -72,35 +73,30 @@ def analyze_signal(df, direction="long"):
     if dist > max_dist:
         sl = entry - max_dist if dir_up else entry + max_dist
 
-    # === TP1 intelligent : swing avec R:R ≥ 1.5 ===
+    # TP1 intelligent : pivot avec RR ≥ 1.5
     pivots = highs if dir_up else lows
     tp1 = None
     for i in reversed(pivots):
         level = df['high'].iloc[i] if dir_up else df['low'].iloc[i]
         rr = (level - entry) / (entry - sl) if dir_up else (entry - level) / (sl - entry)
         if rr >= 1.5:
-            # sécurise un peu le TP avant le pivot exact
             tp1 = level - atr * 0.2 if dir_up else level + atr * 0.2
             break
 
     if tp1 is None:
-        print(f"[{symbol}] ❌ Aucun TP structurel avec RR ≥ 1.5 trouvé.\n")
+        print(f"[{symbol}] ❌ Aucun TP1 structurel avec RR ≥ 1.5 trouvé\n")
         return None
 
-    # === TP2 = extension = TP1 + (TP1 - Entry) ===
+    # TP2 = extension
     extension = abs(tp1 - entry)
     tp2 = tp1 + extension if dir_up else tp1 - extension
 
-    # === R:R calculés
+    # R:R
     risk = abs(entry - sl)
     rr1 = round(abs(tp1 - entry) / risk, 2)
     rr2 = round(abs(tp2 - entry) / risk, 2)
 
-    # === Commentaire
-    if in_fvg:
-        comment = f"🎯 Confirmé (FVG+OTE, RR1={rr1}, RR2={rr2})"
-    else:
-        comment = f"🎯 Confirmé (OTE, RR1={rr1}, RR2={rr2})"
+    comment = f"🎯 Confirmé (TP1 pivot, TP2 extension, RR1={rr1}, RR2={rr2})"
 
     print(f"[{symbol}] ✅ Confirmé | SL={sl:.4f} | TP1={tp1:.4f} | TP2={tp2:.4f} | RR1={rr1}, RR2={rr2}\n")
 
