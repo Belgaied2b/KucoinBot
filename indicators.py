@@ -1,95 +1,60 @@
-import os
-import json
-from datetime import datetime
-from kucoin_utils import fetch_symbols, fetch_klines
-from graph import generate_chart
-from config import CHAT_ID
+# indicators.py
 
-# === Fonctions de validation requises par analyze_signal ===
-def is_cos_valid(df):
+import pandas as pd
+
+def compute_rsi(df: pd.DataFrame, period: int = 14) -> pd.Series:
     """
-    Vérifie la validité du Change Of Structure (COS).
-    Stub : renvoie toujours True.
+    Relative Strength Index (RSI)
     """
-    return True
+    delta = df['close'].diff()
+    up = delta.clip(lower=0)
+    down = -delta.clip(upper=0)
+    ma_up = up.ewm(com=period-1, adjust=False).mean()
+    ma_down = down.ewm(com=period-1, adjust=False).mean()
+    rs = ma_up / ma_down
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
 
-def is_bos_valid(df):
+def compute_macd(df: pd.DataFrame, fast: int = 12, slow: int = 26, signal: int = 9) -> pd.DataFrame:
     """
-    Vérifie la validité du Break Of Structure (BOS).
-    Stub : renvoie toujours True.
+    MACD Line, Signal Line, Histogram
     """
-    return True
+    ema_fast = df['close'].ewm(span=fast, adjust=False).mean()
+    ema_slow = df['close'].ewm(span=slow, adjust=False).mean()
+    macd_line = ema_fast - ema_slow
+    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
+    histogram = macd_line - signal_line
+    return pd.DataFrame({
+        'macd': macd_line,
+        'signal': signal_line,
+        'hist': histogram
+    })
 
-def is_btc_favorable():
+def compute_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     """
-    Vérifie si la tendance globale du BTC est favorable.
-    Stub : renvoie toujours True.
+    Average True Range (ATR)
     """
-    return True
+    high_low = df['high'] - df['low']
+    high_close = (df['high'] - df['close'].shift()).abs()
+    low_close = (df['low'] - df['close'].shift()).abs()
+    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    atr = tr.ewm(span=period, adjust=False).mean()
+    return atr
 
-# === Mémoire des signaux envoyés ===
-if os.path.exists("sent_signals.json"):
-    with open("sent_signals.json", "r") as f:
-        sent_signals = json.load(f)
-else:
-    sent_signals = {}
+def find_pivots(df: pd.DataFrame, window: int = 5):
+    """
+    Détecte pivots hauts et bas sur une fenêtre glissante.
+    - window: nombre de bougies avant/après pour comparaison.
+    Retourne deux listes d’indices: highs, lows.
+    """
+    highs, lows = [], []
+    for i in range(window, len(df) - window):
+        slice_high = df['high'].iloc[i-window:i+window+1]
+        slice_low  = df['low'].iloc[i-window:i+window+1]
 
-# === SCAN PRINCIPAL : détection et envoi ===
-async def scan_and_send_signals(bot, chat_id):
-    # Importer ici pour éviter le circular import
-    from signal_analysis import analyze_signal
+        if df['high'].iloc[i] == slice_high.max():
+            highs.append(i)
+        if df['low'].iloc[i] == slice_low.min():
+            lows.append(i)
 
-    print(f"\n🔁 Scan lancé à {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC")
-    symbols = fetch_symbols()
-    print(f"🔍 Nombre de paires analysées : {len(symbols)}\n")
-
-    for symbol in symbols:
-        for direction in ["long", "short"]:
-            try:
-                signal_id = f"{symbol}-{direction.upper()}"
-                if signal_id in sent_signals:
-                    continue  # ✅ Déjà envoyé
-
-                df = fetch_klines(symbol)
-                if df is None or len(df) < 100:
-                    continue
-
-                df.name = symbol
-                signal = analyze_signal(df, direction=direction)
-                if not signal or signal["type"] != "CONFIRMÉ":
-                    continue
-
-                image_path = generate_chart(df, signal)
-
-                message = f"""
-{symbol} - Signal {signal['type']} ({signal['direction']})
-
-🔵 Entrée idéale : {signal['entry']:.8f}
-🛑 SL : {signal['sl']:.8f}
-🎯 TP : {signal['tp']:.8f}
-📈 {signal['comment']}
-""".strip()
-
-                await bot.send_photo(
-                    chat_id=chat_id,
-                    photo=open(image_path, 'rb'),
-                    caption=message
-                )
-
-                # Mémoriser le signal
-                sent_signals[signal_id] = {
-                    "entry": signal['entry'],
-                    "tp": signal['tp'],
-                    "sl": signal['sl'],
-                    "sent_at": datetime.utcnow().isoformat(),
-                    "direction": signal['direction'],
-                    "symbol": symbol
-                }
-
-                with open("sent_signals.json", "w") as f:
-                    json.dump(sent_signals, f, indent=2)
-
-                print(f"[{symbol}] ✅ Signal {direction.upper()} envoyé")
-
-            except Exception as e:
-                print(f"[{symbol}] ⚠️ Erreur {direction}: {e}")
+    return highs, lows
