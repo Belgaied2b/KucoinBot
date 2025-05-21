@@ -22,10 +22,9 @@ def compute_macd(df: pd.DataFrame, fast: int = 12, slow: int = 26, signal: int =
 
 def compute_fvg(df: pd.DataFrame) -> pd.DataFrame:
     """
-    FVG détectée si :
-    - haussier : Low[i+1] > High[i-1]
-    - baissier : High[i+1] < Low[i-1]
-    Retourne une zone FVG (upper/lower) à chaque index.
+    ICT-style FVG detection:
+    Bullish FVG = Low[i+1] > High[i-1]
+    Bearish FVG = High[i+1] < Low[i-1]
     """
     fvg_upper = []
     fvg_lower = []
@@ -48,22 +47,23 @@ def compute_fvg(df: pd.DataFrame) -> pd.DataFrame:
             fvg_upper.append(None)
             fvg_lower.append(None)
 
-    # Aligner à l'index principal
     fvg_df = pd.DataFrame({
         'fvg_upper': [None] + fvg_upper + [None],
         'fvg_lower': [None] + fvg_lower + [None]
     }, index=df.index)
 
-    # ✅ Correction future-proof
     fvg_df = fvg_df.ffill().bfill()
-
     return fvg_df
 
-def compute_ote(df: pd.DataFrame, window: int = 5) -> pd.DataFrame:
+def compute_ote(df: pd.DataFrame, window: int = 20) -> pd.DataFrame:
+    """
+    OTE = Optimal Trade Entry zone entre 62% et 70.5% de retracement
+    Calculé à partir du plus haut et plus bas d'une fenêtre (swing)
+    """
     high_ = df['high'].rolling(window=window, min_periods=1).max()
     low_  = df['low'].rolling(window=window, min_periods=1).min()
-    ote_upper = high_ - (high_ - low_) * 0.38
-    ote_lower = low_  + (high_ - low_) * 0.38
+    ote_upper = low_ + (high_ - low_) * 0.705
+    ote_lower = low_ + (high_ - low_) * 0.62
     return pd.DataFrame({
         'ote_upper': ote_upper,
         'ote_lower': ote_lower
