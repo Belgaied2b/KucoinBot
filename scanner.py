@@ -2,34 +2,8 @@ import os
 import json
 from datetime import datetime
 from kucoin_utils import fetch_symbols, fetch_klines
-from signal_analysis import analyze_signal
 from graph import generate_chart
 from config import CHAT_ID
-
-# === Fonctions de validation requises par analyze_signal ===
-def is_cos_valid(df):
-    """
-    Vérifie la validité du Change Of Structure (COS).
-    Stub : renvoie toujours True.
-    """
-    # TODO: implémenter la vraie logique de validation du COS
-    return True
-
-def is_bos_valid(df):
-    """
-    Vérifie la validité du Break Of Structure (BOS).
-    Stub : renvoie toujours True.
-    """
-    # TODO: implémenter la vraie logique de validation du BOS
-    return True
-
-def is_btc_favorable():
-    """
-    Vérifie si la tendance globale du BTC est favorable.
-    Stub : renvoie toujours True.
-    """
-    # TODO: implémenter la vraie logique de tendance BTC
-    return True
 
 # === Mémoire des signaux envoyés ===
 if os.path.exists("sent_signals.json"):
@@ -40,6 +14,9 @@ else:
 
 # === SCAN PRINCIPAL : détection et envoi ===
 async def scan_and_send_signals(bot, chat_id):
+    # Import tardif pour éviter l'import circulaire
+    from signal_analysis import analyze_signal
+
     print(f"\n🔁 Scan lancé à {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC")
     symbols = fetch_symbols()
     print(f"🔍 Nombre de paires analysées : {len(symbols)}\n")
@@ -49,7 +26,7 @@ async def scan_and_send_signals(bot, chat_id):
             try:
                 signal_id = f"{symbol}-{direction.upper()}"
                 if signal_id in sent_signals:
-                    continue  # ✅ Déjà envoyé
+                    continue  # déjà envoyé
 
                 df = fetch_klines(symbol)
                 if df is None or len(df) < 100:
@@ -69,6 +46,7 @@ async def scan_and_send_signals(bot, chat_id):
 🛑 SL : {signal['sl']:.8f}
 🎯 TP : {signal['tp']:.8f}
 📈 {signal['comment']}
+R:R = {signal['rr']:.2f}
 """.strip()
 
                 await bot.send_photo(
@@ -77,7 +55,7 @@ async def scan_and_send_signals(bot, chat_id):
                     caption=message
                 )
 
-                # ✅ Mémoriser le signal
+                # Mémoriser le signal
                 sent_signals[signal_id] = {
                     "entry": signal['entry'],
                     "tp": signal['tp'],
@@ -86,7 +64,6 @@ async def scan_and_send_signals(bot, chat_id):
                     "direction": signal['direction'],
                     "symbol": symbol
                 }
-
                 with open("sent_signals.json", "w") as f:
                     json.dump(sent_signals, f, indent=2)
 
