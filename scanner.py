@@ -5,17 +5,15 @@ from kucoin_utils import fetch_symbols, fetch_klines
 from graph import generate_chart
 from config import CHAT_ID
 
-# === Mémoire des signaux envoyés ===
+# Mémoire des signaux envoyés
 if os.path.exists("sent_signals.json"):
     with open("sent_signals.json", "r") as f:
         sent_signals = json.load(f)
 else:
     sent_signals = {}
 
-# === SCAN PRINCIPAL : détection et envoi ===
 async def scan_and_send_signals(bot, chat_id):
-    # Import tardif pour éviter l'import circulaire
-    from signal_analysis import analyze_signal
+    from signal_analysis import analyze_signal  # import tardif
 
     print(f"\n🔁 Scan lancé à {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC")
     symbols = fetch_symbols()
@@ -24,9 +22,9 @@ async def scan_and_send_signals(bot, chat_id):
     for symbol in symbols:
         for direction in ["long", "short"]:
             try:
-                signal_id = f"{symbol}-{direction.upper()}"
-                if signal_id in sent_signals:
-                    continue  # déjà envoyé
+                sid = f"{symbol}-{direction.upper()}"
+                if sid in sent_signals:
+                    continue
 
                 df = fetch_klines(symbol)
                 if df is None or len(df) < 100:
@@ -37,32 +35,24 @@ async def scan_and_send_signals(bot, chat_id):
                 if not signal or signal["type"] != "CONFIRMÉ":
                     continue
 
-                image_path = generate_chart(df, signal)
-
-                message = f"""
-{symbol} - Signal {signal['type']} ({signal['direction']})
-
-🔵 Entrée idéale : {signal['entry']:.8f}
-🛑 SL : {signal['sl']:.8f}
-🎯 TP : {signal['tp']:.8f}
-📈 {signal['comment']}
-R:R = {signal['rr']:.2f}
-""".strip()
-
-                await bot.send_photo(
-                    chat_id=chat_id,
-                    photo=open(image_path, 'rb'),
-                    caption=message
+                img = generate_chart(df, signal)
+                msg = (
+                    f"{symbol} - Signal {signal['type']} ({signal['direction']})\n\n"
+                    f"🔵 Entrée idéale : {signal['entry']:.8f}\n"
+                    f"🛑 SL : {signal['sl']:.8f}\n"
+                    f"🎯 TP : {signal['tp']:.8f}\n"
+                    f"📈 {signal['comment']}\n"
+                    f"R:R = {signal['rr']:.2f}"
                 )
+                await bot.send_photo(chat_id=chat_id, photo=open(img, 'rb'), caption=msg)
 
-                # Mémoriser le signal
-                sent_signals[signal_id] = {
-                    "entry": signal['entry'],
-                    "tp": signal['tp'],
-                    "sl": signal['sl'],
-                    "sent_at": datetime.utcnow().isoformat(),
-                    "direction": signal['direction'],
-                    "symbol": symbol
+                sent_signals[sid] = {
+                    "entry":    signal["entry"],
+                    "tp":       signal["tp"],
+                    "sl":       signal["sl"],
+                    "sent_at":  datetime.utcnow().isoformat(),
+                    "direction":signal["direction"],
+                    "symbol":   symbol
                 }
                 with open("sent_signals.json", "w") as f:
                     json.dump(sent_signals, f, indent=2)
