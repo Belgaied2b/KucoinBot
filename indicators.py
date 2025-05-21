@@ -22,10 +22,10 @@ def compute_macd(df: pd.DataFrame, fast: int = 12, slow: int = 26, signal: int =
 
 def compute_fvg(df: pd.DataFrame) -> pd.DataFrame:
     """
-    FVG détectée si : 
+    FVG détectée si :
     - haussier : Low[i+1] > High[i-1]
     - baissier : High[i+1] < Low[i-1]
-    On retourne la zone entre les deux.
+    Retourne une zone FVG (upper/lower) à chaque index.
     """
     fvg_upper = []
     fvg_lower = []
@@ -54,8 +54,8 @@ def compute_fvg(df: pd.DataFrame) -> pd.DataFrame:
         'fvg_lower': [None] + fvg_lower + [None]
     }, index=df.index)
 
-    # Supprime les lignes inutilisables
-    fvg_df = fvg_df.fillna(method='ffill').fillna(method='bfill')
+    # ✅ Correction future-proof
+    fvg_df = fvg_df.ffill().bfill()
 
     return fvg_df
 
