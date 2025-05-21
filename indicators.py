@@ -20,13 +20,44 @@ def compute_macd(df: pd.DataFrame, fast: int = 12, slow: int = 26, signal: int =
         'histogram': macd_val - signal_line
     }, index=df.index)
 
-def compute_fvg(df: pd.DataFrame, window: int = 5) -> pd.DataFrame:
-    fvg_upper = df['high'].shift(1) - df['low'].shift(-1)
-    fvg_lower = df['low'].shift(1) - df['high'].shift(-1)
-    return pd.DataFrame({
-        'fvg_upper': fvg_upper,
-        'fvg_lower': fvg_lower
+def compute_fvg(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    FVG détectée si : 
+    - haussier : Low[i+1] > High[i-1]
+    - baissier : High[i+1] < Low[i-1]
+    On retourne la zone entre les deux.
+    """
+    fvg_upper = []
+    fvg_lower = []
+
+    for i in range(1, len(df) - 1):
+        high_prev = df['high'].iloc[i - 1]
+        low_next = df['low'].iloc[i + 1]
+        low_prev = df['low'].iloc[i - 1]
+        high_next = df['high'].iloc[i + 1]
+
+        if low_next > high_prev:
+            # FVG haussier
+            fvg_upper.append(low_next)
+            fvg_lower.append(high_prev)
+        elif high_next < low_prev:
+            # FVG baissier
+            fvg_upper.append(low_prev)
+            fvg_lower.append(high_next)
+        else:
+            fvg_upper.append(None)
+            fvg_lower.append(None)
+
+    # Aligner à l'index principal
+    fvg_df = pd.DataFrame({
+        'fvg_upper': [None] + fvg_upper + [None],
+        'fvg_lower': [None] + fvg_lower + [None]
     }, index=df.index)
+
+    # Supprime les lignes inutilisables
+    fvg_df = fvg_df.fillna(method='ffill').fillna(method='bfill')
+
+    return fvg_df
 
 def compute_ote(df: pd.DataFrame, window: int = 5) -> pd.DataFrame:
     high_ = df['high'].rolling(window=window, min_periods=1).max()
@@ -46,9 +77,6 @@ def compute_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     return tr.rolling(window=period, min_periods=1).mean()
 
 def compute_ma(df: pd.DataFrame, period: int = 200) -> pd.Series:
-    """
-    Moyenne mobile simple (MA) – utilisée pour tendance long terme.
-    """
     return df['close'].rolling(window=period, min_periods=1).mean()
 
 def find_pivots(df: pd.DataFrame, window: int = 5):
