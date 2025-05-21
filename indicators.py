@@ -1,71 +1,58 @@
-# indicators.py
-
 import pandas as pd
 
 def compute_rsi(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    """
-    Calcule le RSI (Relative Strength Index) sur la colonne 'close' de df.
-    Stub : à implémenter.
-    """
-    # TODO: remplacer par l'implémentation réelle
-    # Exemple minimal : renvoyer une série à NaN
-    return pd.Series([float('nan')] * len(df), index=df.index)
+    delta = df['close'].diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.rolling(window=period, min_periods=1).mean()
+    avg_loss = loss.rolling(window=period, min_periods=1).mean()
+    rs = avg_gain / avg_loss.replace({0: 1e-10})
+    return 100 - (100 / (1 + rs))
 
 def compute_macd(df: pd.DataFrame, fast: int = 12, slow: int = 26, signal: int = 9) -> pd.DataFrame:
-    """
-    Calcule le MACD sur la colonne 'close' de df.
-    Renvoie un DataFrame avec colonnes ['macd', 'signal', 'histogram'].
-    Stub : à implémenter.
-    """
-    # TODO: remplacer par l'implémentation réelle
+    exp1 = df['close'].ewm(span=fast, adjust=False).mean()
+    exp2 = df['close'].ewm(span=slow, adjust=False).mean()
+    macd_val = exp1 - exp2
+    signal_line = macd_val.ewm(span=signal, adjust=False).mean()
     return pd.DataFrame({
-        'macd':    [float('nan')] * len(df),
-        'signal':  [float('nan')] * len(df),
-        'histogram': [float('nan')] * len(df),
+        'macd': macd_val,
+        'signal': signal_line,
+        'histogram': macd_val - signal_line
     }, index=df.index)
 
 def compute_fvg(df: pd.DataFrame, window: int = 5) -> pd.DataFrame:
-    """
-    Calcule les Fair Value Gaps (FVG) sur df.
-    Stub : à implémenter.
-    """
-    # TODO: remplacer par l'implémentation réelle
+    fvg_upper = df['high'].shift(1) - df['low'].shift(-1)
+    fvg_lower = df['low'].shift(1) - df['high'].shift(-1)
     return pd.DataFrame({
-        'fvg_upper': [float('nan')] * len(df),
-        'fvg_lower': [float('nan')] * len(df),
+        'fvg_upper': fvg_upper,
+        'fvg_lower': fvg_lower
     }, index=df.index)
 
 def compute_ote(df: pd.DataFrame, window: int = 5) -> pd.DataFrame:
-    """
-    Calcule l'Optimal Trade Entry (OTE) sur df.
-    Stub : à implémenter.
-    """
-    # TODO: remplacer par l'implémentation réelle
+    high_ = df['high'].rolling(window=window, min_periods=1).max()
+    low_  = df['low'].rolling(window=window, min_periods=1).min()
+    ote_upper = high_ - (high_ - low_) * 0.38
+    ote_lower = low_  + (high_ - low_) * 0.38
     return pd.DataFrame({
-        'ote_upper': [float('nan')] * len(df),
-        'ote_lower': [float('nan')] * len(df),
+        'ote_upper': ote_upper,
+        'ote_lower': ote_lower
     }, index=df.index)
 
 def compute_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    """
-    Calcule l'Average True Range (ATR) sur df.
-    Stub : à implémenter.
-    """
-    # TODO: remplacer par l'implémentation réelle
-    return pd.Series([float('nan')] * len(df), index=df.index)
+    high_low        = df['high'] - df['low']
+    high_prev_close = (df['high'] - df['close'].shift()).abs()
+    low_prev_close  = (df['low']  - df['close'].shift()).abs()
+    tr = pd.concat([high_low, high_prev_close, low_prev_close], axis=1).max(axis=1)
+    return tr.rolling(window=period, min_periods=1).mean()
+
+def compute_ma(df: pd.DataFrame, period: int = 200) -> pd.Series:
+    return df['close'].rolling(window=period, min_periods=1).mean()
 
 def find_pivots(df: pd.DataFrame, window: int = 5):
-    """
-    Détecte les pivots hauts et bas dans df.
-    - window : nombre de barres avant et après pour comparer.
-    Retourne deux listes d’indices : (highs, lows).
-    """
     highs, lows = [], []
     for i in range(window, len(df) - window):
-        # pivot haut
         if df['high'].iloc[i] == df['high'].iloc[i-window:i+window+1].max():
             highs.append(i)
-        # pivot bas
         if df['low'].iloc[i] == df['low'].iloc[i-window:i+window+1].min():
             lows.append(i)
     return highs, lows
