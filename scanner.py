@@ -2,6 +2,20 @@ import os
 import json
 from datetime import datetime
 from kucoin_utils import fetch_symbols, fetch_klines
+
+# ─── STUBS ────────────────────────────────────────────────────────────────────
+# Ces fonctions sont importées par signal_analysis pour valider COS / BOS / BTC.
+# En l’état, elles renvoient True (à remplacer plus tard par ta vraie logique).
+def is_cos_valid(df):
+    return True
+
+def is_bos_valid(df):
+    return True
+
+def is_btc_favorable():
+    return True
+# ──────────────────────────────────────────────────────────────────────────────
+
 from signal_analysis import analyze_signal
 from graph import generate_chart
 from config import CHAT_ID
@@ -24,7 +38,7 @@ async def scan_and_send_signals(bot, chat_id):
             try:
                 signal_id = f"{symbol}-{direction.upper()}"
                 if signal_id in sent_signals:
-                    continue  # ✅ Déjà envoyé
+                    continue  # déjà envoyé
 
                 df = fetch_klines(symbol)
                 if df is None or len(df) < 100:
@@ -36,28 +50,24 @@ async def scan_and_send_signals(bot, chat_id):
                     continue
 
                 image_path = generate_chart(df, signal)
-
-                message = f"""
-{symbol} - Signal {signal['type']} ({signal['direction']})
-
-🔵 Entrée idéale : {signal['entry']:.8f}
-🛑 SL : {signal['sl']:.8f}
-🎯 TP : {signal['tp']:.8f}
-📈 {signal['comment']}
-""".strip()
-
+                message = (
+                    f"{symbol} - Signal {signal['type']} ({signal['direction']})\n\n"
+                    f"🔵 Entrée idéale : {signal['entry']:.8f}\n"
+                    f"🛑 SL : {signal['sl']:.8f}\n"
+                    f"🎯 TP : {signal['tp']:.8f}\n"
+                    f"📈 {signal['comment']}"
+                )
                 await bot.send_photo(chat_id=chat_id, photo=open(image_path, 'rb'), caption=message)
 
-                # ✅ Mémoriser le signal
+                # Mémoriser le signal
                 sent_signals[signal_id] = {
-                    "entry": signal['entry'],
-                    "tp": signal['tp'],
-                    "sl": signal['sl'],
-                    "sent_at": datetime.utcnow().isoformat(),
-                    "direction": signal['direction'],
-                    "symbol": symbol
+                    "entry":    signal["entry"],
+                    "tp":       signal["tp"],
+                    "sl":       signal["sl"],
+                    "sent_at":  datetime.utcnow().isoformat(),
+                    "direction":signal["direction"],
+                    "symbol":   symbol
                 }
-
                 with open("sent_signals.json", "w") as f:
                     json.dump(sent_signals, f, indent=2)
 
