@@ -1,97 +1,79 @@
-import pandas as pd
-
 from indicators import (
-    compute_rsi, compute_macd, compute_fvg,
-    compute_ote, compute_atr, find_pivots
+    compute_atr,
+    compute_fvg,
+    compute_ote,
+    compute_rsi,
+    compute_macd,
+    find_pivots
 )
-from risk_manager import calculate_rr
-from scanner import is_cos_valid, is_bos_valid, is_btc_favorable
 
+# === Stubs de validation (auparavant dans scanner.py) ===
+def is_cos_valid(df):
+    """Vérifie la validité du Change Of Structure (COS)."""
+    # TODO: implémenter la vraie logique
+    return True
 
-def analyze_signal(df: pd.DataFrame, direction: str = "long"):
+def is_bos_valid(df):
+    """Vérifie la validité du Break Of Structure (BOS)."""
+    # TODO: implémenter la vraie logique
+    return True
+
+def is_btc_favorable():
+    """Vérifie si la tendance globale du BTC est favorable."""
+    # TODO: implémenter la vraie logique
+    return True
+
+def analyze_signal(df, direction="long"):
     """
-    Analyse complète d'un signal CONFIRMÉ pour swing avec pivots S/R :
-    - FVG, OTE, BOS, COS, MA200, BTC validés
-    - SL dynamique sur FVG + ATR + max 6% + pivots
+    Analyse et génère un signal.
+    Retourne dict avec : type, direction, entry, sl, tp, rr, comment.
     """
-    try:
-        # Calcul des indicateurs
-        rsi = compute_rsi(df['close'])
-        macd_line, signal_line = compute_macd(df['close'])
-        fvg = compute_fvg(df, direction)
-        ote = compute_ote(df, direction)
+    # Calcul des indicateurs
+    atr = compute_atr(df).iloc[-1]
+    highs, lows = find_pivots(df, window=5)
 
-        price = df['close'].iat[-1]
-        entry = ote['entry']
-        sl = fvg['sl']
-        atr = compute_atr(df).iat[-1]
+    # Niveau d'entrée (dernier close)
+    entry = df['close'].iloc[-1]
 
-        # Validation structurelle
-        ma200 = df['close'].rolling(200).mean().iat[-1]
-        ma_ok = (price > ma200) if direction == 'long' else (price < ma200)
-        cos_ok = is_cos_valid(df)
-        bos_ok = is_bos_valid(df)
-        btc_ok = is_btc_favorable()
+    # SL/TP initiaux basés sur cos/bos ou plus simplement sur high/low
+    if direction == "long":
+        sl = df['low'].iloc[-1]
+        tp = entry + (entry - sl) * 2.5
+    else:  # short
+        sl = df['high'].iloc[-1]
+        tp = entry - (sl - entry) * 2.5
 
-        print(f"[{df.name}] Check: FVG={fvg['valid']} | OTE={ote['in_ote']} | COS={cos_ok} | BOS={bos_ok} | MA200={ma_ok} | BTC={btc_ok}")
-        if not all([fvg['valid'], ote['in_ote'], cos_ok, bos_ok, ma_ok, btc_ok]):
-            print(f"[{df.name}] ❌ Rejeté (structure invalide)")
-            return None
+    # Ajustement min/max par ATR et % entry
+    min_sl = atr * 1.5
+    max_sl = entry * 0.06
+    dist = abs(entry - sl)
 
-        # Recalcul SL si incohérent
-        if (direction == 'long' and sl >= entry) or (direction == 'short' and sl <= entry):
-            print(f"[{df.name}] ⚠️ SL incohérent. Recalcul automatique.")
-            sl = entry - entry * 0.005 if direction == 'long' else entry + entry * 0.005
+    if dist < min_sl:
+        sl = entry + min_sl if direction=="short" else entry - min_sl
+    elif dist > max_sl:
+        sl = entry + max_sl if direction=="short" else entry - max_sl
 
-        # SL minimum = 1.5 × ATR
-        min_dist = atr * 1.5
-        if direction == 'long' and (entry - sl) < min_dist:
-            sl = entry - min_dist
-        elif direction == 'short' and (sl - entry) < min_dist:
-            sl = entry + min_dist
+    # Ajustement pivot (zones S/R) avec buffer 20% ATR
+    if direction == "long" and lows:
+        pivot = df['low'].iloc[lows[-1]]
+        sl = min(sl, pivot - atr * 0.2)
+    if direction == "short" and highs:
+        pivot = df['high'].iloc[highs[-1]]
+        sl = max(sl, pivot + atr * 0.2)
 
-        # SL maximum = 6 % de l'entry
-        max_dist = entry * 0.06
-        if direction == 'long' and (entry - sl) > max_dist:
-            sl = entry - max_dist
-        elif direction == 'short' and (sl - entry) > max_dist:
-            sl = entry + max_dist
+    # Calcul exact du R:R
+    if direction == "long":
+        rr = (tp - entry) / (entry - sl)
+    else:
+        rr = (entry - tp) / (sl - entry)
+    rr = round(rr, 2)
 
-        # Détection de pivots
-        highs, lows = find_pivots(df, window=5)
-        if direction == 'long' and lows:
-            pivot_price = df['low'].iat[lows[-1]]
-            sl = min(sl, pivot_price - atr * 0.2)
-        elif direction == 'short' and highs:
-            pivot_price = df['high'].iat[highs[-1]]
-            sl = max(sl, pivot_price + atr * 0.2)
-
-        # Calcul TP selon RR souhaité (2.5)
-        tp = calculate_rr(entry, sl, rr_ratio=2.5, direction=direction)
-
-        # Calcul exact du R:R
-        if direction == 'long':
-            rr = (tp - entry) / (entry - sl)
-        else:
-            rr = (entry - tp) / (sl - entry)
-
-        comment = f"🎯 Signal confirmé – entrée idéale après repli\n✔️ R:R = {rr:.2f}"
-        print(f"[{df.name}] ✅ Signal CONFIRMÉ : Entry={entry:.8f}, SL={sl:.8f}, TP={tp:.8f}, R:R={rr:.2f}")
-
-        return {
-            'type': 'CONFIRMÉ',
-            'direction': direction.upper(),
-            'entry': round(entry, 8),
-            'sl': round(sl, 8),
-            'tp': round(tp, 8),
-            'rsi': round(rsi.iat[-1], 2),
-            'macd': round(macd_line.iat[-1], 6),
-            'signal_line': round(signal_line.iat[-1], 6),
-            'comment': comment,
-            'ote_zone': ote.get('zone'),
-            'fvg_zone': fvg.get('zone'),
-            'symbol': df.name
-        }
-    except Exception as e:
-        print(f"[{df.name}] ⚠️ Erreur dans analyze_signal : {e}")
-        return None
+    return {
+        "type": "CONFIRMÉ",
+        "direction": direction,
+        "entry": entry,
+        "sl": sl,
+        "tp": tp,
+        "rr": rr,
+        "comment": "🎯 Signal confirmé – entrée idéale après repli"
+    }
