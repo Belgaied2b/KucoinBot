@@ -22,13 +22,13 @@ def analyze_signal(df, direction="long"):
     highs, lows = find_pivots(df, window=5)
     entry  = df['close'].iloc[-1]
 
-    # Zones OTE & FVG
+    # Zones
     ote_upper, ote_lower = ote['ote_upper'], ote['ote_lower']
     fvg_upper, fvg_lower = fvg['fvg_upper'], fvg['fvg_lower']
     in_ote = (ote_lower <= entry <= ote_upper)
     in_fvg = (fvg_lower <= entry <= fvg_upper)
 
-    # Validations structurelles
+    # Structure & tendance
     bos_ok = is_bos_valid(df, direction)
     cos_ok = is_cos_valid(df, direction)
     btc_ok = is_btc_favorable()
@@ -37,16 +37,15 @@ def analyze_signal(df, direction="long"):
     # Logs
     print(f"[{symbol}]   Entry        : {entry:.4f}")
     print(f"[{symbol}]   OTE valid    : {in_ote}")
-    print(f"[{symbol}]   FVG valid    : {in_fvg}")
+    print(f"[{symbol}]   FVG valid    : {in_fvg} (optionnel)")
     print(f"[{symbol}]   BOS valid    : {bos_ok}")
     print(f"[{symbol}]   COS valid    : {cos_ok}")
     print(f"[{symbol}]   BTC trend    : {btc_ok}")
     print(f"[{symbol}]   MA200 trend  : {ma_ok}")
 
-    # Rejet si un filtre échoue
+    # Filtres obligatoires
     checks = {
         "OTE": in_ote,
-        "FVG": in_fvg,
         "BOS": bos_ok,
         "COS": cos_ok,
         "BTC": btc_ok,
@@ -57,7 +56,7 @@ def analyze_signal(df, direction="long"):
         print(f"[{symbol}] ❌ Rejeté ({', '.join(failed)})\n")
         return None
 
-    # SL basé sur pivot structurel
+    # SL structurel
     if dir_up and lows:
         sl = df['low'].iloc[lows[-1]]
     elif not dir_up and highs:
@@ -65,7 +64,7 @@ def analyze_signal(df, direction="long"):
     else:
         sl = df['low'].iloc[-1] if dir_up else df['high'].iloc[-1]
 
-    # SL sécurisé (min/max)
+    # SL ajusté
     min_dist = atr * 1.5
     max_dist = entry * 0.06
     current_dist = abs(entry - sl)
@@ -74,7 +73,7 @@ def analyze_signal(df, direction="long"):
     elif current_dist > max_dist:
         sl = entry - max_dist if dir_up else entry + max_dist
 
-    # TP1 = dernier swing high/low
+    # TP1 = dernier swing
     if dir_up and highs:
         tp1 = df['high'].iloc[highs[-1]]
     elif not dir_up and lows:
@@ -82,7 +81,7 @@ def analyze_signal(df, direction="long"):
     else:
         tp1 = entry + atr * 3 if dir_up else entry - atr * 3
 
-    # TP2 = extension (même distance que Entry→TP1)
+    # TP2 = extension
     extension = abs(tp1 - entry)
     tp2 = tp1 + extension if dir_up else tp1 - extension
 
@@ -90,6 +89,12 @@ def analyze_signal(df, direction="long"):
     risk = abs(entry - sl)
     rr1 = round(abs(tp1 - entry) / risk, 2)
     rr2 = round(abs(tp2 - entry) / risk, 2)
+
+    # Commentaire
+    if in_fvg:
+        comment = f"🎯 Confirmé (OTE + FVG, R:R1={rr1}, R:R2={rr2})"
+    else:
+        comment = f"🎯 Confirmé (OTE seul, FVG manquant, R:R1={rr1}, R:R2={rr2})"
 
     print(f"[{symbol}] ✅ Confirmé (RR1={rr1}, RR2={rr2}) | SL={sl:.4f} | TP1={tp1:.4f} | TP2={tp2:.4f}\n")
 
@@ -108,5 +113,5 @@ def analyze_signal(df, direction="long"):
         "fvg_zone":  (fvg_upper, fvg_lower),
         "ma200":     ma200,
         "symbol":    symbol,
-        "comment":   f"🎯 Confirmé (TP1 structure, TP2 extension, R:R1={rr1}, R:R2={rr2})"
+        "comment":   comment
     }
