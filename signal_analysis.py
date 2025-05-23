@@ -76,7 +76,7 @@ def analyze_signal(df, direction="long"):
         print(f"[{symbol}] ❌ Rejeté (score qualité insuffisant)\n")
         return None
 
-    if failed and score >= 8 and len(failed) <= 1:
+    if failed and score >= 7 and len(failed) == 1:
         tolerated = failed
         print(f"[{symbol}] ⚠️ Tolérance activée pour : {', '.join(tolerated)}")
     elif failed:
@@ -111,8 +111,10 @@ def analyze_signal(df, direction="long"):
                 break
 
     if tp1 is None:
-        print(f"[{symbol}] ❌ Aucun TP1 avec RR ≥ 1.2 trouvé\n")
-        return None
+        # fallback final : calcul pur R:R 1.2 si aucun pivot trouvé
+        risk = abs(entry - sl)
+        tp1 = entry + 1.2 * risk if dir_up else entry - 1.2 * risk
+        print(f"[{symbol}] ⚠️ TP1 forcé par fallback mathématique (RR1=1.2)")
 
     extension = abs(tp1 - entry)
     tp2 = tp1 + extension if dir_up else tp1 - extension
@@ -132,5 +134,5 @@ def analyze_signal(df, direction="long"):
         'direction': "LONG" if dir_up else "SHORT",
         'type': "CONFIRMÉ",
         'score': score,
-        'comment': f"🎯 Confirmé swing léger (score={score}/10, RR1={rr1}, tolérance={','.join(tolerated) if tolerated else 'Aucune'})"
+        'comment': f"🎯 Confirmé swing pro (score={score}/10, RR1={rr1}, tolérance={','.join(tolerated) if tolerated else 'Aucune'})"
     }
