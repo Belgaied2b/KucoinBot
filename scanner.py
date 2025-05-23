@@ -6,6 +6,7 @@ from signal_analysis import analyze_signal
 from structure_utils import is_cos_valid, is_bos_valid, is_btc_favorable
 from config import TOKEN, CHAT_ID
 from telegram import Bot
+import traceback
 
 bot = Bot(token=TOKEN)
 
@@ -19,15 +20,20 @@ def send_signal_to_telegram(signal):
         f"📈 R:R1  : {signal['rr1']}\n"
         f"📈 R:R2  : {signal['rr2']}\n"
         f"🧠 Score : {signal.get('score', '?')}/10\n"
+        f"{signal.get('comment', '')}"
     )
     bot.send_message(chat_id=CHAT_ID, text=message)
 
 # ✅ Mémoire des signaux déjà envoyés
+sent_signals = {}
 if os.path.exists("sent_signals.json"):
-    with open("sent_signals.json", "r") as f:
-        sent_signals = json.load(f)
-else:
-    sent_signals = {}
+    try:
+        with open("sent_signals.json", "r") as f:
+            sent_signals = json.load(f)
+        print("📂 Contenu actuel de sent_signals.json :")
+        print(json.dumps(sent_signals, indent=2))
+    except Exception as e:
+        print("⚠️ Erreur lors de la lecture de sent_signals.json :", e)
 
 async def scan_and_send_signals():
     print(f"🔁 Scan lancé à {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC\n")
@@ -39,7 +45,7 @@ async def scan_and_send_signals():
 
         try:
             df = fetch_klines(symbol)
-            df.name = symbol
+            df.name = symbol  # ✅ Pour que analyze_signal ait accès au nom
 
             for direction in ["long", "short"]:
                 print(f"[{symbol}] ➡️ Analyse {direction.upper()}")
@@ -48,6 +54,7 @@ async def scan_and_send_signals():
                 if signal:
                     signal_id = f"{symbol}-{direction.upper()}"
                     if signal_id in sent_signals:
+                        print(f"[{symbol}] 🔁 Signal déjà envoyé ({direction.upper()}), ignoré\n")
                         continue
 
                     send_signal_to_telegram(signal)
@@ -65,3 +72,4 @@ async def scan_and_send_signals():
 
         except Exception as e:
             print(f"[{symbol}] ⚠️ Erreur {direction}: {e}")
+            traceback.print_exc()
