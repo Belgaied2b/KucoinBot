@@ -6,7 +6,7 @@ from indicators import (
     compute_ma,
     find_pivots
 )
-from scanner import is_cos_valid, is_bos_valid, is_btc_favorable
+from structure_utils import is_cos_valid, is_bos_valid, is_btc_favorable
 
 def analyze_signal(df, direction="long"):
     symbol = getattr(df, 'name', 'UNKNOWN')
