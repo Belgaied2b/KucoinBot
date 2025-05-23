@@ -43,7 +43,7 @@ async def scan_and_send_signals():
 
             for direction in ["long", "short"]:
                 print(f"[{symbol}] ➡️ Analyse {direction.upper()}")
-                signal = analyze_signal(df.copy(), direction=direction)
+                signal = analyze_signal(df, direction=direction)
 
                 if signal:
                     signal_id = f"{symbol}-{direction.upper()}"
