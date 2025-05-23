@@ -10,7 +10,7 @@ import traceback
 
 bot = Bot(token=TOKEN)
 
-def send_signal_to_telegram(signal):
+async def send_signal_to_telegram(signal):
     message = (
         f"📉 {signal['symbol']} - Signal CONFIRMÉ ({signal['direction']})\n\n"
         f"🎯 Entry : {signal['entry']:.4f}\n"
@@ -23,9 +23,8 @@ def send_signal_to_telegram(signal):
         f"{signal.get('comment', '')}"
     )
     print(f"[{signal['symbol']}] 📤 Envoi Telegram en cours...")
-    bot.send_message(chat_id=CHAT_ID, text=message)
+    await bot.send_message(chat_id=CHAT_ID, text=message)
 
-# ✅ Chargement des signaux déjà envoyés
 sent_signals = {}
 if os.path.exists("sent_signals.json"):
     try:
@@ -46,7 +45,7 @@ async def scan_and_send_signals():
 
         try:
             df = fetch_klines(symbol)
-            df.name = symbol  # Pour signal_analysis
+            df.name = symbol
 
             for direction in ["long", "short"]:
                 print(f"[{symbol}] ➡️ Analyse {direction.upper()}")
@@ -59,7 +58,7 @@ async def scan_and_send_signals():
                         continue
 
                     print(f"[{symbol}] ✅ Nouveau signal accepté : {direction.upper()}")
-                    send_signal_to_telegram(signal)
+                    await send_signal_to_telegram(signal)
 
                     sent_signals[signal_id] = {
                         "entry": signal["entry"],
