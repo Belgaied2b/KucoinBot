@@ -52,12 +52,14 @@ async def scan_and_send_signals():
                 signal = analyze_signal(df, direction=direction)
 
                 if signal:
-                    signal_id = f"{symbol}-{direction.upper()}"
+                    suffix = "TOLÉRÉ" if signal.get("tolere_ote") else "CONFIRMÉ"
+                    signal_id = f"{symbol}-{direction.upper()}-{suffix}"
+
                     if signal_id in sent_signals:
-                        print(f"[{symbol}] 🔁 Signal déjà envoyé ({direction.upper()}), ignoré")
+                        print(f"[{symbol}] 🔁 Signal déjà envoyé ({direction.upper()}-{suffix}), ignoré")
                         continue
 
-                    print(f"[{symbol}] ✅ Nouveau signal accepté : {direction.upper()}")
+                    print(f"[{symbol}] ✅ Nouveau signal accepté : {direction.upper()} ({suffix})")
                     await send_signal_to_telegram(signal)
 
                     sent_signals[signal_id] = {
