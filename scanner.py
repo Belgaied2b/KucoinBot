@@ -22,18 +22,19 @@ def send_signal_to_telegram(signal):
         f"🧠 Score : {signal.get('score', '?')}/10\n"
         f"{signal.get('comment', '')}"
     )
+    print(f"[{signal['symbol']}] 📤 Envoi Telegram en cours...")
     bot.send_message(chat_id=CHAT_ID, text=message)
 
-# ✅ Mémoire des signaux déjà envoyés
+# ✅ Chargement des signaux déjà envoyés
 sent_signals = {}
 if os.path.exists("sent_signals.json"):
     try:
         with open("sent_signals.json", "r") as f:
             sent_signals = json.load(f)
-        print("📂 Contenu actuel de sent_signals.json :")
+        print("📂 sent_signals.json chargé :")
         print(json.dumps(sent_signals, indent=2))
     except Exception as e:
-        print("⚠️ Erreur lors de la lecture de sent_signals.json :", e)
+        print("⚠️ Erreur lecture sent_signals.json :", e)
 
 async def scan_and_send_signals():
     print(f"🔁 Scan lancé à {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC\n")
@@ -45,7 +46,7 @@ async def scan_and_send_signals():
 
         try:
             df = fetch_klines(symbol)
-            df.name = symbol  # ✅ Pour que analyze_signal ait accès au nom
+            df.name = symbol  # Pour signal_analysis
 
             for direction in ["long", "short"]:
                 print(f"[{symbol}] ➡️ Analyse {direction.upper()}")
@@ -54,10 +55,12 @@ async def scan_and_send_signals():
                 if signal:
                     signal_id = f"{symbol}-{direction.upper()}"
                     if signal_id in sent_signals:
-                        print(f"[{symbol}] 🔁 Signal déjà envoyé ({direction.upper()}), ignoré\n")
+                        print(f"[{symbol}] 🔁 Signal déjà envoyé ({direction.upper()}), ignoré")
                         continue
 
+                    print(f"[{symbol}] ✅ Nouveau signal accepté : {direction.upper()}")
                     send_signal_to_telegram(signal)
+
                     sent_signals[signal_id] = {
                         "entry": signal["entry"],
                         "tp": signal["tp1"],
