@@ -7,7 +7,6 @@ from kucoin_utils import fetch_symbols, fetch_klines
 
 def is_cos_valid(df, direction):
     Détection simplifiée du COS (Change of Structure)
-# Retourne True si un swing inverse s'est formé récemment.
     window = 5
     if direction == "long":
         last_pivot_low = df['low'].rolling(window).min().iloc[-1]
