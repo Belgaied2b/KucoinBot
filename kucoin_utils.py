@@ -1,7 +1,7 @@
 import pandas as pd
 import requests
 
-def fetch_symbols():
+def fetch_all_symbols():
     url = "https://api-futures.kucoin.com/api/v1/contracts/active"
     response = requests.get(url)
     data = response.json()["data"]
@@ -22,9 +22,9 @@ def fetch_klines(symbol, interval="1h", limit=150):
     if sample_ts > 1e12:
         unit = "ms"
     elif sample_ts > 1e10:
-        unit = "s"  # valeur normale
+        unit = "s"
     else:
-        unit = "s"  # fallback
+        unit = "s"
 
     df["timestamp"] = pd.to_datetime(df["timestamp"].astype("int64"), unit=unit)
 
