@@ -83,6 +83,10 @@ def analyze_signal(df, direction="long"):
         print(f"[{symbol}] ❌ Rejeté ({', '.join(failed)})\n")
         return None
 
+    if "OTE" in tolerated or in_ote:
+        entry = ote.get("ote_618", entry)
+        print(f"[{symbol}] ✅ Entrée recalculée (fib 0.618) : {entry:.4f}")
+
     if dir_up and lows:
         pivot = df['low'].iloc[lows[-1]]
         sl = pivot - atr
@@ -111,7 +115,6 @@ def analyze_signal(df, direction="long"):
                 break
 
     if tp1 is None:
-        # fallback final : calcul pur R:R 1.2 si aucun pivot trouvé
         risk = abs(entry - sl)
         tp1 = entry + 1.2 * risk if dir_up else entry - 1.2 * risk
         print(f"[{symbol}] ⚠️ TP1 forcé par fallback mathématique (RR1=1.2)")
@@ -122,6 +125,10 @@ def analyze_signal(df, direction="long"):
     risk = abs(entry - sl)
     rr1 = round(abs(tp1 - entry) / risk, 2)
     rr2 = round(abs(tp2 - entry) / risk, 2)
+
+    commentaire = f"🎯 Confirmé swing pro (score={score}/10, RR1={rr1}, tolérance={','.join(tolerated) if tolerated else 'Aucune'})"
+    if "OTE" in tolerated:
+        commentaire += "\n📌 Entrée optimisée sur fib 0.618 (OTE) malgré tolérance"
 
     return {
         'symbol': symbol,
@@ -134,5 +141,6 @@ def analyze_signal(df, direction="long"):
         'direction': "LONG" if dir_up else "SHORT",
         'type': "CONFIRMÉ",
         'score': score,
-        'comment': f"🎯 Confirmé swing pro (score={score}/10, RR1={rr1}, tolérance={','.join(tolerated) if tolerated else 'Aucune'})"
+        'comment': commentaire,
+        'tolere_ote': "OTE" in tolerated
     }
