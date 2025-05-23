@@ -57,21 +57,44 @@ def analyze_signal(df, direction="long"):
         print(f"[{symbol}] ❌ Rejeté ({', '.join(failed)})\n")
         return None
 
-    # SL structurel + ajusté
-    if dir_up and lows:
-        sl = df['low'].iloc[lows[-1]]
-    elif not dir_up and highs:
-        sl = df['high'].iloc[highs[-1]]
-    else:
-        sl = df['low'].iloc[-1] if dir_up else df['high'].iloc[-1]
+    
+    # Validation de la bougie (ex : clôture dans OTE + FVG, bougie haussière pour long)
+    last_open = df['open'].iloc[-1]
+    last_close = df['close'].iloc[-1]
+    last_volume = df['volume'].iloc[-1]
+    avg_volume = df['volume'].rolling(window=20).mean().iloc[-1]
+    bougie_valide = (last_close > last_open) if dir_up else (last_close < last_open)
+    cloture_dans_zones = in_ote and in_fvg
 
-    min_dist = atr * 1.5
-    max_dist = entry * 0.06
-    dist = abs(entry - sl)
-    if dist < min_dist:
-        sl = entry - min_dist if dir_up else entry + min_dist
-    if dist > max_dist:
-        sl = entry - max_dist if dir_up else entry + max_dist
+    # Score qualité
+    score = 0
+    if in_ote: score += 1
+    if in_fvg: score += 1
+    if bos_ok: score += 2
+    if cos_ok: score += 2
+    if btc_ok: score += 1
+    if ma_ok: score += 1
+    if bougie_valide: score += 1
+    if last_volume >= avg_volume: score += 1
+
+    print(f"[{symbol}]   Bougie valide : {bougie_valide}")
+    print(f"[{symbol}]   Volume OK     : {last_volume >= avg_volume} (actuel: {last_volume:.2f} / moy: {avg_volume:.2f})")
+    print(f"[{symbol}]   Score qualité : {score}/10")
+
+    if score < 7:
+        print(f"[{symbol}] ❌ Rejeté (score qualité insuffisant)\n")
+        return None
+
+    
+    # SL structurel amélioré (pivot - ATR) sans contrainte max_dist
+    if dir_up and lows:
+        pivot = df['low'].iloc[lows[-1]]
+        sl = pivot - atr
+    elif not dir_up and highs:
+        pivot = df['high'].iloc[highs[-1]]
+        sl = pivot + atr
+    else:
+        sl = df['low'].iloc[-1] - atr if dir_up else df['high'].iloc[-1] + atr
 
     # TP1 intelligent : pivot avec RR ≥ 1.5
     pivots = highs if dir_up else lows
@@ -96,24 +119,3 @@ def analyze_signal(df, direction="long"):
     rr1 = round(abs(tp1 - entry) / risk, 2)
     rr2 = round(abs(tp2 - entry) / risk, 2)
 
-    comment = f"🎯 Confirmé (TP1 pivot, TP2 extension, RR1={rr1}, RR2={rr2})"
-
-    print(f"[{symbol}] ✅ Confirmé | SL={sl:.4f} | TP1={tp1:.4f} | TP2={tp2:.4f} | RR1={rr1}, RR2={rr2}\n")
-
-    return {
-        "type":      "CONFIRMÉ",
-        "direction": dir_str,
-        "entry":     entry,
-        "sl":        sl,
-        "tp":        tp1,
-        "tp1":       tp1,
-        "tp2":       tp2,
-        "rr":        rr1,
-        "rr1":       rr1,
-        "rr2":       rr2,
-        "ote_zone":  (ote_upper, ote_lower),
-        "fvg_zone":  (fvg_upper, fvg_lower),
-        "ma200":     ma200,
-        "symbol":    symbol,
-        "comment":   comment
-    }
