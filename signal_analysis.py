@@ -48,10 +48,9 @@ def analyze_signal(df, direction="long"):
         "BTC": btc_ok,
         "MA200": ma_ok
     }
+
     failed = [k for k, v in checks.items() if not v]
-    if failed:
-        print(f"[{symbol}] ❌ Rejeté ({', '.join(failed)})\n")
-        return None
+    tolerated = []
 
     last_open = df['open'].iloc[-1]
     last_close = df['close'].iloc[-1]
@@ -77,6 +76,13 @@ def analyze_signal(df, direction="long"):
         print(f"[{symbol}] ❌ Rejeté (score qualité insuffisant)\n")
         return None
 
+    if failed and score >= 8 and len(failed) <= 1:
+        tolerated = failed
+        print(f"[{symbol}] ⚠️ Tolérance activée pour : {', '.join(tolerated)}")
+    elif failed:
+        print(f"[{symbol}] ❌ Rejeté ({', '.join(failed)})\n")
+        return None
+
     if dir_up and lows:
         pivot = df['low'].iloc[lows[-1]]
         sl = pivot - atr
@@ -96,7 +102,16 @@ def analyze_signal(df, direction="long"):
             break
 
     if tp1 is None:
-        print(f"[{symbol}] ❌ Aucun TP1 structurel avec RR ≥ 1.5 trouvé\n")
+        for i in reversed(pivots):
+            level = df['high'].iloc[i] if dir_up else df['low'].iloc[i]
+            rr = (level - entry) / (entry - sl) if dir_up else (entry - level) / (sl - entry)
+            if rr >= 1.2:
+                tp1 = level - atr * 0.2 if dir_up else level + atr * 0.2
+                print(f"[{symbol}] ⚠️ TP1 alternatif utilisé (RR1={rr:.2f})")
+                break
+
+    if tp1 is None:
+        print(f"[{symbol}] ❌ Aucun TP1 avec RR ≥ 1.2 trouvé\n")
         return None
 
     extension = abs(tp1 - entry)
@@ -117,5 +132,5 @@ def analyze_signal(df, direction="long"):
         'direction': "LONG" if dir_up else "SHORT",
         'type': "CONFIRMÉ",
         'score': score,
-        'comment': f"🎯 Confirmé (RR1={rr1}, RR2={rr2}, Score={score}/10, FVG={'✅' if in_fvg else '❌'})"
+        'comment': f"🎯 Confirmé swing léger (score={score}/10, RR1={rr1}, tolérance={','.join(tolerated) if tolerated else 'Aucune'})"
     }
