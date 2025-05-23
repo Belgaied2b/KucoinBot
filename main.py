@@ -16,17 +16,17 @@ async def start(update, context):
     await update.message.reply_text("✅ Bot actif. Utilise /scan pour lancer une analyse manuelle.")
 
 async def scan(update, context):
-    await scan_and_send_signals(context.bot, CHAT_ID)
+    await scan_and_send_signals()
 
 # 🔁 Scan immédiat au démarrage
 async def post_init(application):
     logger.info("🔥 Scan immédiat au démarrage")
-    await scan_and_send_signals(application.bot, CHAT_ID)
+    await scan_and_send_signals()
 
 # ✅ Scan automatique toutes les 10 minutes dans un thread
 def job_scan():
     async def wrapper():
-        await scan_and_send_signals(app.bot, CHAT_ID)
+        await scan_and_send_signals()
 
     def runner():
         loop = asyncio.new_event_loop()
