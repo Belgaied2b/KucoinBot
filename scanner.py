@@ -29,7 +29,7 @@ async def send_signal_to_telegram(signal):
         f"{msg_tolerated}\n"
         f"{msg_rejected}"
     )
-    
+
     print(f"[{signal['symbol']}] 📤 Envoi Telegram en cours...")
     await bot.send_message(chat_id=CHAT_ID, text=message.strip())
 
