@@ -12,7 +12,7 @@ bot = Bot(token=TOKEN)
 async def send_signal_to_telegram(signal):
     rejected = signal.get("rejetes", [])
     tolerated = signal.get("toleres", [])
-    
+
     msg_rejected = f"❌ Rejetés : {', '.join(rejected)}" if rejected else ""
     msg_tolerated = f"⚠️ Tolérés : {', '.join(tolerated)}" if tolerated else ""
 
@@ -38,8 +38,7 @@ if os.path.exists("sent_signals.json"):
     try:
         with open("sent_signals.json", "r") as f:
             sent_signals = json.load(f)
-        print("📂 sent_signals.json chargé :")
-        print(json.dumps(sent_signals, indent=2))
+        print("📂 sent_signals.json chargé")
     except Exception as e:
         print("⚠️ Erreur lecture sent_signals.json :", e)
 
