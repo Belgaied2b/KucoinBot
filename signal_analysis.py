@@ -4,17 +4,16 @@ from indicators import (
     compute_ote,
     compute_fvg,
     compute_ma,
-    find_pivots
+    find_pivots,
+    compute_macd_histogram
 )
 from structure_utils import is_cos_valid, is_bos_valid, is_btc_favorable
-from indicators import compute_macd_histogram
 
 def analyze_signal(df, direction="long"):
     symbol = getattr(df, 'name', 'UNKNOWN')
     dir_up = direction.lower() == "long"
-    dir_str = direction.upper()
 
-    print(f"[{symbol}] ➡️ Analyse {dir_str}")
+    print(f"[{symbol}] ➡️ Analyse {direction.upper()}")
 
     atr = compute_atr(df).iloc[-1]
     ote = compute_ote(df).iloc[-1]
@@ -81,12 +80,13 @@ def analyze_signal(df, direction="long"):
         print(f"[{symbol}] ❌ Rejeté (score qualité insuffisant)\n")
         return None
 
-    if failed and len(failed) == 1:
-        tolerated = failed
-        print(f"[{symbol}] ⚠️ Tolérance activée pour : {', '.join(tolerated)}")
-    elif failed:
-        print(f"[{symbol}] ❌ Rejeté ({', '.join(failed)})\n")
-        return None
+    if failed:
+        if failed == ["OTE"]:
+            tolerated = failed
+            print(f"[{symbol}] ⚠️ Tolérance activée pour : OTE")
+        else:
+            print(f"[{symbol}] ❌ Rejeté ({', '.join(failed)})\n")
+            return None
 
     if "OTE" in tolerated or in_ote:
         entry = ote.get("ote_618", entry)
