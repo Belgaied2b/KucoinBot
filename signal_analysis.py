@@ -4,10 +4,10 @@ from indicators import (
     compute_ote,
     compute_fvg,
     compute_ma,
-    compute_macd_histogram,
     find_pivots
 )
 from structure_utils import is_cos_valid, is_bos_valid, is_btc_favorable
+from indicators import compute_macd_histogram
 
 def analyze_signal(df, direction="long"):
     symbol = getattr(df, 'name', 'UNKNOWN')
@@ -16,14 +16,13 @@ def analyze_signal(df, direction="long"):
 
     print(f"[{symbol}] ➡️ Analyse {dir_str}")
 
-    atr    = compute_atr(df).iloc[-1]
-    ote    = compute_ote(df).iloc[-1]
-    fvg    = compute_fvg(df).iloc[-1]
-    ma200  = compute_ma(df, 200).iloc[-1]
+    atr = compute_atr(df).iloc[-1]
+    ote = compute_ote(df).iloc[-1]
+    fvg = compute_fvg(df).iloc[-1]
+    ma200 = compute_ma(df, 200).iloc[-1]
     macd_hist = compute_macd_histogram(df).iloc[-1]
-    momentum_ok = macd_hist > 0 if dir_up else macd_hist < 0
     highs, lows = find_pivots(df, window=5)
-    entry  = df['close'].iloc[-1]
+    entry = df['close'].iloc[-1]
 
     ote_upper, ote_lower = ote['ote_upper'], ote['ote_lower']
     fvg_upper, fvg_lower = fvg['fvg_upper'], fvg['fvg_lower']
@@ -33,7 +32,8 @@ def analyze_signal(df, direction="long"):
     bos_ok = is_bos_valid(df, direction)
     cos_ok = is_cos_valid(df, direction)
     btc_ok = is_btc_favorable()
-    ma_ok  = (entry > ma200) if dir_up else (entry < ma200)
+    ma_ok = (entry > ma200) if dir_up else (entry < ma200)
+    macd_ok = macd_hist > 0 if dir_up else macd_hist < 0
 
     print(f"[{symbol}]   Entry        : {entry:.4f}")
     print(f"[{symbol}]   OTE valid    : {in_ote}")
@@ -42,11 +42,7 @@ def analyze_signal(df, direction="long"):
     print(f"[{symbol}]   COS valid    : {cos_ok}")
     print(f"[{symbol}]   BTC trend    : {btc_ok}")
     print(f"[{symbol}]   MA200 trend  : {ma_ok}")
-    print(f"[{symbol}]   MACD histogramme : {macd_hist:.5f} => {'Haussier' if momentum_ok else 'Baissier'}")
-
-    if not momentum_ok:
-        print(f"[{symbol}] ❌ Rejeté (MACD momentum contraire)\n")
-        return None
+    print(f"[{symbol}]   MACD histogramme : {macd_hist:.5f} => {'Haussier' if macd_hist > 0 else 'Baissier'}")
 
     last_open = df['open'].iloc[-1]
     last_close = df['close'].iloc[-1]
@@ -63,7 +59,6 @@ def analyze_signal(df, direction="long"):
     if ma_ok: score += 1
     if bougie_valide: score += 1
     if last_volume >= avg_volume: score += 1
-    if momentum_ok: score += 1  # ✅ MACD
 
     print(f"[{symbol}]   Bougie valide : {bougie_valide}")
     print(f"[{symbol}]   Volume OK     : {last_volume >= avg_volume} (actuel: {last_volume:.2f} / moy: {avg_volume:.2f})")
@@ -75,17 +70,18 @@ def analyze_signal(df, direction="long"):
         "BOS": bos_ok,
         "COS": cos_ok,
         "BTC": btc_ok,
-        "MA200": ma_ok
+        "MA200": ma_ok,
+        "MACD": macd_ok
     }
 
     failed = [k for k, v in checks.items() if not v]
     tolerated = []
 
-    if score < 7:
+    if score < 8:
         print(f"[{symbol}] ❌ Rejeté (score qualité insuffisant)\n")
         return None
 
-    if failed and score >= 7 and len(failed) == 1:
+    if failed and len(failed) == 1:
         tolerated = failed
         print(f"[{symbol}] ⚠️ Tolérance activée pour : {', '.join(tolerated)}")
     elif failed:
@@ -138,7 +134,6 @@ def analyze_signal(df, direction="long"):
     commentaire = f"🎯 Confirmé swing pro (score={score}/10, RR1={rr1}, tolérance={','.join(tolerated) if tolerated else 'Aucune'})"
     if "OTE" in tolerated:
         commentaire += "\n📌 Entrée optimisée sur fib 0.618 (OTE) malgré tolérance"
-    commentaire += f"\n📊 MACD Momentum : {'✅' if momentum_ok else '❌'}"
 
     return {
         'symbol': symbol,
@@ -152,5 +147,7 @@ def analyze_signal(df, direction="long"):
         'type': "CONFIRMÉ",
         'score': score,
         'comment': commentaire,
-        'tolere_ote': "OTE" in tolerated
+        'tolere_ote': "OTE" in tolerated,
+        'toleres': tolerated,
+        'rejetes': failed if len(failed) > 1 else []
     }
