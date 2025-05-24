@@ -87,3 +87,15 @@ def find_pivots(df: pd.DataFrame, window: int = 5):
         if df['low'].iloc[i] == df['low'].iloc[i - window:i + window + 1].min():
             lows.append(i)
     return highs, lows
+
+def compute_macd_histogram(df, fast=12, slow=26, signal=9):
+    """
+    Calcule le MACD histogramme (MACD - signal).
+    """
+    ema_fast = df['close'].ewm(span=fast, adjust=False).mean()
+    ema_slow = df['close'].ewm(span=slow, adjust=False).mean()
+    macd = ema_fast - ema_slow
+    signal_line = macd.ewm(span=signal, adjust=False).mean()
+    macd_hist = macd - signal_line
+    return macd_hist
+
