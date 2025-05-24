@@ -12,8 +12,9 @@ from structure_utils import is_cos_valid, is_bos_valid, is_btc_favorable
 def analyze_signal(df, direction="long"):
     symbol = getattr(df, 'name', 'UNKNOWN')
     dir_up = direction.lower() == "long"
+    dir_str = direction.upper()
 
-    print(f"[{symbol}] ➡️ Analyse {direction.upper()}")
+    print(f"[{symbol}] ➡️ Analyse {dir_str}")
 
     atr = compute_atr(df).iloc[-1]
     ote = compute_ote(df).iloc[-1]
@@ -48,6 +49,7 @@ def analyze_signal(df, direction="long"):
     last_volume = df['volume'].iloc[-1]
     avg_volume = df['volume'].rolling(window=20).mean().iloc[-1]
     bougie_valide = (last_close > last_open) if dir_up else (last_close < last_open)
+    volume_ok = last_volume >= avg_volume
 
     score = 0
     if in_ote: score += 1
@@ -57,20 +59,21 @@ def analyze_signal(df, direction="long"):
     if btc_ok: score += 1
     if ma_ok: score += 1
     if bougie_valide: score += 1
-    if last_volume >= avg_volume: score += 1
+    if volume_ok: score += 1
 
     print(f"[{symbol}]   Bougie valide : {bougie_valide}")
-    print(f"[{symbol}]   Volume OK     : {last_volume >= avg_volume} (actuel: {last_volume:.2f} / moy: {avg_volume:.2f})")
+    print(f"[{symbol}]   Volume OK     : {volume_ok} (actuel: {last_volume:.2f} / moy: {avg_volume:.2f})")
     print(f"[{symbol}]   Score qualité : {score}/10")
 
+    # Tous les indicateurs sauf OTE sont bloquants
     checks = {
-        "OTE": in_ote,
         "FVG": in_fvg,
         "BOS": bos_ok,
         "COS": cos_ok,
         "BTC": btc_ok,
         "MA200": ma_ok,
-        "MACD": macd_ok
+        "MACD": macd_ok,
+        "VOLUME": volume_ok,
     }
 
     failed = [k for k, v in checks.items() if not v]
@@ -81,26 +84,26 @@ def analyze_signal(df, direction="long"):
         return None
 
     if failed:
-        if failed == ["OTE"]:
-            tolerated = failed
-            print(f"[{symbol}] ⚠️ Tolérance activée pour : OTE")
-        else:
-            print(f"[{symbol}] ❌ Rejeté ({', '.join(failed)})\n")
-            return None
+        print(f"[{symbol}] ❌ Rejeté ({', '.join(failed)})\n")
+        return None
 
-    if "OTE" in tolerated or in_ote:
+    if not in_ote:
+        tolerated.append("OTE")
+        print(f"[{symbol}] ⚠️ Tolérance activée pour : OTE")
+
+    if in_ote or "OTE" in tolerated:
         entry = ote.get("ote_618", entry)
         print(f"[{symbol}] ✅ Entrée recalculée (fib 0.618) : {entry:.4f}")
 
+    # SL basé sur pivot structurel
     if dir_up and lows:
-        pivot = df['low'].iloc[lows[-1]]
-        sl = pivot - atr
+        sl = df['low'].iloc[lows[-1]] - atr
     elif not dir_up and highs:
-        pivot = df['high'].iloc[highs[-1]]
-        sl = pivot + atr
+        sl = df['high'].iloc[highs[-1]] + atr
     else:
         sl = df['low'].iloc[-1] - atr if dir_up else df['high'].iloc[-1] + atr
 
+    # TP1 avec RR ≥ 1.5 sinon fallback RR ≥ 1.2 sinon mathématique
     pivots = highs if dir_up else lows
     tp1 = None
     for i in reversed(pivots):
@@ -109,7 +112,6 @@ def analyze_signal(df, direction="long"):
         if rr >= 1.5:
             tp1 = level - atr * 0.2 if dir_up else level + atr * 0.2
             break
-
     if tp1 is None:
         for i in reversed(pivots):
             level = df['high'].iloc[i] if dir_up else df['low'].iloc[i]
@@ -118,7 +120,6 @@ def analyze_signal(df, direction="long"):
                 tp1 = level - atr * 0.2 if dir_up else level + atr * 0.2
                 print(f"[{symbol}] ⚠️ TP1 alternatif utilisé (RR1={rr:.2f})")
                 break
-
     if tp1 is None:
         risk = abs(entry - sl)
         tp1 = entry + 1.2 * risk if dir_up else entry - 1.2 * risk
@@ -127,11 +128,10 @@ def analyze_signal(df, direction="long"):
     extension = abs(tp1 - entry)
     tp2 = tp1 + extension if dir_up else tp1 - extension
 
-    risk = abs(entry - sl)
-    rr1 = round(abs(tp1 - entry) / risk, 2)
-    rr2 = round(abs(tp2 - entry) / risk, 2)
+    rr1 = round(abs(tp1 - entry) / abs(entry - sl), 2)
+    rr2 = round(abs(tp2 - entry) / abs(entry - sl), 2)
 
-    commentaire = f"🎯 Confirmé swing pro (score={score}/10, RR1={rr1}, tolérance={','.join(tolerated) if tolerated else 'Aucune'})"
+    commentaire = f"🎯 Confirmé swing pro (score={score}/10, RR1={rr1}, tolérance={'OTE' if tolerated else 'Aucune'})"
     if "OTE" in tolerated:
         commentaire += "\n📌 Entrée optimisée sur fib 0.618 (OTE) malgré tolérance"
 
@@ -149,5 +149,5 @@ def analyze_signal(df, direction="long"):
         'comment': commentaire,
         'tolere_ote': "OTE" in tolerated,
         'toleres': tolerated,
-        'rejetes': failed if len(failed) > 1 else []
+        'rejetes': failed
     }
