@@ -3,7 +3,6 @@ import os
 from datetime import datetime
 from kucoin_utils import fetch_all_symbols, fetch_klines
 from signal_analysis import analyze_signal
-from structure_utils import is_cos_valid, is_bos_valid, is_btc_favorable
 from config import TOKEN, CHAT_ID
 from telegram import Bot
 import traceback
@@ -11,6 +10,12 @@ import traceback
 bot = Bot(token=TOKEN)
 
 async def send_signal_to_telegram(signal):
+    rejected = signal.get("rejetes", [])
+    tolerated = signal.get("toleres", [])
+    
+    msg_rejected = f"❌ Rejetés : {', '.join(rejected)}" if rejected else ""
+    msg_tolerated = f"⚠️ Tolérés : {', '.join(tolerated)}" if tolerated else ""
+
     message = (
         f"📉 {signal['symbol']} - Signal CONFIRMÉ ({signal['direction']})\n\n"
         f"🎯 Entry : {signal['entry']:.4f}\n"
@@ -20,10 +25,13 @@ async def send_signal_to_telegram(signal):
         f"📈 R:R1  : {signal['rr1']}\n"
         f"📈 R:R2  : {signal['rr2']}\n"
         f"🧠 Score : {signal.get('score', '?')}/10\n"
-        f"{signal.get('comment', '')}"
+        f"{signal.get('comment', '')}\n"
+        f"{msg_tolerated}\n"
+        f"{msg_rejected}"
     )
+    
     print(f"[{signal['symbol']}] 📤 Envoi Telegram en cours...")
-    await bot.send_message(chat_id=CHAT_ID, text=message)
+    await bot.send_message(chat_id=CHAT_ID, text=message.strip())
 
 sent_signals = {}
 if os.path.exists("sent_signals.json"):
