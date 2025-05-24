@@ -4,6 +4,7 @@ from indicators import (
     compute_ote,
     compute_fvg,
     compute_ma,
+    compute_macd_histogram,
     find_pivots
 )
 from structure_utils import is_cos_valid, is_bos_valid, is_btc_favorable
@@ -19,22 +20,21 @@ def analyze_signal(df, direction="long"):
     ote    = compute_ote(df).iloc[-1]
     fvg    = compute_fvg(df).iloc[-1]
     ma200  = compute_ma(df, 200).iloc[-1]
+    macd_hist = compute_macd_histogram(df).iloc[-1]
+    momentum_ok = macd_hist > 0 if dir_up else macd_hist < 0
     highs, lows = find_pivots(df, window=5)
     entry  = df['close'].iloc[-1]
 
-    # Zones OTE & FVG
     ote_upper, ote_lower = ote['ote_upper'], ote['ote_lower']
     fvg_upper, fvg_lower = fvg['fvg_upper'], fvg['fvg_lower']
     in_ote = (ote_lower <= entry <= ote_upper)
     in_fvg = (fvg_lower <= entry <= fvg_upper)
 
-    # Structure & tendance
     bos_ok = is_bos_valid(df, direction)
     cos_ok = is_cos_valid(df, direction)
     btc_ok = is_btc_favorable()
     ma_ok  = (entry > ma200) if dir_up else (entry < ma200)
 
-    # Logs initiaux
     print(f"[{symbol}]   Entry        : {entry:.4f}")
     print(f"[{symbol}]   OTE valid    : {in_ote}")
     print(f"[{symbol}]   FVG valid    : {in_fvg}")
@@ -42,8 +42,33 @@ def analyze_signal(df, direction="long"):
     print(f"[{symbol}]   COS valid    : {cos_ok}")
     print(f"[{symbol}]   BTC trend    : {btc_ok}")
     print(f"[{symbol}]   MA200 trend  : {ma_ok}")
+    print(f"[{symbol}]   MACD histogramme : {macd_hist:.5f} => {'Haussier' if momentum_ok else 'Baissier'}")
 
-    # Critères de base
+    if not momentum_ok:
+        print(f"[{symbol}] ❌ Rejeté (MACD momentum contraire)\n")
+        return None
+
+    last_open = df['open'].iloc[-1]
+    last_close = df['close'].iloc[-1]
+    last_volume = df['volume'].iloc[-1]
+    avg_volume = df['volume'].rolling(window=20).mean().iloc[-1]
+    bougie_valide = (last_close > last_open) if dir_up else (last_close < last_open)
+
+    score = 0
+    if in_ote: score += 1
+    if in_fvg: score += 1
+    if bos_ok: score += 2
+    if cos_ok: score += 2
+    if btc_ok: score += 1
+    if ma_ok: score += 1
+    if bougie_valide: score += 1
+    if last_volume >= avg_volume: score += 1
+    if momentum_ok: score += 1  # ✅ MACD
+
+    print(f"[{symbol}]   Bougie valide : {bougie_valide}")
+    print(f"[{symbol}]   Volume OK     : {last_volume >= avg_volume} (actuel: {last_volume:.2f} / moy: {avg_volume:.2f})")
+    print(f"[{symbol}]   Score qualité : {score}/10")
+
     checks = {
         "OTE": in_ote,
         "FVG": in_fvg,
@@ -56,47 +81,11 @@ def analyze_signal(df, direction="long"):
     failed = [k for k, v in checks.items() if not v]
     tolerated = []
 
-    # Bougie + volume
-    last_open = df['open'].iloc[-1]
-    last_close = df['close'].iloc[-1]
-    last_volume = df['volume'].iloc[-1]
-    avg_volume = df['volume'].rolling(window=20).mean().iloc[-1]
-    bougie_valide = (last_close > last_open) if dir_up else (last_close < last_open)
-
-    # Nouvelle validation : bougie clôturée dans la zone FVG + OTE
-    cloture_in_ote = ote_lower <= last_close <= ote_upper
-    cloture_in_fvg = fvg_lower <= last_close <= fvg_upper
-    cloture_valid = cloture_in_ote and cloture_in_fvg
-
-    print(f"[{symbol}]   Bougie valide : {bougie_valide}")
-    print(f"[{symbol}]   Clôture dans zones : {cloture_valid}")
-    print(f"[{symbol}]   Volume OK     : {last_volume >= avg_volume} (actuel: {last_volume:.2f} / moy: {avg_volume:.2f})")
-
-    # Score qualité
-    score = 0
-    if in_ote: score += 1
-    if in_fvg: score += 1
-    if bos_ok: score += 2
-    if cos_ok: score += 2
-    if btc_ok: score += 1
-    if ma_ok: score += 1
-    if bougie_valide: score += 1
-    if last_volume >= avg_volume: score += 1
-
-    print(f"[{symbol}]   Score qualité : {score}/10")
-
-    # Rejet si score insuffisant
     if score < 7:
         print(f"[{symbol}] ❌ Rejeté (score qualité insuffisant)\n")
         return None
 
-    # Rejet si validation bougie dans zone manquante
-    if not cloture_valid:
-        print(f"[{symbol}] ❌ Rejeté (clôture hors zone FVG+OTE)\n")
-        return None
-
-    # Tolérance possible (1 critère KO uniquement)
-    if failed and len(failed) == 1:
+    if failed and score >= 7 and len(failed) == 1:
         tolerated = failed
         print(f"[{symbol}] ⚠️ Tolérance activée pour : {', '.join(tolerated)}")
     elif failed:
@@ -107,17 +96,15 @@ def analyze_signal(df, direction="long"):
         entry = ote.get("ote_618", entry)
         print(f"[{symbol}] ✅ Entrée recalculée (fib 0.618) : {entry:.4f}")
 
-    # SL structurel renforcé
     if dir_up and lows:
         pivot = df['low'].iloc[lows[-1]]
-        sl = pivot - atr * 1.5
+        sl = pivot - atr
     elif not dir_up and highs:
         pivot = df['high'].iloc[highs[-1]]
-        sl = pivot + atr * 1.5
+        sl = pivot + atr
     else:
-        sl = df['low'].iloc[-1] - atr * 1.5 if dir_up else df['high'].iloc[-1] + atr * 1.5
+        sl = df['low'].iloc[-1] - atr if dir_up else df['high'].iloc[-1] + atr
 
-    # TP basé sur R:R ≥ 1.5 ou fallback
     pivots = highs if dir_up else lows
     tp1 = None
     for i in reversed(pivots):
@@ -151,9 +138,7 @@ def analyze_signal(df, direction="long"):
     commentaire = f"🎯 Confirmé swing pro (score={score}/10, RR1={rr1}, tolérance={','.join(tolerated) if tolerated else 'Aucune'})"
     if "OTE" in tolerated:
         commentaire += "\n📌 Entrée optimisée sur fib 0.618 (OTE) malgré tolérance"
-    if cloture_valid:
-        commentaire += "\n✅ Bougie confirmée dans zone OTE + FVG"
-    commentaire += "\n🛡️ SL renforcé : pivot ± 1.5 ATR"
+    commentaire += f"\n📊 MACD Momentum : {'✅' if momentum_ok else '❌'}"
 
     return {
         'symbol': symbol,
