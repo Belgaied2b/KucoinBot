@@ -1,4 +1,6 @@
-def is_cos_valid(df, direction):
+import requests
+
+def is_cos_valid(df, direction): 
     """
     Détection simplifiée du COS (Change of Structure)
     Retourne True si un swing inverse s'est formé récemment.
@@ -24,5 +26,30 @@ def is_bos_valid(df, direction):
         return df['close'].iloc[-1] < lows.iloc[-5]
 
 def is_btc_favorable():
-    # Simulation simple de tendance BTC (à adapter selon ton système réel)
+    # Simulation simple (à remplacer par détection réelle sur BTC si besoin)
     return True
+
+def is_macro_favorable(direction="long"):
+    """
+    Analyse la tendance du marché global (TOTAL et BTC.D) pour filtrer les signaux :
+    - Pour un LONG : TOTAL doit monter et BTC.D ne doit pas monter
+    - Pour un SHORT : TOTAL doit baisser et BTC.D ne doit pas baisser
+    """
+    try:
+        r_total = requests.get("https://api.coingecko.com/api/v3/global")
+        data = r_total.json()
+
+        market_cap_change = data["data"]["market_cap_change_percentage_24h_usd"]
+        btc_dominance_change = data["data"]["market_cap_percentage"]["btc"]
+
+        # Tendance globale : on compare avec des seuils simples
+        total_up = market_cap_change > 0
+        btc_up = btc_dominance_change > 52  # seuil ajustable
+
+        if direction.lower() == "long":
+            return total_up and not btc_up
+        else:
+            return not total_up and btc_up
+    except Exception as e:
+        print(f"⚠️ Erreur macro check (TOTAL/BTC.D): {e}")
+        return False
