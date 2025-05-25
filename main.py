@@ -23,7 +23,7 @@ async def post_init(application):
     logger.info("🔥 Scan immédiat au démarrage")
     await scan_and_send_signals()
 
-# ✅ Scan automatique toutes les 10 minutes dans un thread
+# ✅ Scan automatique toutes les 5 minutes dans un thread
 def job_scan():
     async def wrapper():
         await scan_and_send_signals()
@@ -43,10 +43,10 @@ def main():
     app.add_handler(CommandHandler("scan", scan))
 
     scheduler = BackgroundScheduler(timezone="UTC")
-    scheduler.add_job(job_scan, 'interval', minutes=10)
+    scheduler.add_job(job_scan, 'interval', minutes=5)  # ⏱ SCAN toutes les 5 minutes
     scheduler.start()
 
-    logger.info("🚀 Bot lancé avec scan auto toutes les 10 minutes + scan immédiat")
+    logger.info("🚀 Bot lancé avec scan auto toutes les 5 minutes + scan immédiat")
     app.run_polling()
 
 if __name__ == "__main__":
