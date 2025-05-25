@@ -1,14 +1,3 @@
-from kucoin_utils import fetch_klines
-from indicators import (
-    compute_atr,
-    compute_ote,
-    compute_fvg,
-    compute_ma,
-    find_pivots,
-    compute_macd_histogram
-)
-from structure_utils import is_cos_valid, is_bos_valid, is_btc_favorable
-
 def analyze_signal(df, direction="long"):
     symbol = getattr(df, 'name', 'UNKNOWN')
     dir_up = direction.lower() == "long"
@@ -32,6 +21,7 @@ def analyze_signal(df, direction="long"):
     bos_ok = is_bos_valid(df, direction)
     cos_ok = is_cos_valid(df, direction)
     btc_ok = is_btc_favorable()
+    macro_ok = is_macro_favorable(direction)  # 💡 nouveau filtre
     ma_ok = (entry > ma200) if dir_up else (entry < ma200)
     macd_ok = macd_hist > 0 if dir_up else macd_hist < 0
 
@@ -43,6 +33,7 @@ def analyze_signal(df, direction="long"):
     print(f"[{symbol}]   BTC trend    : {btc_ok}")
     print(f"[{symbol}]   MA200 trend  : {ma_ok}")
     print(f"[{symbol}]   MACD histogramme : {macd_hist:.5f} => {'Haussier' if macd_hist > 0 else 'Baissier'}")
+    print(f"[{symbol}]   Macro trend  : {macro_ok}")
 
     last_open = df['open'].iloc[-1]
     last_close = df['close'].iloc[-1]
@@ -50,7 +41,6 @@ def analyze_signal(df, direction="long"):
     avg_volume = df['volume'].rolling(window=20).mean().iloc[-1]
     bougie_valide = (last_close > last_open) if dir_up else (last_close < last_open)
 
-    # ⛔ Rejet immédiat si bougie invalide
     print(f"[{symbol}]   Bougie valide : {bougie_valide}")
     if not bougie_valide:
         print(f"[{symbol}] ❌ Rejeté (bougie invalide)\n")
@@ -77,7 +67,8 @@ def analyze_signal(df, direction="long"):
         "BTC": btc_ok,
         "MA200": ma_ok,
         "MACD": macd_ok,
-        "VOLUME": last_volume >= avg_volume
+        "VOLUME": last_volume >= avg_volume,
+        "MACRO": macro_ok
     }
 
     failed = [k for k, v in checks.items() if not v]
