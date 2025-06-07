@@ -9,10 +9,36 @@ from indicators import (
 )
 from structure_utils import (
     is_cos_valid,
-    is_bos_valid,
-    is_btc_favorable,
-    is_macro_context_favorable
+    is_bos_valid
 )
+import pandas as pd
+
+
+def analyze_macro(btc_df: pd.DataFrame, total_df: pd.DataFrame, direction: str) -> (bool, list):
+    """
+    Analyse intelligente du contexte macro :
+    - Pour un LONG : BTC et TOTAL doivent être globalement haussiers, BTC.D ne doit pas grimper fort
+    - Pour un SHORT : BTC et TOTAL doivent être globalement baissiers
+    """
+    rejected = []
+    try:
+        btc_trend = btc_df['close'].iloc[-1] > btc_df['close'].iloc[-20]
+        total_trend = total_df['close'].iloc[-1] > total_df['close'].iloc[-20]
+
+        # Interprétation intelligente
+        if direction == "long":
+            if not btc_trend or not total_trend:
+                rejected.append("MACRO (BTC ou TOTAL baissier)")
+        else:
+            if btc_trend or total_trend:
+                rejected.append("MACRO (BTC ou TOTAL haussier)")
+
+    except Exception as e:
+        print(f"⚠️ Erreur analyse macro : {e}")
+        rejected.append("MACRO (indéterminé)")
+
+    return len(rejected) == 0, rejected
+
 
 def analyze_signal(df, direction="long", btc_df=None, total_df=None):
     symbol = getattr(df, 'name', 'UNKNOWN')
@@ -36,21 +62,21 @@ def analyze_signal(df, direction="long", btc_df=None, total_df=None):
 
     bos_ok = is_bos_valid(df, direction)
     cos_ok = is_cos_valid(df, direction)
-    btc_ok = is_btc_favorable()
     ma_ok = (entry > ma200) if dir_up else (entry < ma200)
     macd_ok = macd_hist > 0 if dir_up else macd_hist < 0
-    macro_ok, macro_msg, macro_penalty = is_macro_context_favorable(symbol, direction, btc_df, total_df)
+
+    macro_ok, macro_reject = analyze_macro(btc_df, total_df, direction)
 
     print(f"[{symbol}]   Entry        : {entry:.4f}")
     print(f"[{symbol}]   OTE valid    : {in_ote}")
     print(f"[{symbol}]   FVG valid    : {in_fvg}")
     print(f"[{symbol}]   BOS valid    : {bos_ok}")
     print(f"[{symbol}]   COS valid    : {cos_ok}")
-    print(f"[{symbol}]   BTC trend    : {btc_ok}")
     print(f"[{symbol}]   MA200 trend  : {ma_ok}")
-    print(f"[{symbol}]   MACD hist    : {macd_hist:.5f}")
-    print(f"[{symbol}]   MACRO        : {macro_msg}")
+    print(f"[{symbol}]   MACD histo   : {macd_hist:.5f}")
+    print(f"[{symbol}]   MACRO        : {'OK' if macro_ok else '❌'}")
 
+    # Bougie
     last_open = df['open'].iloc[-1]
     last_close = df['close'].iloc[-1]
     last_volume = df['volume'].iloc[-1]
@@ -62,26 +88,25 @@ def analyze_signal(df, direction="long", btc_df=None, total_df=None):
         print(f"[{symbol}] ❌ Rejeté (bougie invalide)\n")
         return None
 
+    # Score qualité
     score = 0
     if in_ote: score += 1
     if in_fvg: score += 1
     if bos_ok: score += 2
     if cos_ok: score += 2
-    if btc_ok: score += 1
     if ma_ok: score += 1
     if last_volume >= avg_volume: score += 1
     if macd_ok: score += 1
-    score += macro_penalty
+    if macro_ok: score += 1
 
     print(f"[{symbol}]   Volume OK     : {last_volume >= avg_volume} (actuel: {last_volume:.2f} / moy: {avg_volume:.2f})")
     print(f"[{symbol}]   Score qualité : {score}/10")
 
+    # Rejets bloquants sauf OTE
     checks = {
-        "OTE": in_ote,
         "FVG": in_fvg,
         "BOS": bos_ok,
         "COS": cos_ok,
-        "BTC": btc_ok,
         "MA200": ma_ok,
         "MACD": macd_ok,
         "VOLUME": last_volume >= avg_volume,
@@ -95,17 +120,19 @@ def analyze_signal(df, direction="long", btc_df=None, total_df=None):
         print(f"[{symbol}] ❌ Rejeté (score qualité insuffisant)\n")
         return None
 
-    if failed == ["OTE"]:
-        tolerated = ["OTE"]
-        print(f"[{symbol}] ⚠️ Tolérance activée pour : OTE")
-    elif failed:
-        print(f"[{symbol}] ❌ Rejeté ({', '.join(failed)})\n")
+    if failed == [] or failed == ["OTE"]:
+        if "OTE" in failed:
+            tolerated = ["OTE"]
+            print(f"[{symbol}] ⚠️ Tolérance activée pour : OTE")
+    else:
+        print(f"[{symbol}] ❌ Rejeté ({', '.join(failed + macro_reject)})\n")
         return None
 
     if "OTE" in tolerated or in_ote:
         entry = ote.get("ote_618", entry)
-        print(f"[{symbol}] ✅ Entrée recalculée (fib 0.618) : {entry:.4f}")
+        print(f"[{symbol}] ✅ Entrée optimisée (fib 0.618) : {entry:.4f}")
 
+    # SL
     if dir_up and lows:
         pivot = df['low'].iloc[lows[-1]]
         sl = pivot - atr
@@ -115,6 +142,7 @@ def analyze_signal(df, direction="long", btc_df=None, total_df=None):
     else:
         sl = df['low'].iloc[-1] - atr if dir_up else df['high'].iloc[-1] + atr
 
+    # TP intelligent
     pivots = highs if dir_up else lows
     tp1 = None
     for i in reversed(pivots):
@@ -130,13 +158,11 @@ def analyze_signal(df, direction="long", btc_df=None, total_df=None):
             rr = (level - entry) / (entry - sl) if dir_up else (entry - level) / (sl - entry)
             if rr >= 1.2:
                 tp1 = level - atr * 0.2 if dir_up else level + atr * 0.2
-                print(f"[{symbol}] ⚠️ TP1 alternatif utilisé (RR1={rr:.2f})")
                 break
 
     if tp1 is None:
         risk = abs(entry - sl)
         tp1 = entry + 1.2 * risk if dir_up else entry - 1.2 * risk
-        print(f"[{symbol}] ⚠️ TP1 forcé par fallback mathématique (RR1=1.2)")
 
     extension = abs(tp1 - entry)
     tp2 = tp1 + extension if dir_up else tp1 - extension
@@ -147,7 +173,7 @@ def analyze_signal(df, direction="long", btc_df=None, total_df=None):
 
     commentaire = f"🎯 Confirmé swing pro (score={score}/10, RR1={rr1}, tolérance={','.join(tolerated) if tolerated else 'Aucune'})"
     if "OTE" in tolerated:
-        commentaire += "\n📌 Entrée optimisée sur fib 0.618 (OTE) malgré tolérance"
+        commentaire += "\n📌 Entrée optimisée sur fib 0.618 (OTE)"
 
     return {
         'symbol': symbol,
@@ -163,5 +189,5 @@ def analyze_signal(df, direction="long", btc_df=None, total_df=None):
         'comment': commentaire,
         'tolere_ote': "OTE" in tolerated,
         'toleres': tolerated,
-        'rejetes': failed if len(failed) > 1 else []
+        'rejetes': failed + macro_reject if len(failed + macro_reject) > 1 else []
     }
