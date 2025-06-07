@@ -1,16 +1,17 @@
 import json
 import os
-import pandas as pd
-import requests
 from datetime import datetime
 from kucoin_utils import fetch_all_symbols, fetch_klines
 from signal_analysis import analyze_signal
 from config import TOKEN, CHAT_ID
 from telegram import Bot
+import requests
 import traceback
+import pandas as pd
 
 bot = Bot(token=TOKEN)
 
+# 🔁 Envoi Telegram
 async def send_signal_to_telegram(signal):
     rejected = signal.get("rejetes", [])
     tolerated = signal.get("toleres", [])
@@ -35,6 +36,8 @@ async def send_signal_to_telegram(signal):
     print(f"[{signal['symbol']}] 📤 Envoi Telegram en cours...")
     await bot.send_message(chat_id=CHAT_ID, text=message.strip())
 
+
+# 📂 Gestion des doublons
 sent_signals = {}
 if os.path.exists("sent_signals.json"):
     try:
@@ -44,6 +47,8 @@ if os.path.exists("sent_signals.json"):
     except Exception as e:
         print("⚠️ Erreur lecture sent_signals.json :", e)
 
+
+# 📊 Chargement macro BTC / TOTAL
 def fetch_macro_df():
     def get_chart(url):
         r = requests.get(url)
@@ -57,14 +62,33 @@ def fetch_macro_df():
             "volume": [x[1] for x in data["total_volumes"]],
         })
 
+    # BTC
     btc_df = get_chart("https://api.coingecko.com/api/v3/coins/bitcoin/market_chart?vs_currency=usd&days=30")
-    total_df = get_chart("https://api.coingecko.com/api/v3/global/market_cap_chart?vs_currency=usd&days=30")
+
+    # TOTAL reconstitué à partir de la dominance
+    global_data = requests.get("https://api.coingecko.com/api/v3/global").json()
+    btc_dominance = global_data["data"]["market_cap_percentage"]["btc"] / 100
+    total_market_cap = btc_df["close"] / btc_dominance
+
+    total_df = btc_df.copy()
+    total_df["close"] = total_market_cap
+    total_df["high"] = total_market_cap * 1.01
+    total_df["low"] = total_market_cap * 0.99
+    total_df["open"] = total_market_cap
+
     return btc_df, total_df
 
+
+# 🔍 Scan principal
 async def scan_and_send_signals():
     print(f"🔁 Scan lancé à {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC\n")
     all_symbols = fetch_all_symbols()
-    btc_df, total_df = fetch_macro_df()
+
+    try:
+        btc_df, total_df = fetch_macro_df()
+    except Exception as e:
+        print(f"⚠️ Erreur macro fetch : {e}")
+        return
 
     for symbol in all_symbols:
         if not symbol.endswith("USDTM"):
