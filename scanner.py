@@ -1,5 +1,7 @@
 import json
 import os
+import pandas as pd
+import requests
 from datetime import datetime
 from kucoin_utils import fetch_all_symbols, fetch_klines
 from signal_analysis import analyze_signal
@@ -42,9 +44,27 @@ if os.path.exists("sent_signals.json"):
     except Exception as e:
         print("⚠️ Erreur lecture sent_signals.json :", e)
 
+def fetch_macro_df():
+    def get_chart(url):
+        r = requests.get(url)
+        data = r.json()
+        return pd.DataFrame({
+            "timestamp": [x[0] for x in data["prices"]],
+            "close": [x[1] for x in data["prices"]],
+            "high": [x[1] * 1.01 for x in data["prices"]],
+            "low": [x[1] * 0.99 for x in data["prices"]],
+            "open": [x[1] for x in data["prices"]],
+            "volume": [x[1] for x in data["total_volumes"]],
+        })
+
+    btc_df = get_chart("https://api.coingecko.com/api/v3/coins/bitcoin/market_chart?vs_currency=usd&days=30")
+    total_df = get_chart("https://api.coingecko.com/api/v3/global/market_cap_chart?vs_currency=usd&days=30")
+    return btc_df, total_df
+
 async def scan_and_send_signals():
     print(f"🔁 Scan lancé à {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC\n")
     all_symbols = fetch_all_symbols()
+    btc_df, total_df = fetch_macro_df()
 
     for symbol in all_symbols:
         if not symbol.endswith("USDTM"):
@@ -56,7 +76,7 @@ async def scan_and_send_signals():
 
             for direction in ["long", "short"]:
                 print(f"[{symbol}] ➡️ Analyse {direction.upper()}")
-                signal = analyze_signal(df, direction=direction)
+                signal = analyze_signal(df, direction=direction, btc_df=btc_df, total_df=total_df)
 
                 if signal:
                     suffix = "TOLÉRÉ" if signal.get("tolere_ote") else "CONFIRMÉ"
