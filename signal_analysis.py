@@ -15,29 +15,33 @@ import pandas as pd
 
 
 def analyze_macro(btc_df: pd.DataFrame, total_df: pd.DataFrame, direction: str) -> (bool, list):
-    """
-    Analyse intelligente du contexte macro :
-    - Pour un LONG : BTC et TOTAL doivent être globalement haussiers, BTC.D ne doit pas grimper fort
-    - Pour un SHORT : BTC et TOTAL doivent être globalement baissiers
-    """
     rejected = []
     try:
         btc_trend = btc_df['close'].iloc[-1] > btc_df['close'].iloc[-20]
         total_trend = total_df['close'].iloc[-1] > total_df['close'].iloc[-20]
+        btc_range = abs(btc_df['close'].iloc[-1] - btc_df['close'].iloc[-20]) / btc_df['close'].iloc[-20] < 0.01
+        total_range = abs(total_df['close'].iloc[-1] - total_df['close'].iloc[-20]) / total_df['close'].iloc[-20] < 0.01
 
-        # Interprétation intelligente
-        if direction == "long":
+        if btc_range and total_range:
+            rejected.append("MACRO (BTC et TOTAL en range)")
+        elif direction == "long":
             if not btc_trend or not total_trend:
                 rejected.append("MACRO (BTC ou TOTAL baissier)")
         else:
             if btc_trend or total_trend:
                 rejected.append("MACRO (BTC ou TOTAL haussier)")
-
     except Exception as e:
         print(f"⚠️ Erreur analyse macro : {e}")
         rejected.append("MACRO (indéterminé)")
 
     return len(rejected) == 0, rejected
+
+
+def detect_fakeout(df, direction):
+    if direction == "long":
+        return df['low'].iloc[-1] < df['low'].rolling(window=20).min().iloc[-2]
+    else:
+        return df['high'].iloc[-1] > df['high'].rolling(window=20).max().iloc[-2]
 
 
 def analyze_signal(df, direction="long", btc_df=None, total_df=None):
@@ -66,6 +70,7 @@ def analyze_signal(df, direction="long", btc_df=None, total_df=None):
     macd_ok = macd_hist > 0 if dir_up else macd_hist < 0
 
     macro_ok, macro_reject = analyze_macro(btc_df, total_df, direction)
+    fakeout_ok = detect_fakeout(df, direction)
 
     print(f"[{symbol}]   Entry        : {entry:.4f}")
     print(f"[{symbol}]   OTE valid    : {in_ote}")
@@ -74,9 +79,9 @@ def analyze_signal(df, direction="long", btc_df=None, total_df=None):
     print(f"[{symbol}]   COS valid    : {cos_ok}")
     print(f"[{symbol}]   MA200 trend  : {ma_ok}")
     print(f"[{symbol}]   MACD histo   : {macd_hist:.5f}")
+    print(f"[{symbol}]   Fakeout ok   : {fakeout_ok}")
     print(f"[{symbol}]   MACRO        : {'OK' if macro_ok else '❌'}")
 
-    # Bougie
     last_open = df['open'].iloc[-1]
     last_close = df['close'].iloc[-1]
     last_volume = df['volume'].iloc[-1]
@@ -84,11 +89,12 @@ def analyze_signal(df, direction="long", btc_df=None, total_df=None):
     bougie_valide = (last_close > last_open) if dir_up else (last_close < last_open)
 
     print(f"[{symbol}]   Bougie valide : {bougie_valide}")
+
     if not bougie_valide:
-        print(f"[{symbol}] ❌ Rejeté (bougie invalide)\n")
+        print(f"[{symbol}] ❌ Rejeté (bougie invalide)
+")
         return None
 
-    # Score qualité
     score = 0
     if in_ote: score += 1
     if in_fvg: score += 1
@@ -98,11 +104,11 @@ def analyze_signal(df, direction="long", btc_df=None, total_df=None):
     if last_volume >= avg_volume: score += 1
     if macd_ok: score += 1
     if macro_ok: score += 1
+    if fakeout_ok: score += 1
 
     print(f"[{symbol}]   Volume OK     : {last_volume >= avg_volume} (actuel: {last_volume:.2f} / moy: {avg_volume:.2f})")
     print(f"[{symbol}]   Score qualité : {score}/10")
 
-    # Rejets bloquants sauf OTE
     checks = {
         "FVG": in_fvg,
         "BOS": bos_ok,
@@ -110,14 +116,16 @@ def analyze_signal(df, direction="long", btc_df=None, total_df=None):
         "MA200": ma_ok,
         "MACD": macd_ok,
         "VOLUME": last_volume >= avg_volume,
-        "MACRO": macro_ok
+        "MACRO": macro_ok,
+        "FAKEOUT": fakeout_ok
     }
 
     failed = [k for k, v in checks.items() if not v]
     tolerated = []
 
     if score < 8:
-        print(f"[{symbol}] ❌ Rejeté (score qualité insuffisant)\n")
+        print(f"[{symbol}] ❌ Rejeté (score qualité insuffisant)
+")
         return None
 
     if failed == [] or failed == ["OTE"]:
@@ -125,14 +133,14 @@ def analyze_signal(df, direction="long", btc_df=None, total_df=None):
             tolerated = ["OTE"]
             print(f"[{symbol}] ⚠️ Tolérance activée pour : OTE")
     else:
-        print(f"[{symbol}] ❌ Rejeté ({', '.join(failed + macro_reject)})\n")
+        print(f"[{symbol}] ❌ Rejeté ({', '.join(failed + macro_reject)})
+")
         return None
 
     if "OTE" in tolerated or in_ote:
         entry = ote.get("ote_618", entry)
         print(f"[{symbol}] ✅ Entrée optimisée (fib 0.618) : {entry:.4f}")
 
-    # SL
     if dir_up and lows:
         pivot = df['low'].iloc[lows[-1]]
         sl = pivot - atr
@@ -142,7 +150,6 @@ def analyze_signal(df, direction="long", btc_df=None, total_df=None):
     else:
         sl = df['low'].iloc[-1] - atr if dir_up else df['high'].iloc[-1] + atr
 
-    # TP intelligent
     pivots = highs if dir_up else lows
     tp1 = None
     for i in reversed(pivots):
