@@ -53,13 +53,16 @@ def fetch_macro_df():
     def get_chart(url):
         r = requests.get(url)
         data = r.json()
+        if "prices" not in data:
+            raise ValueError("❌ Données invalides (clé 'prices' manquante)")
+
         return pd.DataFrame({
             "timestamp": [x[0] for x in data["prices"]],
             "close": [x[1] for x in data["prices"]],
             "high": [x[1] * 1.01 for x in data["prices"]],
             "low": [x[1] * 0.99 for x in data["prices"]],
             "open": [x[1] for x in data["prices"]],
-            "volume": [x[1] for x in data["total_volumes"]],
+            "volume": [x[1] for x in data.get("total_volumes", data["prices"])],
         })
 
     # BTC
