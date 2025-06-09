@@ -13,31 +13,41 @@ from structure_utils import (
 )
 import pandas as pd
 
-def analyze_macro(btc_df: pd.DataFrame, total_df: pd.DataFrame, btc_d_df: pd.DataFrame, direction: str) -> (bool, list):
-    """
-    Analyse intelligente du contexte macro :
-    - Pour un LONG : BTC et TOTAL doivent être haussiers, BTC.D ne doit pas grimper
-    - Pour un SHORT : BTC et TOTAL doivent être baissiers, BTC.D ne doit pas baisser
-    """
+
+def analyze_macro(btc_df: pd.DataFrame, total_df: pd.DataFrame, btc_4h_df: pd.DataFrame, direction: str) -> (bool, list):
     rejected = []
+
     try:
         btc_trend = btc_df['close'].iloc[-1] > btc_df['close'].iloc[-20]
         total_trend = total_df['close'].iloc[-1] > total_df['close'].iloc[-20]
-        btc_d_trend = btc_d_df['close'].iloc[-1] > btc_d_df['close'].iloc[-20]
+        btc_range_flat = abs(btc_df['close'].iloc[-1] - btc_df['close'].iloc[-20]) < btc_df['close'].iloc[-20] * 0.02
+
+        macd_4h = compute_macd_histogram(btc_4h_df).iloc[-1]
+        ma_4h = compute_ma(btc_4h_df, 200).iloc[-1]
+        price_4h = btc_4h_df['close'].iloc[-1]
+        trend_4h_ok = (price_4h > ma_4h and macd_4h > 0) if direction == "long" else (price_4h < ma_4h and macd_4h < 0)
+
+        if btc_range_flat:
+            rejected.append("BTC en range (flat)")
+
+        if not trend_4h_ok:
+            rejected.append("Pas confirmé en 4H (BTC)")
 
         if direction == "long":
-            if not btc_trend or not total_trend or btc_d_trend:
-                rejected.append("MACRO (BTC/TOTAL ou BTC.D défavorable)")
+            if not btc_trend or not total_trend:
+                rejected.append("MACRO (BTC ou TOTAL baissier)")
         else:
-            if btc_trend or total_trend or not btc_d_trend:
-                rejected.append("MACRO (BTC/TOTAL ou BTC.D défavorable)")
+            if btc_trend or total_trend:
+                rejected.append("MACRO (BTC ou TOTAL haussier)")
+
     except Exception as e:
         print(f"⚠️ Erreur analyse macro : {e}")
         rejected.append("MACRO (indéterminé)")
 
     return len(rejected) == 0, rejected
 
-def analyze_signal(df, direction="long", btc_df=None, total_df=None, btc_d_df=None):
+
+def analyze_signal(df, direction="long", btc_df=None, total_df=None, btc_4h_df=None):
     symbol = getattr(df, 'name', 'UNKNOWN')
     dir_up = direction.lower() == "long"
     dir_str = direction.upper()
@@ -61,7 +71,8 @@ def analyze_signal(df, direction="long", btc_df=None, total_df=None, btc_d_df=No
     cos_ok = is_cos_valid(df, direction)
     ma_ok = (entry > ma200) if dir_up else (entry < ma200)
     macd_ok = macd_hist > 0 if dir_up else macd_hist < 0
-    macro_ok, macro_reject = analyze_macro(btc_df, total_df, btc_d_df, direction)
+
+    macro_ok, macro_reject = analyze_macro(btc_df, total_df, btc_4h_df, direction)
 
     print(f"[{symbol}]   Entry        : {entry:.4f}")
     print(f"[{symbol}]   OTE valid    : {in_ote}")
@@ -72,7 +83,6 @@ def analyze_signal(df, direction="long", btc_df=None, total_df=None, btc_d_df=No
     print(f"[{symbol}]   MACD histo   : {macd_hist:.5f}")
     print(f"[{symbol}]   MACRO        : {'OK' if macro_ok else '❌'}")
 
-    # Bougie confirmation
     last_open = df['open'].iloc[-1]
     last_close = df['close'].iloc[-1]
     last_volume = df['volume'].iloc[-1]
@@ -84,7 +94,6 @@ def analyze_signal(df, direction="long", btc_df=None, total_df=None, btc_d_df=No
         print(f"[{symbol}] ❌ Rejeté (bougie invalide)\n")
         return None
 
-    # Score qualité
     score = 0
     if in_ote: score += 1
     if in_fvg: score += 1
@@ -98,7 +107,6 @@ def analyze_signal(df, direction="long", btc_df=None, total_df=None, btc_d_df=No
     print(f"[{symbol}]   Volume OK     : {last_volume >= avg_volume} (actuel: {last_volume:.2f} / moy: {avg_volume:.2f})")
     print(f"[{symbol}]   Score qualité : {score}/10")
 
-    # Vérification bloquante sauf OTE
     checks = {
         "FVG": in_fvg,
         "BOS": bos_ok,
@@ -128,7 +136,6 @@ def analyze_signal(df, direction="long", btc_df=None, total_df=None, btc_d_df=No
         entry = ote.get("ote_618", entry)
         print(f"[{symbol}] ✅ Entrée optimisée (fib 0.618) : {entry:.4f}")
 
-    # SL dynamique
     if dir_up and lows:
         pivot = df['low'].iloc[lows[-1]]
         sl = pivot - atr
@@ -138,7 +145,6 @@ def analyze_signal(df, direction="long", btc_df=None, total_df=None, btc_d_df=No
     else:
         sl = df['low'].iloc[-1] - atr if dir_up else df['high'].iloc[-1] + atr
 
-    # TP intelligent
     pivots = highs if dir_up else lows
     tp1 = None
     for i in reversed(pivots):
