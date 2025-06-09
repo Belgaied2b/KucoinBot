@@ -91,7 +91,7 @@ def analyze_signal(df, direction="long", btc_df=None, total_df=None):
     print(f"[{symbol}]   Bougie valide : {bougie_valide}")
 
     if not bougie_valide:
-        print(f"[{symbol}] ❌ Rejeté (bougie invalide)
+        print(f"[{symbol}] ❌ Rejeté (bougie invalide)\n")
 ")
         return None
 
