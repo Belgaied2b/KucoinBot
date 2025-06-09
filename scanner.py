@@ -48,7 +48,7 @@ if os.path.exists("sent_signals.json"):
         print("⚠️ Erreur lecture sent_signals.json :", e)
 
 
-# 📊 Chargement macro BTC / TOTAL / BTC.D
+# 📊 Chargement macro BTC / TOTAL
 def fetch_macro_df():
     def get_chart(url):
         r = requests.get(url)
@@ -62,7 +62,10 @@ def fetch_macro_df():
             "volume": [x[1] for x in data["total_volumes"]],
         })
 
+    # BTC
     btc_df = get_chart("https://api.coingecko.com/api/v3/coins/bitcoin/market_chart?vs_currency=usd&days=30")
+
+    # TOTAL reconstitué
     global_data = requests.get("https://api.coingecko.com/api/v3/global").json()
     btc_dominance = global_data["data"]["market_cap_percentage"]["btc"] / 100
     total_market_cap = btc_df["close"] / btc_dominance
@@ -73,16 +76,7 @@ def fetch_macro_df():
     total_df["low"] = total_market_cap * 0.99
     total_df["open"] = total_market_cap
 
-    btc_d_df = pd.DataFrame({
-        "timestamp": [btc_df["timestamp"].iloc[i] for i in range(len(btc_df))],
-        "close": [btc_dominance * 100] * len(btc_df),
-        "high": [btc_dominance * 100] * len(btc_df),
-        "low": [btc_dominance * 100] * len(btc_df),
-        "open": [btc_dominance * 100] * len(btc_df),
-        "volume": [0] * len(btc_df)
-    })
-
-    return btc_df, total_df, btc_d_df
+    return btc_df, total_df
 
 
 # 🔍 Scan principal
@@ -91,7 +85,8 @@ async def scan_and_send_signals():
     all_symbols = fetch_all_symbols()
 
     try:
-        btc_df, total_df, btc_d_df = fetch_macro_df()
+        btc_df, total_df = fetch_macro_df()
+        btc_4h_df = fetch_klines("BTC-USDT", interval="4h", limit=50)
     except Exception as e:
         print(f"⚠️ Erreur macro fetch : {e}")
         return
@@ -106,7 +101,13 @@ async def scan_and_send_signals():
 
             for direction in ["long", "short"]:
                 print(f"[{symbol}] ➡️ Analyse {direction.upper()}")
-                signal = analyze_signal(df, direction=direction, btc_df=btc_df, total_df=total_df, btc_d_df=btc_d_df)
+                signal = analyze_signal(
+                    df,
+                    direction=direction,
+                    btc_df=btc_df,
+                    total_df=total_df,
+                    btc_4h_df=btc_4h_df
+                )
 
                 if signal:
                     suffix = "TOLÉRÉ" if signal.get("tolere_ote") else "CONFIRMÉ"
