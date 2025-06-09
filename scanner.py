@@ -1,5 +1,6 @@
 import json
 import os
+import time
 from datetime import datetime
 from kucoin_utils import fetch_all_symbols, fetch_klines
 from signal_analysis import analyze_signal
@@ -48,11 +49,14 @@ if os.path.exists("sent_signals.json"):
         print("⚠️ Erreur lecture sent_signals.json :", e)
 
 
-# 📊 Chargement macro BTC / TOTAL
-def fetch_macro_df():
-    def get_chart(url):
+# 📊 Chargement macro BTC / TOTAL / BTC.D
+def get_chart(url):
+    try:
+        time.sleep(1)  # pour éviter les limites d'API
         r = requests.get(url)
         data = r.json()
+        if "prices" not in data or "total_volumes" not in data:
+            raise ValueError("Données manquantes dans la réponse CoinGecko")
         return pd.DataFrame({
             "timestamp": [x[0] for x in data["prices"]],
             "close": [x[1] for x in data["prices"]],
@@ -61,11 +65,20 @@ def fetch_macro_df():
             "open": [x[1] for x in data["prices"]],
             "volume": [x[1] for x in data["total_volumes"]],
         })
+    except Exception as e:
+        print(f"⚠️ Erreur get_chart ({url}): {e}")
+        return None
 
-    # BTC
+
+def fetch_macro_df():
     btc_df = get_chart("https://api.coingecko.com/api/v3/coins/bitcoin/market_chart?vs_currency=usd&days=30")
+    if btc_df is None:
+        raise ValueError("Impossible de charger les données BTC")
 
-    # TOTAL reconstitué
+    btc_d_df = get_chart("https://api.coingecko.com/api/v3/coins/bitcoin/market_chart?vs_currency=usd&days=30")
+    if btc_d_df is None:
+        raise ValueError("Impossible de charger les données BTC.D")
+
     global_data = requests.get("https://api.coingecko.com/api/v3/global").json()
     btc_dominance = global_data["data"]["market_cap_percentage"]["btc"] / 100
     total_market_cap = btc_df["close"] / btc_dominance
@@ -76,7 +89,7 @@ def fetch_macro_df():
     total_df["low"] = total_market_cap * 0.99
     total_df["open"] = total_market_cap
 
-    return btc_df, total_df
+    return btc_df, total_df, btc_d_df
 
 
 # 🔍 Scan principal
@@ -85,8 +98,7 @@ async def scan_and_send_signals():
     all_symbols = fetch_all_symbols()
 
     try:
-        btc_df, total_df = fetch_macro_df()
-        btc_4h_df = fetch_klines("BTC-USDT", interval="4h", limit=50)
+        btc_df, total_df, btc_d_df = fetch_macro_df()
     except Exception as e:
         print(f"⚠️ Erreur macro fetch : {e}")
         return
@@ -101,13 +113,7 @@ async def scan_and_send_signals():
 
             for direction in ["long", "short"]:
                 print(f"[{symbol}] ➡️ Analyse {direction.upper()}")
-                signal = analyze_signal(
-                    df,
-                    direction=direction,
-                    btc_df=btc_df,
-                    total_df=total_df,
-                    btc_4h_df=btc_4h_df
-                )
+                signal = analyze_signal(df, direction=direction, btc_df=btc_df, total_df=total_df, btc_d_df=btc_d_df)
 
                 if signal:
                     suffix = "TOLÉRÉ" if signal.get("tolere_ote") else "CONFIRMÉ"
