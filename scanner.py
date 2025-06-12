@@ -79,15 +79,23 @@ def fetch_macro_df():
     if btc_d_df is None:
         raise ValueError("Impossible de charger les données BTC.D")
 
-    global_data = requests.get("https://api.coingecko.com/api/v3/global").json()
-    btc_dominance = global_data["data"]["market_cap_percentage"]["btc"] / 100
-    total_market_cap = btc_df["close"] / btc_dominance
+    try:
+        global_response = requests.get("https://api.coingecko.com/api/v3/global")
+        global_data = global_response.json()
 
-    total_df = btc_df.copy()
-    total_df["close"] = total_market_cap
-    total_df["high"] = total_market_cap * 1.01
-    total_df["low"] = total_market_cap * 0.99
-    total_df["open"] = total_market_cap
+        if "data" not in global_data or "market_cap_percentage" not in global_data["data"]:
+            raise ValueError("Champ 'data' manquant dans la réponse de CoinGecko")
+
+        btc_dominance = global_data["data"]["market_cap_percentage"]["btc"] / 100
+        total_market_cap = btc_df["close"] / btc_dominance
+
+        total_df = btc_df.copy()
+        total_df["close"] = total_market_cap
+        total_df["high"] = total_market_cap * 1.01
+        total_df["low"] = total_market_cap * 0.99
+        total_df["open"] = total_market_cap
+    except Exception as e:
+        raise ValueError(f"Erreur parsing global_data : {e}")
 
     return btc_df, total_df, btc_d_df
 
