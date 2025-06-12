@@ -1,4 +1,5 @@
 import numpy as np
+import pandas as pd
 from structure_utils import detect_bos_cos
 from indicators import compute_macd_histogram as calculate_macd_histogram
 from indicators import compute_rsi as calculate_rsi
@@ -12,9 +13,9 @@ def analyze_signal(df, direction="long", btc_df=None, total_df=None, btc_d_df=No
     timeframe = "1H"
 
     df_4h = df_1h.copy()
-    df_4h["timestamp"] = df_4h.index
+    df_4h["timestamp"] = pd.to_datetime(df_4h["timestamp"], unit="ms")
     df_4h.set_index("timestamp", inplace=True)
-    df_4h = df_4h.resample("4H").agg({
+    df_4h = df_4h.resample("4h").agg({
         "open": "first",
         "high": "max",
         "low": "min",
@@ -94,30 +95,24 @@ def analyze_signal(df, direction="long", btc_df=None, total_df=None, btc_d_df=No
 def is_ma200_valid(df, direction):
     ma200 = calculate_ma(df["close"], period=200)
     current_price = df["close"].iloc[-1]
-    if direction == "long":
-        return current_price > ma200.iloc[-1]
-    else:
-        return current_price < ma200.iloc[-1]
+    return current_price > ma200.iloc[-1] if direction == "long" else current_price < ma200.iloc[-1]
 
 def is_ote(price, df, direction):
     high = df["high"].rolling(20).max().iloc[-1]
     low = df["low"].rolling(20).min().iloc[-1]
     fib_618 = low + 0.618 * (high - low)
     fib_705 = low + 0.705 * (high - low)
-    if direction == "long":
-        return fib_618 <= price <= fib_705
-    else:
-        return fib_618 >= price >= fib_705
+    return fib_618 <= price <= fib_705 if direction == "long" else fib_705 <= price <= fib_618
 
 def is_fvg_valid(df, direction):
-    fvg_zones = calculate_fvg_zones(df)
-    if not fvg_zones:
-        return False
+    fvg_df = calculate_fvg_zones(df)
     latest_price = df["close"].iloc[-1]
-    for zone in fvg_zones[-3:]:
-        if direction == "long" and zone["low"] <= latest_price <= zone["high"]:
-            return True
-        if direction == "short" and zone["low"] <= latest_price <= zone["high"]:
+    for i in range(-3, 0):
+        low = fvg_df['fvg_lower'].iloc[i]
+        high = fvg_df['fvg_upper'].iloc[i]
+        if pd.isna(low) or pd.isna(high):
+            continue
+        if low <= latest_price <= high:
             return True
     return False
 
@@ -132,12 +127,9 @@ def is_valid_candle(df, direction):
     return body > wick * 0.4
 
 def is_macd_valid(df, direction):
-    hist = calculate_macd_histogram(df["close"])
+    hist = calculate_macd_histogram(df)
     value = hist.iloc[-1]
-    if direction == "long":
-        return value > 0, value
-    else:
-        return value < 0, value
+    return (value > 0, value) if direction == "long" else (value < 0, value)
 
 def is_confirmed_on_4h(df_4h, direction):
     ma200 = calculate_ma(df_4h["close"], period=200)
