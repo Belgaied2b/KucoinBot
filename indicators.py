@@ -21,11 +21,6 @@ def compute_macd(df: pd.DataFrame, fast: int = 12, slow: int = 26, signal: int =
     }, index=df.index)
 
 def compute_fvg(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    ICT-style FVG detection:
-    Bullish FVG = Low[i+1] > High[i-1]
-    Bearish FVG = High[i+1] < Low[i-1]
-    """
     fvg_upper = []
     fvg_lower = []
 
@@ -36,11 +31,9 @@ def compute_fvg(df: pd.DataFrame) -> pd.DataFrame:
         high_next = df['high'].iloc[i + 1]
 
         if low_next > high_prev:
-            # FVG haussier
             fvg_upper.append(low_next)
             fvg_lower.append(high_prev)
         elif high_next < low_prev:
-            # FVG baissier
             fvg_upper.append(low_prev)
             fvg_lower.append(high_next)
         else:
@@ -56,10 +49,6 @@ def compute_fvg(df: pd.DataFrame) -> pd.DataFrame:
     return fvg_df
 
 def compute_ote(df: pd.DataFrame, window: int = 20) -> pd.DataFrame:
-    """
-    OTE = Optimal Trade Entry zone entre 62% et 70.5% de retracement
-    Calculé à partir du plus haut et plus bas d'une fenêtre (swing)
-    """
     high_ = df['high'].rolling(window=window, min_periods=1).max()
     low_  = df['low'].rolling(window=window, min_periods=1).min()
     ote_upper = low_ + (high_ - low_) * 0.705
@@ -91,11 +80,18 @@ def find_pivots(df: pd.DataFrame, window: int = 5):
 def compute_macd_histogram(df, fast=12, slow=26, signal=9):
     """
     Calcule le MACD histogramme (MACD - signal).
+    Accepte une Series (close) ou un DataFrame contenant 'close'.
     """
-    ema_fast = df['close'].ewm(span=fast, adjust=False).mean()
-    ema_slow = df['close'].ewm(span=slow, adjust=False).mean()
+    if isinstance(df, pd.Series):
+        close = df
+    elif isinstance(df, pd.DataFrame) and 'close' in df.columns:
+        close = df['close']
+    else:
+        raise ValueError("compute_macd_histogram() requiert une Series ou un DataFrame avec 'close'")
+
+    ema_fast = close.ewm(span=fast, adjust=False).mean()
+    ema_slow = close.ewm(span=slow, adjust=False).mean()
     macd = ema_fast - ema_slow
     signal_line = macd.ewm(span=signal, adjust=False).mean()
     macd_hist = macd - signal_line
     return macd_hist
-
