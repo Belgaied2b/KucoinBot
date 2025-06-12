@@ -94,3 +94,25 @@ def is_macro_context_favorable(symbol, direction, btc_df, total_df):
         return True, "⚠️ Macro partiellement favorable : " + ", ".join(notes), -1
     else:
         return False, "❌ Macro défavorable : " + ", ".join(notes), -2
+
+# ✅ Fonction manquante ajoutée pour éviter ImportError
+def detect_bos_cos(df, direction="long", tf_confirm=None):
+    """
+    Détecte la structure de marché (BOS / COS) sur la base des plus hauts et plus bas.
+    Si `tf_confirm` est fourni, il est utilisé comme timeframe de confirmation.
+    """
+    bos = False
+    cos = False
+
+    df = df.copy()
+    df['high_shifted'] = df['high'].shift(1)
+    df['low_shifted'] = df['low'].shift(1)
+
+    if direction == "long":
+        bos = df['high'].iloc[-1] > df['high_shifted'].max()
+        cos = df['low'].iloc[-1] > df['low_shifted'].min()
+    elif direction == "short":
+        bos = df['low'].iloc[-1] < df['low_shifted'].min()
+        cos = df['high'].iloc[-1] < df['high_shifted'].max()
+
+    return bos, cos
