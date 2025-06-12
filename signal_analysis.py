@@ -1,4 +1,5 @@
 import numpy as np
+import pandas as pd
 from structure_utils import detect_bos_cos
 from indicators import compute_macd_histogram as calculate_macd_histogram
 from indicators import compute_rsi as calculate_rsi
@@ -12,8 +13,7 @@ def analyze_signal(df, direction="long", btc_df=None, total_df=None, btc_d_df=No
     timeframe = "1H"
 
     df_4h = df_1h.copy()
-    df_4h["timestamp"] = df_4h.index
-    df_4h.set_index("timestamp", inplace=True)
+    df_4h.index = pd.to_datetime(df_4h.index)  # ✅ Correction ici
     df_4h = df_4h.resample("4h").agg({
         "open": "first",
         "high": "max",
@@ -92,7 +92,7 @@ def analyze_signal(df, direction="long", btc_df=None, total_df=None, btc_d_df=No
     }
 
 def is_ma200_valid(df, direction):
-    ma200 = calculate_ma(df, period=200)
+    ma200 = calculate_ma(df["close"], period=200)
     current_price = df["close"].iloc[-1]
     return current_price > ma200.iloc[-1] if direction == "long" else current_price < ma200.iloc[-1]
 
@@ -101,19 +101,19 @@ def is_ote(price, df, direction):
     low = df["low"].rolling(20).min().iloc[-1]
     fib_618 = low + 0.618 * (high - low)
     fib_705 = low + 0.705 * (high - low)
-    if direction == "long":
-        return fib_618 <= price <= fib_705
-    else:
-        return fib_618 >= price >= fib_705
+    return fib_618 <= price <= fib_705 if direction == "long" else fib_618 >= price >= fib_705
 
 def is_fvg_valid(df, direction):
-    fvg_df = calculate_fvg_zones(df)
+    fvg_zones = calculate_fvg_zones(df)
+    if not isinstance(fvg_zones, pd.DataFrame):
+        return False
     latest_price = df["close"].iloc[-1]
     for i in range(-3, 0):
-        upper = fvg_df["fvg_upper"].iloc[i]
-        lower = fvg_df["fvg_lower"].iloc[i]
-        if upper and lower and lower <= latest_price <= upper:
-            return True
+        if pd.notna(fvg_zones["fvg_upper"].iloc[i]) and pd.notna(fvg_zones["fvg_lower"].iloc[i]):
+            low = fvg_zones["fvg_lower"].iloc[i]
+            high = fvg_zones["fvg_upper"].iloc[i]
+            if low <= latest_price <= high:
+                return True
     return False
 
 def is_volume_valid(df):
@@ -129,13 +129,10 @@ def is_valid_candle(df, direction):
 def is_macd_valid(df, direction):
     hist = calculate_macd_histogram(df["close"])
     value = hist.iloc[-1]
-    if direction == "long":
-        return value > 0, value
-    else:
-        return value < 0, value
+    return (value > 0, value) if direction == "long" else (value < 0, value)
 
 def is_confirmed_on_4h(df_4h, direction):
-    ma200 = calculate_ma(df_4h, period=200)
+    ma200 = calculate_ma(df_4h["close"], period=200)
     close = df_4h["close"].iloc[-1]
     return close > ma200.iloc[-1] if direction == "long" else close < ma200.iloc[-1]
 
@@ -143,24 +140,13 @@ def is_macro_valid(btc_df, total_df, btc_d_df, direction):
     btc_trend = btc_df["close"].iloc[-1] > btc_df["close"].iloc[-5]
     total_trend = total_df["close"].iloc[-1] > total_df["close"].iloc[-5]
     btc_d_trend = btc_d_df["close"].iloc[-1] > btc_d_df["close"].iloc[-5]
-
-    if direction == "long":
-        return btc_trend and total_trend and not btc_d_trend
-    else:
-        return not btc_trend and not total_trend and btc_d_trend
+    return btc_trend and total_trend and not btc_d_trend if direction == "long" else not btc_trend and not total_trend and btc_d_trend
 
 def calculate_sl_tp(df, entry, direction):
     atr = df["high"].rolling(14).max().iloc[-1] - df["low"].rolling(14).min().iloc[-1]
-    if direction == "long":
-        sl = entry - atr * 0.5
-        tp1 = entry + atr
-        tp2 = entry + atr * 2
-    else:
-        sl = entry + atr * 0.5
-        tp1 = entry - atr
-        tp2 = entry - atr * 2
-
+    sl = entry - atr * 0.5 if direction == "long" else entry + atr * 0.5
+    tp1 = entry + atr if direction == "long" else entry - atr
+    tp2 = entry + atr * 2 if direction == "long" else entry - atr * 2
     rr1 = round(abs(tp1 - entry) / abs(entry - sl), 2)
     rr2 = round(abs(tp2 - entry) / abs(entry - sl), 2)
-
     return round(sl, 4), round(tp1, 4), round(tp2, 4), rr1, rr2
