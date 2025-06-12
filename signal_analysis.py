@@ -1,6 +1,9 @@
 import numpy as np
 from structure_utils import detect_bos_cos
-from indicators import calculate_macd_histogram, calculate_rsi, calculate_ma, calculate_fvg_zones
+from indicators import compute_macd_histogram as calculate_macd_histogram
+from indicators import compute_rsi as calculate_rsi
+from indicators import compute_ma as calculate_ma
+from indicators import compute_fvg as calculate_fvg_zones
 from chart_generator import generate_chart
 
 def analyze_signal(df, direction="long", btc_df=None, total_df=None, btc_d_df=None):
