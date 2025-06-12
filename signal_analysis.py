@@ -12,7 +12,10 @@ def analyze_signal(df, direction="long", btc_df=None, total_df=None, btc_d_df=No
     df_1h.name = df.name
     timeframe = "1H"
 
-    # ✅ S'assurer que l'index est bien de type datetime pour resample
+    if "close" not in df_1h.columns:
+        print(f"[{df.name}] ❌ Erreur : colonne 'close' absente")
+        return None
+
     df_4h = df_1h.copy()
     df_4h.index = pd.to_datetime(df_4h.index, errors='coerce')
     df_4h = df_4h.dropna(subset=["open", "high", "low", "close", "volume"])
@@ -25,10 +28,6 @@ def analyze_signal(df, direction="long", btc_df=None, total_df=None, btc_d_df=No
     }).dropna()
 
     symbol = df.name
-    if "close" not in df_1h.columns:
-        print(f"[{symbol}] ❌ Erreur : colonne 'close' absente")
-        return None
-
     entry = df_1h["close"].iloc[-1]
 
     fvg_valid = is_fvg_valid(df_1h, direction)
@@ -109,7 +108,7 @@ def is_ote(price, df, direction):
     low = df["low"].rolling(20).min().iloc[-1]
     fib_618 = low + 0.618 * (high - low)
     fib_705 = low + 0.705 * (high - low)
-    return fib_618 <= price <= fib_705 if direction == "long" else fib_618 >= price >= fib_705
+    return fib_618 <= price <= fib_705 if direction == "long" else fib_705 <= price <= fib_618
 
 def is_fvg_valid(df, direction):
     fvg_zones = calculate_fvg_zones(df)
@@ -135,7 +134,7 @@ def is_valid_candle(df, direction):
     return body > wick * 0.4
 
 def is_macd_valid(df, direction):
-    hist = calculate_macd_histogram(df["close"])
+    hist = calculate_macd_histogram(df)  # ✅ Correction ici
     value = hist.iloc[-1]
     return (value > 0, value) if direction == "long" else (value < 0, value)
 
