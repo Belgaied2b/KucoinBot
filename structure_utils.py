@@ -2,6 +2,7 @@ import requests
 import time
 import pandas as pd
 
+# ✅ COS avec seuil
 def is_cos_valid(df, direction): 
     window = 5
     if direction == "long":
@@ -11,6 +12,7 @@ def is_cos_valid(df, direction):
         last_pivot_high = df['high'].rolling(window).max().iloc[-1]
         return df['close'].iloc[-1] < last_pivot_high * 0.98
 
+# ✅ BOS avec seuil
 def is_bos_valid(df, direction):
     highs = df['high'].rolling(5).max()
     lows = df['low'].rolling(5).min()
@@ -19,10 +21,11 @@ def is_bos_valid(df, direction):
     else:
         return df['close'].iloc[-1] < lows.iloc[-5]
 
+# ✅ Placeholder si besoin futur
 def is_btc_favorable():
-    return True  # laissé en placeholder
+    return True
 
-# ⚠️ Nouveau filtre macro intelligent
+# ✅ Macro filtrage intelligent
 _cached_macro = None
 _last_macro_check = 0
 
@@ -95,24 +98,31 @@ def is_macro_context_favorable(symbol, direction, btc_df, total_df):
     else:
         return False, "❌ Macro défavorable : " + ", ".join(notes), -2
 
-# ✅ Fonction manquante ajoutée pour éviter ImportError
-def detect_bos_cos(df, direction="long", tf_confirm=None):
+# ✅ Correction ici : fonction compatible avec confirm=True
+def detect_bos_cos(df, direction="long", confirm=False):
     """
-    Détecte la structure de marché (BOS / COS) sur la base des plus hauts et plus bas.
-    Si `tf_confirm` est fourni, il est utilisé comme timeframe de confirmation.
+    Détecte BOS/COS avec possibilité de confirmation stricte via clôture + volume.
     """
-    bos = False
-    cos = False
-
     df = df.copy()
-    df['high_shifted'] = df['high'].shift(1)
-    df['low_shifted'] = df['low'].shift(1)
+    last_close = df["close"].iloc[-1]
+    last_volume = df["volume"].iloc[-1]
+    avg_volume = df["volume"].rolling(20).mean().iloc[-1]
+
+    recent_high = df["high"].rolling(5).max().iloc[-2]
+    recent_low = df["low"].rolling(5).min().iloc[-2]
+
+    bos, cos = False, False
 
     if direction == "long":
-        bos = df['high'].iloc[-1] > df['high_shifted'].max()
-        cos = df['low'].iloc[-1] > df['low_shifted'].min()
+        bos = last_close > recent_high
+        cos = last_close > recent_low
     elif direction == "short":
-        bos = df['low'].iloc[-1] < df['low_shifted'].min()
-        cos = df['high'].iloc[-1] < df['high_shifted'].max()
+        bos = last_close < recent_low
+        cos = last_close < recent_high
+
+    if confirm:
+        if last_volume < avg_volume * 1.2:
+            bos = False
+            cos = False
 
     return bos, cos
