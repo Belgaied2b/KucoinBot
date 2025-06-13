@@ -20,6 +20,24 @@ def compute_macd(df: pd.DataFrame, fast: int = 12, slow: int = 26, signal: int =
         'histogram': macd_val - signal_line
     }, index=df.index)
 
+def compute_macd_histogram(df, fast=12, slow=26, signal=9):
+    """
+    Calcule uniquement l'histogramme MACD (MACD - signal).
+    Accepte une Series (close) ou un DataFrame contenant 'close'.
+    """
+    if isinstance(df, pd.Series):
+        close = df
+    elif isinstance(df, pd.DataFrame) and 'close' in df.columns:
+        close = df['close']
+    else:
+        raise ValueError("compute_macd_histogram() requiert une Series ou un DataFrame avec 'close'")
+
+    ema_fast = close.ewm(span=fast, adjust=False).mean()
+    ema_slow = close.ewm(span=slow, adjust=False).mean()
+    macd = ema_fast - ema_slow
+    signal_line = macd.ewm(span=signal, adjust=False).mean()
+    return macd - signal_line
+
 def compute_fvg(df: pd.DataFrame) -> pd.DataFrame:
     fvg_upper = []
     fvg_lower = []
@@ -60,38 +78,20 @@ def compute_ote(df: pd.DataFrame, window: int = 20) -> pd.DataFrame:
 
 def compute_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     high_low        = df['high'] - df['low']
-    high_prev_close = (df['high'] - df['close'].shift()).abs()
-    low_prev_close  = (df['low']  - df['close'].shift()).abs()
-    tr = pd.concat([high_low, high_prev_close, low_prev_close], axis=1).max(axis=1)
+    high_close_prev = (df['high'] - df['close'].shift()).abs()
+    low_close_prev  = (df['low']  - df['close'].shift()).abs()
+    tr = pd.concat([high_low, high_close_prev, low_close_prev], axis=1).max(axis=1)
     return tr.rolling(window=period, min_periods=1).mean()
 
 def compute_ma(df: pd.DataFrame, period: int = 200) -> pd.Series:
     return df['close'].rolling(window=period, min_periods=1).mean()
 
 def find_pivots(df: pd.DataFrame, window: int = 5):
-    highs, lows = [], []
+    highs = []
+    lows = []
     for i in range(window, len(df) - window):
         if df['high'].iloc[i] == df['high'].iloc[i - window:i + window + 1].max():
             highs.append(i)
         if df['low'].iloc[i] == df['low'].iloc[i - window:i + window + 1].min():
             lows.append(i)
     return highs, lows
-
-def compute_macd_histogram(df, fast=12, slow=26, signal=9):
-    """
-    Calcule le MACD histogramme (MACD - signal).
-    Accepte une Series (close) ou un DataFrame contenant 'close'.
-    """
-    if isinstance(df, pd.Series):
-        close = df
-    elif isinstance(df, pd.DataFrame) and 'close' in df.columns:
-        close = df['close']
-    else:
-        raise ValueError("compute_macd_histogram() requiert une Series ou un DataFrame avec 'close'")
-
-    ema_fast = close.ewm(span=fast, adjust=False).mean()
-    ema_slow = close.ewm(span=slow, adjust=False).mean()
-    macd = ema_fast - ema_slow
-    signal_line = macd.ewm(span=signal, adjust=False).mean()
-    macd_hist = macd - signal_line
-    return macd_hist
