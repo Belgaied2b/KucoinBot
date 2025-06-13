@@ -19,6 +19,31 @@ def is_fvg_valid(df: pd.DataFrame, direction: str) -> bool:
     else:
         return price < df["fvg_upper"].iloc[-1]
 
+def is_valid_breakout(df, direction):
+    last = df.iloc[-1]
+    body = abs(last["close"] - last["open"])
+    wick = last["high"] - last["low"]
+    volume = last["volume"]
+    avg_volume = df["volume"].rolling(20).mean().iloc[-1]
+    if wick == 0: return False
+    body_ratio = body / wick
+    if direction == "long":
+        return last["close"] > last["open"] and body_ratio > 0.5 and volume > avg_volume
+    else:
+        return last["close"] < last["open"] and body_ratio > 0.5 and volume > avg_volume
+
+def is_fakeout(df, direction):
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
+    if direction == "long":
+        return prev["high"] > df["high"].rolling(20).max().iloc[-3] and last["close"] < prev["open"]
+    else:
+        return prev["low"] < df["low"].rolling(20).min().iloc[-3] and last["close"] > prev["open"]
+
+def is_range(df):
+    recent = df["close"].iloc[-5:]
+    return recent.max() - recent.min() < df["close"].mean() * 0.01
+
 def analyze_signal(df, direction="long", btc_df=None, total_df=None, btc_d_df=None):
     df_1h = df.copy()
     df_1h.name = df.name
@@ -51,13 +76,19 @@ def analyze_signal(df, direction="long", btc_df=None, total_df=None, btc_d_df=No
     candle_ok = is_valid_candle(df_1h, direction)
     volume_ok = is_volume_valid(df_1h)
     confirm_ok = is_confirmed_on_4h(df_4h, direction)
+    breakout_ok = is_valid_breakout(df_1h, direction)
+    fakeout_detected = is_fakeout(df_1h, direction)
+    btc_range = is_range(btc_df)
+    total_range = is_range(total_df)
 
     sl, tp1, tp2, rr1, rr2 = calculate_sl_tp(df_1h, entry, direction)
     rejected = []
     tolerated = []
     score = 10
 
-    if not fvg_valid: rejected.append("FVG"); score -= 2
+    if fakeout_detected: rejected.append("Fakeout"); score -= 2
+    if not breakout_ok: rejected.append("Breakout"); score -= 1
+    if not fvg_valid: rejected.append("FVG"); score -= 1
     if not bos_ok: rejected.append("BOS"); score -= 1
     if not cos_ok: rejected.append("COS"); score -= 1
     if not ma200_ok: rejected.append("MA200"); score -= 1
@@ -66,6 +97,7 @@ def analyze_signal(df, direction="long", btc_df=None, total_df=None, btc_d_df=No
     if not confirm_ok: rejected.append("CONFIRM 4H"); score -= 1
     if not candle_ok: rejected.append("Bougie"); score -= 1
     if not volume_ok: rejected.append("Volume"); score -= 1
+    if btc_range or total_range: rejected.append("Marché Neutre"); score -= 1
 
     tolere_ote = False
     if not ote_valid:
@@ -82,6 +114,8 @@ def analyze_signal(df, direction="long", btc_df=None, total_df=None, btc_d_df=No
     print(f"[{symbol}]   MACD histo   : {macd_value:.5f}")
     print(f"[{symbol}]   MACRO        : {'✅' if macro_ok else '❌'}")
     print(f"[{symbol}]   CONFIRM 4H   : {'✅' if confirm_ok else '❌'}")
+    print(f"[{symbol}]   Breakout     : {'✅' if breakout_ok else '❌'}")
+    print(f"[{symbol}]   Fakeout      : {'❌' if fakeout_detected else '✅'}")
     print(f"[{symbol}]   Bougie valide : {candle_ok}")
     print(f"[{symbol}]   Volume OK     : {volume_ok} (actuel: {df_1h['volume'].iloc[-1]:.2f} / moy: {df_1h['volume'].rolling(20).mean().iloc[-1]:.2f})")
     print(f"[{symbol}]   Score qualité : {score}/10")
@@ -108,6 +142,7 @@ def analyze_signal(df, direction="long", btc_df=None, total_df=None, btc_d_df=No
         "tolere_ote": tolere_ote
     }
 
+# Fonctions auxiliaires
 def is_ma200_valid(df, direction):
     ma200 = calculate_ma(df, period=200)
     current_price = df["close"].iloc[-1]
