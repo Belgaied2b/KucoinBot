@@ -11,16 +11,15 @@ from indicators import (
 )
 from chart_generator import generate_chart
 
-def is_fvg_valid(df: pd.DataFrame, direction: str) -> bool:
+def is_fvg_valid(df: pd.DataFrame, direction: str) -> (bool, tuple):
     fvg = calculate_fvg_zones(df)
     df = df.copy()
     df["fvg_upper"] = fvg["fvg_upper"]
     df["fvg_lower"] = fvg["fvg_lower"]
-    price = df["close"].iloc[-1]
     if direction == "long":
-        return price > df["fvg_lower"].iloc[-1]
+        return df["close"].iloc[-1] > df["fvg_lower"].iloc[-1], (df["fvg_lower"].iloc[-1], df["fvg_upper"].iloc[-1])
     else:
-        return price < df["fvg_upper"].iloc[-1]
+        return df["close"].iloc[-1] < df["fvg_upper"].iloc[-1], (df["fvg_upper"].iloc[-1], df["fvg_lower"].iloc[-1])
 
 def detect_choch(df: pd.DataFrame, direction: str) -> bool:
     if len(df) < 5:
@@ -51,8 +50,8 @@ def analyze_signal(df, direction="long", btc_df=None, total_df=None, btc_d_df=No
 
     entry = df_1h["close"].iloc[-1]
 
-    fvg_valid = is_fvg_valid(df_1h, direction)
-    ote_valid = is_ote(entry, df_1h, direction)
+    fvg_valid, fvg_zone = is_fvg_valid(df_1h, direction)
+    ote_valid, ote_zone = is_ote(entry, df_1h, direction, return_zone=True)
     ma200_ok = is_ma200_valid(df_1h, direction)
     bos_ok, cos_ok = detect_bos_cos(df_1h, direction)
     choch_ok = detect_choch(df_1h, direction)
@@ -102,11 +101,15 @@ def analyze_signal(df, direction="long", btc_df=None, total_df=None, btc_d_df=No
     print(f"[{symbol}]   ATR OK        : {atr_ok}")
     print(f"[{symbol}]   Score qualité : {score}/10")
 
+    if not ote_valid:
+        print(f"[{symbol}] ⚠️ Entrée en dehors de la zone optimale.")
+        print(f"[{symbol}] 📍 Zone idéale d'entrée : entre {round(ote_zone[0], 4)} et {round(ote_zone[1], 4)}")
+
     if score < 8:
         print(f"[{symbol}] ❌ Rejeté (score qualité insuffisant)\n")
         return None
 
-    chart_path = generate_chart(df_1h, symbol, ote_zone=(0, 0), fvg_zone=(0, 0), entry=entry, sl=sl, tp=tp1, direction=direction.upper())
+    chart_path = generate_chart(df_1h, symbol, ote_zone, fvg_zone, entry, sl, tp1, direction.upper())
 
     return {
         "symbol": symbol,
@@ -129,11 +132,13 @@ def is_ma200_valid(df, direction):
     current_price = df["close"].iloc[-1]
     return current_price > ma200.iloc[-1] if direction == "long" else current_price < ma200.iloc[-1]
 
-def is_ote(price, df, direction):
+def is_ote(price, df, direction, return_zone=False):
     high = df["high"].rolling(20).max().iloc[-1]
     low = df["low"].rolling(20).min().iloc[-1]
     fib_618 = low + 0.618 * (high - low)
     fib_705 = low + 0.705 * (high - low)
+    if return_zone:
+        return (fib_618 <= price <= fib_705 if direction == "long" else fib_705 <= price <= fib_618), (fib_618, fib_705)
     return fib_618 <= price <= fib_705 if direction == "long" else fib_705 <= price <= fib_618
 
 def is_volume_valid(df):
