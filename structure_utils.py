@@ -21,9 +21,9 @@ def is_bos_valid(df, direction):
 
 def is_choch_detected(df, direction):
     """
-    Détecte un CHoCH (Change of Character) :
-    - Long : plus bas + plus haut cassés
-    - Short : plus haut + plus bas cassés
+    Détecte un CHoCH (change of character).
+    - Pour un long : le prix fait un plus haut significatif après avoir fait un plus bas plus bas.
+    - Pour un short : le prix fait un plus bas significatif après avoir fait un plus haut plus haut.
     """
     if len(df) < 10:
         return False
@@ -35,18 +35,27 @@ def is_choch_detected(df, direction):
         last_low = df['low'].iloc[-3]
         current_high = df['high'].iloc[-1]
         return last_low < recent_lows.iloc[-5] and current_high > recent_highs.iloc[-5]
+
     elif direction == "short":
         last_high = df['high'].iloc[-3]
         current_low = df['low'].iloc[-1]
         return last_high > recent_highs.iloc[-5] and current_low < recent_lows.iloc[-5]
+
     return False
 
 def detect_bos_cos(df, direction="long", tf_confirm=None):
+    """
+    Détecte la structure de marché (BOS / COS) avec option CHoCH.
+    """
     bos = is_bos_valid(df, direction)
     cos = is_cos_valid(df, direction)
     return bos, cos
 
-# 🔍 Macro contexte global (CoinGecko)
+# Placeholder BTC favorabilité
+def is_btc_favorable():
+    return True
+
+# 🔍 Filtrage macro intelligent (CoinGecko)
 _cached_macro = None
 _last_macro_check = 0
 
@@ -89,32 +98,28 @@ def is_macro_context_favorable(symbol, direction, btc_df, total_df):
             macro_score += 1
         else:
             notes.append("❌ TOTAL faible")
-        if btc_d < 52:
-            macro_score += 1
-        else:
-            notes.append("❌ BTC.D en hausse")
+        # BTC.D uniquement informatif
         if btc_above_ma and not btc_range:
             macro_score += 1
         else:
             notes.append("❌ BTC faible ou en range")
-
+        if btc_d >= 52:
+            notes.append("ℹ️ BTC.D élevé")
     elif direction == "short":
         if not total_trend or total_change < -0.5:
             macro_score += 1
         else:
             notes.append("❌ TOTAL encore haussier")
-        if btc_d > 50:
-            macro_score += 1
-        else:
-            notes.append("❌ BTC.D en baisse")
         if not btc_above_ma:
             macro_score += 1
         else:
             notes.append("❌ BTC reste haussier")
+        if btc_d <= 50:
+            notes.append("ℹ️ BTC.D faible")
 
-    if macro_score == 3:
+    if macro_score == 2:
         return True, "✅ Macro favorable", 0
-    elif macro_score == 2:
+    elif macro_score == 1:
         return True, "⚠️ Macro partiellement favorable : " + ", ".join(notes), -1
     else:
         return False, "❌ Macro défavorable : " + ", ".join(notes), -2
