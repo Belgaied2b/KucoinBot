@@ -21,9 +21,9 @@ def is_bos_valid(df, direction):
 
 def is_choch_detected(df, direction):
     """
-    Détecte un CHoCH (change of character).
-    - Pour un long : le prix fait un plus haut significatif après avoir fait un plus bas plus bas.
-    - Pour un short : le prix fait un plus bas significatif après avoir fait un plus haut plus haut.
+    Détecte un CHoCH (Change of Character) :
+    - Long : plus bas + plus haut cassés
+    - Short : plus haut + plus bas cassés
     """
     if len(df) < 10:
         return False
@@ -35,27 +35,18 @@ def is_choch_detected(df, direction):
         last_low = df['low'].iloc[-3]
         current_high = df['high'].iloc[-1]
         return last_low < recent_lows.iloc[-5] and current_high > recent_highs.iloc[-5]
-
     elif direction == "short":
         last_high = df['high'].iloc[-3]
         current_low = df['low'].iloc[-1]
         return last_high > recent_highs.iloc[-5] and current_low < recent_lows.iloc[-5]
-
     return False
 
 def detect_bos_cos(df, direction="long", tf_confirm=None):
-    """
-    Détecte la structure de marché (BOS / COS) avec option CHoCH.
-    """
     bos = is_bos_valid(df, direction)
     cos = is_cos_valid(df, direction)
     return bos, cos
 
-# Placeholder BTC favorabilité
-def is_btc_favorable():
-    return True
-
-# 🔍 Filtrage macro intelligent (CoinGecko)
+# 🔍 Macro contexte global (CoinGecko)
 _cached_macro = None
 _last_macro_check = 0
 
