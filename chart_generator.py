@@ -6,12 +6,17 @@ import os
 
 def generate_chart(df, symbol, ote_zone, fvg_zone, entry, sl, tp, direction):
     df = df.copy().tail(100)
-    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-    df.set_index('timestamp', inplace=True)
+
+    if 'timestamp' in df.columns:
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms', errors='coerce')
+        df = df.dropna(subset=["timestamp"])
+        df.set_index('timestamp', inplace=True)
+    else:
+        df.index = pd.to_datetime(df.index, errors='coerce')
+        df = df.dropna(subset=["open", "high", "low", "close"])
 
     fig, ax = plt.subplots(figsize=(10, 5))
 
-    # Largeur de bougie en timedelta (ex : 10 minutes)
     candle_width = timedelta(minutes=10)
 
     for i in range(len(df)):
@@ -33,10 +38,8 @@ def generate_chart(df, symbol, ote_zone, fvg_zone, entry, sl, tp, direction):
             color=color
         ))
 
-    # OTE zone
+    # Zones OTE et FVG
     ax.axhspan(ote_zone[1], ote_zone[0], color='blue', alpha=0.2, label='OTE')
-
-    # FVG zone
     ax.axhspan(fvg_zone[1], fvg_zone[0], color='orange', alpha=0.2, label='FVG')
 
     # Lignes Entry / SL / TP
@@ -46,18 +49,18 @@ def generate_chart(df, symbol, ote_zone, fvg_zone, entry, sl, tp, direction):
 
     # Flèche directionnelle
     y_start = entry
-    y_end = tp if direction == "LONG" else sl
+    y_end = tp if direction.upper() == "LONG" else sl
     ax.annotate('', xy=(df.index[-1], y_end), xytext=(df.index[-1], y_start),
                 arrowprops=dict(facecolor='blue', shrink=0.05, width=2, headwidth=8))
 
-    ax.set_title(f'{symbol} - {direction}')
+    ax.set_title(f'{symbol} - {direction.upper()}')
     ax.legend()
     ax.xaxis.set_major_formatter(mdates.DateFormatter('%m-%d %H:%M'))
     plt.xticks(rotation=45)
     plt.tight_layout()
 
     # Sauvegarde
-    path = f"chart_{symbol.replace('/', '_')}_{direction}.png"
+    path = f"chart_{symbol.replace('/', '_')}_{direction.upper()}.png"
     plt.savefig(path)
     plt.close()
     return path
