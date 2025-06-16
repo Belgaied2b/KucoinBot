@@ -159,8 +159,7 @@ def is_confirmed_on_4h(df_4h, direction):
 def is_macro_valid(btc_df, total_df, btc_d_df, direction):
     btc_trend = btc_df["close"].iloc[-1] > btc_df["close"].iloc[-5]
     total_trend = total_df["close"].iloc[-1] > total_df["close"].iloc[-5]
-    btc_d_trend = btc_d_df["close"].iloc[-1] > btc_d_df["close"].iloc[-5]
-    return btc_trend and total_trend and not btc_d_trend if direction == "long" else not btc_trend and not total_trend and btc_d_trend
+    return btc_trend and total_trend if direction == "long" else not btc_trend and not total_trend
 
 def is_atr_valid(df, threshold=0.5):
     atr = compute_atr(df).iloc[-1]
