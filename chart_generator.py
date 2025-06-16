@@ -1,7 +1,7 @@
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timedelta
 import os
 
 def generate_chart(df, symbol, ote_zone, fvg_zone, entry, sl, tp, direction):
@@ -10,15 +10,26 @@ def generate_chart(df, symbol, ote_zone, fvg_zone, entry, sl, tp, direction):
     df.set_index('timestamp', inplace=True)
 
     fig, ax = plt.subplots(figsize=(10, 5))
-    width = 0.0005 * (df.index[-1] - df.index[0]).total_seconds()
+
+    # Largeur de bougie en timedelta (ex : 10 minutes)
+    candle_width = timedelta(minutes=10)
 
     for i in range(len(df)):
         color = 'green' if df['close'].iloc[i] >= df['open'].iloc[i] else 'red'
-        ax.plot([df.index[i], df.index[i]], [df['low'].iloc[i], df['high'].iloc[i]], color=color, linewidth=0.5)
+        time = df.index[i]
+        open_price = df['open'].iloc[i]
+        close_price = df['close'].iloc[i]
+        low = df['low'].iloc[i]
+        high = df['high'].iloc[i]
+
+        # Mèche
+        ax.plot([time, time], [low, high], color=color, linewidth=0.5)
+
+        # Corps
         ax.add_patch(plt.Rectangle(
-            (df.index[i], min(df['open'].iloc[i], df['close'].iloc[i])),
-            width,
-            abs(df['close'].iloc[i] - df['open'].iloc[i]),
+            (time - candle_width / 2, min(open_price, close_price)),
+            candle_width,
+            abs(close_price - open_price),
             color=color
         ))
 
@@ -28,10 +39,10 @@ def generate_chart(df, symbol, ote_zone, fvg_zone, entry, sl, tp, direction):
     # FVG zone
     ax.axhspan(fvg_zone[1], fvg_zone[0], color='orange', alpha=0.2, label='FVG')
 
-    # Entrée, SL, TP
-    ax.axhline(entry, color='blue', linestyle='--', linewidth=1)
-    ax.axhline(sl, color='red', linestyle='--', linewidth=1)
-    ax.axhline(tp, color='green', linestyle='--', linewidth=1)
+    # Lignes Entry / SL / TP
+    ax.axhline(entry, color='blue', linestyle='--', linewidth=1, label='Entry')
+    ax.axhline(sl, color='red', linestyle='--', linewidth=1, label='SL')
+    ax.axhline(tp, color='green', linestyle='--', linewidth=1, label='TP')
 
     # Flèche directionnelle
     y_start = entry
