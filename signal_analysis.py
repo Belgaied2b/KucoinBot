@@ -22,6 +22,16 @@ def is_fvg_valid(df: pd.DataFrame, direction: str) -> bool:
     else:
         return price < df["fvg_upper"].iloc[-1]
 
+def detect_choch(df: pd.DataFrame, direction: str) -> bool:
+    if len(df) < 5:
+        return False
+    highs = df["high"].rolling(5).max()
+    lows = df["low"].rolling(5).min()
+    if direction == "long":
+        return df["low"].iloc[-1] > lows.iloc[-2] and df["high"].iloc[-1] > highs.iloc[-2]
+    else:
+        return df["high"].iloc[-1] < highs.iloc[-2] and df["low"].iloc[-1] < lows.iloc[-2]
+
 def analyze_signal(df, direction="long", btc_df=None, total_df=None, btc_d_df=None):
     df_1h = df.copy()
     df_1h.name = df.name
@@ -31,11 +41,7 @@ def analyze_signal(df, direction="long", btc_df=None, total_df=None, btc_d_df=No
     df_4h.index = pd.to_datetime(df_4h.index, errors='coerce')
     df_4h = df_4h.dropna(subset=["open", "high", "low", "close", "volume"])
     df_4h = df_4h.resample("4h").agg({
-        "open": "first",
-        "high": "max",
-        "low": "min",
-        "close": "last",
-        "volume": "sum"
+        "open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"
     }).dropna()
 
     symbol = df.name
@@ -48,7 +54,8 @@ def analyze_signal(df, direction="long", btc_df=None, total_df=None, btc_d_df=No
     fvg_valid = is_fvg_valid(df_1h, direction)
     ote_valid = is_ote(entry, df_1h, direction)
     ma200_ok = is_ma200_valid(df_1h, direction)
-    bos_ok, cos_ok = detect_bos_cos(df_1h, direction, confirm=True)
+    bos_ok, cos_ok = detect_bos_cos(df_1h, direction)
+    choch_ok = detect_choch(df_1h, direction)
     macd_ok, macd_value = is_macd_valid(df_1h, direction)
     macro_ok = is_macro_valid(btc_df, total_df, btc_d_df, direction)
     candle_ok = is_valid_candle(df_1h, direction)
@@ -65,6 +72,7 @@ def analyze_signal(df, direction="long", btc_df=None, total_df=None, btc_d_df=No
     if not fvg_valid: rejected.append("FVG"); score -= 2
     if not bos_ok: rejected.append("BOS"); score -= 1
     if not cos_ok: rejected.append("COS"); score -= 1
+    if not choch_ok: rejected.append("CHoCH"); score -= 1
     if not ma200_ok: rejected.append("MA200"); score -= 1
     if not macd_ok: rejected.append("MACD"); score -= 1
     if not macro_ok: rejected.append("MACRO"); score -= 1
@@ -84,6 +92,7 @@ def analyze_signal(df, direction="long", btc_df=None, total_df=None, btc_d_df=No
     print(f"[{symbol}]   FVG valid    : {fvg_valid}")
     print(f"[{symbol}]   BOS valid    : {bos_ok}")
     print(f"[{symbol}]   COS valid    : {cos_ok}")
+    print(f"[{symbol}]   CHoCH valid  : {choch_ok}")
     print(f"[{symbol}]   MA200 trend  : {ma200_ok}")
     print(f"[{symbol}]   MACD histo   : {macd_value:.5f}")
     print(f"[{symbol}]   MACRO        : {'✅' if macro_ok else '❌'}")
@@ -97,7 +106,7 @@ def analyze_signal(df, direction="long", btc_df=None, total_df=None, btc_d_df=No
         print(f"[{symbol}] ❌ Rejeté (score qualité insuffisant)\n")
         return None
 
-    chart_path = generate_chart(df_1h, entry, sl, tp1, tp2, direction)
+    chart_path = generate_chart(df_1h, symbol, ote_zone=(0, 0), fvg_zone=(0, 0), entry=entry, sl=sl, tp=tp1, direction=direction.upper())
 
     return {
         "symbol": symbol,
