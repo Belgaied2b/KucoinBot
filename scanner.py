@@ -12,7 +12,6 @@ import pandas as pd
 
 bot = Bot(token=TOKEN)
 
-# 🔁 Envoi Telegram
 async def send_signal_to_telegram(signal):
     rejected = signal.get("rejetes", [])
     tolerated = signal.get("toleres", [])
@@ -34,11 +33,9 @@ async def send_signal_to_telegram(signal):
         f"{msg_rejected}"
     )
 
-    print(f"[{signal['symbol']}] 📤 Envoi Telegram en cours...")
+    print(f"[{signal['symbol']}] 📤 Envoi Telegram...")
     await bot.send_message(chat_id=CHAT_ID, text=message.strip())
 
-
-# 📂 Gestion des doublons
 sent_signals = {}
 if os.path.exists("sent_signals.json"):
     try:
@@ -48,16 +45,13 @@ if os.path.exists("sent_signals.json"):
     except Exception as e:
         print("⚠️ Erreur lecture sent_signals.json :", e)
 
-
-# 📊 Chargement macro BTC / TOTAL / BTC.D
 def get_chart(url):
     try:
-        time.sleep(1.2)  # éviter les limites API
+        time.sleep(1)
         r = requests.get(url)
-        r.raise_for_status()
         data = r.json()
         if "prices" not in data or "total_volumes" not in data:
-            raise ValueError("Données manquantes dans la réponse CoinGecko")
+            raise ValueError("Données manquantes")
         return pd.DataFrame({
             "timestamp": [x[0] for x in data["prices"]],
             "close": [x[1] for x in data["prices"]],
@@ -67,45 +61,30 @@ def get_chart(url):
             "volume": [x[1] for x in data["total_volumes"]],
         })
     except Exception as e:
-        print(f"⚠️ Erreur get_chart ({url}): {e}")
+        print(f"⚠️ Erreur get_chart : {e}")
         return None
-
 
 def fetch_macro_df():
     btc_df = get_chart("https://api.coingecko.com/api/v3/coins/bitcoin/market_chart?vs_currency=usd&days=30")
-    if btc_df is None:
-        raise ValueError("Impossible de charger les données BTC")
-
-    btc_d_df = get_chart("https://api.coingecko.com/api/v3/coins/bitcoin/market_chart?vs_currency=usd&days=30")
-    if btc_d_df is None:
-        raise ValueError("Impossible de charger les données BTC.D")
+    btc_d_df = btc_df.copy()
 
     try:
         global_response = requests.get("https://api.coingecko.com/api/v3/global")
-        global_response.raise_for_status()
         global_data = global_response.json()
-
-        if not global_data or "data" not in global_data or "market_cap_percentage" not in global_data["data"]:
-            raise ValueError("Données 'data' ou 'market_cap_percentage' manquantes")
-
-        btc_dominance = global_data["data"]["market_cap_percentage"]["btc"] / 100
-        if btc_dominance == 0:
-            raise ValueError("Dominance BTC invalide (0)")
-
-        total_market_cap = btc_df["close"] / btc_dominance
+        dominance = global_data["data"]["market_cap_percentage"]["btc"] / 100
+        total_market_cap = btc_df["close"] / dominance
 
         total_df = btc_df.copy()
         total_df["close"] = total_market_cap
         total_df["high"] = total_market_cap * 1.01
         total_df["low"] = total_market_cap * 0.99
         total_df["open"] = total_market_cap
+
     except Exception as e:
         raise ValueError(f"Erreur parsing global_data : {e}")
 
     return btc_df, total_df, btc_d_df
 
-
-# 🔍 Scan principal
 async def scan_and_send_signals():
     print(f"🔁 Scan lancé à {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC\n")
     all_symbols = fetch_all_symbols()
@@ -133,7 +112,7 @@ async def scan_and_send_signals():
                     signal_id = f"{symbol}-{direction.upper()}-{suffix}"
 
                     if signal_id in sent_signals:
-                        print(f"[{symbol}] 🔁 Signal déjà envoyé ({direction.upper()}-{suffix}), ignoré")
+                        print(f"[{symbol}] 🔁 Déjà envoyé ({signal_id}), ignoré")
                         continue
 
                     print(f"[{symbol}] ✅ Nouveau signal accepté : {direction.upper()} ({suffix})")
