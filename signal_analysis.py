@@ -4,7 +4,7 @@ from indicators import compute_macd_histogram, compute_rsi, compute_ma, compute_
 from structure_utils import detect_bos_cos, detect_choch
 from chart_generator import generate_chart
 
-def analyze_signal(df, direction, btc_df, total_df, btc_d_df, symbol=None):
+def analyze_signal(df, direction, btc_df, total_df, btc_d_df):
     try:
         if df is None or df.empty or 'timestamp' not in df.columns:
             print("⚠️ Données invalides pour analyse.")
@@ -47,6 +47,7 @@ def analyze_signal(df, direction, btc_df, total_df, btc_d_df, symbol=None):
             fvg_zone = (None, None)
             in_fvg = False
 
+        # Indicateurs techniques
         bos_ok, cos_ok = detect_bos_cos(df, direction)
         choch_ok = detect_choch(df, direction)
         candle_ok = close.iloc[-1] > df['open'].iloc[-1]
@@ -55,19 +56,30 @@ def analyze_signal(df, direction, btc_df, total_df, btc_d_df, symbol=None):
         ma_trend_ok = close.iloc[-1] > ma200.iloc[-1] if direction == "long" else close.iloc[-1] < ma200.iloc[-1]
         macd_ok = macd_hist.iloc[-1] > 0 if direction == "long" else macd_hist.iloc[-1] < 0
 
+        # MACRO
         total_diff = total_df['close'].iloc[-1] - total_df['close'].iloc[-5]
         macro_ok = (total_diff > 0) if direction == "long" else (total_diff < 0)
+
+        # BTC.D
+        btc_d_change = btc_d_df['close'].iloc[-1] - btc_d_df['close'].iloc[-5]
+        if abs(btc_d_change) < 0.2:
+            btc_d_status = "stagnant"
+        elif btc_d_change > 0:
+            btc_d_status = "haussier"
+        else:
+            btc_d_status = "baissier"
 
         rejected = []
         tolerated = []
         score = 0
 
+        # OTE tolérable
         if in_ote:
             tolerated.append("OTE")
         else:
             rejected.append("OTE")
 
-        for name, ok in [
+        checks = [
             ("FVG", in_fvg),
             ("BOS", bos_ok),
             ("COS", cos_ok),
@@ -79,7 +91,9 @@ def analyze_signal(df, direction, btc_df, total_df, btc_d_df, symbol=None):
             ("ATR", atr_ok),
             ("CONFIRM 4H", True),
             ("MACRO", macro_ok)
-        ]:
+        ]
+
+        for name, ok in checks:
             if name == "OTE":
                 continue
             if ok:
@@ -100,7 +114,7 @@ def analyze_signal(df, direction, btc_df, total_df, btc_d_df, symbol=None):
 
         image_path = generate_chart(
             df.reset_index(),
-            symbol=symbol or "Unknown",
+            symbol=df.name if hasattr(df, 'name') else "Unknown",
             ote_zone=ote_zone,
             fvg_zone=fvg_zone,
             entry=entry,
@@ -109,8 +123,15 @@ def analyze_signal(df, direction, btc_df, total_df, btc_d_df, symbol=None):
             direction=direction.upper()
         )
 
+        comment = (
+            f"📌 Zone idéale d'entrée :\n"
+            f"OTE = {ote_zone[1]:.4f} → {ote_zone[0]:.4f}\n"
+            f"FVG = {fvg_zone[1]:.4f} → {fvg_zone[0]:.4f}\n"
+            f"📊 BTC.D = {btc_d_status}"
+        )
+
         return {
-            "symbol": symbol or "Unknown",
+            "symbol": df.name if hasattr(df, 'name') else "Unknown",
             "direction": direction.upper(),
             "entry": entry,
             "sl": sl,
@@ -122,12 +143,7 @@ def analyze_signal(df, direction, btc_df, total_df, btc_d_df, symbol=None):
             "tolere_ote": not in_ote,
             "toleres": tolerated,
             "rejetes": rejected,
-            "comment": (
-                f"📌 Zone idéale d'entrée :\n"
-                f"OTE = {ote_zone[1]:.4f} → {ote_zone[0]:.4f}\n"
-                f"FVG = {fvg_zone[1]:.4f} → {fvg_zone[0]:.4f}"
-                if fvg_zone[0] else ""
-            )
+            "comment": comment
         }
 
     except Exception as e:
