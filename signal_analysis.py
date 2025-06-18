@@ -1,17 +1,21 @@
 import pandas as pd
 import numpy as np
-from indicators import compute_macd_histogram, compute_rsi, compute_ma, compute_atr, compute_fvg_zones, find_pivots
+from indicators import compute_macd_histogram, compute_rsi, compute_ma, compute_atr, compute_fvg_zones
 from structure_utils import detect_bos_cos, detect_choch
 from chart_generator import generate_chart
 
-def analyze_signal(df, direction, btc_df, total_df, btc_d_df, symbol=None):
+def analyze_signal(df, direction, btc_df, total_df, btc_d_df):
     try:
+        if df is None or df.empty or 'timestamp' not in df.columns:
+            print("⚠️ Données invalides pour analyse.")
+            return None
+
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
         df.set_index('timestamp', inplace=True)
-        df = df.copy().dropna().tail(150)
+        df = df.dropna().copy()
 
         if len(df) < 100:
-            print(f"[{symbol}] ⚠️ Pas assez de données pour l’analyse.")
+            print("⚠️ Pas assez de données pour l’analyse.")
             return None
 
         close = df['close']
@@ -29,12 +33,12 @@ def analyze_signal(df, direction, btc_df, total_df, btc_d_df, symbol=None):
 
         # OTE
         last_pivot = close.iloc[-20]
-        ote_high = last_pivot * 1.0
+        ote_high = last_pivot
         ote_low = last_pivot * 0.786 if direction == "long" else last_pivot * 1.272
         ote_zone = (ote_high, ote_low) if direction == "long" else (ote_low, ote_high)
         in_ote = ote_low <= close.iloc[-1] <= ote_high
 
-        # FVG valid
+        # FVG
         last_fvg = df[['fvg_upper', 'fvg_lower']].dropna().tail(1)
         if not last_fvg.empty:
             fvg_zone = (last_fvg['fvg_upper'].values[0], last_fvg['fvg_lower'].values[0])
@@ -45,7 +49,6 @@ def analyze_signal(df, direction, btc_df, total_df, btc_d_df, symbol=None):
 
         bos_ok, cos_ok = detect_bos_cos(df, direction)
         choch_ok = detect_choch(df, direction)
-
         candle_ok = close.iloc[-1] > df['open'].iloc[-1]
         volume_ok = volume.iloc[-1] > volume.rolling(20).mean().iloc[-1] * 1.2
         atr_ok = atr.iloc[-1] > atr.rolling(20).mean().iloc[-1]
@@ -80,21 +83,20 @@ def analyze_signal(df, direction, btc_df, total_df, btc_d_df, symbol=None):
             else: rejected.append(name)
 
         if score < 8:
-            print(f"[{symbol}] ❌ Score insuffisant : {score}")
+            print(f"❌ Score insuffisant : {score}")
             return None
 
         entry = close.iloc[-1]
         sl = entry - atr.iloc[-1] if direction == "long" else entry + atr.iloc[-1]
         tp1 = entry + (entry - sl) * 1.0 if direction == "long" else entry - (sl - entry) * 1.0
         tp2 = entry + (entry - sl) * 2.0 if direction == "long" else entry - (sl - entry) * 2.0
-
         rr1 = round((tp1 - entry) / (entry - sl), 2)
         rr2 = round((tp2 - entry) / (entry - sl), 2)
 
-        image_path = generate_chart(df.reset_index(), symbol=symbol, ote_zone=ote_zone, fvg_zone=fvg_zone, entry=entry, sl=sl, tp=tp1, direction=direction.upper())
+        image_path = generate_chart(df.reset_index(), symbol=df.name if hasattr(df, 'name') else "Unknown", ote_zone=ote_zone, fvg_zone=fvg_zone, entry=entry, sl=sl, tp=tp1, direction=direction.upper())
 
         return {
-            "symbol": symbol,
+            "symbol": df.name if hasattr(df, 'name') else "Unknown",
             "direction": direction.upper(),
             "entry": entry,
             "sl": sl,
@@ -110,5 +112,5 @@ def analyze_signal(df, direction, btc_df, total_df, btc_d_df, symbol=None):
         }
 
     except Exception as e:
-        print(f"[{symbol}] ⚠️ Erreur analyse signal : {e}")
+        print(f"⚠️ Erreur analyse signal : {e}")
         return None
