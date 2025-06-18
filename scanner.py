@@ -20,6 +20,20 @@ async def send_signal_to_telegram(signal):
     msg_rejected = f"❌ Rejetés : {', '.join(rejected)}" if rejected else ""
     msg_tolerated = f"⚠️ Tolérés : {', '.join(tolerated)}" if tolerated else ""
 
+    comment = signal.get("comment", "")
+
+    macro_status = signal.get("macro_status", {})
+    btc_d_trend = macro_status.get("btc_d", 0)
+    btc_trend = macro_status.get("btc", False)
+    total_trend = macro_status.get("total", False)
+
+    macro_msg = (
+        f"🌍 Contexte macro :\n"
+        f"BTC = {'✅' if btc_trend else '❌'}\n"
+        f"TOTAL = {'✅' if total_trend else '❌'}\n"
+        f"BTC.D = {'🔼' if btc_d_trend > 0 else '🔽' if btc_d_trend < 0 else '➡️'}"
+    )
+
     message = (
         f"📉 {signal['symbol']} - Signal CONFIRMÉ ({signal['direction']})\n\n"
         f"🎯 Entry : {signal['entry']:.4f}\n"
@@ -28,8 +42,9 @@ async def send_signal_to_telegram(signal):
         f"🎯 TP2   : {signal['tp2']:.4f}\n"
         f"📈 R:R1  : {signal['rr1']}\n"
         f"📈 R:R2  : {signal['rr2']}\n"
-        f"🧠 Score : {signal.get('score', '?')}/10\n"
-        f"{signal.get('comment', '')}\n"
+        f"🧠 Score : {signal.get('score', '?')}/10\n\n"
+        f"{comment}\n\n"
+        f"{macro_msg}\n\n"
         f"{msg_tolerated}\n"
         f"{msg_rejected}"
     )
@@ -52,7 +67,7 @@ if os.path.exists("sent_signals.json"):
 # 📊 Chargement macro BTC / TOTAL / BTC.D
 def get_chart(url):
     try:
-        time.sleep(1)  # pour éviter les limites d'API
+        time.sleep(1)
         r = requests.get(url)
         data = r.json()
         if "prices" not in data or "total_volumes" not in data:
