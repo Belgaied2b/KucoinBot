@@ -37,7 +37,6 @@ async def send_signal_to_telegram(signal):
     print(f"[{signal['symbol']}] 📤 Envoi Telegram en cours...")
     await bot.send_message(chat_id=CHAT_ID, text=message.strip())
 
-
 # 📂 Gestion des doublons
 sent_signals = {}
 if os.path.exists("sent_signals.json"):
@@ -48,11 +47,10 @@ if os.path.exists("sent_signals.json"):
     except Exception as e:
         print("⚠️ Erreur lecture sent_signals.json :", e)
 
-
 # 📊 Chargement macro BTC / TOTAL / BTC.D
 def get_chart(url):
     try:
-        time.sleep(1)  # éviter les limites API
+        time.sleep(1)
         r = requests.get(url)
         data = r.json()
         if "prices" not in data or "total_volumes" not in data:
@@ -68,7 +66,6 @@ def get_chart(url):
     except Exception as e:
         print(f"⚠️ Erreur get_chart ({url}): {e}")
         return None
-
 
 def fetch_macro_df():
     btc_df = get_chart("https://api.coingecko.com/api/v3/coins/bitcoin/market_chart?vs_currency=usd&days=30")
@@ -99,7 +96,6 @@ def fetch_macro_df():
 
     return btc_df, total_df, btc_d_df
 
-
 # 🔍 Scan principal
 async def scan_and_send_signals():
     print(f"🔁 Scan lancé à {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC\n")
@@ -117,11 +113,15 @@ async def scan_and_send_signals():
 
         try:
             df = fetch_klines(symbol)
-            df.name = symbol  # ✅ Ajout crucial
+            if df is None or df.empty or 'timestamp' not in df.columns or len(df) < 50:
+                print(f"[{symbol}] ⚠️ Données insuffisantes ou format invalide, ignoré")
+                continue
+
+            df.name = symbol
 
             for direction in ["long", "short"]:
                 print(f"[{symbol}] ➡️ Analyse {direction.upper()}")
-                signal = analyze_signal(df, direction=direction, btc_df=btc_df, total_df=total_df, btc_d_df=btc_d_df, symbol=symbol)
+                signal = analyze_signal(df.copy(), direction=direction, btc_df=btc_df, total_df=total_df, btc_d_df=btc_d_df, symbol=symbol)
 
                 if signal:
                     suffix = "TOLÉRÉ" if signal.get("tolere_ote") else "CONFIRMÉ"
@@ -147,5 +147,5 @@ async def scan_and_send_signals():
                         json.dump(sent_signals, f, indent=2)
 
         except Exception as e:
-            print(f"[{symbol}] ⚠️ Erreur {direction}: {e}")
+            print(f"[{symbol}] ⚠️ Erreur analyse signal ({direction.upper()}) : {e}")
             traceback.print_exc()
