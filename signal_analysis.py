@@ -11,13 +11,16 @@ from indicators import (
 )
 from chart_generator import generate_chart
 
-def is_fvg_valid(df: pd.DataFrame, direction: str) -> (bool, tuple):
+def is_fvg_valid(df: pd.DataFrame, direction: str) -> bool:
     fvg = calculate_fvg_zones(df)
-    upper = fvg["fvg_upper"].iloc[-1]
-    lower = fvg["fvg_lower"].iloc[-1]
+    df = df.copy()
+    df["fvg_upper"] = fvg["fvg_upper"]
+    df["fvg_lower"] = fvg["fvg_lower"]
     price = df["close"].iloc[-1]
-    valid = price > lower if direction == "long" else price < upper
-    return valid, (upper, lower)
+    if direction == "long":
+        return price > df["fvg_lower"].iloc[-1]
+    else:
+        return price < df["fvg_upper"].iloc[-1]
 
 def detect_choch(df: pd.DataFrame, direction: str) -> bool:
     if len(df) < 5:
@@ -32,9 +35,11 @@ def detect_choch(df: pd.DataFrame, direction: str) -> bool:
 def analyze_signal(df, direction="long", btc_df=None, total_df=None, btc_d_df=None):
     df_1h = df.copy()
     df_1h.name = df.name
+    timeframe = "1H"
+
     df_4h = df_1h.copy()
     df_4h.index = pd.to_datetime(df_4h.index, errors='coerce')
-    df_4h = df_4h.dropna()
+    df_4h = df_4h.dropna(subset=["open", "high", "low", "close", "volume"])
     df_4h = df_4h.resample("4h").agg({
         "open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"
     }).dropna()
@@ -45,8 +50,9 @@ def analyze_signal(df, direction="long", btc_df=None, total_df=None, btc_d_df=No
         return None
 
     entry = df_1h["close"].iloc[-1]
-    fvg_valid, fvg_zone = is_fvg_valid(df_1h, direction)
-    ote_valid, ote_zone = is_ote(entry, df_1h, direction, return_zone=True)
+
+    fvg_valid = is_fvg_valid(df_1h, direction)
+    ote_valid = is_ote(entry, df_1h, direction)
     ma200_ok = is_ma200_valid(df_1h, direction)
     bos_ok, cos_ok = detect_bos_cos(df_1h, direction)
     choch_ok = detect_choch(df_1h, direction)
@@ -56,6 +62,7 @@ def analyze_signal(df, direction="long", btc_df=None, total_df=None, btc_d_df=No
     volume_ok = is_volume_valid(df_1h)
     confirm_ok = is_confirmed_on_4h(df_4h, direction)
     atr_ok = is_atr_valid(df_1h)
+
     sl, tp1, tp2, rr1, rr2 = calculate_sl_tp_dynamic(df_1h, entry, direction)
 
     rejected = []
@@ -79,7 +86,7 @@ def analyze_signal(df, direction="long", btc_df=None, total_df=None, btc_d_df=No
         tolerated.append("OTE")
         tolere_ote = True
 
-    print(f"[{symbol}] ➡️ Analyse {direction.upper()} (timeframe = 1H)")
+    print(f"[{symbol}] ➡️ Analyse {direction.upper()} (timeframe = {timeframe})")
     print(f"[{symbol}]   Entry        : {entry:.4f}")
     print(f"[{symbol}]   OTE valid    : {ote_valid}")
     print(f"[{symbol}]   FVG valid    : {fvg_valid}")
@@ -99,8 +106,15 @@ def analyze_signal(df, direction="long", btc_df=None, total_df=None, btc_d_df=No
         print(f"[{symbol}] ❌ Rejeté (score qualité insuffisant)\n")
         return None
 
-    chart_path = generate_chart(df_1h, symbol, ote_zone, fvg_zone, entry, sl, tp1, direction.upper())
-    ideal_msg = "✅ L’entrée actuelle est dans la zone idéale OTE + FVG." if ote_valid and fvg_valid else f"⚠️ Entrée idéale : zone OTE+FVG entre {min(ote_zone):.4f} et {max(ote_zone):.4f}"
+    # ➕ Message zone idéale
+    fib_618 = df_1h["low"].rolling(20).min().iloc[-1] + 0.618 * (df_1h["high"].rolling(20).max().iloc[-1] - df_1h["low"].rolling(20).min().iloc[-1])
+    fib_705 = df_1h["low"].rolling(20).min().iloc[-1] + 0.705 * (df_1h["high"].rolling(20).max().iloc[-1] - df_1h["low"].rolling(20).min().iloc[-1])
+    fvg = calculate_fvg_zones(df_1h)
+    fvg_low = fvg["fvg_lower"].iloc[-1]
+    fvg_high = fvg["fvg_upper"].iloc[-1]
+    ideal_msg = f"📌 Zone idéale d'entrée :\nOTE = {fib_618:.4f} → {fib_705:.4f}\nFVG = {fvg_low:.4f} → {fvg_high:.4f}"
+
+    chart_path = generate_chart(df_1h, symbol, ote_zone=(fib_705, fib_618), fvg_zone=(fvg_high, fvg_low), entry=entry, sl=sl, tp=tp1, direction=direction.upper())
 
     return {
         "symbol": symbol,
@@ -116,26 +130,20 @@ def analyze_signal(df, direction="long", btc_df=None, total_df=None, btc_d_df=No
         "toleres": tolerated,
         "rejetes": rejected,
         "tolere_ote": tolere_ote,
-        "ideal_msg": ideal_msg
+        "comment": ideal_msg
     }
-
-def is_ote(price, df, direction, return_zone=False):
-    high = df["high"].rolling(20).max().iloc[-1]
-    low = df["low"].rolling(20).min().iloc[-1]
-    fib_618 = low + 0.618 * (high - low)
-    fib_705 = low + 0.705 * (high - low)
-    if direction == "long":
-        valid = fib_618 <= price <= fib_705
-        zone = (fib_705, fib_618)
-    else:
-        valid = fib_705 <= price <= fib_618
-        zone = (fib_618, fib_705)
-    return (valid, zone) if return_zone else valid
 
 def is_ma200_valid(df, direction):
     ma200 = calculate_ma(df, period=200)
     current_price = df["close"].iloc[-1]
     return current_price > ma200.iloc[-1] if direction == "long" else current_price < ma200.iloc[-1]
+
+def is_ote(price, df, direction):
+    high = df["high"].rolling(20).max().iloc[-1]
+    low = df["low"].rolling(20).min().iloc[-1]
+    fib_618 = low + 0.618 * (high - low)
+    fib_705 = low + 0.705 * (high - low)
+    return fib_618 <= price <= fib_705 if direction == "long" else fib_705 <= price <= fib_618
 
 def is_volume_valid(df):
     avg_volume = df["volume"].rolling(20).mean().iloc[-1]
@@ -181,6 +189,7 @@ def calculate_sl_tp_dynamic(df, entry, direction):
         sl = entry - atr * 0.5 if direction == "long" else entry + atr * 0.5
         tp1 = entry + atr if direction == "long" else entry - atr
         tp2 = entry + atr * 2 if direction == "long" else entry - atr * 2
+
     rr1 = round(abs(tp1 - entry) / abs(entry - sl), 2)
     rr2 = round(abs(tp2 - entry) / abs(entry - sl), 2)
     return round(sl, 4), round(tp1, 4), round(tp2, 4), rr1, rr2
