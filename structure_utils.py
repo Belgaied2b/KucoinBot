@@ -1,28 +1,43 @@
 import pandas as pd
-import numpy as np
 
 def is_bos_valid(df, direction):
-    """Détecte un Break of Structure (BOS)."""
+    """
+    Break of Structure (BOS) : le prix casse un plus haut (long) ou plus bas (short) précédent.
+    """
+    if len(df) < 30:
+        return False
+
     highs = df['high'].rolling(window=20).max()
     lows = df['low'].rolling(window=20).min()
 
     if direction == "long":
-        return df['close'].iloc[-1] > highs.shift(1).iloc[-5]
+        previous_high = highs.shift(1).iloc[-5]
+        return df['close'].iloc[-1] > previous_high
     else:
-        return df['close'].iloc[-1] < lows.shift(1).iloc[-5]
+        previous_low = lows.shift(1).iloc[-5]
+        return df['close'].iloc[-1] < previous_low
 
 def is_cos_valid(df, direction):
-    """Détecte une Confirmation of Structure (COS)."""
+    """
+    Confirmation of Structure (COS) : après cassure BOS, le marché tient la structure.
+    """
+    if len(df) < 30:
+        return False
+
     highs = df['high'].rolling(window=10).max()
     lows = df['low'].rolling(window=10).min()
 
     if direction == "long":
-        return df['low'].iloc[-1] > lows.shift(1).iloc[-5]
+        previous_low = lows.shift(1).iloc[-5]
+        return df['low'].iloc[-1] > previous_low
     else:
-        return df['high'].iloc[-1] < highs.shift(1).iloc[-5]
+        previous_high = highs.shift(1).iloc[-5]
+        return df['high'].iloc[-1] < previous_high
 
 def detect_bos_cos(df, direction):
-    """Valide BOS + COS."""
+    """
+    Retourne le statut BOS et COS (True/False).
+    """
     try:
         bos = is_bos_valid(df, direction)
         cos = is_cos_valid(df, direction)
@@ -31,19 +46,22 @@ def detect_bos_cos(df, direction):
         return False, False
 
 def detect_choch(df, direction):
-    """Détecte un CHoCH (Change of Character)."""
+    """
+    Change of Character (CHoCH) : retournement de tendance.
+    Exemple : tendance baissière avec cassure haussière (long).
+    """
     try:
-        if len(df) < 50:
+        if len(df) < 40:
             return False
 
         highs = df['high'].rolling(window=10).max()
         lows = df['low'].rolling(window=10).min()
 
         if direction == "long":
-            prev_low = lows.iloc[-10]
-            return df['close'].iloc[-1] > df['high'].iloc[-10] and df['low'].iloc[-1] > prev_low
+            choch_up = df['close'].iloc[-1] > df['high'].iloc[-10] and df['low'].iloc[-1] > lows.shift(1).iloc[-10]
+            return choch_up
         else:
-            prev_high = highs.iloc[-10]
-            return df['close'].iloc[-1] < df['low'].iloc[-10] and df['high'].iloc[-1] < prev_high
+            choch_down = df['close'].iloc[-1] < df['low'].iloc[-10] and df['high'].iloc[-1] < highs.shift(1).iloc[-10]
+            return choch_down
     except Exception:
         return False
