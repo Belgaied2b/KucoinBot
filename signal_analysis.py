@@ -1,64 +1,137 @@
 import numpy as np
 import pandas as pd
-from structure_utils import detect_bos_cos
+from structure_utils import detect_bos_cos, detect_choch
 from indicators import (
     compute_macd_histogram,
-    compute_rsi,
     compute_ma,
-    compute_fvg as calculate_fvg_zones,
+    compute_fvg_zones,
     compute_atr,
     find_pivots
 )
 from chart_generator import generate_chart
 
-def is_fvg_valid(df: pd.DataFrame, direction: str) -> bool:
-    fvg = calculate_fvg_zones(df)
-    df = df.copy()
-    df["fvg_upper"] = fvg["fvg_upper"]
-    df["fvg_lower"] = fvg["fvg_lower"]
+def is_ote(entry, df, direction):
+    fib_high = df["high"].iloc[-20:-1].max()
+    fib_low = df["low"].iloc[-20:-1].min()
+
+    if direction == "long":
+        ote_top = fib_low + 0.618 * (fib_high - fib_low)
+        ote_bottom = fib_low + 0.705 * (fib_high - fib_low)
+    else:
+        ote_top = fib_high - 0.705 * (fib_high - fib_low)
+        ote_bottom = fib_high - 0.618 * (fib_high - fib_low)
+
+    in_zone = ote_bottom <= entry <= ote_top
+    return in_zone, (min(ote_top, ote_bottom), max(ote_top, ote_bottom))
+
+def is_fvg_valid(df, direction):
+    fvg = compute_fvg_zones(df)
+    if not fvg:
+        return False, (0, 0)
+    zone = fvg[-1]
+    price = df["close"].iloc[-1]
+    if direction == "long" and price > zone[0]:
+        return True, zone
+    elif direction == "short" and price < zone[1]:
+        return True, zone
+    return False, zone
+
+def is_ma200_valid(df, direction):
+    ma200 = compute_ma(df, period=200)
     price = df["close"].iloc[-1]
     if direction == "long":
-        return price > df["fvg_lower"].iloc[-1]
+        return price > ma200.iloc[-1]
     else:
-        return price < df["fvg_upper"].iloc[-1]
+        return price < ma200.iloc[-1]
 
-def detect_choch(df: pd.DataFrame, direction: str) -> bool:
-    if len(df) < 5:
-        return False
-    highs = df["high"].rolling(5).max()
-    lows = df["low"].rolling(5).min()
+def is_macd_valid(df, direction):
+    hist = compute_macd_histogram(df)
+    value = hist.iloc[-1]
     if direction == "long":
-        return df["low"].iloc[-1] > lows.iloc[-2] and df["high"].iloc[-1] > highs.iloc[-2]
+        return value > 0, value
     else:
-        return df["high"].iloc[-1] < highs.iloc[-2] and df["low"].iloc[-1] < lows.iloc[-2]
+        return value < 0, value
+
+def is_macro_valid(btc_df, total_df, direction):
+    try:
+        btc_slope = btc_df["close"].iloc[-1] - btc_df["close"].iloc[-10]
+        total_slope = total_df["close"].iloc[-1] - total_df["close"].iloc[-10]
+
+        if direction == "long":
+            return btc_slope > 0 and total_slope > 0
+        else:
+            return btc_slope < 0 and total_slope < 0
+    except:
+        return False
+
+def is_confirmed_on_4h(df, direction):
+    last_candle = df.iloc[-1]
+    body = abs(last_candle["close"] - last_candle["open"])
+    range_candle = last_candle["high"] - last_candle["low"]
+    body_ratio = body / range_candle if range_candle != 0 else 0
+
+    if direction == "long":
+        return last_candle["close"] > last_candle["open"] and body_ratio > 0.5
+    else:
+        return last_candle["close"] < last_candle["open"] and body_ratio > 0.5
+
+def is_valid_candle(df, direction):
+    last = df.iloc[-1]
+    if direction == "long":
+        return last["close"] > last["open"]
+    else:
+        return last["close"] < last["open"]
+
+def is_volume_valid(df):
+    recent_vol = df["volume"].iloc[-1]
+    avg_vol = df["volume"].iloc[-20:-1].mean()
+    return recent_vol > avg_vol * 1.2
+
+def is_atr_valid(df):
+    atr = compute_atr(df)
+    return atr.iloc[-1] > 0.01
+
+def calculate_sl_tp_dynamic(df, entry, direction):
+    atr = compute_atr(df).iloc[-1]
+    sl_buffer = atr * 1.5
+    tp1_buffer = atr * 3
+    tp2_buffer = atr * 5
+
+    if direction == "long":
+        sl = entry - sl_buffer
+        tp1 = entry + tp1_buffer
+        tp2 = entry + tp2_buffer
+    else:
+        sl = entry + sl_buffer
+        tp1 = entry - tp1_buffer
+        tp2 = entry - tp2_buffer
+
+    rr1 = round(abs(tp1 - entry) / abs(entry - sl), 2)
+    rr2 = round(abs(tp2 - entry) / abs(entry - sl), 2)
+    return round(sl, 4), round(tp1, 4), round(tp2, 4), rr1, rr2
 
 def analyze_signal(df, direction="long", btc_df=None, total_df=None, btc_d_df=None):
     df_1h = df.copy()
     df_1h.name = df.name
-    timeframe = "1H"
+    symbol = df.name
+    entry = df_1h["close"].iloc[-1]
 
+    # Convertir et resampler en 4H
     df_4h = df_1h.copy()
     df_4h.index = pd.to_datetime(df_4h.index, errors='coerce')
     df_4h = df_4h.dropna(subset=["open", "high", "low", "close", "volume"])
-    df_4h = df_4h.resample("4h").agg({
+    df_4h = df_4h.resample("4H").agg({
         "open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"
     }).dropna()
 
-    symbol = df.name
-    if "close" not in df_1h.columns:
-        print(f"[{symbol}] ❌ Erreur : colonne 'close' absente")
-        return None
-
-    entry = df_1h["close"].iloc[-1]
-
-    fvg_valid = is_fvg_valid(df_1h, direction)
-    ote_valid, ote_zone = is_ote(entry, df_1h, direction, return_zone=True)
-    fvg_zone = get_last_fvg_zone(df_1h)
+    # Calculs indicateurs
+    fvg_valid, fvg_zone = is_fvg_valid(df_1h, direction)
+    ote_valid, ote_zone = is_ote(entry, df_1h, direction)
     ma200_ok = is_ma200_valid(df_1h, direction)
     bos_ok, cos_ok = detect_bos_cos(df_1h, direction)
     choch_ok = detect_choch(df_1h, direction)
-    macd_ok, macd_value = is_macd_valid(df_1h, direction)
-    macro_ok, macro_status = is_macro_valid(btc_df, total_df, btc_d_df, direction)
+    macd_ok, macd_val = is_macd_valid(df_1h, direction)
+    macro_ok = is_macro_valid(btc_df, total_df, direction)
     candle_ok = is_valid_candle(df_1h, direction)
     volume_ok = is_volume_valid(df_1h)
     confirm_ok = is_confirmed_on_4h(df_4h, direction)
@@ -78,8 +151,8 @@ def analyze_signal(df, direction="long", btc_df=None, total_df=None, btc_d_df=No
     if not macd_ok: rejected.append("MACD"); score -= 1
     if not macro_ok: rejected.append("MACRO"); score -= 1
     if not confirm_ok: rejected.append("CONFIRM 4H"); score -= 1
-    if not candle_ok: rejected.append("Bougie"); score -= 1
-    if not volume_ok: rejected.append("Volume"); score -= 1
+    if not candle_ok: rejected.append("BOUGIE"); score -= 1
+    if not volume_ok: rejected.append("VOLUME"); score -= 1
     if not atr_ok: rejected.append("ATR"); score -= 1
 
     tolere_ote = False
@@ -87,7 +160,7 @@ def analyze_signal(df, direction="long", btc_df=None, total_df=None, btc_d_df=No
         tolerated.append("OTE")
         tolere_ote = True
 
-    print(f"[{symbol}] ➡️ Analyse {direction.upper()} (timeframe = {timeframe})")
+    print(f"[{symbol}] ➡️ Analyse {direction.upper()}")
     print(f"[{symbol}]   Entry        : {entry:.4f}")
     print(f"[{symbol}]   OTE valid    : {ote_valid}")
     print(f"[{symbol}]   FVG valid    : {fvg_valid}")
@@ -95,25 +168,19 @@ def analyze_signal(df, direction="long", btc_df=None, total_df=None, btc_d_df=No
     print(f"[{symbol}]   COS valid    : {cos_ok}")
     print(f"[{symbol}]   CHoCH valid  : {choch_ok}")
     print(f"[{symbol}]   MA200 trend  : {ma200_ok}")
-    print(f"[{symbol}]   MACD histo   : {macd_value:.5f}")
-    print(f"[{symbol}]   MACRO        : {'✅' if macro_ok else '❌'}")
-    print(f"[{symbol}]   CONFIRM 4H   : {'✅' if confirm_ok else '❌'}")
-    print(f"[{symbol}]   Bougie valide : {candle_ok}")
-    print(f"[{symbol}]   Volume OK     : {volume_ok}")
-    print(f"[{symbol}]   ATR OK        : {atr_ok}")
+    print(f"[{symbol}]   MACD histo   : {macd_val:.5f}")
+    print(f"[{symbol}]   CONFIRM 4H   : {confirm_ok}")
+    print(f"[{symbol}]   VOLUME OK    : {volume_ok}")
+    print(f"[{symbol}]   ATR OK       : {atr_ok}")
     print(f"[{symbol}]   Score qualité : {score}/10")
 
     if score < 8:
         print(f"[{symbol}] ❌ Rejeté (score qualité insuffisant)\n")
         return None
 
-    chart_path = generate_chart(df_1h, symbol, ote_zone=ote_zone, fvg_zone=fvg_zone, entry=entry, sl=sl, tp=tp1, direction=direction.upper())
+    chart_path = generate_chart(df_1h, symbol, ote_zone, fvg_zone, entry, sl, tp1, direction.upper())
 
-    comment = (
-        f"📌 Zone idéale d'entrée :\n"
-        f"OTE = {ote_zone[0]:.4f} → {ote_zone[1]:.4f}\n"
-        f"FVG = {fvg_zone[0]:.4f} → {fvg_zone[1]:.4f}"
-    )
+    comment = f"📌 Zone idéale d'entrée :\nOTE = {ote_zone[0]:.4f} → {ote_zone[1]:.4f}\nFVG = {fvg_zone[0]:.4f} → {fvg_zone[1]:.4f}"
 
     return {
         "symbol": symbol,
@@ -129,79 +196,5 @@ def analyze_signal(df, direction="long", btc_df=None, total_df=None, btc_d_df=No
         "toleres": tolerated,
         "rejetes": rejected,
         "tolere_ote": tolere_ote,
-        "comment": comment,
-        "macro_status": macro_status
+        "comment": comment
     }
-
-def is_ma200_valid(df, direction):
-    ma200 = compute_ma(df, period=200)
-    current_price = df["close"].iloc[-1]
-    return current_price > ma200.iloc[-1] if direction == "long" else current_price < ma200.iloc[-1]
-
-def is_ote(price, df, direction, return_zone=False):
-    high = df["high"].rolling(20).max().iloc[-1]
-    low = df["low"].rolling(20).min().iloc[-1]
-    fib_618 = low + 0.618 * (high - low)
-    fib_705 = low + 0.705 * (high - low)
-    zone = (fib_618, fib_705) if direction == "long" else (fib_705, fib_618)
-    valid = fib_618 <= price <= fib_705 if direction == "long" else fib_705 <= price <= fib_618
-    return (valid, zone) if return_zone else valid
-
-def get_last_fvg_zone(df):
-    fvg = calculate_fvg_zones(df)
-    upper = fvg["fvg_upper"].iloc[-1]
-    lower = fvg["fvg_lower"].iloc[-1]
-    return (lower, upper)
-
-def is_volume_valid(df):
-    avg_volume = df["volume"].rolling(20).mean().iloc[-1]
-    current_volume = df["volume"].iloc[-1]
-    return current_volume > avg_volume * 1.2
-
-def is_valid_candle(df, direction):
-    body = abs(df["close"].iloc[-1] - df["open"].iloc[-1])
-    wick = df["high"].iloc[-1] - df["low"].iloc[-1]
-    return body > wick * 0.4
-
-def is_macd_valid(df, direction):
-    hist = compute_macd_histogram(df["close"])
-    value = hist.iloc[-1]
-    return (value > 0, value) if direction == "long" else (value < 0, value)
-
-def is_confirmed_on_4h(df_4h, direction):
-    ma200 = compute_ma(df_4h, period=200)
-    close = df_4h["close"].iloc[-1]
-    return close > ma200.iloc[-1] if direction == "long" else close < ma200.iloc[-1]
-
-def is_macro_valid(btc_df, total_df, btc_d_df, direction):
-    btc_trend = btc_df["close"].iloc[-1] > btc_df["close"].iloc[-5]
-    total_trend = total_df["close"].iloc[-1] > total_df["close"].iloc[-5]
-    btc_d_trend = btc_d_df["close"].iloc[-1] > btc_d_df["close"].iloc[-5]
-    btc_d_symbol = "🔼" if btc_d_trend else "🔽" if btc_d_df["close"].iloc[-1] < btc_d_df["close"].iloc[-5] else "➡️"
-    status = f"\n🌍 Contexte macro :\nBTC = {'✅' if btc_trend else '❌'}\nTOTAL = {'✅' if total_trend else '❌'}\nBTC.D = {btc_d_symbol}"
-    valid = btc_trend and total_trend if direction == "long" else not btc_trend and not total_trend
-    return valid, status
-
-def is_atr_valid(df, threshold=0.5):
-    atr = compute_atr(df).iloc[-1]
-    return atr > threshold
-
-def calculate_sl_tp_dynamic(df, entry, direction):
-    highs, lows = find_pivots(df)
-    if direction == "long" and lows:
-        sl = df["low"].iloc[lows[-1]]
-        tp1 = entry + (entry - sl)
-        tp2 = entry + 2 * (entry - sl)
-    elif direction == "short" and highs:
-        sl = df["high"].iloc[highs[-1]]
-        tp1 = entry - (sl - entry)
-        tp2 = entry - 2 * (sl - entry)
-    else:
-        atr = compute_atr(df).iloc[-1]
-        sl = entry - atr * 0.5 if direction == "long" else entry + atr * 0.5
-        tp1 = entry + atr if direction == "long" else entry - atr
-        tp2 = entry + atr * 2 if direction == "long" else entry - atr * 2
-
-    rr1 = round(abs(tp1 - entry) / abs(entry - sl), 2)
-    rr2 = round(abs(tp2 - entry) / abs(entry - sl), 2)
-    return round(sl, 4), round(tp1, 4), round(tp2, 4), rr1, rr2
