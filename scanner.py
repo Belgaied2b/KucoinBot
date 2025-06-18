@@ -117,11 +117,17 @@ async def scan_and_send_signals():
                 print(f"[{symbol}] ⚠️ Données insuffisantes ou format invalide, ignoré")
                 continue
 
-            df.name = symbol
+            df.name = symbol  # Attache le nom du symbole au DataFrame
 
             for direction in ["long", "short"]:
                 print(f"[{symbol}] ➡️ Analyse {direction.upper()}")
-                signal = analyze_signal(df.copy(), direction=direction, btc_df=btc_df, total_df=total_df, btc_d_df=btc_d_df, symbol=symbol)
+                signal = analyze_signal(
+                    df.copy(),
+                    direction=direction,
+                    btc_df=btc_df,
+                    total_df=total_df,
+                    btc_d_df=btc_d_df
+                )
 
                 if signal:
                     suffix = "TOLÉRÉ" if signal.get("tolere_ote") else "CONFIRMÉ"
