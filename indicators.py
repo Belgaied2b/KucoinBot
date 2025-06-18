@@ -7,20 +7,18 @@ def compute_macd_histogram(close_series, fast=12, slow=26, signal=9):
     macd = exp1 - exp2
     signal_line = macd.ewm(span=signal, adjust=False).mean()
     histogram = macd - signal_line
-    return histogram.fillna(0)
+    return histogram
 
 def compute_rsi(close_series, period=14):
     delta = close_series.diff()
-    gain = delta.where(delta > 0, 0)
-    loss = -delta.where(delta < 0, 0)
-    avg_gain = gain.rolling(window=period).mean()
-    avg_loss = loss.rolling(window=period).mean()
-    rs = avg_gain / avg_loss.replace(0, np.nan)
+    gain = delta.where(delta > 0, 0).rolling(window=period).mean()
+    loss = -delta.where(delta < 0, 0).rolling(window=period).mean()
+    rs = gain / loss
     rsi = 100 - (100 / (1 + rs))
-    return rsi.fillna(50)  # neutre si incalculable
+    return rsi
 
 def compute_ma(df, period=200):
-    return df['close'].rolling(window=period).mean().fillna(method='bfill')
+    return df['close'].rolling(window=period).mean()
 
 def compute_atr(df, period=14):
     high = df['high']
@@ -34,7 +32,7 @@ def compute_atr(df, period=14):
 
     tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
     atr = tr.rolling(window=period).mean()
-    return atr.fillna(method='bfill')
+    return atr
 
 def compute_fvg_zones(df):
     fvg_upper = []
