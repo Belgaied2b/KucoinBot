@@ -2,13 +2,13 @@ import json
 import os
 import time
 from datetime import datetime
+import traceback
+import requests
+import pandas as pd
 from kucoin_utils import fetch_all_symbols, fetch_klines
 from signal_analysis import analyze_signal
 from config import TOKEN, CHAT_ID
 from telegram import Bot
-import requests
-import traceback
-import pandas as pd
 
 bot = Bot(token=TOKEN)
 
@@ -117,7 +117,7 @@ async def scan_and_send_signals():
                 print(f"[{symbol}] ⚠️ Données insuffisantes ou format invalide, ignoré")
                 continue
 
-            df.name = symbol  # Attache le nom du symbole au DataFrame
+            df.name = symbol  # utile pour le graphique
 
             for direction in ["long", "short"]:
                 print(f"[{symbol}] ➡️ Analyse {direction.upper()}")
