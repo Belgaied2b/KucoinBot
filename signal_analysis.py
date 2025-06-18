@@ -47,39 +47,33 @@ def analyze_signal(df, direction, btc_df, total_df, btc_d_df):
             fvg_zone = (None, None)
             in_fvg = False
 
-        # Indicateurs techniques
+        # Structure
         bos_ok, cos_ok = detect_bos_cos(df, direction)
         choch_ok = detect_choch(df, direction)
+
+        # Autres filtres
         candle_ok = close.iloc[-1] > df['open'].iloc[-1]
         volume_ok = volume.iloc[-1] > volume.rolling(20).mean().iloc[-1] * 1.2
         atr_ok = atr.iloc[-1] > atr.rolling(20).mean().iloc[-1]
         ma_trend_ok = close.iloc[-1] > ma200.iloc[-1] if direction == "long" else close.iloc[-1] < ma200.iloc[-1]
         macd_ok = macd_hist.iloc[-1] > 0 if direction == "long" else macd_hist.iloc[-1] < 0
 
-        # MACRO
+        # Macro marché
         total_diff = total_df['close'].iloc[-1] - total_df['close'].iloc[-5]
         macro_ok = (total_diff > 0) if direction == "long" else (total_diff < 0)
 
-        # BTC.D
-        btc_d_change = btc_d_df['close'].iloc[-1] - btc_d_df['close'].iloc[-5]
-        if abs(btc_d_change) < 0.2:
-            btc_d_status = "stagnant"
-        elif btc_d_change > 0:
-            btc_d_status = "haussier"
-        else:
-            btc_d_status = "baissier"
+        # BTC Dominance
+        btc_d_current = btc_d_df['close'].iloc[-1]
+        btc_d_prev = btc_d_df['close'].iloc[-5]
+        btc_d_status = "haussier" if btc_d_current > btc_d_prev else "baissier" if btc_d_current < btc_d_prev else "stagnant"
 
+        # Système de validation
         rejected = []
         tolerated = []
         score = 0
 
-        # OTE tolérable
-        if in_ote:
-            tolerated.append("OTE")
-        else:
-            rejected.append("OTE")
-
         checks = [
+            ("OTE", in_ote),
             ("FVG", in_fvg),
             ("BOS", bos_ok),
             ("COS", cos_ok),
@@ -95,15 +89,17 @@ def analyze_signal(df, direction, btc_df, total_df, btc_d_df):
 
         for name, ok in checks:
             if name == "OTE":
+                if not ok:
+                    tolerated.append(name)
                 continue
-            if ok:
-                score += 1
-            else:
+            if not ok:
                 rejected.append(name)
 
-        if score < 8:
-            print(f"❌ Score insuffisant : {score}")
+        if rejected:
+            print(f"❌ Signal rejeté à cause de : {', '.join(rejected)}")
             return None
+        else:
+            score = len(checks) - 1  # OTE n’est pas compté dans le score
 
         entry = close.iloc[-1]
         sl = entry - atr.iloc[-1] if direction == "long" else entry + atr.iloc[-1]
@@ -112,26 +108,11 @@ def analyze_signal(df, direction, btc_df, total_df, btc_d_df):
         rr1 = round((tp1 - entry) / (entry - sl), 2)
         rr2 = round((tp2 - entry) / (entry - sl), 2)
 
-        image_path = generate_chart(
-            df.reset_index(),
-            symbol=df.name if hasattr(df, 'name') else "Unknown",
-            ote_zone=ote_zone,
-            fvg_zone=fvg_zone,
-            entry=entry,
-            sl=sl,
-            tp=tp1,
-            direction=direction.upper()
-        )
-
-        comment = (
-            f"📌 Zone idéale d'entrée :\n"
-            f"OTE = {ote_zone[1]:.4f} → {ote_zone[0]:.4f}\n"
-            f"FVG = {fvg_zone[1]:.4f} → {fvg_zone[0]:.4f}\n"
-            f"📊 BTC.D = {btc_d_status}"
-        )
+        symbol = df.name if hasattr(df, 'name') else "Unknown"
+        image_path = generate_chart(df.reset_index(), symbol=symbol, ote_zone=ote_zone, fvg_zone=fvg_zone, entry=entry, sl=sl, tp=tp1, direction=direction.upper())
 
         return {
-            "symbol": df.name if hasattr(df, 'name') else "Unknown",
+            "symbol": symbol,
             "direction": direction.upper(),
             "entry": entry,
             "sl": sl,
@@ -143,7 +124,12 @@ def analyze_signal(df, direction, btc_df, total_df, btc_d_df):
             "tolere_ote": not in_ote,
             "toleres": tolerated,
             "rejetes": rejected,
-            "comment": comment
+            "comment": (
+                f"📌 Zone idéale d'entrée :\n"
+                f"OTE = {ote_zone[1]:.4f} → {ote_zone[0]:.4f}\n"
+                f"FVG = {fvg_zone[1]:.4f} → {fvg_zone[0]:.4f}\n\n"
+                f"📊 BTC Dominance : {btc_d_status.upper()}"
+            )
         }
 
     except Exception as e:
