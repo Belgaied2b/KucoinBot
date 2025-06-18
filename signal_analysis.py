@@ -4,18 +4,20 @@ from indicators import compute_macd_histogram, compute_rsi, compute_ma, compute_
 from structure_utils import detect_bos_cos, detect_choch
 from chart_generator import generate_chart
 
-def analyze_signal(df, direction, btc_df, total_df, btc_d_df):
+def analyze_signal(df, direction, btc_df, total_df, btc_d_df, symbol=None):
     try:
         if df is None or df.empty or 'timestamp' not in df.columns:
             print("⚠️ Données invalides pour analyse.")
             return None
+
+        df.name = symbol if symbol else "Unknown"
 
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
         df.set_index('timestamp', inplace=True)
         df = df.dropna().copy()
 
         if len(df) < 100:
-            print("⚠️ Pas assez de données pour l’analyse.")
+            print(f"[{df.name}] ⚠️ Pas assez de données pour l’analyse.")
             return None
 
         close = df['close']
@@ -78,12 +80,15 @@ def analyze_signal(df, direction, btc_df, total_df, btc_d_df):
             ("CONFIRM 4H", True),
             ("MACRO", macro_ok)
         ]:
-            if name == "OTE": continue
-            if ok: score += 1
-            else: rejected.append(name)
+            if name == "OTE":
+                continue
+            if ok:
+                score += 1
+            else:
+                rejected.append(name)
 
         if score < 8:
-            print(f"❌ Score insuffisant : {score}")
+            print(f"[{df.name}] ❌ Score insuffisant : {score}")
             return None
 
         entry = close.iloc[-1]
@@ -93,10 +98,19 @@ def analyze_signal(df, direction, btc_df, total_df, btc_d_df):
         rr1 = round((tp1 - entry) / (entry - sl), 2)
         rr2 = round((tp2 - entry) / (entry - sl), 2)
 
-        image_path = generate_chart(df.reset_index(), symbol=df.name if hasattr(df, 'name') else "Unknown", ote_zone=ote_zone, fvg_zone=fvg_zone, entry=entry, sl=sl, tp=tp1, direction=direction.upper())
+        image_path = generate_chart(
+            df.reset_index(),
+            symbol=df.name,
+            ote_zone=ote_zone,
+            fvg_zone=fvg_zone,
+            entry=entry,
+            sl=sl,
+            tp=tp1,
+            direction=direction.upper()
+        )
 
         return {
-            "symbol": df.name if hasattr(df, 'name') else "Unknown",
+            "symbol": df.name,
             "direction": direction.upper(),
             "entry": entry,
             "sl": sl,
@@ -112,5 +126,5 @@ def analyze_signal(df, direction, btc_df, total_df, btc_d_df):
         }
 
     except Exception as e:
-        print(f"⚠️ Erreur analyse signal : {e}")
+        print(f"[{symbol or 'Unknown'}] ⚠️ Erreur analyse signal : {e}")
         return None
