@@ -20,20 +20,6 @@ async def send_signal_to_telegram(signal):
     msg_rejected = f"❌ Rejetés : {', '.join(rejected)}" if rejected else ""
     msg_tolerated = f"⚠️ Tolérés : {', '.join(tolerated)}" if tolerated else ""
 
-    comment = signal.get("comment", "")
-
-    macro_status = signal.get("macro_status", {})
-    btc_d_trend = macro_status.get("btc_d", 0)
-    btc_trend = macro_status.get("btc", False)
-    total_trend = macro_status.get("total", False)
-
-    macro_msg = (
-        f"🌍 Contexte macro :\n"
-        f"BTC = {'✅' if btc_trend else '❌'}\n"
-        f"TOTAL = {'✅' if total_trend else '❌'}\n"
-        f"BTC.D = {'🔼' if btc_d_trend > 0 else '🔽' if btc_d_trend < 0 else '➡️'}"
-    )
-
     message = (
         f"📉 {signal['symbol']} - Signal CONFIRMÉ ({signal['direction']})\n\n"
         f"🎯 Entry : {signal['entry']:.4f}\n"
@@ -42,9 +28,8 @@ async def send_signal_to_telegram(signal):
         f"🎯 TP2   : {signal['tp2']:.4f}\n"
         f"📈 R:R1  : {signal['rr1']}\n"
         f"📈 R:R2  : {signal['rr2']}\n"
-        f"🧠 Score : {signal.get('score', '?')}/10\n\n"
-        f"{comment}\n\n"
-        f"{macro_msg}\n\n"
+        f"🧠 Score : {signal.get('score', '?')}/10\n"
+        f"{signal.get('comment', '')}\n"
         f"{msg_tolerated}\n"
         f"{msg_rejected}"
     )
@@ -67,8 +52,9 @@ if os.path.exists("sent_signals.json"):
 # 📊 Chargement macro BTC / TOTAL / BTC.D
 def get_chart(url):
     try:
-        time.sleep(1)
+        time.sleep(1.2)  # éviter les limites API
         r = requests.get(url)
+        r.raise_for_status()
         data = r.json()
         if "prices" not in data or "total_volumes" not in data:
             raise ValueError("Données manquantes dans la réponse CoinGecko")
@@ -96,12 +82,16 @@ def fetch_macro_df():
 
     try:
         global_response = requests.get("https://api.coingecko.com/api/v3/global")
+        global_response.raise_for_status()
         global_data = global_response.json()
 
-        if "data" not in global_data or "market_cap_percentage" not in global_data["data"]:
-            raise ValueError("Champ 'data' manquant dans la réponse de CoinGecko")
+        if not global_data or "data" not in global_data or "market_cap_percentage" not in global_data["data"]:
+            raise ValueError("Données 'data' ou 'market_cap_percentage' manquantes")
 
         btc_dominance = global_data["data"]["market_cap_percentage"]["btc"] / 100
+        if btc_dominance == 0:
+            raise ValueError("Dominance BTC invalide (0)")
+
         total_market_cap = btc_df["close"] / btc_dominance
 
         total_df = btc_df.copy()
