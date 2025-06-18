@@ -10,14 +10,12 @@ def analyze_signal(df, direction, btc_df, total_df, btc_d_df, symbol=None):
             print("⚠️ Données invalides pour analyse.")
             return None
 
-        df.name = symbol if symbol else "Unknown"
-
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
         df.set_index('timestamp', inplace=True)
         df = df.dropna().copy()
 
         if len(df) < 100:
-            print(f"[{df.name}] ⚠️ Pas assez de données pour l’analyse.")
+            print("⚠️ Pas assez de données pour l’analyse.")
             return None
 
         close = df['close']
@@ -64,8 +62,10 @@ def analyze_signal(df, direction, btc_df, total_df, btc_d_df, symbol=None):
         tolerated = []
         score = 0
 
-        if in_ote: tolerated.append("OTE")
-        else: rejected.append("OTE")
+        if in_ote:
+            tolerated.append("OTE")
+        else:
+            rejected.append("OTE")
 
         for name, ok in [
             ("FVG", in_fvg),
@@ -88,7 +88,7 @@ def analyze_signal(df, direction, btc_df, total_df, btc_d_df, symbol=None):
                 rejected.append(name)
 
         if score < 8:
-            print(f"[{df.name}] ❌ Score insuffisant : {score}")
+            print(f"❌ Score insuffisant : {score}")
             return None
 
         entry = close.iloc[-1]
@@ -100,7 +100,7 @@ def analyze_signal(df, direction, btc_df, total_df, btc_d_df, symbol=None):
 
         image_path = generate_chart(
             df.reset_index(),
-            symbol=df.name,
+            symbol=symbol or "Unknown",
             ote_zone=ote_zone,
             fvg_zone=fvg_zone,
             entry=entry,
@@ -110,7 +110,7 @@ def analyze_signal(df, direction, btc_df, total_df, btc_d_df, symbol=None):
         )
 
         return {
-            "symbol": df.name,
+            "symbol": symbol or "Unknown",
             "direction": direction.upper(),
             "entry": entry,
             "sl": sl,
@@ -122,9 +122,14 @@ def analyze_signal(df, direction, btc_df, total_df, btc_d_df, symbol=None):
             "tolere_ote": not in_ote,
             "toleres": tolerated,
             "rejetes": rejected,
-            "comment": f"📌 Zone idéale d'entrée :\nOTE = {ote_zone[1]:.4f} → {ote_zone[0]:.4f}\nFVG = {fvg_zone[1]:.4f} → {fvg_zone[0]:.4f}" if fvg_zone[0] else ""
+            "comment": (
+                f"📌 Zone idéale d'entrée :\n"
+                f"OTE = {ote_zone[1]:.4f} → {ote_zone[0]:.4f}\n"
+                f"FVG = {fvg_zone[1]:.4f} → {fvg_zone[0]:.4f}"
+                if fvg_zone[0] else ""
+            )
         }
 
     except Exception as e:
-        print(f"[{symbol or 'Unknown'}] ⚠️ Erreur analyse signal : {e}")
+        print(f"⚠️ Erreur analyse signal : {e}")
         return None
