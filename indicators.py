@@ -11,8 +11,8 @@ def compute_macd_histogram(close_series, fast=12, slow=26, signal=9):
 
 def compute_rsi(close_series, period=14):
     delta = close_series.diff()
-    gain = delta.where(delta > 0, 0).rolling(window=period).mean()
-    loss = -delta.where(delta < 0, 0).rolling(window=period).mean()
+    gain = delta.clip(lower=0).rolling(window=period).mean()
+    loss = -delta.clip(upper=0).rolling(window=period).mean()
     rs = gain / loss
     rsi = 100 - (100 / (1 + rs))
     return rsi
@@ -35,39 +35,49 @@ def compute_atr(df, period=14):
     return atr
 
 def compute_fvg_zones(df):
-    fvg_upper = []
-    fvg_lower = []
+    """
+    Fair Value Gaps (FVG) détectés à partir des bougies :
+    - FVG haussier si low[i-2] > high[i]
+    - FVG baissier si high[i-2] < low[i]
+    """
+    fvg_upper = [np.nan, np.nan]
+    fvg_lower = [np.nan, np.nan]
 
     for i in range(2, len(df)):
         prev_low = df['low'].iloc[i - 2]
-        current_high = df['high'].iloc[i]
-
         prev_high = df['high'].iloc[i - 2]
-        current_low = df['low'].iloc[i]
+        curr_low = df['low'].iloc[i]
+        curr_high = df['high'].iloc[i]
 
-        if prev_low > current_high:
-            fvg_lower.append(current_high)
+        if prev_low > curr_high:  # FVG haussier
+            fvg_lower.append(curr_high)
             fvg_upper.append(prev_low)
-        elif prev_high < current_low:
-            fvg_upper.append(current_low)
+        elif prev_high < curr_low:  # FVG baissier
             fvg_lower.append(prev_high)
+            fvg_upper.append(curr_low)
         else:
-            fvg_upper.append(np.nan)
             fvg_lower.append(np.nan)
+            fvg_upper.append(np.nan)
 
-    fvg_df = pd.DataFrame({
-        'fvg_upper': [np.nan, np.nan] + fvg_upper,
-        'fvg_lower': [np.nan, np.nan] + fvg_lower
+    return pd.DataFrame({
+        'fvg_lower': fvg_lower,
+        'fvg_upper': fvg_upper
     }, index=df.index)
 
-    return fvg_df
-
 def find_pivots(df, left=5, right=5):
+    """
+    Détection des pivots (haut/bas locaux) utilisés pour TP dynamiques.
+    """
     highs = []
     lows = []
+
     for i in range(left, len(df) - right):
-        if df['high'].iloc[i] == max(df['high'].iloc[i - left:i + right + 1]):
+        window = df['high'].iloc[i - left:i + right + 1]
+        if df['high'].iloc[i] == window.max():
             highs.append(i)
-        if df['low'].iloc[i] == min(df['low'].iloc[i - left:i + right + 1]):
+
+        window = df['low'].iloc[i - left:i + right + 1]
+        if df['low'].iloc[i] == window.min():
             lows.append(i)
+
     return highs, lows
