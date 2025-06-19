@@ -1,72 +1,61 @@
 import pandas as pd
 import numpy as np
 
-def compute_macd_histogram(close, short=12, long=26, signal=9):
-    ema_short = close.ewm(span=short, adjust=False).mean()
-    ema_long = close.ewm(span=long, adjust=False).mean()
-    macd_line = ema_short - ema_long
-    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
-    histogram = macd_line - signal_line
-    return histogram.fillna(0)
+def compute_rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    delta = series.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    rs = gain / loss
+    return 100 - (100 / (1 + rs))
 
-def compute_rsi(close, period=14):
-    delta = close.diff()
-    gain = delta.where(delta > 0, 0)
-    loss = -delta.where(delta < 0, 0)
+def compute_macd_histogram(series: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> pd.Series:
+    ema_fast = series.ewm(span=fast, min_periods=1).mean()
+    ema_slow = series.ewm(span=slow, min_periods=1).mean()
+    macd = ema_fast - ema_slow
+    signal_line = macd.ewm(span=signal, min_periods=1).mean()
+    histogram = macd - signal_line
+    return histogram
 
-    avg_gain = gain.rolling(window=period).mean()
-    avg_loss = loss.rolling(window=period).mean()
+def compute_ma(df: pd.DataFrame, period: int = 200) -> pd.Series:
+    return df['close'].rolling(window=period).mean().bfill()
 
-    rs = avg_gain / (avg_loss + 1e-9)  # éviter division par zéro
-    rsi = 100 - (100 / (1 + rs))
-    return rsi.fillna(50)
-
-def compute_ma(df, period=200):
-    return df['close'].rolling(window=period).mean().fillna(method='bfill')
-
-def compute_atr(df, period=14):
+def compute_atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     high = df['high']
     low = df['low']
     close = df['close']
-
     tr1 = high - low
-    tr2 = (high - close.shift(1)).abs()
-    tr3 = (low - close.shift(1)).abs()
-    true_range = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    tr2 = abs(high - close.shift())
+    tr3 = abs(low - close.shift())
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    atr = tr.rolling(window=period).mean()
+    return atr.bfill()
 
-    atr = true_range.rolling(window=period).mean()
-    return atr.fillna(method='bfill')
-
-def compute_fvg_zones(df):
-    """
-    Détecte les gaps de valeur (Fair Value Gaps) sur les 3 dernières bougies.
-    """
+def compute_fvg_zones(df: pd.DataFrame) -> pd.DataFrame:
     fvg_upper = []
     fvg_lower = []
 
     for i in range(2, len(df)):
-        prev_low = df['low'].iloc[i - 2]
-        mid_close = df['close'].iloc[i - 1]
-        curr_high = df['high'].iloc[i]
-
         prev_high = df['high'].iloc[i - 2]
-        curr_low = df['low'].iloc[i]
+        prev_low = df['low'].iloc[i - 2]
+        current_open = df['open'].iloc[i]
+        current_close = df['close'].iloc[i]
 
-        # FVG haussier : la bougie du milieu ne remplit pas complètement
-        if curr_low > prev_high:
-            fvg_upper.append(curr_low)
+        # Fair Value Gap (bougie 0 ignore 1, compare à 2)
+        if current_open > prev_high:
+            fvg_upper.append(current_open)
             fvg_lower.append(prev_high)
-        # FVG baissier : même logique inversée
-        elif curr_high < prev_low:
+        elif current_open < prev_low:
             fvg_upper.append(prev_low)
-            fvg_lower.append(curr_high)
+            fvg_lower.append(current_open)
         else:
             fvg_upper.append(None)
             fvg_lower.append(None)
 
-    # Compléter le début pour correspondre à la longueur
-    padding = [None, None]
-    fvg_upper = padding + fvg_upper
-    fvg_lower = padding + fvg_lower
+    # Décaler pour aligner avec les index d’origine
+    fvg_upper = [None, None] + fvg_upper
+    fvg_lower = [None, None] + fvg_lower
 
-    return pd.DataFrame({'fvg_upper': fvg_upper, 'fvg_lower': fvg_lower}, index=df.index)
+    return pd.DataFrame({
+        'fvg_upper': fvg_upper,
+        'fvg_lower': fvg_lower
+    }, index=df.index)
