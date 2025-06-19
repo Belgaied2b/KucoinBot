@@ -132,13 +132,11 @@ async def scan_and_send_signals():
                 print(f"[{symbol}] ⚠️ Données insuffisantes ou format invalide, ignoré")
                 continue
 
-            df.name = symbol
-
             for direction in ["long", "short"]:
                 print(f"[{symbol}] ➡️ Analyse {direction.upper()}")
 
                 df_copy = df.copy()
-                df_copy.name = symbol  # ✅ nécessaire pour corriger Unknown
+                df_copy.name = symbol  # ✅ Corrige "Unknown" dans tous les cas
 
                 signal = analyze_signal(
                     df_copy,
