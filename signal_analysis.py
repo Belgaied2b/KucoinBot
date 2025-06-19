@@ -128,12 +128,12 @@ def analyze_signal(df, direction, btc_df, total_df, btc_d_df):
             else:
                 rejected.append(name)
 
+        final_score = round((total_score / max_score) * 10, 1)
+        print(f"[{df.name if hasattr(df, 'name') else 'Unknown'}] ✅ Score pondéré : {final_score}/10")
+
         if rejected:
             print(f"❌ Rejeté : {', '.join(rejected)}")
             return None
-
-        final_score = round((total_score / max_score) * 10, 1)
-        print(f"[{df.name if hasattr(df, 'name') else 'Unknown'}] ✅ Score pondéré : {final_score}/10")
 
         # Entrée/SL/TP
         entry = close.iloc[-1]
