@@ -136,17 +136,12 @@ async def scan_and_send_signals():
                 print(f"[{symbol}] ➡️ Analyse {direction.upper()}")
 
                 df_copy = df.copy()
-                df_copy.name = symbol  # ✅ Corrige "Unknown" dans tous les cas
+                df_copy.name = symbol
 
                 signal = analyze_signal(
-    df_copy,
-    symbol=symbol,
-    direction=direction,
-    btc_df=btc_df,
-    total_df=total_df,
-    btc_d_df=btc_d_df
-)
-                
+                    df_copy, direction, btc_df, total_df, btc_d_df, symbol
+                )
+
                 if signal:
                     suffix = "TOLÉRÉ" if signal.get("tolere_ote") else "CONFIRMÉ"
                     signal_id = f"{symbol}-{direction.upper()}-{suffix}"
