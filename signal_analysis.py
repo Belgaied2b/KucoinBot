@@ -109,7 +109,16 @@ def analyze_signal(df, direction, btc_df, total_df, btc_d_df):
         rr2 = round((tp2 - entry) / (entry - sl), 2)
 
         symbol = df.name if hasattr(df, 'name') else "Unknown"
-        image_path = generate_chart(df.reset_index(), symbol=symbol, ote_zone=ote_zone, fvg_zone=fvg_zone, entry=entry, sl=sl, tp=tp1, direction=direction.upper())
+        image_path = generate_chart(
+            df.reset_index(), 
+            symbol=symbol, 
+            ote_zone=ote_zone, 
+            fvg_zone=fvg_zone, 
+            entry=entry, 
+            sl=sl, 
+            tp=tp1, 
+            direction=direction.upper()
+        )
 
         return {
             "symbol": symbol,
