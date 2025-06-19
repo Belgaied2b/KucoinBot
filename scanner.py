@@ -138,7 +138,7 @@ async def scan_and_send_signals():
                 print(f"[{symbol}] ➡️ Analyse {direction.upper()}")
 
                 df_copy = df.copy()
-                df_copy.name = symbol  # ✅ Corrige "Unknown"
+                df_copy.name = symbol  # ✅ nécessaire pour corriger Unknown
 
                 signal = analyze_signal(
                     df_copy,
@@ -156,7 +156,8 @@ async def scan_and_send_signals():
                         print(f"[{symbol}] 🔁 Signal déjà envoyé ({direction.upper()}-{suffix}), ignoré")
                         continue
 
-                    print(f"[{symbol}] ✅ Nouveau signal accepté : {direction.upper()} ({suffix}) | Score : {signal['score']}/10")
+                    score = signal.get("score", "?")
+                    print(f"[{symbol}] ✅ Nouveau signal accepté : {direction.upper()} ({suffix}) | Score pondéré : {score}/10")
                     await send_signal_to_telegram(signal)
 
                     sent_signals[signal_id] = {
