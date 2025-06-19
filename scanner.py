@@ -17,24 +17,30 @@ async def send_signal_to_telegram(signal):
     rejected = signal.get("rejetes", [])
     tolerated = signal.get("toleres", [])
 
+    symbol = signal.get("symbol", "❓Inconnu")
     msg_rejected = f"❌ Rejetés : {', '.join(rejected)}" if rejected else ""
     msg_tolerated = f"⚠️ Tolérés : {', '.join(tolerated)}" if tolerated else ""
 
-    message = (
-        f"📉 {signal['symbol']} - Signal CONFIRMÉ ({signal['direction']})\n\n"
-        f"🎯 Entry : {signal['entry']:.4f}\n"
-        f"🛑 SL    : {signal['sl']:.4f}\n"
-        f"🎯 TP1   : {signal['tp1']:.4f}\n"
-        f"🎯 TP2   : {signal['tp2']:.4f}\n"
-        f"📈 R:R1  : {signal['rr1']}\n"
-        f"📈 R:R2  : {signal['rr2']}\n"
-        f"🧠 Score : {signal.get('score', '?')}/10\n"
-        f"{signal.get('comment', '')}\n"
-        f"{msg_tolerated}\n"
-        f"{msg_rejected}"
-    )
+    message_parts = [
+        f"📉 {symbol} - Signal CONFIRMÉ ({signal['direction']})\n",
+        f"🎯 Entry : {signal['entry']:.4f}",
+        f"🛑 SL    : {signal['sl']:.4f}",
+        f"🎯 TP1   : {signal['tp1']:.4f}",
+        f"🎯 TP2   : {signal['tp2']:.4f}",
+        f"📈 R:R1  : {signal['rr1']}",
+        f"📈 R:R2  : {signal['rr2']}",
+        f"🧠 Score : {signal.get('score', '?')}/10",
+        f"{signal.get('comment', '')}"
+    ]
 
-    print(f"[{signal['symbol']}] 📤 Envoi Telegram en cours...")
+    if msg_tolerated:
+        message_parts.append(msg_tolerated)
+    if msg_rejected:
+        message_parts.append(msg_rejected)
+
+    message = "\n".join(message_parts)
+
+    print(f"[{symbol}] 📤 Envoi Telegram en cours...")
     await bot.send_message(chat_id=CHAT_ID, text=message.strip())
 
 # 📂 Gestion des doublons
@@ -117,7 +123,7 @@ async def scan_and_send_signals():
                 print(f"[{symbol}] ⚠️ Données insuffisantes ou format invalide, ignoré")
                 continue
 
-            df.name = symbol  # utile pour le graphique
+            df.name = symbol  # Pour l’analyse + le graphique
 
             for direction in ["long", "short"]:
                 print(f"[{symbol}] ➡️ Analyse {direction.upper()}")
