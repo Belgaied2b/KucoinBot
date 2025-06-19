@@ -17,8 +17,7 @@ def analyze_signal(df, direction, btc_df, total_df, btc_d_df):
         df.set_index('timestamp', inplace=True)
         df = df.dropna().copy()
 
-        # ✅ Capture du nom du symbole une fois pour toutes
-        symbol = df.name if hasattr(df, 'name') else "Unknown"
+        symbol = getattr(df, 'name', 'Unknown')
 
         if len(df) < 100:
             print(f"[{symbol}] ⚠️ Pas assez de données pour l’analyse.")
