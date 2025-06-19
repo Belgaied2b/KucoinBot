@@ -1,7 +1,7 @@
 import json
 import time
 import pandas as pd
-from kucoin_utils import fetch_all_symbols, fetch_klines
+from kucoin_utils import get_kucoin_symbols, fetch_klines
 from signal_analysis import analyze_signal
 from telegram_utils import send_signal_to_telegram
 from macro import get_macro_context
