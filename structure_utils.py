@@ -10,17 +10,14 @@ def detect_swing_points(df):
     swing_lows = []
 
     for i in range(2, len(df) - 2):
-        if highs[i] > highs[i - 2] and highs[i] > highs[i - 1] and highs[i] > highs[i + 1] and highs[i] > highs[i + 2]:
-            swing_highs.append((df.index[i], highs[i]))
-        if lows[i] < lows[i - 2] and lows[i] < lows[i - 1] and lows[i] < lows[i + 1] and lows[i] < lows[i + 2]:
-            swing_lows.append((df.index[i], lows[i]))
+        if highs.iloc[i] > highs.iloc[i - 2] and highs.iloc[i] > highs.iloc[i - 1] and highs.iloc[i] > highs.iloc[i + 1] and highs.iloc[i] > highs.iloc[i + 2]:
+            swing_highs.append((df.index[i], highs.iloc[i]))
+        if lows.iloc[i] < lows.iloc[i - 2] and lows.iloc[i] < lows.iloc[i - 1] and lows.iloc[i] < lows.iloc[i + 1] and lows.iloc[i] < lows.iloc[i + 2]:
+            swing_lows.append((df.index[i], lows.iloc[i]))
 
     return swing_highs, swing_lows
 
 def is_bos_valid(df, direction):
-    """
-    Break of Structure (BOS) : cassure confirmée d’un pivot précédent.
-    """
     swing_highs, swing_lows = detect_swing_points(df)
 
     if direction == "long" and len(swing_highs) >= 2:
@@ -32,9 +29,6 @@ def is_bos_valid(df, direction):
     return False
 
 def is_cos_valid(df, direction):
-    """
-    Confirmation of Structure (COS) : le marché tient la structure après BOS.
-    """
     if len(df) < 30:
         return False
 
@@ -57,9 +51,6 @@ def detect_bos_cos(df, direction):
         return False, False
 
 def detect_choch(df, direction):
-    """
-    Change of Character (CHoCH) : retournement de tendance détecté par cassure inverse confirmée.
-    """
     try:
         if len(df) < 50:
             return False
