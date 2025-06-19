@@ -4,7 +4,7 @@ from indicators import (
     compute_macd_histogram, compute_rsi,
     compute_ma, compute_atr, compute_fvg_zones
 )
-from structure_utils import detect_bos_cos, detect_choch, detect_swing_points
+from structure_utils import detect_bos_cos, detect_choch
 from chart_generator import generate_chart
 
 def analyze_signal(df, direction, btc_df, total_df, btc_d_df, symbol):
@@ -36,28 +36,20 @@ def analyze_signal(df, direction, btc_df, total_df, btc_d_df, symbol):
         df['fvg_upper'] = fvg_df['fvg_upper']
         df['fvg_lower'] = fvg_df['fvg_lower']
 
-        # 🔹 Swing points pour OTE
-        swing_highs, swing_lows = detect_swing_points(df)
-        last_swing = swing_lows[-1][1] if direction == "long" else swing_highs[-1][1]
-
+        # 🔹 OTE renforcé avec Fib réel
+        last_pivot = close.iloc[-20]
         if direction == "long":
-            ote_high = last_swing * 0.786
-            ote_low = last_swing * 0.618
+            ote_high = last_pivot * 0.786
+            ote_low = last_pivot * 0.618
         else:
-            ote_low = last_swing * 1.272
-            ote_high = last_swing * 1.618
+            ote_low = last_pivot * 1.272
+            ote_high = last_pivot * 1.618
         ote_zone = (ote_high, ote_low) if direction == "long" else (ote_low, ote_high)
         in_ote = ote_low <= close.iloc[-1] <= ote_high
 
-        # 🔹 FVG directionnel
-        valid_fvg = fvg_df.dropna().copy()
-        if direction == "long":
-            valid_fvg = valid_fvg[valid_fvg['fvg_upper'] > valid_fvg['fvg_lower']]
-        else:
-            valid_fvg = valid_fvg[valid_fvg['fvg_upper'] < valid_fvg['fvg_lower']]
-
-        if not valid_fvg.empty:
-            last_fvg = valid_fvg.tail(1)
+        # 🔹 FVG
+        last_fvg = df[['fvg_upper', 'fvg_lower']].dropna().tail(1)
+        if not last_fvg.empty:
             fvg_zone = (last_fvg['fvg_upper'].values[0], last_fvg['fvg_lower'].values[0])
             in_fvg = fvg_zone[1] <= close.iloc[-1] <= fvg_zone[0]
         else:
@@ -68,46 +60,28 @@ def analyze_signal(df, direction, btc_df, total_df, btc_d_df, symbol):
         bos_ok, cos_ok = detect_bos_cos(df, direction)
         choch_ok = detect_choch(df, direction)
 
-        # 🔹 Bougie confirmée
-        candle_size = abs(df['close'].iloc[-1] - df['open'].iloc[-1])
-        full_size = df['high'].iloc[-1] - df['low'].iloc[-1]
-        if full_size == 0:
-            candle_ok = False
-        else:
-            candle_ok = (candle_size / full_size > 0.6) and volume.iloc[-1] > volume.rolling(20).mean().iloc[-1]
-
-        # 🔹 Volume fort
-        volume_median = volume.rolling(20).median().iloc[-1]
-        volume_ok = volume.iloc[-1] > volume_median * 1.2
-
-        # 🔹 ATR min
+        # 🔹 Autres filtres
+        candle_ok = close.iloc[-1] > df['open'].iloc[-1]
+        volume_ok = volume.iloc[-1] > volume.rolling(20).mean().iloc[-1] * 1.2
         atr_ok = atr.iloc[-1] > atr.rolling(20).mean().iloc[-1]
+        ma_trend_ok = close.iloc[-1] > ma200.iloc[-1] if direction == "long" else close.iloc[-1] < ma200.iloc[-1]
+        macd_ok = macd_hist.iloc[-1] > 0 if direction == "long" else macd_hist.iloc[-1] < 0
 
-        # 🔹 MA200 pente + tendance
-        ma_slope = ma200.iloc[-1] - ma200.iloc[-5]
-        ma_trend_ok = (ma_slope > 0 and close.iloc[-1] > ma200.iloc[-1]) if direction == "long" else (ma_slope < 0 and close.iloc[-1] < ma200.iloc[-1])
-
-        # 🔹 MACD : direction + accélération
-        macd_ok = (
-            macd_hist.iloc[-1] > 0 and macd_hist.iloc[-1] > macd_hist.iloc[-2]
-        ) if direction == "long" else (
-            macd_hist.iloc[-1] < 0 and macd_hist.iloc[-1] < macd_hist.iloc[-2]
-        )
-
-        # 🔹 Divergences
-        rsi_div = (rsi.iloc[-1] > rsi.iloc[-5]) if direction == "long" else (rsi.iloc[-1] < rsi.iloc[-5])
-        macd_div = (macd_hist.iloc[-1] > macd_hist.iloc[-5]) if direction == "long" else (macd_hist.iloc[-1] < macd_hist.iloc[-5])
+        # 🔹 Divergence RSI/MACD
+        rsi_div = rsi.iloc[-1] > rsi.iloc[-5] if direction == "long" else rsi.iloc[-1] < rsi.iloc[-5]
+        macd_div = macd_hist.iloc[-1] > macd_hist.iloc[-5] if direction == "long" else macd_hist.iloc[-1] < macd_hist.iloc[-5]
         divergence_ok = rsi_div and macd_div
 
-        # 🔹 Macro
+        # 🔹 Macro marché
         total_diff = total_df['close'].iloc[-1] - total_df['close'].iloc[-5]
         macro_ok = (total_diff > 0) if direction == "long" else (total_diff < 0)
 
+        # 🔹 BTC Dominance
         btc_d_current = btc_d_df['close'].iloc[-1]
         btc_d_prev = btc_d_df['close'].iloc[-5]
         btc_d_status = "haussier" if btc_d_current > btc_d_prev else "baissier" if btc_d_current < btc_d_prev else "stagnant"
 
-        # 🔍 Score pondéré expert
+        # 🔍 Système pondéré
         weights = {
             "FVG": 1.0,
             "BOS": 2.0,
@@ -161,7 +135,7 @@ def analyze_signal(df, direction, btc_df, total_df, btc_d_df, symbol):
             print(f"❌ Rejeté : {', '.join(rejected)}")
             return None
 
-        # 🎯 Niveaux de trade
+        # Entrée/SL/TP
         entry = close.iloc[-1]
         sl = entry - atr.iloc[-1] if direction == "long" else entry + atr.iloc[-1]
         tp1 = entry + (entry - sl) * 1.0 if direction == "long" else entry - (sl - entry) * 1.0
@@ -169,7 +143,7 @@ def analyze_signal(df, direction, btc_df, total_df, btc_d_df, symbol):
         rr1 = round((tp1 - entry) / (entry - sl), 2)
         rr2 = round((tp2 - entry) / (entry - sl), 2)
 
-        # 📊 Graphique
+        # Chart
         generate_chart(
             df.reset_index(), symbol=symbol,
             ote_zone=ote_zone, fvg_zone=fvg_zone,
