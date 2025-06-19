@@ -1,7 +1,7 @@
 import pandas as pd
 import requests
 
-def get_kucoin_symbols():
+def fetch_all_symbols():
     url = "https://api-futures.kucoin.com/api/v1/contracts/active"
     response = requests.get(url)
     data = response.json()["data"]
