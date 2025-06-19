@@ -17,8 +17,11 @@ def analyze_signal(df, direction, btc_df, total_df, btc_d_df):
         df.set_index('timestamp', inplace=True)
         df = df.dropna().copy()
 
+        # ✅ Capture du nom du symbole une fois pour toutes
+        symbol = df.name if hasattr(df, 'name') else "Unknown"
+
         if len(df) < 100:
-            print("⚠️ Pas assez de données pour l’analyse.")
+            print(f"[{symbol}] ⚠️ Pas assez de données pour l’analyse.")
             return None
 
         close = df['close']
@@ -129,7 +132,7 @@ def analyze_signal(df, direction, btc_df, total_df, btc_d_df):
                 rejected.append(name)
 
         final_score = round((total_score / max_score) * 10, 1)
-        print(f"[{df.name if hasattr(df, 'name') else 'Unknown'}] ✅ Score pondéré : {final_score}/10")
+        print(f"[{symbol}] ✅ Score pondéré : {final_score}/10")
 
         if rejected:
             print(f"❌ Rejeté : {', '.join(rejected)}")
@@ -144,7 +147,6 @@ def analyze_signal(df, direction, btc_df, total_df, btc_d_df):
         rr2 = round((tp2 - entry) / (entry - sl), 2)
 
         # Chart
-        symbol = df.name if hasattr(df, 'name') else "Unknown"
         generate_chart(
             df.reset_index(), symbol=symbol,
             ote_zone=ote_zone, fvg_zone=fvg_zone,
