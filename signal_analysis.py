@@ -7,7 +7,7 @@ from indicators import (
 from structure_utils import detect_bos_cos, detect_choch
 from chart_generator import generate_chart
 
-def analyze_signal(df, direction, btc_df, total_df, btc_d_df):
+def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df):
     try:
         if df is None or df.empty or 'timestamp' not in df.columns:
             print("⚠️ Données invalides pour analyse.")
@@ -16,8 +16,6 @@ def analyze_signal(df, direction, btc_df, total_df, btc_d_df):
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
         df.set_index('timestamp', inplace=True)
         df = df.dropna().copy()
-
-        symbol = getattr(df, 'name', 'Unknown')
 
         if len(df) < 100:
             print(f"[{symbol}] ⚠️ Pas assez de données pour l’analyse.")
@@ -174,5 +172,5 @@ def analyze_signal(df, direction, btc_df, total_df, btc_d_df):
         }
 
     except Exception as e:
-        print(f"⚠️ Erreur analyse signal : {e}")
+        print(f"[{symbol}] ⚠️ Erreur analyse signal : {e}")
         return None
