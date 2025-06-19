@@ -1,42 +1,31 @@
-import requests
 import pandas as pd
+import requests
 
-BASE_URL = "https://api.kucoin.com"
+def fetch_all_symbols():
+    url = "https://api-futures.kucoin.com/api/v1/contracts/active"
+    response = requests.get(url)
+    data = response.json()["data"]
+    return [item["symbol"] for item in data if item["symbol"].endswith("USDTM")]
 
-def get_kucoin_symbols():
-    try:
-        response = requests.get(f"{BASE_URL}/api/v1/contracts/active")
-        data = response.json()["data"]
-        symbols = [item["symbol"] for item in data if item["symbol"].endswith("USDTM")]
-        return symbols
-    except Exception as e:
-        print(f"Erreur lors de la récupération des symboles KuCoin : {e}")
-        return []
+def fetch_klines(symbol, interval="1h", limit=150):
+    granularity = {"1h": 60, "4h": 240}[interval]
+    url = "https://api-futures.kucoin.com/api/v1/kline/query"
+    params = {"symbol": symbol, "granularity": granularity, "limit": limit}
+    response = requests.get(url, params=params)
+    data = response.json()["data"]
 
-def fetch_klines(symbol, interval="1h", limit=200):
-    try:
-        url = f"{BASE_URL}/api/v1/market/candles?symbol={symbol}&granularity={convert_interval(interval)}"
-        response = requests.get(url)
-        response.raise_for_status()
-        raw_data = response.json()["data"][:limit]
-        df = pd.DataFrame(raw_data, columns=["timestamp", "open", "high", "low", "close", "volume", "turnover"])
-        df = df.iloc[::-1]  # inverse l’ordre
-        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="s")
-        df[["open", "high", "low", "close", "volume"]] = df[["open", "high", "low", "close", "volume"]].astype(float)
-        return df
-    except Exception as e:
-        print(f"Erreur fetch_klines pour {symbol}: {e}")
-        return None
+    df = pd.DataFrame(data, columns=["timestamp", "open", "close", "high", "low", "volume"])
+    df = df.astype(float)
 
-def convert_interval(interval):
-    mapping = {
-        "1m": 60,
-        "3m": 180,
-        "5m": 300,
-        "15m": 900,
-        "30m": 1800,
-        "1h": 3600,
-        "4h": 14400,
-        "1d": 86400
-    }
-    return mapping.get(interval, 3600)
+    # ✅ Détection automatique de l'unité du timestamp
+    sample_ts = df["timestamp"].iloc[0]
+    if sample_ts > 1e12:
+        unit = "ms"
+    elif sample_ts > 1e10:
+        unit = "s"
+    else:
+        unit = "s"
+
+    df["timestamp"] = pd.to_datetime(df["timestamp"].astype("int64"), unit=unit)
+
+    return df[["timestamp", "open", "high", "low", "close", "volume"]]
