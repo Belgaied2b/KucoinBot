@@ -1,48 +1,43 @@
 import pandas as pd
 
-def detect_swing_points(df):
-    """
-    Détecte les points haut/bas structurels (HH/LL)
-    """
-    highs = df['high']
-    lows = df['low']
-    swing_highs = []
-    swing_lows = []
-
-    for i in range(2, len(df) - 2):
-        if highs.iloc[i] > highs.iloc[i - 2] and highs.iloc[i] > highs.iloc[i - 1] and highs.iloc[i] > highs.iloc[i + 1] and highs.iloc[i] > highs.iloc[i + 2]:
-            swing_highs.append((df.index[i], highs.iloc[i]))
-        if lows.iloc[i] < lows.iloc[i - 2] and lows.iloc[i] < lows.iloc[i - 1] and lows.iloc[i] < lows.iloc[i + 1] and lows.iloc[i] < lows.iloc[i + 2]:
-            swing_lows.append((df.index[i], lows.iloc[i]))
-
-    return swing_highs, swing_lows
-
 def is_bos_valid(df, direction):
-    swing_highs, swing_lows = detect_swing_points(df)
-
-    if direction == "long" and len(swing_highs) >= 2:
-        last_high = swing_highs[-2][1]
-        return df['close'].iloc[-1] > last_high
-    elif direction == "short" and len(swing_lows) >= 2:
-        last_low = swing_lows[-2][1]
-        return df['close'].iloc[-1] < last_low
-    return False
-
-def is_cos_valid(df, direction):
+    """
+    Break of Structure (BOS) : le prix casse un plus haut (long) ou plus bas (short) précédent.
+    """
     if len(df) < 30:
         return False
 
-    swing_highs, swing_lows = detect_swing_points(df)
+    highs = df['high'].rolling(window=20).max()
+    lows = df['low'].rolling(window=20).min()
 
-    if direction == "long" and len(swing_lows) >= 1:
-        last_low = swing_lows[-1][1]
-        return df['low'].iloc[-1] > last_low
-    elif direction == "short" and len(swing_highs) >= 1:
-        last_high = swing_highs[-1][1]
-        return df['high'].iloc[-1] < last_high
-    return False
+    if direction == "long":
+        previous_high = highs.shift(1).iloc[-5]
+        return df['close'].iloc[-1] > previous_high
+    else:
+        previous_low = lows.shift(1).iloc[-5]
+        return df['close'].iloc[-1] < previous_low
+
+def is_cos_valid(df, direction):
+    """
+    Confirmation of Structure (COS) : après cassure BOS, le marché tient la structure.
+    """
+    if len(df) < 30:
+        return False
+
+    highs = df['high'].rolling(window=10).max()
+    lows = df['low'].rolling(window=10).min()
+
+    if direction == "long":
+        previous_low = lows.shift(1).iloc[-5]
+        return df['low'].iloc[-1] > previous_low
+    else:
+        previous_high = highs.shift(1).iloc[-5]
+        return df['high'].iloc[-1] < previous_high
 
 def detect_bos_cos(df, direction):
+    """
+    Retourne le statut BOS et COS (True/False).
+    """
     try:
         bos = is_bos_valid(df, direction)
         cos = is_cos_valid(df, direction)
@@ -51,19 +46,22 @@ def detect_bos_cos(df, direction):
         return False, False
 
 def detect_choch(df, direction):
+    """
+    Change of Character (CHoCH) : retournement de tendance.
+    Exemple : tendance baissière avec cassure haussière (long).
+    """
     try:
-        if len(df) < 50:
+        if len(df) < 40:
             return False
 
-        swing_highs, swing_lows = detect_swing_points(df)
+        highs = df['high'].rolling(window=10).max()
+        lows = df['low'].rolling(window=10).min()
 
-        if direction == "long" and len(swing_highs) >= 2:
-            last_high = swing_highs[-2][1]
-            return df['close'].iloc[-1] > last_high and df['volume'].iloc[-1] > df['volume'].rolling(20).mean().iloc[-1]
-        elif direction == "short" and len(swing_lows) >= 2:
-            last_low = swing_lows[-2][1]
-            return df['close'].iloc[-1] < last_low and df['volume'].iloc[-1] > df['volume'].rolling(20).mean().iloc[-1]
-
-        return False
+        if direction == "long":
+            choch_up = df['close'].iloc[-1] > df['high'].iloc[-10] and df['low'].iloc[-1] > lows.shift(1).iloc[-10]
+            return choch_up
+        else:
+            choch_down = df['close'].iloc[-1] < df['low'].iloc[-10] and df['high'].iloc[-1] < highs.shift(1).iloc[-10]
+            return choch_down
     except Exception:
         return False
