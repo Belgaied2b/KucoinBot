@@ -1,12 +1,12 @@
 import json
 import time
 import pandas as pd
-from kucoin_utils import get_kucoin_symbols, fetch_klines
+from kucoin_utils import fetch_all_symbols, fetch_klines
 from signal_analysis import analyze_signal
-from telegram import send_signal_to_telegram
+from telegram_utils import send_signal_to_telegram
 from macro import get_macro_context
 
-# Liste des signaux déjà envoyés (éviter les doublons)
+# Chargement des signaux déjà envoyés
 try:
     with open("sent_signals.json", "r") as f:
         sent_signals = json.load(f)
@@ -21,8 +21,8 @@ def save_sent_signal(symbol, direction):
 def already_sent(symbol, direction):
     return f"{symbol}_{direction}" in sent_signals
 
-def scan_and_send_signals():
-    symbols = get_kucoin_symbols()
+async def scan_and_send_signals():
+    symbols = fetch_all_symbols()
     context_macro = get_macro_context()
 
     for symbol in symbols:
@@ -40,6 +40,3 @@ def scan_and_send_signals():
             if signal:
                 send_signal_to_telegram(signal)
                 save_sent_signal(symbol, direction)
-
-if __name__ == "__main__":
-    scan_and_send_signals()
