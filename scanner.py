@@ -17,30 +17,24 @@ async def send_signal_to_telegram(signal):
     rejected = signal.get("rejetes", [])
     tolerated = signal.get("toleres", [])
 
-    symbol = signal.get("symbol", "❓Inconnu")
     msg_rejected = f"❌ Rejetés : {', '.join(rejected)}" if rejected else ""
     msg_tolerated = f"⚠️ Tolérés : {', '.join(tolerated)}" if tolerated else ""
 
-    message_parts = [
-        f"📉 {symbol} - Signal CONFIRMÉ ({signal['direction']})\n",
-        f"🎯 Entry : {signal['entry']:.4f}",
-        f"🛑 SL    : {signal['sl']:.4f}",
-        f"🎯 TP1   : {signal['tp1']:.4f}",
-        f"🎯 TP2   : {signal['tp2']:.4f}",
-        f"📈 R:R1  : {signal['rr1']}",
-        f"📈 R:R2  : {signal['rr2']}",
-        f"🧠 Score : {signal.get('score', '?')}/10",
-        f"{signal.get('comment', '')}"
-    ]
+    message = (
+        f"📉 {signal['symbol']} - Signal CONFIRMÉ ({signal['direction']})\n\n"
+        f"🎯 Entry : {signal['entry']:.4f}\n"
+        f"🛑 SL    : {signal['sl']:.4f}\n"
+        f"🎯 TP1   : {signal['tp1']:.4f}\n"
+        f"🎯 TP2   : {signal['tp2']:.4f}\n"
+        f"📈 R:R1  : {signal['rr1']}\n"
+        f"📈 R:R2  : {signal['rr2']}\n"
+        f"🧠 Score : {signal.get('score', '?')}/10\n"
+        f"{signal.get('comment', '')}\n"
+        f"{msg_tolerated}\n"
+        f"{msg_rejected}"
+    )
 
-    if msg_tolerated:
-        message_parts.append(msg_tolerated)
-    if msg_rejected:
-        message_parts.append(msg_rejected)
-
-    message = "\n".join(message_parts)
-
-    print(f"[{symbol}] 📤 Envoi Telegram en cours...")
+    print(f"[{signal['symbol']}] 📤 Envoi Telegram en cours...")
     await bot.send_message(chat_id=CHAT_ID, text=message.strip())
 
 # 📂 Gestion des doublons
@@ -53,26 +47,41 @@ if os.path.exists("sent_signals.json"):
     except Exception as e:
         print("⚠️ Erreur lecture sent_signals.json :", e)
 
-# 📊 Chargement macro BTC / TOTAL / BTC.D
+# ✅ Fonction robuste CoinGecko
 def get_chart(url):
     try:
-        time.sleep(1)
+        time.sleep(1.2)
         r = requests.get(url)
+        r.raise_for_status()
         data = r.json()
-        if "prices" not in data or "total_volumes" not in data:
-            raise ValueError("Données manquantes dans la réponse CoinGecko")
-        return pd.DataFrame({
-            "timestamp": [x[0] for x in data["prices"]],
-            "close": [x[1] for x in data["prices"]],
-            "high": [x[1] * 1.01 for x in data["prices"]],
-            "low": [x[1] * 0.99 for x in data["prices"]],
-            "open": [x[1] for x in data["prices"]],
-            "volume": [x[1] for x in data["total_volumes"]],
+
+        if "prices" not in data:
+            raise ValueError("⚠️ 'prices' absent de la réponse")
+
+        timestamps = [x[0] for x in data["prices"]]
+        closes = [x[1] for x in data["prices"]]
+
+        if "total_volumes" in data and len(data["total_volumes"]) == len(timestamps):
+            volumes = [x[1] for x in data["total_volumes"]]
+        else:
+            volumes = [0 for _ in timestamps]
+
+        df = pd.DataFrame({
+            "timestamp": timestamps,
+            "close": closes,
+            "high": [c * 1.01 for c in closes],
+            "low": [c * 0.99 for c in closes],
+            "open": closes,
+            "volume": volumes
         })
+
+        return df
+
     except Exception as e:
         print(f"⚠️ Erreur get_chart ({url}): {e}")
         return None
 
+# 📊 Chargement macro BTC / TOTAL / BTC.D
 def fetch_macro_df():
     btc_df = get_chart("https://api.coingecko.com/api/v3/coins/bitcoin/market_chart?vs_currency=usd&days=30")
     if btc_df is None:
@@ -123,7 +132,7 @@ async def scan_and_send_signals():
                 print(f"[{symbol}] ⚠️ Données insuffisantes ou format invalide, ignoré")
                 continue
 
-            df.name = symbol  # Pour l’analyse + le graphique
+            df.name = symbol
 
             for direction in ["long", "short"]:
                 print(f"[{symbol}] ➡️ Analyse {direction.upper()}")
@@ -143,7 +152,7 @@ async def scan_and_send_signals():
                         print(f"[{symbol}] 🔁 Signal déjà envoyé ({direction.upper()}-{suffix}), ignoré")
                         continue
 
-                    print(f"[{symbol}] ✅ Nouveau signal accepté : {direction.upper()} ({suffix})")
+                    print(f"[{symbol}] ✅ Nouveau signal accepté : {direction.upper()} ({suffix}) | Score : {signal['score']}/10")
                     await send_signal_to_telegram(signal)
 
                     sent_signals[signal_id] = {
