@@ -7,7 +7,7 @@ from indicators import (
 from structure_utils import detect_bos_cos, detect_choch
 from chart_generator import generate_chart
 
-def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df):
+def analyze_signal(df, direction, btc_df, total_df, btc_d_df):
     try:
         if df is None or df.empty or 'timestamp' not in df.columns:
             print("⚠️ Données invalides pour analyse.")
@@ -16,6 +16,8 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df):
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
         df.set_index('timestamp', inplace=True)
         df = df.dropna().copy()
+
+        symbol = df.name if hasattr(df, 'name') else "Unknown"
 
         if len(df) < 100:
             print(f"[{symbol}] ⚠️ Pas assez de données pour l’analyse.")
@@ -81,7 +83,7 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df):
         btc_d_prev = btc_d_df['close'].iloc[-5]
         btc_d_status = "haussier" if btc_d_current > btc_d_prev else "baissier" if btc_d_current < btc_d_prev else "stagnant"
 
-        # 🔍 Système pondéré
+        # 🔍 Pondération
         weights = {
             "FVG": 1.0,
             "BOS": 2.0,
@@ -119,7 +121,7 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df):
         }
 
         for name, valid in checks.items():
-            if name == "OTE":
+            if name in ["OTE", "BOUGIE"]:
                 if not valid:
                     tolerated.append(name)
                 continue
@@ -143,7 +145,6 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df):
         rr1 = round((tp1 - entry) / (entry - sl), 2)
         rr2 = round((tp2 - entry) / (entry - sl), 2)
 
-        # Chart
         generate_chart(
             df.reset_index(), symbol=symbol,
             ote_zone=ote_zone, fvg_zone=fvg_zone,
@@ -172,5 +173,5 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df):
         }
 
     except Exception as e:
-        print(f"[{symbol}] ⚠️ Erreur analyse signal : {e}")
+        print(f"⚠️ Erreur analyse signal : {e}")
         return None
