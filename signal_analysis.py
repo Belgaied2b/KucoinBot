@@ -36,11 +36,10 @@ def analyze_signal(df, direction, btc_df, total_df, btc_d_df, symbol):
         df['fvg_upper'] = fvg_df['fvg_upper']
         df['fvg_lower'] = fvg_df['fvg_lower']
 
-        # 🔹 Swing points
+        # 🔹 Swing points pour OTE
         swing_highs, swing_lows = detect_swing_points(df)
         last_swing = swing_lows[-1][1] if direction == "long" else swing_highs[-1][1]
 
-        # 🔹 OTE zone
         if direction == "long":
             ote_high = last_swing * 0.786
             ote_low = last_swing * 0.618
@@ -65,28 +64,37 @@ def analyze_signal(df, direction, btc_df, total_df, btc_d_df, symbol):
             fvg_zone = (None, None)
             in_fvg = False
 
-        # 🔹 Indicateurs techniques
+        # 🔹 Structure
         bos_ok, cos_ok = detect_bos_cos(df, direction)
         choch_ok = detect_choch(df, direction)
 
+        # 🔹 Bougie confirmée
         candle_size = abs(df['close'].iloc[-1] - df['open'].iloc[-1])
         full_size = df['high'].iloc[-1] - df['low'].iloc[-1]
-        candle_ok = (candle_size / full_size > 0.6) and volume.iloc[-1] > volume.rolling(20).mean().iloc[-1]
+        if full_size == 0:
+            candle_ok = False
+        else:
+            candle_ok = (candle_size / full_size > 0.6) and volume.iloc[-1] > volume.rolling(20).mean().iloc[-1]
 
+        # 🔹 Volume fort
         volume_median = volume.rolling(20).median().iloc[-1]
         volume_ok = volume.iloc[-1] > volume_median * 1.2
 
+        # 🔹 ATR min
         atr_ok = atr.iloc[-1] > atr.rolling(20).mean().iloc[-1]
+
+        # 🔹 MA200 pente + tendance
         ma_slope = ma200.iloc[-1] - ma200.iloc[-5]
         ma_trend_ok = (ma_slope > 0 and close.iloc[-1] > ma200.iloc[-1]) if direction == "long" else (ma_slope < 0 and close.iloc[-1] < ma200.iloc[-1])
 
+        # 🔹 MACD : direction + accélération
         macd_ok = (
             macd_hist.iloc[-1] > 0 and macd_hist.iloc[-1] > macd_hist.iloc[-2]
         ) if direction == "long" else (
             macd_hist.iloc[-1] < 0 and macd_hist.iloc[-1] < macd_hist.iloc[-2]
         )
 
-        # 🔹 Divergences RSI / MACD
+        # 🔹 Divergences
         rsi_div = (rsi.iloc[-1] > rsi.iloc[-5]) if direction == "long" else (rsi.iloc[-1] < rsi.iloc[-5])
         macd_div = (macd_hist.iloc[-1] > macd_hist.iloc[-5]) if direction == "long" else (macd_hist.iloc[-1] < macd_hist.iloc[-5])
         divergence_ok = rsi_div and macd_div
@@ -153,7 +161,7 @@ def analyze_signal(df, direction, btc_df, total_df, btc_d_df, symbol):
             print(f"❌ Rejeté : {', '.join(rejected)}")
             return None
 
-        # 🎯 Trade levels
+        # 🎯 Niveaux de trade
         entry = close.iloc[-1]
         sl = entry - atr.iloc[-1] if direction == "long" else entry + atr.iloc[-1]
         tp1 = entry + (entry - sl) * 1.0 if direction == "long" else entry - (sl - entry) * 1.0
@@ -161,7 +169,7 @@ def analyze_signal(df, direction, btc_df, total_df, btc_d_df, symbol):
         rr1 = round((tp1 - entry) / (entry - sl), 2)
         rr2 = round((tp2 - entry) / (entry - sl), 2)
 
-        # 📊 Chart
+        # 📊 Graphique
         generate_chart(
             df.reset_index(), symbol=symbol,
             ote_zone=ote_zone, fvg_zone=fvg_zone,
