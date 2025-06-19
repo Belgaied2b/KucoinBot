@@ -67,7 +67,7 @@ def analyze_signal(df, direction, btc_df, total_df, btc_d_df):
         btc_d_prev = btc_d_df['close'].iloc[-5]
         btc_d_status = "haussier" if btc_d_current > btc_d_prev else "baissier" if btc_d_current < btc_d_prev else "stagnant"
 
-        # Système de validation
+        # Validation + scoring
         rejected = []
         tolerated = []
         score = 0
@@ -100,6 +100,7 @@ def analyze_signal(df, direction, btc_df, total_df, btc_d_df):
             return None
         else:
             score = len(checks) - 1  # OTE n’est pas compté dans le score
+            print(f"[{df.name if hasattr(df, 'name') else 'Unknown'}] ✅ Score qualité : {score}/10")
 
         entry = close.iloc[-1]
         sl = entry - atr.iloc[-1] if direction == "long" else entry + atr.iloc[-1]
@@ -110,13 +111,13 @@ def analyze_signal(df, direction, btc_df, total_df, btc_d_df):
 
         symbol = df.name if hasattr(df, 'name') else "Unknown"
         image_path = generate_chart(
-            df.reset_index(), 
-            symbol=symbol, 
-            ote_zone=ote_zone, 
-            fvg_zone=fvg_zone, 
-            entry=entry, 
-            sl=sl, 
-            tp=tp1, 
+            df.reset_index(),
+            symbol=symbol,
+            ote_zone=ote_zone,
+            fvg_zone=fvg_zone,
+            entry=entry,
+            sl=sl,
+            tp=tp1,
             direction=direction.upper()
         )
 
