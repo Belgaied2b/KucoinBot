@@ -136,8 +136,12 @@ async def scan_and_send_signals():
 
             for direction in ["long", "short"]:
                 print(f"[{symbol}] ➡️ Analyse {direction.upper()}")
+
+                df_copy = df.copy()
+                df_copy.name = symbol  # ✅ Corrige "Unknown"
+
                 signal = analyze_signal(
-                    df.copy(),
+                    df_copy,
                     direction=direction,
                     btc_df=btc_df,
                     total_df=total_df,
