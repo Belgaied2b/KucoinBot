@@ -3,30 +3,31 @@ import pandas as pd
 def detect_bos_cos(df, direction="long", lookback=20):
     """
     Détecte un Break of Structure (BOS) et un Change of Structure (COS)
-    en analysant les cassures de plus hauts ou plus bas significatifs.
+    en comparant la clôture actuelle aux précédents hauts/bas significatifs.
+    BOS = cassure dans le sens de la tendance.
+    COS = cassure dans le sens opposé à la tendance.
     """
-    if df is None or len(df) < lookback:
+    if df is None or len(df) < lookback + 2:
         return False, False
 
-    highs = df['high'].rolling(window=lookback).max()
-    lows = df['low'].rolling(window=lookback).min()
-
-    last_high = highs.iloc[-2]
-    last_low = lows.iloc[-2]
+    df = df.copy()
+    recent = df[-(lookback+2):-2]  # On exclut les deux dernières bougies
+    prev_high = recent['high'].max()
+    prev_low = recent['low'].min()
     close = df['close'].iloc[-1]
 
     bos = False
     cos = False
 
     if direction == "long":
-        if close > last_high:
+        if close > prev_high:
             bos = True
-        if close < last_low:
+        if close < prev_low:
             cos = True
     else:
-        if close < last_low:
+        if close < prev_low:
             bos = True
-        if close > last_high:
+        if close > prev_high:
             cos = True
 
     return bos, cos
@@ -34,22 +35,20 @@ def detect_bos_cos(df, direction="long", lookback=20):
 
 def detect_choch(df, direction="long", lookback=20):
     """
-    Détecte un Change of Character (CHoCH) :
-    Indique un retournement potentiel par cassure inverse de structure précédente.
+    Détecte un CHoCH (Change of Character) : cassure du dernier pivot opposé
+    à la tendance actuelle, indiquant un possible retournement.
+    Exemple : en tendance haussière, cassure du dernier bas structurel.
     """
-    if df is None or len(df) < lookback + 1:
+    if df is None or len(df) < lookback + 2:
         return False
 
-    recent_highs = df['high'].rolling(window=lookback).max()
-    recent_lows = df['low'].rolling(window=lookback).min()
+    df = df.copy()
+    recent = df[-(lookback+2):-2]  # On exclut les deux dernières bougies
+    prev_high = recent['high'].max()
+    prev_low = recent['low'].min()
     close = df['close'].iloc[-1]
 
-    # On vérifie une cassure inverse par rapport à la tendance actuelle
     if direction == "long":
-        previous_lows = recent_lows.shift(1)
-        choch = close < previous_lows.iloc[-1]
+        return close < prev_low
     else:
-        previous_highs = recent_highs.shift(1)
-        choch = close > previous_highs.iloc[-1]
-
-    return choch
+        return close > prev_high
