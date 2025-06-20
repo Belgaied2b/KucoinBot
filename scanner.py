@@ -47,11 +47,14 @@ if os.path.exists("sent_signals.json"):
     except Exception as e:
         print("⚠️ Erreur lecture sent_signals.json :", e)
 
-# ✅ Fonction robuste CoinGecko
+# ✅ Fonction robuste CoinGecko avec headers
 def get_chart(url):
+    headers = {
+        "User-Agent": "Mozilla/5.0"
+    }
     try:
-        time.sleep(1.2)  # protection 429
-        r = requests.get(url)
+        time.sleep(1.5)
+        r = requests.get(url, headers=headers)
         r.raise_for_status()
         data = r.json()
 
@@ -60,7 +63,6 @@ def get_chart(url):
 
         timestamps = [x[0] for x in data["prices"]]
         closes = [x[1] for x in data["prices"]]
-
         volumes = (
             [x[1] for x in data["total_volumes"]]
             if "total_volumes" in data and len(data["total_volumes"]) == len(timestamps)
@@ -75,7 +77,6 @@ def get_chart(url):
             "open": closes,
             "volume": volumes
         })
-
         return df
 
     except Exception as e:
@@ -84,17 +85,17 @@ def get_chart(url):
 
 # 📊 Chargement macro BTC / TOTAL / BTC.D
 def fetch_macro_df():
+    headers = {
+        "User-Agent": "Mozilla/5.0"
+    }
+
     btc_df = get_chart("https://api.coingecko.com/api/v3/coins/bitcoin/market_chart?vs_currency=usd&days=30")
     if btc_df is None:
         raise ValueError("Impossible de charger les données BTC")
 
-    btc_d_df = get_chart("https://api.coingecko.com/api/v3/coins/bitcoin/market_chart?vs_currency=usd&days=30")
-    if btc_d_df is None:
-        raise ValueError("Impossible de charger les données BTC.D")
-
     try:
-        time.sleep(1.2)
-        global_response = requests.get("https://api.coingecko.com/api/v3/global")
+        time.sleep(1.5)
+        global_response = requests.get("https://api.coingecko.com/api/v3/global", headers=headers)
         global_response.raise_for_status()
         global_data = global_response.json()
 
@@ -109,6 +110,9 @@ def fetch_macro_df():
         total_df["high"] = total_market_cap * 1.01
         total_df["low"] = total_market_cap * 0.99
         total_df["open"] = total_market_cap
+
+        btc_d_df = btc_df.copy()
+        btc_d_df["close"] = btc_dominance
 
     except Exception as e:
         raise ValueError(f"Erreur parsing global_data : {e}")
@@ -140,7 +144,7 @@ async def scan_and_send_signals():
                 print(f"[{symbol}] ➡️ Analyse {direction.upper()}")
 
                 df_copy = df.copy()
-                df_copy.name = symbol  # Pour logs et graphique
+                df_copy.name = symbol
 
                 signal = analyze_signal(
                     df_copy,
@@ -151,12 +155,12 @@ async def scan_and_send_signals():
                     btc_d_df=btc_d_df
                 )
 
-                score = signal.get("score", "?") if signal else "?"
-                rejected = signal.get("rejetes", ["inconnus"]) if signal else ["inconnus"]
-                tolerated = signal.get("toleres", []) if signal else []
-                comment = signal.get("comment", "") if signal else ""
+                score = signal.get("score", "?")
+                rejected = signal.get("rejetes", ["inconnus"])
+                tolerated = signal.get("toleres", [])
+                comment = signal.get("comment", "")
 
-                if signal and signal.get("valid"):
+                if signal.get("valid"):
                     suffix = "TOLÉRÉ" if signal.get("tolere_ote") else "CONFIRMÉ"
                     signal_id = f"{symbol}-{direction.upper()}-{suffix}"
 
