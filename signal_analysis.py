@@ -112,11 +112,27 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df):
         if not btc_ok: rejected.append("BTC")
 
         # 🧠 Score pondéré expert
-        score = 10
-        score -= 0.4 * len(tolerated)
-        if not in_ote:
-            score -= 0.2
-        score = round(max(score, 0), 2)  # Jamais négatif
+        poids = {
+            "MA200": 1.5,
+            "MACD": 1.5,
+            "BOS": 1.5,
+            "COS": 1.0,
+            "CHoCH": 1.0,
+            "FVG": 1.0,
+            "VOLUME": 1.5,
+            "BOUGIE": 0.5,
+            "TOTAL": 1.0,
+            "BTC": 1.0
+        }
+
+        score_total = sum(poids.values())
+        score_obtenu = 0
+
+        for indicateur, p in poids.items():
+            if indicateur not in rejected:
+                score_obtenu += p
+
+        score = round((score_obtenu / score_total) * 10, 1)
 
         # 💬 Commentaire complet
         comment = (
