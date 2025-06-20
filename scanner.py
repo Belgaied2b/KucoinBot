@@ -47,10 +47,10 @@ if os.path.exists("sent_signals.json"):
     except Exception as e:
         print("⚠️ Erreur lecture sent_signals.json :", e)
 
-# ✅ Fonction robuste CoinGecko
+# ✅ CoinGecko API sécurisée
 def get_chart(url):
     try:
-        time.sleep(1.2)
+        time.sleep(1.5)
         r = requests.get(url)
         r.raise_for_status()
         data = r.json()
@@ -82,17 +82,20 @@ def get_chart(url):
         print(f"⚠️ Erreur get_chart ({url}): {e}")
         return None
 
-# 📊 Chargement macro BTC / TOTAL / BTC.D
+# 📊 Chargement BTC / TOTAL / BTC.D
 def fetch_macro_df():
     btc_df = get_chart("https://api.coingecko.com/api/v3/coins/bitcoin/market_chart?vs_currency=usd&days=30")
+    time.sleep(1.5)
     if btc_df is None:
         raise ValueError("Impossible de charger les données BTC")
 
     btc_d_df = get_chart("https://api.coingecko.com/api/v3/coins/bitcoin/market_chart?vs_currency=usd&days=30")
+    time.sleep(1.5)
     if btc_d_df is None:
         raise ValueError("Impossible de charger les données BTC.D")
 
     try:
+        time.sleep(1.5)
         global_response = requests.get("https://api.coingecko.com/api/v3/global")
         global_data = global_response.json()
 
@@ -113,7 +116,7 @@ def fetch_macro_df():
 
     return btc_df, total_df, btc_d_df
 
-# 🔍 Scan principal
+# 🔍 Analyse & envoi
 async def scan_and_send_signals():
     print(f"🔁 Scan lancé à {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC\n")
     all_symbols = fetch_all_symbols()
@@ -138,7 +141,7 @@ async def scan_and_send_signals():
                 print(f"[{symbol}] ➡️ Analyse {direction.upper()}")
 
                 df_copy = df.copy()
-                df_copy.name = symbol  # Pour logs et graphique
+                df_copy.name = symbol
 
                 signal = analyze_signal(
                     df_copy,
