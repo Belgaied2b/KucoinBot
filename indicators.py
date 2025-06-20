@@ -6,8 +6,8 @@ def compute_rsi(series, period=14):
         return pd.Series([np.nan] * len(series), index=series.index)
 
     delta = series.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
+    gain = delta.where(delta > 0, 0.0)
+    loss = -delta.where(delta < 0, 0.0)
 
     avg_gain = gain.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
     avg_loss = loss.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
@@ -42,11 +42,10 @@ def compute_atr(df, period=14):
         return pd.Series([np.nan] * len(df), index=df.index)
 
     prev_close = df['close'].shift(1)
-    tr = pd.concat([
-        df['high'] - df['low'],
-        (df['high'] - prev_close).abs(),
-        (df['low'] - prev_close).abs()
-    ], axis=1).max(axis=1)
+    tr1 = df['high'] - df['low']
+    tr2 = (df['high'] - prev_close).abs()
+    tr3 = (df['low'] - prev_close).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
 
     atr = tr.rolling(window=period, min_periods=period).mean()
     return atr.bfill()
@@ -64,9 +63,11 @@ def compute_fvg_zones(df, lookback=30):
         prev1 = df.iloc[i - 1]
         curr = df.iloc[i]
 
+        # FVG haussier
         if prev1['high'] < curr['low']:
             fvg_upper[i] = curr['low']
             fvg_lower[i] = prev1['high']
+        # FVG baissier
         elif prev1['low'] > curr['high']:
             fvg_upper[i] = prev1['low']
             fvg_lower[i] = curr['high']
