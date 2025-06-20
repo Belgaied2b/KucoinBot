@@ -24,7 +24,7 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df):
         df.sort_index(inplace=True)
         last_close = df['close'].iloc[-1]
 
-        # 🟦 OTE (Optimal Trade Entry)
+        # 🟦 OTE
         high_price = df['high'].rolling(window=50).max().iloc[-1]
         low_price = df['low'].rolling(window=50).min().iloc[-1]
         if direction == "long":
@@ -36,13 +36,16 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df):
             ote_end = high_price - 0.618 * (high_price - low_price)
             in_ote = ote_start >= last_close >= ote_end
 
-        # 🟧 FVG
+        # 🟧 FVG (directionnel)
         fvg_df = compute_fvg_zones(df)
         fvg_upper = fvg_df['fvg_upper'].iloc[-1]
         fvg_lower = fvg_df['fvg_lower'].iloc[-1]
         in_fvg = False
         if not np.isnan(fvg_upper) and not np.isnan(fvg_lower):
-            in_fvg = fvg_lower <= last_close <= fvg_upper
+            if direction == "long" and fvg_lower < fvg_upper:
+                in_fvg = fvg_lower <= last_close <= fvg_upper
+            elif direction == "short" and fvg_upper < fvg_lower:
+                in_fvg = fvg_upper <= last_close <= fvg_lower
 
         # 🔁 Volume
         avg_volume = df['volume'].rolling(window=20).mean().iloc[-1]
@@ -57,17 +60,24 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df):
         macd_hist = compute_macd_histogram(df['close'])
         macd_ok = macd_hist.iloc[-1] > 0 if direction == "long" else macd_hist.iloc[-1] < 0
 
-        # 🔁 BOS / COS
+        # 🧠 Divergences RSI/MACD
+        rsi = compute_rsi(df['close'])
+        rsi_div = rsi.iloc[-3] > rsi.iloc[-2] < rsi.iloc[-1] if direction == "long" else rsi.iloc[-3] < rsi.iloc[-2] > rsi.iloc[-1]
+        macd_div = macd_hist.iloc[-3] > macd_hist.iloc[-2] < macd_hist.iloc[-1] if direction == "long" else macd_hist.iloc[-3] < macd_hist.iloc[-2] > macd_hist.iloc[-1]
+        divergence_ok = rsi_div and macd_div
+
+        # 🔁 BOS / COS avec confirmation (clôture + volume)
         bos_ok, cos_ok = detect_bos_cos(df, direction)
+        candle = df.iloc[-1]
+        breakout_confirm = (candle['close'] > candle['open'] and candle['volume'] > avg_volume) if direction == "long" else (candle['close'] < candle['open'] and candle['volume'] > avg_volume)
+        bos_ok = bos_ok and breakout_confirm
+        cos_ok = cos_ok and breakout_confirm
 
         # 🔄 CHoCH
         choch_ok = detect_choch(df, direction)
 
         # 🔥 Bougie forte
-        close = df['close'].iloc[-1]
-        open_ = df['open'].iloc[-1]
-        volume = df['volume'].iloc[-1]
-        body = abs(close - open_)
+        body = abs(df['close'].iloc[-1] - df['open'].iloc[-1])
         wick = df['high'].iloc[-1] - df['low'].iloc[-1]
         body_ratio = body / wick if wick > 0 else 0
         candle_ok = body_ratio > 0.5 and volume > avg_volume
@@ -77,7 +87,7 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df):
         atr_value = atr.iloc[-1]
         atr_ok = atr_value > 0.005 * last_close
 
-        # 📊 Contexte macro : TOTAL & BTC
+        # 📊 Contexte macro
         total_slope = total_df['close'].diff().rolling(window=5).mean().iloc[-1]
         btc_slope = btc_df['close'].diff().rolling(window=5).mean().iloc[-1]
         market_ok = total_slope > 0 if direction == "long" else total_slope < 0
@@ -110,6 +120,7 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df):
         if not in_ote: tolerated.append("OTE")
         if not market_ok: rejected.append("TOTAL")
         if not btc_ok: rejected.append("BTC")
+        if not divergence_ok: rejected.append("DIVERGENCE")
 
         # 🧠 Score pondéré expert
         poids = {
@@ -122,19 +133,15 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df):
             "VOLUME": 1.5,
             "BOUGIE": 0.5,
             "TOTAL": 1.0,
-            "BTC": 1.0
+            "BTC": 1.0,
+            "DIVERGENCE": 1.0
         }
 
         score_total = sum(poids.values())
-        score_obtenu = 0
-
-        for indicateur, p in poids.items():
-            if indicateur not in rejected:
-                score_obtenu += p
-
+        score_obtenu = sum(v for k, v in poids.items() if k not in rejected)
         score = round((score_obtenu / score_total) * 10, 1)
 
-        # 💬 Commentaire complet
+        # 💬 Commentaire
         comment = (
             f"📌 Zone idéale d'entrée :\n"
             f"OTE = {round(ote_start, 4)} → {round(ote_end, 4)}\n"
@@ -151,7 +158,7 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df):
                 "comment": comment
             }
 
-        # ✅ Génération du graphique
+        # ✅ Graphique
         generate_chart(
             df,
             symbol,
