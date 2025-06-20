@@ -2,9 +2,6 @@ import pandas as pd
 import numpy as np
 
 def compute_rsi(series, period=14):
-    """
-    RSI pro – utilise une moyenne exponentielle pour plus de réactivité.
-    """
     if series is None or len(series) < period:
         return pd.Series([np.nan] * len(series), index=series.index)
 
@@ -15,15 +12,12 @@ def compute_rsi(series, period=14):
     avg_gain = gain.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
     avg_loss = loss.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
 
-    rs = avg_gain / avg_loss
+    rs = avg_gain / avg_loss.replace(0, np.nan)
     rsi = 100 - (100 / (1 + rs))
-    return rsi
+    return rsi.fillna(0)
 
 
 def compute_macd_histogram(series, fast=12, slow=26, signal=9):
-    """
-    Histogramme MACD – version pro avec EMA et filtrage stable.
-    """
     if series is None or len(series) < slow + signal:
         return pd.Series([np.nan] * len(series), index=series.index)
 
@@ -33,22 +27,17 @@ def compute_macd_histogram(series, fast=12, slow=26, signal=9):
     macd_line = ema_fast - ema_slow
     signal_line = macd_line.ewm(span=signal, min_periods=signal, adjust=False).mean()
     histogram = macd_line - signal_line
-    return histogram
+
+    return histogram.fillna(0)
 
 
 def compute_ma(df, period=200):
-    """
-    Moyenne mobile (MA200) classique sur les clôtures.
-    """
     if df is None or 'close' not in df.columns or len(df) < period:
         return pd.Series([np.nan] * len(df), index=df.index)
     return df['close'].rolling(window=period, min_periods=period).mean()
 
 
 def compute_atr(df, period=14):
-    """
-    ATR – mesure de la volatilité réelle du marché.
-    """
     if df is None or len(df) < period or not all(x in df.columns for x in ['high', 'low', 'close']):
         return pd.Series([np.nan] * len(df), index=df.index)
 
@@ -60,13 +49,10 @@ def compute_atr(df, period=14):
     ], axis=1).max(axis=1)
 
     atr = tr.rolling(window=period, min_periods=period).mean()
-    return atr
+    return atr.fillna(method='bfill')
 
 
 def compute_fvg_zones(df, lookback=30):
-    """
-    Détection pro des zones FVG (Fair Value Gaps) — version stricte.
-    """
     if df is None or len(df) < 3 or not all(k in df.columns for k in ['high', 'low']):
         return pd.DataFrame({'fvg_upper': [np.nan]*len(df), 'fvg_lower': [np.nan]*len(df)}, index=df.index)
 
@@ -78,12 +64,9 @@ def compute_fvg_zones(df, lookback=30):
         prev1 = df.iloc[i - 1]
         curr = df.iloc[i]
 
-        # FVG haussier
         if prev1['high'] < curr['low']:
             fvg_upper[i] = curr['low']
             fvg_lower[i] = prev1['high']
-
-        # FVG baissier
         elif prev1['low'] > curr['high']:
             fvg_upper[i] = prev1['low']
             fvg_lower[i] = curr['high']
