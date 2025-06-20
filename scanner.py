@@ -93,7 +93,9 @@ def fetch_macro_df():
         raise ValueError("Impossible de charger les données BTC.D")
 
     try:
+        time.sleep(1.2)
         global_response = requests.get("https://api.coingecko.com/api/v3/global")
+        global_response.raise_for_status()
         global_data = global_response.json()
 
         if "data" not in global_data or "market_cap_percentage" not in global_data["data"]:
@@ -149,8 +151,8 @@ async def scan_and_send_signals():
                     btc_d_df=btc_d_df
                 )
 
-                score = signal.get("score", 0) if signal else 0
-                rejected = signal.get("rejetes", ["données invalides"]) if signal else ["données invalides"]
+                score = signal.get("score", "?") if signal else "?"
+                rejected = signal.get("rejetes", ["inconnus"]) if signal else ["inconnus"]
                 tolerated = signal.get("toleres", []) if signal else []
                 comment = signal.get("comment", "") if signal else ""
 
