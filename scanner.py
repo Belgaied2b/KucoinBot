@@ -138,7 +138,7 @@ async def scan_and_send_signals():
                 print(f"[{symbol}] ➡️ Analyse {direction.upper()}")
 
                 df_copy = df.copy()
-                df_copy.name = symbol
+                df_copy.name = symbol  # Pour logs et graphique
 
                 signal = analyze_signal(
                     df_copy,
@@ -188,8 +188,8 @@ async def scan_and_send_signals():
 
                 else:
                     print(f"[{symbol}] ❌ Aucun signal détecté ({direction.upper()})")
-                    print("   🧠 Score     : inférieur à 8/10 ou indicateur bloquant")
-                    print("   ❌ Rejetés   : analyse non valide")
+                    print(f"   🧠 Score     : {signal.get('score', '?') if signal else '?'}")
+                    print(f"   ❌ Rejetés   : {', '.join(signal['rejetes']) if signal and 'rejetes' in signal else 'inconnus'}")
                     print("-" * 60)
 
         except Exception as e:
