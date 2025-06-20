@@ -39,4 +39,18 @@ def fetch_klines(symbol, interval="1h", limit=150):
         df = df.astype(float)
 
         sample_ts = df["timestamp"].iloc[0]
-        unit = "ms" if
+        unit = "ms" if sample_ts > 1e12 else "s"
+        df["timestamp"] = pd.to_datetime(df["timestamp"].astype("int64"), unit=unit)
+
+        df = df[["timestamp", "open", "high", "low", "close", "volume"]]
+        df.set_index("timestamp", inplace=True)
+
+        if df.isnull().values.any():
+            print(f"[{symbol}] ⚠️ Données corrompues ou NaN détectés")
+            return None
+
+        return df
+
+    except Exception as e:
+        print(f"[{symbol}] ⚠️ Erreur fetch_klines : {e}")
+        return None
