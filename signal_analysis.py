@@ -13,7 +13,7 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df):
     if df is None or df.empty or 'timestamp' not in df.columns:
         return {
             "valid": False,
-            "score": 0,
+            "score": "?",
             "rejetes": ["données invalides"],
             "toleres": [],
             "comment": "DataFrame vide ou colonne 'timestamp' manquante"
@@ -111,10 +111,11 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df):
         if not market_ok: rejected.append("TOTAL")
         if not btc_ok: rejected.append("BTC")
 
-        # 🧠 Score
+        # 🧠 Score pondéré
         score = 10
         score -= 0.4 * len(tolerated)
-        if not in_ote: score -= 0.2
+        if not in_ote:
+            score -= 0.2
         score = round(score, 2)
 
         comment = (
@@ -165,7 +166,7 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df):
     except Exception as e:
         return {
             "valid": False,
-            "score": 0,
+            "score": "?",
             "rejetes": ["erreur interne"],
             "toleres": [],
             "comment": str(e)
