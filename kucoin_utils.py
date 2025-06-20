@@ -7,7 +7,7 @@ def fetch_all_symbols():
     """
     url = "https://api-futures.kucoin.com/api/v1/contracts/active"
     try:
-        response = requests.get(url)
+        response = requests.get(url, timeout=10)
         response.raise_for_status()
         data = response.json().get("data", [])
         return [item["symbol"] for item in data if item["symbol"].endswith("USDTM")]
@@ -17,8 +17,8 @@ def fetch_all_symbols():
 
 def fetch_klines(symbol, interval="1h", limit=150):
     """
-    Récupère les chandeliers historiques (klines) pour un symbole donné.
-    Supporte 1h et 4h via 'granularity'. Logique de vérification renforcée.
+    Récupère les chandeliers historiques pour un symbole donné.
+    Renvoie un DataFrame avec 'timestamp' et colonnes OHLCV.
     """
     granularity_map = {"1h": 60, "4h": 240}
     granularity = granularity_map.get(interval, 60)
@@ -27,7 +27,7 @@ def fetch_klines(symbol, interval="1h", limit=150):
     params = {"symbol": symbol, "granularity": granularity, "limit": limit}
 
     try:
-        response = requests.get(url, params=params)
+        response = requests.get(url, params=params, timeout=10)
         response.raise_for_status()
         data = response.json().get("data", [])
 
@@ -38,15 +38,17 @@ def fetch_klines(symbol, interval="1h", limit=150):
         df = pd.DataFrame(data, columns=["timestamp", "open", "close", "high", "low", "volume"])
         df = df.astype(float)
 
+        # Correction de l'unité de temps
         sample_ts = df["timestamp"].iloc[0]
         unit = "ms" if sample_ts > 1e12 else "s"
         df["timestamp"] = pd.to_datetime(df["timestamp"].astype("int64"), unit=unit)
 
+        # Réorganisation des colonnes
         df = df[["timestamp", "open", "high", "low", "close", "volume"]]
-        df.set_index("timestamp", inplace=True)
+        df.set_index("timestamp", inplace=False)
 
         if df.isnull().values.any():
-            print(f"[{symbol}] ⚠️ Données corrompues ou NaN détectés")
+            print(f"[{symbol}] ⚠️ Données corrompues ou NaN détectées")
             return None
 
         return df
