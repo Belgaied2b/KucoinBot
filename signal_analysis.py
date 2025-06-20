@@ -11,13 +11,19 @@ from chart_generator import generate_chart
 
 def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df):
     if df is None or df.empty or 'timestamp' not in df.columns:
-        return None
+        return {
+            "valid": False,
+            "score": "?",
+            "rejetes": ["données invalides"],
+            "toleres": [],
+            "comment": ""
+        }
 
     df = df.copy()
     df.sort_index(inplace=True)
     last_close = df['close'].iloc[-1]
 
-    # 🟦 OTE (zone d’entrée optimale)
+    # 🟦 OTE
     high_price = df['high'].rolling(window=50).max().iloc[-1]
     low_price = df['low'].rolling(window=50).min().iloc[-1]
     if direction == "long":
@@ -46,7 +52,7 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df):
     ma200 = compute_ma(df)
     ma_ok = last_close > ma200.iloc[-1] if direction == "long" else last_close < ma200.iloc[-1]
 
-    # 🟢 MACD histogramme
+    # 🟢 MACD
     macd_hist = compute_macd_histogram(df['close'])
     macd_ok = macd_hist.iloc[-1] > 0 if direction == "long" else macd_hist.iloc[-1] < 0
 
@@ -56,7 +62,7 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df):
     # 🔄 CHoCH
     choch_ok = detect_choch(df, direction)
 
-    # 🔥 Bougie de confirmation
+    # 🔥 Bougie
     close = df['close'].iloc[-1]
     open_ = df['open'].iloc[-1]
     volume = df['volume'].iloc[-1]
@@ -68,26 +74,26 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df):
     # 📉 Volatilité (ATR)
     atr = compute_atr(df)
     atr_ok = atr.iloc[-1] > 0.005 * last_close
+    atr_value = atr.iloc[-1]
 
-    # 📊 Contexte macro : TOTAL + BTC
+    # 📊 Macro TOTAL + BTC
     total_slope = total_df['close'].diff().rolling(window=5).mean().iloc[-1]
     btc_slope = btc_df['close'].diff().rolling(window=5).mean().iloc[-1]
     market_ok = total_slope > 0 if direction == "long" else total_slope < 0
     btc_ok = btc_slope > 0 if direction == "long" else btc_slope < 0
 
-    # 📊 BTC Dominance
+    # 📊 BTC.D
     btc_d_change = btc_d_df['close'].diff().rolling(window=5).mean().iloc[-1]
     btc_d_status = "HAUSSIER" if btc_d_change > 0 else "BAISSIER" if btc_d_change < 0 else "STAGNANT"
 
-    # 🎯 TP, SL, R:R
-    atr_value = atr.iloc[-1]
+    # SL/TP/RR
     sl = last_close + atr_value * 2 if direction == "short" else last_close - atr_value * 2
     tp1 = last_close - atr_value * 2 if direction == "short" else last_close + atr_value * 2
     tp2 = last_close - atr_value * 4 if direction == "short" else last_close + atr_value * 4
     rr1 = round(abs(tp1 - last_close) / abs(sl - last_close), 1)
     rr2 = round(abs(tp2 - last_close) / abs(sl - last_close), 1)
 
-    # 🧠 Validation stricte sauf OTE + bougie = tolérés
+    # 🔍 Validation
     rejected = []
     tolerated = []
 
@@ -104,17 +110,29 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df):
     if not market_ok: rejected.append("TOTAL")
     if not btc_ok: rejected.append("BTC")
 
-    if len(rejected) > 0:
-        print(f"[{symbol}] ❌ Signal rejeté (indicateurs bloquants) : {rejected}")
-        return None
-
-    # ✅ Score pondéré expert
+    # 🧠 Score
     score = 10
     if tolerated: score -= 0.4 * len(tolerated)
     if not in_ote: score -= 0.2
     score = round(score, 2)
 
-    # 📷 Génération du graphique
+    comment = (
+        f"📌 Zone idéale d'entrée :\n"
+        f"OTE = {round(ote_start, 4)} → {round(ote_end, 4)}\n"
+        f"FVG = {round(fvg_lower, 4)} → {round(fvg_upper, 4)}\n\n"
+        f"📊 BTC Dominance : {btc_d_status}"
+    )
+
+    if len(rejected) > 0:
+        return {
+            "valid": False,
+            "score": score,
+            "rejetes": rejected,
+            "toleres": tolerated,
+            "comment": comment
+        }
+
+    # ✅ Génération du graphique
     generate_chart(
         df,
         symbol,
@@ -126,14 +144,8 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df):
         direction=direction
     )
 
-    comment = (
-        f"📌 Zone idéale d'entrée :\n"
-        f"OTE = {round(ote_start, 4)} → {round(ote_end, 4)}\n"
-        f"FVG = {round(fvg_lower, 4)} → {round(fvg_upper, 4)}\n\n"
-        f"📊 BTC Dominance : {btc_d_status}"
-    )
-
     return {
+        "valid": True,
         "symbol": symbol,
         "direction": direction.upper(),
         "entry": round(last_close, 4),
