@@ -186,6 +186,12 @@ async def scan_and_send_signals():
                     with open("sent_signals.json", "w") as f:
                         json.dump(sent_signals, f, indent=2)
 
+                else:
+                    print(f"[{symbol}] ❌ Aucun signal détecté ({direction.upper()})")
+                    print("   🧠 Score     : inférieur à 8/10 ou indicateur bloquant")
+                    print("   ❌ Rejetés   : analyse non valide")
+                    print("-" * 60)
+
         except Exception as e:
             print(f"[{symbol}] ⚠️ Erreur analyse signal ({direction.upper()}) : {e}")
             traceback.print_exc()
