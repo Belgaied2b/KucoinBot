@@ -49,7 +49,7 @@ def compute_atr(df, period=14):
     ], axis=1).max(axis=1)
 
     atr = tr.rolling(window=period, min_periods=period).mean()
-    return atr.fillna(method='bfill')
+    return atr.bfill()
 
 
 def compute_fvg_zones(df, lookback=30):
