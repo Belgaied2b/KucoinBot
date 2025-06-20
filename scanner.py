@@ -191,7 +191,12 @@ async def scan_and_send_signals():
                 else:
                     print(f"[{symbol}] ❌ Aucun signal détecté ({direction.upper()})")
                     print(f"   🧠 Score     : {score}/10")
-                    print(f"   ❌ Rejetés   : {', '.join(rejected)}")
+                    if tolerated:
+                        print(f"   ⚠️ Tolérés   : {', '.join(tolerated)}")
+                    if rejected:
+                        print(f"   ❌ Rejetés   : {', '.join(rejected)}")
+                    if comment:
+                        print(f"   💬 Commentaire : {comment.strip()}")
                     print("-" * 60)
 
         except Exception as e:
