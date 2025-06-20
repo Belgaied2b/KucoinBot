@@ -149,18 +149,18 @@ async def scan_and_send_signals():
                     btc_d_df=btc_d_df
                 )
 
-                if signal:
+                score = signal.get("score", "?") if signal else "?"
+                rejected = signal.get("rejetes", []) if signal else ["analyse échouée"]
+                tolerated = signal.get("toleres", []) if signal else []
+                comment = signal.get("comment", "") if signal else ""
+
+                if signal and signal.get("valid"):
                     suffix = "TOLÉRÉ" if signal.get("tolere_ote") else "CONFIRMÉ"
                     signal_id = f"{symbol}-{direction.upper()}-{suffix}"
 
                     if signal_id in sent_signals:
                         print(f"[{symbol}] 🔁 Signal déjà envoyé ({direction.upper()}-{suffix}), ignoré")
                         continue
-
-                    score = signal.get("score", "?")
-                    rejected = signal.get("rejetes", [])
-                    tolerated = signal.get("toleres", [])
-                    comment = signal.get("comment", "")
 
                     print(f"[{symbol}] ✅ Nouveau signal accepté : {direction.upper()} ({suffix})")
                     print(f"   🧠 Score     : {score}/10")
@@ -188,8 +188,8 @@ async def scan_and_send_signals():
 
                 else:
                     print(f"[{symbol}] ❌ Aucun signal détecté ({direction.upper()})")
-                    print(f"   🧠 Score     : {signal.get('score', '?') if signal else '?'}")
-                    print(f"   ❌ Rejetés   : {', '.join(signal['rejetes']) if signal and 'rejetes' in signal else 'inconnus'}")
+                    print(f"   🧠 Score     : {score}/10")
+                    print(f"   ❌ Rejetés   : {', '.join(rejected)}")
                     print("-" * 60)
 
         except Exception as e:
