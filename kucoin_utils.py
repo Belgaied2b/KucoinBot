@@ -6,40 +6,37 @@ def fetch_all_symbols():
     Récupère tous les contrats PERP actifs en USDTM depuis KuCoin.
     """
     url = "https://api-futures.kucoin.com/api/v1/contracts/active"
-    response = requests.get(url)
-    data = response.json().get("data", [])
-    return [item["symbol"] for item in data if item["symbol"].endswith("USDTM")]
+    try:
+        response = requests.get(url)
+        response.raise_for_status()
+        data = response.json().get("data", [])
+        return [item["symbol"] for item in data if item["symbol"].endswith("USDTM")]
+    except Exception as e:
+        print(f"⚠️ Erreur fetch_all_symbols : {e}")
+        return []
 
 def fetch_klines(symbol, interval="1h", limit=150):
     """
     Récupère les chandeliers historiques (klines) pour un symbole donné.
-    Supporte 1h et 4h via 'granularity'.
+    Supporte 1h et 4h via 'granularity'. Logique de vérification renforcée.
     """
     granularity_map = {"1h": 60, "4h": 240}
     granularity = granularity_map.get(interval, 60)
 
     url = "https://api-futures.kucoin.com/api/v1/kline/query"
     params = {"symbol": symbol, "granularity": granularity, "limit": limit}
-    response = requests.get(url, params=params)
-    data = response.json().get("data", [])
 
-    if not data:
-        return None
+    try:
+        response = requests.get(url, params=params)
+        response.raise_for_status()
+        data = response.json().get("data", [])
 
-    df = pd.DataFrame(data, columns=["timestamp", "open", "close", "high", "low", "volume"])
-    df = df.astype(float)
+        if not data or len(data) < 50:
+            print(f"[{symbol}] ❌ Données insuffisantes ({len(data)} bougies)")
+            return None
 
-    # 🔎 Détection intelligente de l’unité de timestamp
-    sample_ts = df["timestamp"].iloc[0]
-    if sample_ts > 1e12:
-        unit = "ms"
-    elif sample_ts > 1e10:
-        unit = "s"
-    else:
-        unit = "s"
+        df = pd.DataFrame(data, columns=["timestamp", "open", "close", "high", "low", "volume"])
+        df = df.astype(float)
 
-    df["timestamp"] = pd.to_datetime(df["timestamp"].astype("int64"), unit=unit)
-    df = df[["timestamp", "open", "high", "low", "close", "volume"]]
-    df.set_index("timestamp", inplace=True)
-
-    return df
+        sample_ts = df["timestamp"].iloc[0]
+        unit = "ms" if
