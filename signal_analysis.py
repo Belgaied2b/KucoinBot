@@ -104,7 +104,7 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df):
         rr1 = round(abs(tp1 - last_close) / abs(sl - last_close), 1)
         rr2 = round(abs(tp2 - last_close) / abs(sl - last_close), 1)
 
-        # 📋 Validation stricte
+        # 📋 Validation stricte avec tolérances définies
         rejected = []
         tolerated = []
 
@@ -112,15 +112,15 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df):
         if not ma_ok: rejected.append("MA200")
         if not macd_ok: rejected.append("MACD")
         if not bos_ok: rejected.append("BOS")
-        if not cos_ok: rejected.append("COS")
-        if not choch_ok: rejected.append("CHoCH")
+        if not cos_ok: tolerated.append("COS") if not cos_ok else None
+        if not choch_ok: tolerated.append("CHoCH") if not choch_ok else None
         if not candle_ok: tolerated.append("BOUGIE")
         if not atr_ok: rejected.append("ATR")
         if not in_fvg: rejected.append("FVG")
         if not in_ote: tolerated.append("OTE")
         if not market_ok: rejected.append("TOTAL")
         if not btc_ok: rejected.append("BTC")
-        if not divergence_ok: rejected.append("DIVERGENCE")
+        if not divergence_ok: tolerated.append("DIVERGENCE")
 
         # 🧠 Score pondéré expert
         poids = {
