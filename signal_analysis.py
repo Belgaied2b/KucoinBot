@@ -80,7 +80,7 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df):
         body = abs(df['close'].iloc[-1] - df['open'].iloc[-1])
         wick = df['high'].iloc[-1] - df['low'].iloc[-1]
         body_ratio = body / wick if wick > 0 else 0
-        candle_ok = body_ratio > 0.5 and volume > avg_volume
+        candle_ok = body_ratio > 0.5 and last_volume > avg_volume
 
         # 📉 Volatilité via ATR
         atr = compute_atr(df)
