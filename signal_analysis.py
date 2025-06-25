@@ -97,10 +97,16 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df):
         btc_d_change = btc_d_df['close'].diff().rolling(window=5).mean().iloc[-1]
         btc_d_status = "HAUSSIER" if btc_d_change > 0 else "BAISSIER" if btc_d_change < 0 else "STAGNANT"
 
-        # SL / TP dynamiques
-        sl = last_close + atr_value * 2 if direction == "short" else last_close - atr_value * 2
-        tp1 = last_close - atr_value * 2 if direction == "short" else last_close + atr_value * 2
-        tp2 = last_close - atr_value * 4 if direction == "short" else last_close + atr_value * 4
+        # SL / TP dynamiques via structure
+        if direction == "long":
+            sl = min(df['low'].iloc[-10:]) - atr_value * 0.5
+            tp1 = last_close + abs(last_close - sl) * 1.5
+            tp2 = last_close + abs(last_close - sl) * 3
+        else:
+            sl = max(df['high'].iloc[-10:]) + atr_value * 0.5
+            tp1 = last_close - abs(last_close - sl) * 1.5
+            tp2 = last_close - abs(last_close - sl) * 3
+
         rr1 = round(abs(tp1 - last_close) / abs(sl - last_close), 1)
         rr2 = round(abs(tp2 - last_close) / abs(sl - last_close), 1)
 
@@ -116,7 +122,7 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df):
         if not choch_ok: rejected.append("CHoCH")
         if not candle_ok: tolerated.append("BOUGIE")
         if not atr_ok: rejected.append("ATR")
-        if not in_fvg: rejected.append("FVG")
+        if not in_fvg: tolerated.append("FVG")
         if not in_ote: tolerated.append("OTE")
         if not market_ok: rejected.append("TOTAL")
         if not btc_ok: rejected.append("BTC")
@@ -158,7 +164,7 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df):
                 "comment": comment
             }
 
-        # ✅ Graphique
+        # ✅ Génération graphique
         generate_chart(
             df,
             symbol,
