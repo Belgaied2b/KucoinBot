@@ -67,11 +67,11 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df):
         divergence_ok = rsi_div and macd_div
 
         # BOS / COS
-        bos_ok, cos_ok = detect_bos_cos(df, direction)
+        bos_ok, cos = detect_bos_cos(df, direction)
         candle = df.iloc[-1]
         breakout_confirm = (candle['close'] > candle['open'] and candle['volume'] > avg_volume) if direction == "long" else (candle['close'] < candle['open'] and candle['volume'] > avg_volume)
         bos_ok = bos_ok and breakout_confirm
-        cos_ok = cos_ok and breakout_confirm
+        cos_ok = cos and breakout_confirm
 
         # CHoCH
         choch_ok = detect_choch(df, direction)
@@ -110,7 +110,7 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df):
         rr1 = round(abs(tp1 - last_close) / abs(sl - last_close), 1)
         rr2 = round(abs(tp2 - last_close) / abs(sl - last_close), 1)
 
-        # Validation stricte
+        # Validation stricte + tolérance intelligente
         rejected = []
         tolerated = []
 
@@ -118,14 +118,15 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df):
         if not ma_ok: rejected.append("MA200")
         if not macd_ok: rejected.append("MACD")
         if not bos_ok: rejected.append("BOS")
-        if not cos_ok: rejected.append("COS")
-        if not choch_ok: rejected.append("CHoCH")
-        if not candle_ok: tolerated.append("BOUGIE")
         if not atr_ok: rejected.append("ATR")
-        if not in_fvg: tolerated.append("FVG")
-        if not in_ote: tolerated.append("OTE")
         if not market_ok: rejected.append("TOTAL")
         if not btc_ok: rejected.append("BTC")
+
+        if not cos_ok: tolerated.append("COS")
+        if not choch_ok: tolerated.append("CHoCH")
+        if not candle_ok: tolerated.append("BOUGIE")
+        if not in_fvg: tolerated.append("FVG")
+        if not in_ote: tolerated.append("OTE")
         if not divergence_ok: tolerated.append("DIVERGENCE")
 
         # Score pondéré
