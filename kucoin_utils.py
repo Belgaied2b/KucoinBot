@@ -36,20 +36,19 @@ def fetch_klines(symbol, interval="1h", limit=150):
             return None
 
         df = pd.DataFrame(data, columns=["timestamp", "open", "close", "high", "low", "volume"])
-        df = df.astype(float)
 
-        # Correction de l'unité de temps
-        sample_ts = df["timestamp"].iloc[0]
-        unit = "ms" if sample_ts > 1e12 else "s"
-        df["timestamp"] = pd.to_datetime(df["timestamp"].astype("int64"), unit=unit)
+        # Conversion explicite des colonnes OHLCV en float
+        for col in ["open", "close", "high", "low", "volume"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
 
-        # Réorganisation des colonnes
+        # Conversion timestamp
+        df["timestamp"] = pd.to_numeric(df["timestamp"], errors="coerce")
+        unit = "ms" if df["timestamp"].iloc[0] > 1e12 else "s"
+        df["timestamp"] = pd.to_datetime(df["timestamp"], unit=unit)
+
         df = df[["timestamp", "open", "high", "low", "close", "volume"]]
+        df = df.dropna()
         df.set_index("timestamp", inplace=False)
-
-        if df.isnull().values.any():
-            print(f"[{symbol}] ⚠️ Données corrompues ou NaN détectées")
-            return None
 
         return df
 
