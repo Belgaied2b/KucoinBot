@@ -1,4 +1,4 @@
-import pandas as pd
+import pandas as pd 
 from indicators import (
     compute_rsi, compute_macd_histogram, compute_fvg_zones,
     compute_ma, compute_atr, detect_divergence
@@ -30,16 +30,23 @@ def analyze_signal(df, symbol, direction, df_4h=None, btc_df=None, total_df=None
 
     df = df.copy()
 
-    # ✅ Conversion forcée en float pour éviter les erreurs de type
+    # ✅ Conversion en float avec double sécurité
     float_cols = ["open", "high", "low", "close", "volume"]
     for col in float_cols:
         df[col] = pd.to_numeric(df[col], errors="coerce")
     df.dropna(subset=float_cols, inplace=True)
+
+    # 🔒 Reconversion si certains types sont restés "object"
+    for col in float_cols:
+        if df[col].dtype == object:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    df.dropna(subset=float_cols, inplace=True)
+
     if len(df) < 30:
         result["comment"] = "Pas assez de données après nettoyage."
         return result
 
-    # ✅ Calculs techniques avec conversion sécurisée
+    # ✅ Calculs techniques
     df["rsi"] = pd.to_numeric(compute_rsi(df["close"]), errors="coerce")
     df["macd_histogram"] = pd.to_numeric(compute_macd_histogram(df["close"]), errors="coerce")
     df["ma200"] = pd.to_numeric(compute_ma(df), errors="coerce")
@@ -68,10 +75,14 @@ def analyze_signal(df, symbol, direction, df_4h=None, btc_df=None, total_df=None
         result["toleres"].append("OTE")
 
     # 📉 Bougie confirmation
-    latest_close = float(df["close"].iloc[-1])
-    latest_open = float(df["open"].iloc[-1])
-    latest_volume = float(df["volume"].iloc[-1])
-    avg_volume = float(df["volume"].mean())
+    try:
+        latest_close = float(df["close"].iloc[-1])
+        latest_open = float(df["open"].iloc[-1])
+        latest_volume = float(df["volume"].iloc[-1])
+        avg_volume = float(df["volume"].mean())
+    except Exception as e:
+        result["comment"] = f"Erreur lecture bougie : {e}"
+        return result
 
     candle_valid = (
         (latest_close > latest_open if direction == "long" else latest_close < latest_open)
