@@ -29,13 +29,27 @@ def analyze_signal(df, symbol, direction, df_4h=None, btc_df=None, total_df=None
         return result
 
     df = df.copy()
+
+    # 🔐 Force la conversion en float pour éviter les erreurs de type
+    for col in ["open", "close", "high", "low", "volume"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df.dropna(subset=["open", "close", "high", "low", "volume"], inplace=True)
+    if len(df) < 30:
+        result["comment"] = "Pas assez de données après nettoyage."
+        return result
+
     df["rsi"] = compute_rsi(df["close"])
     df["macd_histogram"] = compute_macd_histogram(df["close"])
     df["ma200"] = compute_ma(df)
     df["atr"] = compute_atr(df)
 
-    # Détection structurelle
-    bos, cos, choch = detect_bos_cos_choch(df, direction)
+    # Structure
+    try:
+        bos, cos, choch = detect_bos_cos_choch(df, direction)
+    except Exception as e:
+        result["comment"] = f"Erreur structure (BOS/COS/CHoCH) : {e}"
+        return result
+
     if not bos:
         result["rejetes"].append("BOS")
     if not cos:
@@ -43,12 +57,12 @@ def analyze_signal(df, symbol, direction, df_4h=None, btc_df=None, total_df=None
     if not choch:
         result["rejetes"].append("CHoCH")
 
-    # Détection divergences
+    # Divergences
     divergence_valid = detect_divergence(df, direction)
     if not divergence_valid:
         result["toleres"].append("DIVERGENCE")
 
-    # Zone OTE + FVG
+    # Zones OTE + FVG
     ote_zone = calculate_ote_zone(df, direction)
     fvg_zones = compute_fvg_zones(df)
     entry = find_entry_in_ote_fvg(df, ote_zone, fvg_zones, direction)
@@ -59,15 +73,20 @@ def analyze_signal(df, symbol, direction, df_4h=None, btc_df=None, total_df=None
     latest_close = df["close"].iloc[-1]
     latest_open = df["open"].iloc[-1]
     latest_volume = df["volume"].iloc[-1]
-    candle_valid = (latest_close > latest_open if direction == "long" else latest_close < latest_open) and latest_volume > df["volume"].mean()
+    avg_volume = df["volume"].mean()
+
+    candle_valid = (
+        (latest_close > latest_open if direction == "long" else latest_close < latest_open)
+        and latest_volume > avg_volume
+    )
     if not candle_valid:
         result["toleres"].append("BOUGIE")
 
     # Volume
-    if latest_volume < df["volume"].mean() * 1.2:
+    if latest_volume < avg_volume * 1.2:
         result["rejetes"].append("VOLUME")
 
-    # MACD momentum
+    # MACD
     macd_valid = df["macd_histogram"].iloc[-1] > 0 if direction == "long" else df["macd_histogram"].iloc[-1] < 0
     if not macd_valid:
         result["rejetes"].append("MACD")
@@ -78,18 +97,18 @@ def analyze_signal(df, symbol, direction, df_4h=None, btc_df=None, total_df=None
     if not ma200_valid:
         result["rejetes"].append("MA200")
 
-    # Contexte macro
+    # Macro contexte
     total_ok, btc_d_trend, total_trend = check_market_conditions(direction, btc_df, total_df, btcd_df)
     if not total_ok:
         result["rejetes"].append("MACRO TOTAL")
 
-    # TP et SL dynamiques
+    # SL/TP dynamiques
     sl = price - 1.5 * df["atr"].iloc[-1] if direction == "long" else price + 1.5 * df["atr"].iloc[-1]
     tp = find_dynamic_tp(df, price, sl, direction)
     if tp is None:
         result["rejetes"].append("TP")
 
-    # SCORE PONDÉRÉ
+    # Calcul du score
     score = 10
     for rej in result["rejetes"]:
         if rej in ["VOLUME", "MACRO TOTAL", "MACD", "MA200", "BOS", "COS", "CHoCH"]:
@@ -110,11 +129,12 @@ def analyze_signal(df, symbol, direction, df_4h=None, btc_df=None, total_df=None
     # Résultat final
     result.update({
         "is_valid": True,
-        "entry": entry or price,
+        "entry": round(entry if entry else price, 4),
         "sl": round(sl, 4),
         "tp": round(tp, 4),
         "chart_path": chart_path,
-        "comment": f"✅ Signal confirmé – Score : {result['score']}/10 ⚠️ Tolérés : {', '.join(result['toleres'])}" + (f" (BTC.D : {btc_d_trend}, TOTAL : {total_trend})" if btc_d_trend else "")
+        "comment": f"✅ Signal confirmé – Score : {result['score']}/10 ⚠️ Tolérés : {', '.join(result['toleres'])}" +
+                   (f" (BTC.D : {btc_d_trend}, TOTAL : {total_trend})" if btc_d_trend else "")
     })
 
     return result
