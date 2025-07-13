@@ -1,67 +1,76 @@
 import matplotlib.pyplot as plt
-import matplotlib.dates as mdates
-import pandas as pd
-import numpy as np
-from datetime import timedelta
+import matplotlib.patches as patches
+import os
+from datetime import datetime
 
-def generate_chart(df, symbol, ote_zone, fvg_zone, entry, sl, tp, direction):
-    df = df.copy().tail(100)
-
-    if 'timestamp' not in df.columns:
-        return None
-
-    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-    df.set_index('timestamp', inplace=True)
-
+def generate_chart(df, symbol, ote_zone, fvg_zones, entry, sl, tp, direction):
     fig, ax = plt.subplots(figsize=(10, 5))
-    candle_width = timedelta(minutes=10)
+    df_tail = df.tail(100)
 
-    for i in range(len(df)):
-        color = 'green' if df['close'].iloc[i] >= df['open'].iloc[i] else 'red'
-        time = df.index[i]
-        open_price = df['open'].iloc[i]
-        close_price = df['close'].iloc[i]
-        low = df['low'].iloc[i]
-        high = df['high'].iloc[i]
+    # Tracé des chandeliers simplifiés
+    for i in range(len(df_tail)):
+        o = df_tail["open"].iloc[i]
+        h = df_tail["high"].iloc[i]
+        l = df_tail["low"].iloc[i]
+        c = df_tail["close"].iloc[i]
+        color = "green" if c >= o else "red"
+        ax.plot([i, i], [l, h], color=color, linewidth=1)
+        ax.plot([i, i], [o, c], color=color, linewidth=4)
 
-        ax.plot([time, time], [low, high], color=color, linewidth=0.5)
-        ax.add_patch(plt.Rectangle(
-            (time - candle_width / 2, min(open_price, close_price)),
-            candle_width,
-            abs(close_price - open_price),
-            color=color
-        ))
+    # Zone OTE (rectangle bleu)
+    if ote_zone:
+        ax.add_patch(
+            patches.Rectangle(
+                (90, ote_zone[0]),
+                10,
+                ote_zone[1] - ote_zone[0],
+                linewidth=1,
+                edgecolor='blue',
+                facecolor='blue',
+                alpha=0.2,
+                label="OTE"
+            )
+        )
 
-    # ✅ Zone OTE
-    if not any(np.isnan(ote_zone)):
-        ax.axhspan(ote_zone[1], ote_zone[0], color='blue', alpha=0.2, label='OTE')
+    # Zones FVG (rectangle gris)
+    for fvg in fvg_zones:
+        ax.add_patch(
+            patches.Rectangle(
+                (90, fvg[0]),
+                10,
+                fvg[1] - fvg[0],
+                linewidth=1,
+                edgecolor='gray',
+                facecolor='gray',
+                alpha=0.2,
+                label="FVG"
+            )
+        )
 
-    # ✅ Zone FVG
-    if not any(np.isnan(fvg_zone)):
-        ax.axhspan(fvg_zone[1], fvg_zone[0], color='orange', alpha=0.2, label='FVG')
+    # SL, TP, Entry
+    if entry:
+        ax.axhline(entry, color="orange", linestyle="--", label="Entrée")
+    if sl:
+        ax.axhline(sl, color="red", linestyle="--", label="SL")
+    if tp:
+        ax.axhline(tp, color="green", linestyle="--", label="TP")
 
-    # ✅ Entry, SL, TP
-    ax.axhline(entry, color='blue', linestyle='--', linewidth=1, label='Entry')
-    ax.axhline(sl, color='red', linestyle='--', linewidth=1, label='SL')
-    ax.axhline(tp, color='green', linestyle='--', linewidth=1, label='TP')
+    # Direction (flèche)
+    y_pos = entry or df_tail["close"].iloc[-1]
+    if direction == "long":
+        ax.annotate('⬆️ LONG', xy=(95, y_pos), xytext=(95, y_pos + 0.02 * y_pos), fontsize=12)
+    else:
+        ax.annotate('⬇️ SHORT', xy=(95, y_pos), xytext=(95, y_pos - 0.02 * y_pos), fontsize=12)
 
-    # ✅ Flèche directionnelle
-    try:
-        y_start = entry
-        y_end = tp if direction.upper() == "LONG" else sl
-        if y_end != y_start:
-            ax.annotate('', xy=(df.index[-1], y_end), xytext=(df.index[-1], y_start),
-                        arrowprops=dict(facecolor='blue', shrink=0.05, width=2, headwidth=8))
-    except Exception:
-        pass
+    ax.set_title(f"{symbol} – Signal {direction.upper()}")
+    ax.set_xlim(85, 100)
+    ax.grid(True)
 
-    ax.set_title(f'{symbol} - {direction.upper()}')
-    ax.legend(loc='upper left')
-    ax.xaxis.set_major_formatter(mdates.DateFormatter('%m-%d %H:%M'))
-    plt.xticks(rotation=45)
-    plt.tight_layout()
-
-    path = f"chart_{symbol.replace('/', '_')}_{direction.upper()}.png"
-    plt.savefig(path)
+    # Sauvegarde
+    now = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"charts/{symbol}_{direction}_{now}.png"
+    os.makedirs("charts", exist_ok=True)
+    plt.savefig(filename, bbox_inches='tight')
     plt.close()
-    return path
+
+    return filename
