@@ -30,21 +30,20 @@ def analyze_signal(df, symbol, direction, df_4h=None, btc_df=None, total_df=None
 
     df = df.copy()
 
-    # 🔐 Conversion forcée en float
-    for col in ["open", "close", "high", "low", "volume"]:
+    # ✅ Conversion forcée en float pour éviter les erreurs de type
+    float_cols = ["open", "high", "low", "close", "volume"]
+    for col in float_cols:
         df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    df.dropna(subset=["open", "close", "high", "low", "volume"], inplace=True)
+    df.dropna(subset=float_cols, inplace=True)
     if len(df) < 30:
         result["comment"] = "Pas assez de données après nettoyage."
         return result
 
-    # 🔎 Calculs techniques avec conversion sécurisée
+    # ✅ Calculs techniques avec conversion sécurisée
     df["rsi"] = pd.to_numeric(compute_rsi(df["close"]), errors="coerce")
     df["macd_histogram"] = pd.to_numeric(compute_macd_histogram(df["close"]), errors="coerce")
     df["ma200"] = pd.to_numeric(compute_ma(df), errors="coerce")
     df["atr"] = pd.to_numeric(compute_atr(df), errors="coerce")
-
     df.dropna(subset=["rsi", "macd_histogram", "ma200", "atr"], inplace=True)
 
     # 🧱 Structure
@@ -53,7 +52,6 @@ def analyze_signal(df, symbol, direction, df_4h=None, btc_df=None, total_df=None
     except Exception as e:
         result["comment"] = f"Erreur structure (BOS/COS/CHoCH) : {e}"
         return result
-
     if not bos: result["rejetes"].append("BOS")
     if not cos: result["rejetes"].append("COS")
     if not choch: result["rejetes"].append("CHoCH")
@@ -70,10 +68,10 @@ def analyze_signal(df, symbol, direction, df_4h=None, btc_df=None, total_df=None
         result["toleres"].append("OTE")
 
     # 📉 Bougie confirmation
-    latest_close = df["close"].iloc[-1]
-    latest_open = df["open"].iloc[-1]
-    latest_volume = df["volume"].iloc[-1]
-    avg_volume = df["volume"].mean()
+    latest_close = float(df["close"].iloc[-1])
+    latest_open = float(df["open"].iloc[-1])
+    latest_volume = float(df["volume"].iloc[-1])
+    avg_volume = float(df["volume"].mean())
 
     candle_valid = (
         (latest_close > latest_open if direction == "long" else latest_close < latest_open)
@@ -87,14 +85,14 @@ def analyze_signal(df, symbol, direction, df_4h=None, btc_df=None, total_df=None
         result["rejetes"].append("VOLUME")
 
     # 📈 MACD
-    macd_value = df["macd_histogram"].iloc[-1]
+    macd_value = float(df["macd_histogram"].iloc[-1])
     macd_valid = macd_value > 0 if direction == "long" else macd_value < 0
     if not macd_valid:
         result["rejetes"].append("MACD")
 
     # 📏 MA200
-    price = df["close"].iloc[-1]
-    ma200_value = df["ma200"].iloc[-1]
+    price = float(df["close"].iloc[-1])
+    ma200_value = float(df["ma200"].iloc[-1])
     ma200_valid = price > ma200_value if direction == "long" else price < ma200_value
     if not ma200_valid:
         result["rejetes"].append("MA200")
@@ -105,7 +103,7 @@ def analyze_signal(df, symbol, direction, df_4h=None, btc_df=None, total_df=None
         result["rejetes"].append("MACRO TOTAL")
 
     # 🎯 SL / TP
-    atr = df["atr"].iloc[-1]
+    atr = float(df["atr"].iloc[-1])
     sl = price - 1.5 * atr if direction == "long" else price + 1.5 * atr
     tp = find_dynamic_tp(df, price, sl, direction)
     if tp is None:
@@ -122,7 +120,7 @@ def analyze_signal(df, symbol, direction, df_4h=None, btc_df=None, total_df=None
         score -= 0.5
     result["score"] = max(score, 0)
 
-    # ❌ Rejet du signal si insuffisant
+    # ❌ Rejet si score insuffisant
     if result["score"] < 8 or len(result["rejetes"]) > 0:
         result["comment"] = (
             f"Signal rejeté – Score : {result['score']}/10 "
