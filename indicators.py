@@ -40,3 +40,32 @@ def calculate_fvg_zones(df, direction="long"):
             if prev2["high"] < curr["low"]:
                 zones.append((prev2["high"], curr["low"]))
     return zones
+
+def detect_divergence(df, direction="long", window=20):
+    """
+    Détecte une divergence simple entre le prix et le RSI.
+    - LONG : le prix fait un plus bas mais le RSI ne confirme pas
+    - SHORT : le prix fait un plus haut mais le RSI ne confirme pas
+    """
+    if "rsi" not in df.columns:
+        df["rsi"] = calculate_rsi(df)
+
+    prices = df["close"].iloc[-window:]
+    rsis = df["rsi"].iloc[-window:]
+
+    if direction == "long":
+        price_low = prices.idxmin()
+        rsi_at_price_low = rsis.loc[price_low]
+
+        next_low = prices[price_low:].idxmin()
+        rsi_next = rsis.loc[next_low]
+
+        return rsi_next > rsi_at_price_low
+    else:
+        price_high = prices.idxmax()
+        rsi_at_price_high = rsis.loc[price_high]
+
+        next_high = prices[price_high:].idxmax()
+        rsi_next = rsis.loc[next_high]
+
+        return rsi_next < rsi_at_price_high
