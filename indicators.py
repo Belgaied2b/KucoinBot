@@ -2,9 +2,10 @@ import pandas as pd
 import numpy as np
 
 def compute_rsi(series, period=14):
+    series = pd.to_numeric(series, errors='coerce')
     if series is None or len(series) < period:
         return pd.Series([np.nan] * len(series), index=series.index)
-    
+
     delta = series.diff()
     gain = delta.where(delta > 0, 0.0)
     loss = -delta.where(delta < 0, 0.0)
@@ -18,6 +19,7 @@ def compute_rsi(series, period=14):
 
 
 def compute_macd_histogram(series, fast=12, slow=26, signal=9):
+    series = pd.to_numeric(series, errors='coerce')
     if series is None or len(series) < slow + signal:
         return pd.Series([np.nan] * len(series), index=series.index)
 
@@ -34,12 +36,17 @@ def compute_macd_histogram(series, fast=12, slow=26, signal=9):
 def compute_ma(df, period=200):
     if df is None or 'close' not in df.columns or len(df) < period:
         return pd.Series([np.nan] * len(df), index=df.index)
+    df['close'] = pd.to_numeric(df['close'], errors='coerce')
     return df['close'].rolling(window=period, min_periods=period).mean()
 
 
 def compute_atr(df, period=14):
     if df is None or len(df) < period or not all(x in df.columns for x in ['high', 'low', 'close']):
         return pd.Series([np.nan] * len(df), index=df.index)
+
+    df['high'] = pd.to_numeric(df['high'], errors='coerce')
+    df['low'] = pd.to_numeric(df['low'], errors='coerce')
+    df['close'] = pd.to_numeric(df['close'], errors='coerce')
 
     prev_close = df['close'].shift(1)
     tr1 = df['high'] - df['low']
@@ -59,9 +66,11 @@ def compute_fvg_zones(df, lookback=30):
     fvg_lower = [np.nan] * len(df)
 
     for i in range(2, len(df)):
-        prev2 = df.iloc[i - 2]
         prev1 = df.iloc[i - 1]
         curr = df.iloc[i]
+
+        if pd.isna(prev1['high']) or pd.isna(curr['low']):
+            continue
 
         # FVG haussier
         if prev1['high'] < curr['low']:
@@ -80,37 +89,45 @@ def compute_fvg_zones(df, lookback=30):
 
 def detect_divergence(df, direction="long", window=20):
     """
-    Détecte une divergence simple entre le prix et le RSI.
+    Détecte une divergence RSI ou MACD entre le prix et l’indicateur.
     """
-    if df is None or len(df) < window or "close" not in df.columns:
-        return False
-
-    if "rsi" not in df.columns:
-        df["rsi"] = compute_rsi(df["close"])
-
-    prices = df["close"].iloc[-window:]
-    rsis = df["rsi"].iloc[-window:]
-
-    if prices.empty or rsis.empty or len(prices) < 5:
+    if df is None or len(df) < window + 5:
         return False
 
     try:
+        if not all(col in df.columns for col in ['close', 'rsi', 'macd_histogram']):
+            return False
+
+        df = df.copy()
+        df['close'] = pd.to_numeric(df['close'], errors='coerce')
+        df['rsi'] = pd.to_numeric(df['rsi'], errors='coerce')
+        df['macd_histogram'] = pd.to_numeric(df['macd_histogram'], errors='coerce')
+        df.dropna(subset=['close', 'rsi', 'macd_histogram'], inplace=True)
+
+        if len(df) < window + 5:
+            return False
+
+        recent = df.iloc[-window:]
+
         if direction == "long":
-            price_low = prices.idxmin()
-            rsi_at_price_low = rsis.loc[price_low]
+            price_min_idx = recent['close'].idxmin()
+            rsi_min_idx = recent['rsi'].idxmin()
+            macd_min_idx = recent['macd_histogram'].idxmin()
 
-            next_low = prices[price_low:].idxmin()
-            rsi_next = rsis.loc[next_low]
-
-            return rsi_next > rsi_at_price_low
+            price_div = df['close'].iloc[-1] > df['close'].loc[price_min_idx]
+            rsi_div = df['rsi'].iloc[-1] > df['rsi'].loc[rsi_min_idx]
+            macd_div = df['macd_histogram'].iloc[-1] > df['macd_histogram'].loc[macd_min_idx]
         else:
-            price_high = prices.idxmax()
-            rsi_at_price_high = rsis.loc[price_high]
+            price_max_idx = recent['close'].idxmax()
+            rsi_max_idx = recent['rsi'].idxmax()
+            macd_max_idx = recent['macd_histogram'].idxmax()
 
-            next_high = prices[price_high:].idxmax()
-            rsi_next = rsis.loc[next_high]
+            price_div = df['close'].iloc[-1] < df['close'].loc[price_max_idx]
+            rsi_div = df['rsi'].iloc[-1] < df['rsi'].loc[rsi_max_idx]
+            macd_div = df['macd_histogram'].iloc[-1] < df['macd_histogram'].loc[macd_max_idx]
 
-            return rsi_next < rsi_at_price_high
+        return price_div and (rsi_div or macd_div)
+
     except Exception as e:
         print(f"⚠️ Erreur divergence sur {df.name if hasattr(df, 'name') else 'symbole inconnu'} : {e}")
         return False
