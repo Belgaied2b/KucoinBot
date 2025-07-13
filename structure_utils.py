@@ -1,3 +1,4 @@
+import pandas as pd
 def detect_bos_cos_choch(df, direction="long"):
     bos, cos, choch = False, False, False
 
