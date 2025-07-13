@@ -1,48 +1,32 @@
-import pandas as pd
+def detect_bos_cos_choch(df, direction="long"):
+    bos, cos, choch = False, False, False
 
-def detect_bos_cos(df, direction="long", lookback=20):
-    """
-    Détecte un Break of Structure (BOS) et un Change of Structure (COS)
-    BOS : cassure dans le sens de la tendance.
-    COS : cassure dans le sens opposé à la tendance.
-    """
-    if df is None or len(df) < lookback + 3:
-        return False, False
+    highs = df["high"].rolling(window=5).max()
+    lows = df["low"].rolling(window=5).min()
 
-    df = df.copy()
-    recent = df.iloc[-(lookback + 3):-3]  # On prend les bougies antérieures, on exclut les 3 dernières
-    prev_high = recent['high'].max()
-    prev_low = recent['low'].min()
-    current_close = df['close'].iloc[-1]
+    recent_high = highs.iloc[-2]
+    recent_low = lows.iloc[-2]
+    current_high = df["high"].iloc[-1]
+    current_low = df["low"].iloc[-1]
+    prev_close = df["close"].iloc[-2]
+    current_close = df["close"].iloc[-1]
 
-    bos = False
-    cos = False
+    # BOS = cassure du plus haut/bas récent avec clôture dans le sens du trade
+    if direction == "long" and current_close > recent_high:
+        bos = True
+    if direction == "short" and current_close < recent_low:
+        bos = True
 
+    # COS = rejet ou cassure inverse de structure faible
+    if direction == "long" and current_low < recent_low and current_close < prev_close:
+        cos = True
+    if direction == "short" and current_high > recent_high and current_close > prev_close:
+        cos = True
+
+    # CHoCH = signal de retournement confirmé
     if direction == "long":
-        bos = current_close > prev_high  # cassure vers le haut
-        cos = current_close < prev_low   # cassure vers le bas (structure brisée)
+        choch = df["low"].iloc[-1] > df["low"].iloc[-5] and df["close"].iloc[-1] > df["close"].iloc[-5]
     else:
-        bos = current_close < prev_low   # cassure vers le bas
-        cos = current_close > prev_high  # cassure vers le haut (structure brisée)
+        choch = df["high"].iloc[-1] < df["high"].iloc[-5] and df["close"].iloc[-1] < df["close"].iloc[-5]
 
-    return bos, cos
-
-
-def detect_choch(df, direction="long", lookback=20):
-    """
-    Détecte un CHoCH (Change of Character) = cassure du pivot opposé à la tendance.
-    Utile pour repérer un retournement de marché.
-    """
-    if df is None or len(df) < lookback + 3:
-        return False
-
-    df = df.copy()
-    recent = df.iloc[-(lookback + 3):-3]  # Exclure les dernières bougies instables
-    prev_high = recent['high'].max()
-    prev_low = recent['low'].min()
-    current_close = df['close'].iloc[-1]
-
-    if direction == "long":
-        return current_close < prev_low  # cassure d'un bas = retournement baissier
-    else:
-        return current_close > prev_high  # cassure d'un haut = retournement haussier
+    return bos, cos, choch
