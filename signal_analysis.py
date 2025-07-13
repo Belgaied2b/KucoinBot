@@ -1,7 +1,7 @@
 import pandas as pd
 from indicators import (
-    calculate_rsi, calculate_macd_histogram, calculate_fvg_zones,
-    calculate_ma200, calculate_atr, detect_divergence
+    compute_rsi, compute_macd_histogram, compute_fvg_zones,
+    compute_ma, compute_atr, detect_divergence
 )
 from structure_utils import detect_bos_cos_choch
 from chart_generator import generate_chart
@@ -29,10 +29,10 @@ def analyze_signal(df, symbol, direction, df_4h=None, btc_df=None, total_df=None
         return result
 
     df = df.copy()
-    df["rsi"] = calculate_rsi(df)
-    df["macd_histogram"] = calculate_macd_histogram(df)
-    df["ma200"] = calculate_ma200(df)
-    df["atr"] = calculate_atr(df)
+    df["rsi"] = compute_rsi(df["close"])
+    df["macd_histogram"] = compute_macd_histogram(df["close"])
+    df["ma200"] = compute_ma(df)
+    df["atr"] = compute_atr(df)
 
     # Détection structurelle
     bos, cos, choch = detect_bos_cos_choch(df, direction)
@@ -50,7 +50,7 @@ def analyze_signal(df, symbol, direction, df_4h=None, btc_df=None, total_df=None
 
     # Zone OTE + FVG
     ote_zone = calculate_ote_zone(df, direction)
-    fvg_zones = calculate_fvg_zones(df, direction)
+    fvg_zones = compute_fvg_zones(df)
     entry = find_entry_in_ote_fvg(df, ote_zone, fvg_zones, direction)
     if entry is None:
         result["toleres"].append("OTE")
