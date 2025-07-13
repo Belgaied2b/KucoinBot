@@ -8,8 +8,8 @@ from signal_analysis import analyze_signal
 from macros import load_macro_data
 from utils import save_signal_to_csv, log_message
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+TELEGRAM_TOKEN = os.getenv("TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("CHAT_ID")
 bot = telegram.Bot(token=TELEGRAM_TOKEN)
 
 # Fichier de doublons
