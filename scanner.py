@@ -42,6 +42,15 @@ def send_signal_to_telegram(result):
     with open(result["chart_path"], "rb") as img:
         bot.send_photo(chat_id=TELEGRAM_CHAT_ID, photo=img, caption=caption, parse_mode="Markdown")
 
+def convert_df_types(df):
+    """
+    Convertit les colonnes critiques en float64 pour éviter les erreurs de type.
+    """
+    for col in ['open', 'high', 'low', 'close', 'volume']:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+    return df.dropna(subset=['open', 'high', 'low', 'close', 'volume'])
+
 def scan_and_send_signals():
     print("🔄 Scan démarré")
     symbols = fetch_all_symbols()
@@ -55,7 +64,13 @@ def scan_and_send_signals():
             if df is None or df.empty:
                 continue
 
-            df.name = symbol  # Pour les graphiques
+            df = convert_df_types(df)
+            df_4h = convert_df_types(df_4h)
+            if df.empty or df_4h.empty:
+                print(f"⚠️ Données vides ou invalides sur {symbol}")
+                continue
+
+            df.name = symbol  # Pour les logs et graphiques
 
             for direction in ["long", "short"]:
                 if already_sent(symbol, direction):
