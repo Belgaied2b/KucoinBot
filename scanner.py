@@ -1,209 +1,81 @@
-import json
 import os
-import time
-from datetime import datetime
-import traceback
-import requests
+import json
 import pandas as pd
-from kucoin_utils import fetch_all_symbols, fetch_klines
+import telegram
+from datetime import datetime
+from kucoin_utils import get_all_perp_symbols, get_klines
 from signal_analysis import analyze_signal
-from config import TOKEN, CHAT_ID
-from telegram import Bot
+from macros import load_macro_data
+from utils import save_signal_to_csv, log_message
 
-bot = Bot(token=TOKEN)
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+bot = telegram.Bot(token=TELEGRAM_TOKEN)
 
-# 🔁 Envoi Telegram
-async def send_signal_to_telegram(signal):
-    rejected = signal.get("rejetes", [])
-    tolerated = signal.get("toleres", [])
-    comment = signal.get("comment", "").strip()
+# Fichier de doublons
+SENT_SIGNALS_FILE = "sent_signals.json"
+if not os.path.exists(SENT_SIGNALS_FILE):
+    with open(SENT_SIGNALS_FILE, "w") as f:
+        json.dump([], f)
 
-    msg_rejected = f"❌ Rejetés : {', '.join(rejected)}" if rejected else ""
-    msg_tolerated = f"⚠️ Tolérés : {', '.join(tolerated)}" if tolerated else ""
+def load_sent_signals():
+    with open(SENT_SIGNALS_FILE, "r") as f:
+        return json.load(f)
 
-    message = (
-        f"📉 {signal['symbol']} - Signal CONFIRMÉ ({signal['direction']})\n\n"
-        f"🎯 Entry : {signal['entry']:.4f}\n"
-        f"🛑 SL    : {signal['sl']:.4f}\n"
-        f"🎯 TP1   : {signal['tp1']:.4f}\n"
-        f"🎯 TP2   : {signal['tp2']:.4f}\n"
-        f"📈 R:R1  : {signal['rr1']}\n"
-        f"📈 R:R2  : {signal['rr2']}\n"
-        f"🧠 Score : {signal.get('score', '?')}/10\n"
-        f"{comment}\n"
-        f"{msg_tolerated}\n"
-        f"{msg_rejected}"
-    )
+def save_sent_signal(symbol, direction):
+    data = load_sent_signals()
+    data.append(f"{symbol}_{direction.upper()}")
+    with open(SENT_SIGNALS_FILE, "w") as f:
+        json.dump(data, f)
 
-    print(f"[{signal['symbol']}] 📤 Envoi Telegram en cours...")
-    await bot.send_message(chat_id=CHAT_ID, text=message.strip())
+def already_sent(symbol, direction):
+    return f"{symbol}_{direction.upper()}" in load_sent_signals()
 
-# 📂 Gestion des doublons
-sent_signals = {}
-if os.path.exists("sent_signals.json"):
-    try:
-        with open("sent_signals.json", "r") as f:
-            sent_signals = json.load(f)
-        print("📂 sent_signals.json chargé")
-    except Exception as e:
-        print("⚠️ Erreur lecture sent_signals.json :", e)
+def send_signal_to_telegram(result):
+    caption = f"📊 *{result['symbol']}* – {result['direction']} CONFIRMÉ\n\n"
+    caption += f"{result['comment']}\n\n"
+    caption += f"🎯 Entrée : `{result['entry']}`\n"
+    caption += f"🛡 SL : `{result['sl']}` | 🎯 TP : `{result['tp']}`\n"
+    caption += f"#Swing #Crypto #Signal"
 
-# ✅ Requête CoinGecko robuste
-def get_chart(url):
-    headers = {"User-Agent": "Mozilla/5.0"}
-    try:
-        time.sleep(1.5)
-        r = requests.get(url, headers=headers)
-        r.raise_for_status()
-        data = r.json()
+    with open(result["chart_path"], "rb") as img:
+        bot.send_photo(chat_id=TELEGRAM_CHAT_ID, photo=img, caption=caption, parse_mode="Markdown")
 
-        if "prices" not in data:
-            raise ValueError("⚠️ 'prices' absent de la réponse")
+def scan_and_send_signals():
+    print("🔄 Scan démarré")
+    symbols = get_all_perp_symbols()
+    macro = load_macro_data()
+    sent = load_sent_signals()
 
-        timestamps = [x[0] for x in data["prices"]]
-        closes = [x[1] for x in data["prices"]]
-        volumes = (
-            [x[1] for x in data["total_volumes"]]
-            if "total_volumes" in data and len(data["total_volumes"]) == len(timestamps)
-            else [0 for _ in timestamps]
-        )
-
-        df = pd.DataFrame({
-            "timestamp": timestamps,
-            "close": closes,
-            "high": [c * 1.01 for c in closes],
-            "low": [c * 0.99 for c in closes],
-            "open": closes,
-            "volume": volumes
-        })
-
-        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
-        df = df[["timestamp", "open", "high", "low", "close", "volume"]]
-        df.set_index("timestamp", inplace=False)
-        return df
-
-    except Exception as e:
-        print(f"⚠️ Erreur get_chart ({url}): {e}")
-        return None
-
-# 📊 Chargement des données macro
-def fetch_macro_df():
-    headers = {"User-Agent": "Mozilla/5.0"}
-
-    btc_df = get_chart("https://api.coingecko.com/api/v3/coins/bitcoin/market_chart?vs_currency=usd&days=30")
-    if btc_df is None:
-        raise ValueError("Impossible de charger les données BTC")
-
-    try:
-        time.sleep(1.5)
-        response = requests.get("https://api.coingecko.com/api/v3/global", headers=headers)
-        response.raise_for_status()
-        global_data = response.json()
-
-        if "data" not in global_data or "market_cap_percentage" not in global_data["data"]:
-            raise ValueError("Champ 'data' manquant dans la réponse CoinGecko")
-
-        btc_dominance = global_data["data"]["market_cap_percentage"]["btc"] / 100
-        total_market_cap = btc_df["close"] / btc_dominance
-
-        total_df = btc_df.copy()
-        total_df["close"] = total_market_cap
-        total_df["high"] = total_market_cap * 1.01
-        total_df["low"] = total_market_cap * 0.99
-        total_df["open"] = total_market_cap
-
-        btc_d_df = btc_df.copy()
-        btc_d_df["close"] = btc_dominance
-
-    except Exception as e:
-        raise ValueError(f"Erreur parsing global_data : {e}")
-
-    return btc_df, total_df, btc_d_df
-
-# 🔍 Scan principal
-async def scan_and_send_signals():
-    print(f"🔁 Scan lancé à {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC\n")
-    all_symbols = fetch_all_symbols()
-
-    try:
-        btc_df, total_df, btc_d_df = fetch_macro_df()
-    except Exception as e:
-        print(f"⚠️ Erreur macro fetch : {e}")
-        return
-
-    for symbol in all_symbols:
-        if not symbol.endswith("USDTM"):
-            continue
-
+    for symbol in symbols:
         try:
-            df = fetch_klines(symbol)
-            if df is None or df.empty or 'timestamp' not in df.columns:
-                print(f"[{symbol}] ⚠️ Données invalides ou vides, ignoré")
+            df = get_klines(symbol, interval="1h", limit=200)
+            df_4h = get_klines(symbol, interval="4h", limit=200)
+
+            if df is None or df.empty:
                 continue
 
+            df.name = symbol  # Pour chart
+
             for direction in ["long", "short"]:
-                print(f"[{symbol}] ➡️ Analyse {direction.upper()}")
+                if already_sent(symbol, direction):
+                    continue
 
-                df_copy = df.copy()
-                df_copy.name = symbol
-
-                signal = analyze_signal(
-                    df_copy,
+                result = analyze_signal(
+                    df=df,
                     symbol=symbol,
                     direction=direction,
-                    btc_df=btc_df,
-                    total_df=total_df,
-                    btc_d_df=btc_d_df
+                    df_4h=df_4h,
+                    btc_df=macro["BTC"],
+                    total_df=macro["TOTAL"],
+                    btcd_df=macro["BTC.D"]
                 )
 
-                score = signal.get("score", 0)
-                rejected = signal.get("rejetes", [])
-                tolerated = signal.get("toleres", [])
-                comment = signal.get("comment", "")
+                log_message(symbol, direction, result)
 
-                if signal.get("valid"):
-                    suffix = "TOLÉRÉ" if signal.get("tolere_ote") else "CONFIRMÉ"
-                    signal_id = f"{symbol}-{direction.upper()}-{suffix}"
-
-                    if signal_id in sent_signals:
-                        print(f"[{symbol}] 🔁 Signal déjà envoyé ({direction.upper()}-{suffix}), ignoré")
-                        continue
-
-                    print(f"[{symbol}] ✅ Nouveau signal accepté : {direction.upper()} ({suffix})")
-                    print(f"   🧠 Score     : {score}/10")
-                    if tolerated:
-                        print(f"   ⚠️ Tolérés   : {', '.join(tolerated)}")
-                    if rejected:
-                        print(f"   ❌ Rejetés   : {', '.join(rejected)}")
-                    if comment:
-                        print(f"   💬 Commentaire : {comment.strip()}")
-                    print("-" * 60)
-
-                    await send_signal_to_telegram(signal)
-
-                    sent_signals[signal_id] = {
-                        "entry": signal["entry"],
-                        "tp": signal["tp1"],
-                        "sl": signal["sl"],
-                        "sent_at": datetime.utcnow().isoformat(),
-                        "direction": signal["direction"],
-                        "symbol": symbol
-                    }
-
-                    with open("sent_signals.json", "w") as f:
-                        json.dump(sent_signals, f, indent=2)
-
-                else:
-                    print(f"[{symbol}] ❌ Aucun signal détecté ({direction.upper()})")
-                    print(f"   🧠 Score     : {score}/10")
-                    if tolerated:
-                        print(f"   ⚠️ Tolérés   : {', '.join(tolerated)}")
-                    if rejected:
-                        print(f"   ❌ Rejetés   : {', '.join(rejected)}")
-                    if comment:
-                        print(f"   💬 Commentaire : {comment.strip()}")
-                    print("-" * 60)
-
+                if result["is_valid"]:
+                    send_signal_to_telegram(result)
+                    save_sent_signal(symbol, direction)
+                    save_signal_to_csv(result)
         except Exception as e:
-            print(f"[{symbol}] ⚠️ Erreur analyse signal : {e}")
-            traceback.print_exc()
+            print(f"⚠️ Erreur sur {symbol} : {e}")
