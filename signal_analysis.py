@@ -31,13 +31,12 @@ def analyze_signal(df, symbol, direction, df_4h=None, btc_df=None, total_df=None
 
     df = df.copy()
 
-    # 🔒 Conversion stricte des colonnes
+    # 🔒 Conversion stricte
     float_cols = ["open", "high", "low", "close", "volume"]
     for col in float_cols:
         df[col] = pd.to_numeric(df[col], errors="coerce")
     df.dropna(subset=float_cols, inplace=True)
 
-    # 🔍 Vérification stricte des types
     for col in float_cols:
         if not np.issubdtype(df[col].dtype, np.floating):
             result["comment"] = f"Colonne {col} invalide (type {df[col].dtype})"
@@ -85,15 +84,15 @@ def analyze_signal(df, symbol, direction, df_4h=None, btc_df=None, total_df=None
         result["comment"] = f"Erreur OTE/FVG : {e}"
         return result
 
-    # Bougie de confirmation
+    # Bougie
     try:
-        latest_close = float(df["close"].iloc[-1])
-        latest_open = float(df["open"].iloc[-1])
-        latest_volume = float(df["volume"].iloc[-1])
+        close = float(df["close"].iloc[-1])
+        open_ = float(df["open"].iloc[-1])
+        volume = float(df["volume"].iloc[-1])
         avg_volume = float(df["volume"].mean())
         candle_valid = (
-            (latest_close > latest_open if direction == "long" else latest_close < latest_open)
-            and latest_volume > avg_volume
+            (close > open_ if direction == "long" else close < open_)
+            and volume > avg_volume
         )
         if not candle_valid:
             result["toleres"].append("BOUGIE")
@@ -103,7 +102,7 @@ def analyze_signal(df, symbol, direction, df_4h=None, btc_df=None, total_df=None
 
     # Volume
     try:
-        if latest_volume < avg_volume * 1.2:
+        if volume < avg_volume * 1.2:
             result["rejetes"].append("VOLUME")
     except Exception as e:
         result["comment"] = f"Erreur volume : {e}"
@@ -111,9 +110,8 @@ def analyze_signal(df, symbol, direction, df_4h=None, btc_df=None, total_df=None
 
     # MACD
     try:
-        macd_value = float(df["macd_histogram"].iloc[-1])
-        macd_ok = macd_value > 0 if direction == "long" else macd_value < 0
-        if not macd_ok:
+        macd = float(df["macd_histogram"].iloc[-1])
+        if (direction == "long" and macd <= 0) or (direction == "short" and macd >= 0):
             result["rejetes"].append("MACD")
     except Exception as e:
         result["comment"] = f"Erreur MACD : {e}"
@@ -121,10 +119,8 @@ def analyze_signal(df, symbol, direction, df_4h=None, btc_df=None, total_df=None
 
     # MA200
     try:
-        ma200 = float(df["ma200"].iloc[-1])
-        price = float(df["close"].iloc[-1])
-        ma_ok = price > ma200 if direction == "long" else price < ma200
-        if not ma_ok:
+        ma = float(df["ma200"].iloc[-1])
+        if (direction == "long" and close <= ma) or (direction == "short" and close >= ma):
             result["rejetes"].append("MA200")
     except Exception as e:
         result["comment"] = f"Erreur MA200 : {e}"
@@ -142,8 +138,8 @@ def analyze_signal(df, symbol, direction, df_4h=None, btc_df=None, total_df=None
     # SL / TP
     try:
         atr = float(df["atr"].iloc[-1])
-        sl = price - 1.5 * atr if direction == "long" else price + 1.5 * atr
-        tp = find_dynamic_tp(df, price, sl, direction)
+        sl = close - 1.5 * atr if direction == "long" else close + 1.5 * atr
+        tp = find_dynamic_tp(df, close, sl, direction)
         if tp is None:
             result["rejetes"].append("TP")
     except Exception as e:
@@ -166,16 +162,14 @@ def analyze_signal(df, symbol, direction, df_4h=None, btc_df=None, total_df=None
         )
         return result
 
-    # Graphique
     try:
         chart_path = generate_chart(df, symbol, ote_zone, fvg_zones, entry, sl, tp, direction)
     except:
         chart_path = None
 
-    # Résultat final
     result.update({
         "is_valid": True,
-        "entry": round(entry if entry else price, 4),
+        "entry": round(entry if entry else close, 4),
         "sl": round(sl, 4),
         "tp": round(tp, 4),
         "chart_path": chart_path,
