@@ -31,15 +31,20 @@ def analyze_signal(df, symbol, direction, df_4h=None, btc_df=None, total_df=None
 
     df = df.copy()
 
+    # 🛠️ DEBUG : affiche types initiaux
+    print(f"[DEBUG] {symbol} — Types initiaux des colonnes :\n{df.dtypes}")
+
     # 🔒 Conversion stricte
     float_cols = ["open", "high", "low", "close", "volume"]
     for col in float_cols:
         df[col] = pd.to_numeric(df[col], errors="coerce")
     df.dropna(subset=float_cols, inplace=True)
 
+    # 🔍 Vérification stricte
     for col in float_cols:
         if not np.issubdtype(df[col].dtype, np.floating):
             result["comment"] = f"Colonne {col} invalide (type {df[col].dtype})"
+            print(f"[DEBUG] {symbol} — Colonne {col} invalide (type {df[col].dtype})")
             return result
 
     if len(df) < 30:
@@ -146,7 +151,7 @@ def analyze_signal(df, symbol, direction, df_4h=None, btc_df=None, total_df=None
         result["comment"] = f"Erreur SL/TP : {e}"
         return result
 
-    # Score pondéré
+    # ✅ Score final
     score = 10
     for rej in result["rejetes"]:
         score -= 2 if rej in ["VOLUME", "MACRO TOTAL", "MACD", "MA200", "BOS", "COS", "CHoCH"] else 1
@@ -157,11 +162,13 @@ def analyze_signal(df, symbol, direction, df_4h=None, btc_df=None, total_df=None
     if result["score"] < 8 or result["rejetes"]:
         result["comment"] = (
             f"Signal rejeté – Score : {result['score']}/10 "
-            f"❌ Rejetés : {', '.join(result['rejetes'])} "
-            f"⚠️ Tolérés : {', '.join(result['toleres'])}"
+            f"❌ Rejetés : {', '.join(result['rejetes']) or 'Aucun'} "
+            f"⚠️ Tolérés : {', '.join(result['toleres']) or 'Aucun'}"
         )
+        print(f"[DEBUG] {symbol} — Score {result['score']} — Rejetés: {result['rejetes']} — Tolérés: {result['toleres']}")
         return result
 
+    # 🖼️ Chart
     try:
         chart_path = generate_chart(df, symbol, ote_zone, fvg_zones, entry, sl, tp, direction)
     except:
@@ -175,9 +182,10 @@ def analyze_signal(df, symbol, direction, df_4h=None, btc_df=None, total_df=None
         "chart_path": chart_path,
         "comment": (
             f"✅ Signal confirmé – Score : {result['score']}/10 "
-            f"⚠️ Tolérés : {', '.join(result['toleres'])}"
+            f"⚠️ Tolérés : {', '.join(result['toleres']) or 'Aucun'}"
             + (f" (BTC.D : {btc_d_trend}, TOTAL : {total_trend})" if btc_d_trend else "")
         )
     })
 
+    print(f"[DEBUG] {symbol} — ✅ Signal VALIDÉ — Score {result['score']}/10")
     return result
