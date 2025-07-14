@@ -18,7 +18,7 @@ def fetch_all_symbols():
 def fetch_klines(symbol, interval="1h", limit=150):
     """
     Récupère les chandeliers historiques pour un symbole donné.
-    Renvoie un DataFrame avec 'timestamp' et colonnes OHLCV.
+    Renvoie un DataFrame propre avec 'timestamp' et colonnes OHLCV en float64.
     """
     granularity_map = {"1h": 60, "4h": 240}
     granularity = granularity_map.get(interval, 60)
@@ -35,20 +35,24 @@ def fetch_klines(symbol, interval="1h", limit=150):
             print(f"[{symbol}] ❌ Données insuffisantes ({len(data)} bougies)")
             return None
 
+        # Construction du DataFrame avec colonnes connues
         df = pd.DataFrame(data, columns=["timestamp", "open", "close", "high", "low", "volume"])
 
-        # Conversion explicite des colonnes OHLCV en float
-        for col in ["open", "close", "high", "low", "volume"]:
+        # Conversion explicite des colonnes en float
+        float_cols = ["open", "high", "low", "close", "volume"]
+        for col in float_cols:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
-        # Conversion timestamp
+        # Conversion du timestamp
         df["timestamp"] = pd.to_numeric(df["timestamp"], errors="coerce")
+        df.dropna(subset=["timestamp"], inplace=True)
         unit = "ms" if df["timestamp"].iloc[0] > 1e12 else "s"
         df["timestamp"] = pd.to_datetime(df["timestamp"], unit=unit)
 
-        df = df[["timestamp", "open", "high", "low", "close", "volume"]]
-        df = df.dropna()
-        df.set_index("timestamp", inplace=False)
+        # Nettoyage final
+        df = df[["timestamp"] + float_cols]
+        df.dropna(inplace=True)
+        df.reset_index(drop=True, inplace=True)
 
         return df
 
