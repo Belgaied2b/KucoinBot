@@ -34,10 +34,10 @@ def analyze_signal(df, symbol, direction, df_4h=None, btc_df=None, total_df=None
     # 🛠️ DEBUG : affiche types initiaux
     print(f"[DEBUG] {symbol} — Types initiaux des colonnes :\n{df.dtypes}")
 
-    # 🔒 Conversion stricte
+    # 🔒 Conversion stricte en float64
     float_cols = ["open", "high", "low", "close", "volume"]
     for col in float_cols:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
+        df[col] = pd.to_numeric(df[col], errors="coerce").astype(np.float64)
     df.dropna(subset=float_cols, inplace=True)
 
     # 🔍 Vérification stricte
