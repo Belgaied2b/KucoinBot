@@ -1,4 +1,4 @@
-import pandas as pd 
+import pandas as pd
 from indicators import (
     compute_rsi, compute_macd_histogram, compute_fvg_zones,
     compute_ma, compute_atr, detect_divergence
@@ -30,15 +30,15 @@ def analyze_signal(df, symbol, direction, df_4h=None, btc_df=None, total_df=None
 
     df = df.copy()
 
-    # ✅ Conversion en float avec double sécurité
+    # ✅ Conversion stricte des colonnes en float
     float_cols = ["open", "high", "low", "close", "volume"]
     for col in float_cols:
         df[col] = pd.to_numeric(df[col], errors="coerce")
     df.dropna(subset=float_cols, inplace=True)
 
-    # 🔒 Reconversion si certains types sont restés "object"
+    # 🔒 Sécurité supplémentaire : reconversion si type object
     for col in float_cols:
-        if df[col].dtype == object:
+        if not pd.api.types.is_float_dtype(df[col]):
             df[col] = pd.to_numeric(df[col], errors="coerce")
     df.dropna(subset=float_cols, inplace=True)
 
@@ -46,7 +46,7 @@ def analyze_signal(df, symbol, direction, df_4h=None, btc_df=None, total_df=None
         result["comment"] = "Pas assez de données après nettoyage."
         return result
 
-    # ✅ Calculs techniques
+    # ✅ Indicateurs techniques
     df["rsi"] = pd.to_numeric(compute_rsi(df["close"]), errors="coerce")
     df["macd_histogram"] = pd.to_numeric(compute_macd_histogram(df["close"]), errors="coerce")
     df["ma200"] = pd.to_numeric(compute_ma(df), errors="coerce")
@@ -96,14 +96,22 @@ def analyze_signal(df, symbol, direction, df_4h=None, btc_df=None, total_df=None
         result["rejetes"].append("VOLUME")
 
     # 📈 MACD
-    macd_value = float(df["macd_histogram"].iloc[-1])
+    try:
+        macd_value = float(df["macd_histogram"].iloc[-1])
+    except Exception as e:
+        result["comment"] = f"Erreur MACD : {e}"
+        return result
     macd_valid = macd_value > 0 if direction == "long" else macd_value < 0
     if not macd_valid:
         result["rejetes"].append("MACD")
 
     # 📏 MA200
-    price = float(df["close"].iloc[-1])
-    ma200_value = float(df["ma200"].iloc[-1])
+    try:
+        price = float(df["close"].iloc[-1])
+        ma200_value = float(df["ma200"].iloc[-1])
+    except Exception as e:
+        result["comment"] = f"Erreur MA200 : {e}"
+        return result
     ma200_valid = price > ma200_value if direction == "long" else price < ma200_value
     if not ma200_valid:
         result["rejetes"].append("MA200")
