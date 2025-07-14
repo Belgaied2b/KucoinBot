@@ -13,36 +13,35 @@ def detect_bos_cos_choch(df, direction="long"):
         df['close'] = pd.to_numeric(df['close'], errors='coerce')
         df.dropna(subset=['high', 'low', 'close'], inplace=True)
 
-        # Marge pour structure locale
-        window = 20
-        recent = df[-window:]
+        # Travail sur les 30 dernières bougies
+        lookback = 30
+        recent = df[-lookback:]
 
-        highest_high = recent['high'].max()
-        lowest_low = recent['low'].min()
+        swing_high = recent['high'].max()
+        swing_low = recent['low'].min()
 
-        close_now = recent['close'].iloc[-1]
-        close_prev = recent['close'].iloc[-2]
-        high_now = recent['high'].iloc[-1]
-        low_now = recent['low'].iloc[-1]
+        last_close = recent['close'].iloc[-1]
+        prev_close = recent['close'].iloc[-2]
+        last_high = recent['high'].iloc[-1]
+        last_low = recent['low'].iloc[-1]
 
-        # BOS (Break of Structure)
-        if direction == "long" and close_now > highest_high * 0.995:
+        # 🔹 BOS : cassure du plus haut/bas récent
+        if direction == "long" and last_close >= swing_high * 0.995:
             bos = True
-        elif direction == "short" and close_now < lowest_low * 1.005:
+        elif direction == "short" and last_close <= swing_low * 1.005:
             bos = True
 
-        # COS (Change of Structure, retour vers support)
-        if direction == "long" and low_now < lowest_low and close_now < close_prev:
+        # 🔹 COS : repli dans structure
+        if direction == "long" and last_low <= swing_low and last_close < prev_close:
             cos = True
-        elif direction == "short" and high_now > highest_high and close_now > close_prev:
+        elif direction == "short" and last_high >= swing_high and last_close > prev_close:
             cos = True
 
-        # CHoCH (Change of Character)
-        close_5 = df['close'].iloc[-5]
+        # 🔹 CHoCH : inversion locale de tendance
         if direction == "long":
-            choch = close_now > close_5 and low_now > df['low'].iloc[-5]
+            choch = last_close > df['close'].iloc[-5] and last_low > df['low'].iloc[-5]
         else:
-            choch = close_now < close_5 and high_now < df['high'].iloc[-5]
+            choch = last_close < df['close'].iloc[-5] and last_high < df['high'].iloc[-5]
 
     except Exception as e:
         print(f"⚠️ Erreur structure (BOS/COS/CHoCH) : {e}")
