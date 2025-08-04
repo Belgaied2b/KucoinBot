@@ -6,6 +6,7 @@ from indicators import (
     calculate_rsi,
     calculate_atr,
     detect_fvg,
+    detect_ote_zone,
     is_price_in_ote_zone,
     detect_divergence,
 )
@@ -22,9 +23,9 @@ def confirm_4h_trend(symbol, direction):
     if df_4h is None or len(df_4h) < 50:
         return False
 
-    df_4h['ma200'] = calculate_ma(df_4h['close'], 200)
+    df_4h = calculate_ma(df_4h, 200)
     last_close = df_4h['close'].iloc[-1]
-    ma200 = df_4h['ma200'].iloc[-1]
+    ma200 = df_4h['ma_200'].iloc[-1]
 
     if direction == 'long':
         return last_close > ma200
@@ -35,23 +36,25 @@ def analyze_signal(df, symbol, direction):
     if df is None or df.empty or 'timestamp' not in df.columns:
         return None
 
-    df['ma200'] = calculate_ma(df['close'], 200)
+    df = calculate_ma(df, 200)
     df['macd_histogram'] = calculate_macd_histogram(df)
-    df['rsi'] = calculate_rsi(df['close'])
+    df['rsi'] = calculate_rsi(df)
     df['atr'] = calculate_atr(df)
+
     fvg_zone = detect_fvg(df, direction)
-    ote_zone = is_price_in_ote_zone(df, direction)
+    ote_zone = detect_ote_zone(df, direction)
+
     bos = detect_bos(df, direction)
     cos = detect_cos(df, direction)
     choch = detect_choch(df, direction)
-    divergence = detect_divergence(df, direction)
+    divergence = detect_divergence(df)
 
     confirmation_4h = confirm_4h_trend(symbol, direction)
     current_price = df['close'].iloc[-1]
     volume_ok = df['volume'].iloc[-1] > df['volume'].rolling(20).mean().iloc[-1] * 1.2
     macd_ok = df['macd_histogram'].iloc[-1] > 0 if direction == 'long' else df['macd_histogram'].iloc[-1] < 0
-    ma_ok = current_price > df['ma200'].iloc[-1] if direction == 'long' else current_price < df['ma200'].iloc[-1]
-    in_ote = ote_zone is not None and ote_zone[0] <= current_price <= ote_zone[1]
+    ma_ok = current_price > df['ma_200'].iloc[-1] if direction == 'long' else current_price < df['ma_200'].iloc[-1]
+    in_ote = is_price_in_ote_zone(df, ote_zone)
     in_fvg = fvg_zone is not None and fvg_zone[0] <= current_price <= fvg_zone[1]
 
     # SL/TP dynamiques via ATR
