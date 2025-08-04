@@ -1,6 +1,7 @@
 import pandas as pd
 import numpy as np
 
+
 def compute_rsi(series, period=14):
     if series is None or len(series) < period:
         return pd.Series([np.nan] * len(series), index=series.index if series is not None else None)
@@ -81,10 +82,8 @@ def compute_fvg_zones(df, lookback=30):
 def is_volume_strong(df, window=20, multiplier=1.2):
     if df is None or 'volume' not in df.columns or len(df) < window:
         return False
-
     avg_volume = df['volume'].rolling(window=window, min_periods=1).mean().iloc[-1]
-    current_volume = df['volume'].iloc[-1]
-    return current_volume > avg_volume * multiplier
+    return df['volume'].iloc[-1] > avg_volume * multiplier
 
 
 def is_above_ma200(df):
@@ -118,14 +117,32 @@ def is_atr_sufficient(df, min_ratio=0.005):
     return atr.iloc[-1] > df['close'].iloc[-1] * min_ratio
 
 
-def is_total_ok(total_df, direction="long", window=20):
-    if total_df is None or len(total_df) < window + 1 or 'close' not in total_df.columns:
+def is_total_ok(total_df, direction="long"):
+    if total_df is None or len(total_df) < 3:
         return False
+    last = total_df['close'].iloc[-1]
+    prev = total_df['close'].iloc[-3]
+    return last > prev if direction == "long" else last < prev
 
-    total_df = total_df.copy()
-    total_df['ma'] = total_df['close'].rolling(window=window).mean()
 
-    if direction == "long":
-        return total_df['close'].iloc[-1] > total_df['ma'].iloc[-1]
-    else:
-        return total_df['close'].iloc[-1] < total_df['ma'].iloc[-1]
+def is_btc_ok(btc_df):
+    if btc_df is None or len(btc_df) < 3:
+        return False
+    close = btc_df['close']
+    return close.iloc[-1] > close.iloc[-2] > close.iloc[-3] or close.iloc[-1] < close.iloc[-2] < close.iloc[-3]
+
+
+def is_bullish_divergence(df):
+    if df is None or len(df) < 20:
+        return False
+    rsi = compute_rsi(df['close'])
+    price_low = df['low']
+    return price_low.iloc[-1] < price_low.iloc[-5] and rsi.iloc[-1] > rsi.iloc[-5]
+
+
+def is_bearish_divergence(df):
+    if df is None or len(df) < 20:
+        return False
+    rsi = compute_rsi(df['close'])
+    price_high = df['high']
+    return price_high.iloc[-1] > price_high.iloc[-5] and rsi.iloc[-1] < rsi.iloc[-5]
