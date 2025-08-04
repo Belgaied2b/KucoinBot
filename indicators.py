@@ -31,9 +31,11 @@ def compute_macd_histogram(series, fast=12, slow=26, signal=9):
     return histogram.fillna(0)
 
 
-def compute_ma(df, period=200):
+def compute_ma(df, period=200, method='sma'):
     if df is None or 'close' not in df.columns or len(df) < period:
         return pd.Series([np.nan] * len(df), index=df.index)
+    if method == 'ema':
+        return df['close'].ewm(span=period, adjust=False).mean()
     return df['close'].rolling(window=period, min_periods=period).mean()
 
 
@@ -47,7 +49,7 @@ def compute_atr(df, period=14):
     tr3 = (df['low'] - prev_close).abs()
     tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
 
-    atr = tr.rolling(window=period, min_periods=period).mean()
+    atr = tr.ewm(span=period, min_periods=period, adjust=False).mean()
     return atr.bfill()
 
 
@@ -59,7 +61,6 @@ def compute_fvg_zones(df, lookback=30):
     fvg_lower = [np.nan] * len(df)
 
     for i in range(2, len(df)):
-        prev2 = df.iloc[i - 2]
         prev1 = df.iloc[i - 1]
         curr = df.iloc[i]
 
