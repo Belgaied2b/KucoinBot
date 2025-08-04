@@ -1,89 +1,88 @@
-import pandas as pd
+import numpy as np
 from indicators import (
-    calculate_indicators, is_price_in_ote_zone,
-    find_fvg_zone, is_bullish_breakout,
-    is_bearish_breakout, is_volume_strong,
-    is_bullish_candle, is_bearish_candle,
-    is_above_ma200, is_below_ma200,
-    calculate_sl_tp_levels
+    detect_ote_zone, detect_fvg, is_above_ma200, is_below_ma200,
+    calculate_atr, calculate_macd_histogram
 )
-from telegram import Bot
-import os
 
-# Initialisation du bot Telegram
-bot = Bot(token=os.getenv("TOKEN"))
-chat_id = int(os.getenv("CHAT_ID"))
+def confirm_with_4h(df_4h, direction):
+    try:
+        ma200 = df_4h['close'].rolling(window=200).mean()
+        last_close = df_4h['close'].iloc[-1]
+        last_open = df_4h['open'].iloc[-1]
+        last_volume = df_4h['volume'].iloc[-1]
+        avg_volume = df_4h['volume'].mean()
 
-# Valeurs fixes
-TRADE_AMOUNT = 20
-TRADE_LEVERAGE = 3
+        is_bull = last_close > last_open
+        is_bear = last_close < last_open
+        strong_vol = last_volume > avg_volume * 1.2
+        above_ma = last_close > ma200.iloc[-1]
+        below_ma = last_close < ma200.iloc[-1]
 
-def analyze_signal(df, symbol, direction):
-    df = calculate_indicators(df)
+        if direction == 'long':
+            return is_bull and strong_vol and above_ma
+        else:
+            return is_bear and strong_vol and below_ma
+    except:
+        return False
 
-    if len(df) < 50 or 'close' not in df.columns:
+def analyze_signal(df_dict, symbol, direction):
+    df = df_dict["1h"]
+    df_4h = df_dict["4h"]
+    df.name = symbol
+
+    if df is None or df.empty or 'timestamp' not in df.columns:
         return None
 
-    latest = df.iloc[-1]
-    entry_price = latest['close']
+    # MACD momentum
+    macd_hist = calculate_macd_histogram(df)
+    if direction == 'long' and macd_hist.iloc[-1] < 0:
+        return None
+    if direction == 'short' and macd_hist.iloc[-1] > 0:
+        return None
+
+    # Zone OTE
+    ote_zone = detect_ote_zone(df, direction)
+    if ote_zone is None:
+        return None
+
+    last_price = df['close'].iloc[-1]
+    if not (ote_zone[0] <= last_price <= ote_zone[1]):
+        return None
+
+    # FVG directionnel
+    fvg_zone = detect_fvg(df, direction)
+    if fvg_zone is None:
+        return None
 
     # MA200
-    if direction == "long" and not is_above_ma200(df):
+    if direction == 'long' and not is_above_ma200(df):
         return None
-    if direction == "short" and not is_below_ma200(df):
-        return None
-
-    # Breakout de structure (BOS)
-    if direction == "long" and not is_bullish_breakout(df):
-        return None
-    if direction == "short" and not is_bearish_breakout(df):
+    if direction == 'short' and not is_below_ma200(df):
         return None
 
-    # Bougie de confirmation
-    if direction == "long" and not is_bullish_candle(df):
-        return None
-    if direction == "short" and not is_bearish_candle(df):
+    # Confirmation 4H obligatoire
+    if not confirm_with_4h(df_4h, direction):
         return None
 
-    # Volume fort
-    if not is_volume_strong(df):
+    # ATR / SL / TP
+    atr = calculate_atr(df)
+    if atr is None or atr == 0:
         return None
 
-    # Zones OTE + FVG
-    ote_zone = is_price_in_ote_zone(df, direction)
-    fvg_zone = find_fvg_zone(df, direction)
+    if direction == 'long':
+        sl = df['low'].iloc[-1] - atr
+        tp = last_price + (last_price - sl) * 2
+    else:
+        sl = df['high'].iloc[-1] + atr
+        tp = last_price - (sl - last_price) * 2
 
-    if not ote_zone or not fvg_zone:
-        return None
-
-    # Vérifie que le prix actuel est DANS les 2 zones
-    if not (ote_zone[0] <= entry_price <= ote_zone[1]) or not (fvg_zone[0] <= entry_price <= fvg_zone[1]):
-        return None
-
-    # SL / TP dynamiques
-    sl, tp = calculate_sl_tp_levels(df, direction)
-
-    # Envoie du signal Telegram
-    message = f"""
-📈 Signal CONFIRMÉ - {symbol}
-Direction : {direction.upper()}
-Prix actuel : {entry_price:.4f}
-
-🎯 Entrée : dans OTE + FVG ✅
-🛡 SL : {sl:.4f}
-🎯 TP : {tp:.4f}
-💰 Taille : {TRADE_AMOUNT} USDT
-📊 Levier : x{TRADE_LEVERAGE}
-"""
-    bot.send_message(chat_id=chat_id, text=message)
-
-    # Renvoie les infos pour passage d'ordre
+    # Résultat
     return {
         "symbol": symbol,
-        "entry": entry_price,
-        "sl": sl,
-        "tp": tp,
-        "side": direction,
-        "amount": TRADE_AMOUNT,
-        "leverage": TRADE_LEVERAGE
+        "direction": direction,
+        "entry": last_price,
+        "sl": round(sl, 4),
+        "tp": round(tp, 4),
+        "ote_zone": ote_zone,
+        "fvg_zone": fvg_zone
     }
