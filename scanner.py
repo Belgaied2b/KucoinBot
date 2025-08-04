@@ -6,12 +6,6 @@ import telegram
 from kucoin_utils import get_perp_symbols, get_klines
 from signal_analysis import analyze_signal
 
-# ✅ Configuration des logs pour Railway
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
-)
-
 # 📡 Telegram
 BOT_TOKEN = os.getenv("TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
@@ -46,20 +40,26 @@ async def scan_and_send_signals():
         df_4h = get_klines(symbol, interval="4hour", limit=100)
 
         if df_1h is None or df_1h.empty or df_4h is None or df_4h.empty:
-            logging.warning(f"⚠️ Données manquantes pour {symbol}, skip.")
+            logging.info(f"❌ {symbol} → Données manquantes, ignoré.")
             continue
 
-        df_1h.name = symbol  # Pour logs et graphiques
+        df_1h.name = symbol  # Utile pour logs ou graphique
 
         for direction in ["long", "short"]:
             result = analyze_signal(df_1h, df_4h, direction)
 
-            if not result or not result.get("valide"):
-                logging.info(f"⛔ {symbol} ({direction}) rejeté ou non valide.")
+            if not result:
+                logging.info(f"❌ {symbol} ({direction.upper()}) → Analyse ignorée ou data vide.")
+                continue
+
+            if not result.get("valide"):
+                score = result.get("score", 0)
+                comment = result.get("commentaire", "Aucun commentaire")
+                logging.info(f"⛔ {symbol} ({direction.upper()}) → Rejeté | Score: {score}/10 | {comment}")
                 continue
 
             if already_sent(symbol, direction):
-                logging.info(f"⏭️ Signal déjà envoyé pour {symbol} ({direction})")
+                logging.info(f"⏭️ Signal déjà envoyé pour {symbol} ({direction.upper()})")
                 continue
 
             message = (
@@ -73,7 +73,7 @@ async def scan_and_send_signals():
 
             try:
                 await bot.send_message(chat_id=CHAT_ID, text=message)
-                logging.info(f"📩 Signal envoyé pour {symbol} ({direction})")
+                logging.info(f"📩 Signal envoyé pour {symbol} ({direction.upper()})")
                 save_sent_signal(symbol, direction)
             except Exception as e:
                 logging.error(f"❌ Erreur envoi Telegram {symbol} : {e}")
