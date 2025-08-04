@@ -6,12 +6,12 @@ import telegram
 from kucoin_utils import get_perp_symbols, get_klines
 from signal_analysis import analyze_signal
 
-# Telegram
+# 📡 Telegram
 BOT_TOKEN = os.getenv("TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 bot = telegram.Bot(token=BOT_TOKEN)
 
-# Fichier local pour éviter les doublons
+# 🧠 Mémoire des signaux envoyés
 SENT_SIGNALS_FILE = "sent_signals.json"
 if not os.path.exists(SENT_SIGNALS_FILE):
     with open(SENT_SIGNALS_FILE, "w") as f:
@@ -30,7 +30,7 @@ def save_sent_signal(symbol, direction):
 def already_sent(symbol, direction):
     return f"{symbol}_{direction}" in load_sent_signals()
 
-# Fonction principale
+# 🚀 Fonction principale
 async def scan_and_send_signals():
     logging.info("🔍 Scan en cours...")
     symbols = get_perp_symbols()
@@ -42,10 +42,12 @@ async def scan_and_send_signals():
         if df_1h.empty or df_4h.empty:
             continue
 
+        df_1h.name = symbol  # Utile pour les logs ou graphiques
+
         for direction in ["long", "short"]:
             result = analyze_signal(df_1h, df_4h, direction)
 
-            if not result.get("valide"):
+            if not result or not result.get("valide"):
                 continue
 
             if already_sent(symbol, direction):
@@ -66,4 +68,4 @@ async def scan_and_send_signals():
                 logging.info(f"📩 Signal envoyé pour {symbol} ({direction})")
                 save_sent_signal(symbol, direction)
             except Exception as e:
-                logging.error(f"Erreur envoi Telegram {symbol} : {e}")
+                logging.error(f"❌ Erreur envoi Telegram {symbol} : {e}")
