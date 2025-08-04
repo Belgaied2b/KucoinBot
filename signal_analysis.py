@@ -32,9 +32,9 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df):
             ote_end = low_price + 0.786 * (high_price - low_price)
             in_ote = ote_start <= last_close <= ote_end
         else:
-            ote_start = high_price - 0.786 * (high_price - low_price)
-            ote_end = high_price - 0.618 * (high_price - low_price)
-            in_ote = ote_start >= last_close >= ote_end
+            ote_start = high_price - 0.618 * (high_price - low_price)
+            ote_end = high_price - 0.786 * (high_price - low_price)
+            in_ote = ote_end <= last_close <= ote_start
 
         # FVG
         fvg_df = compute_fvg_zones(df)
@@ -42,10 +42,12 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df):
         fvg_lower = fvg_df['fvg_lower'].iloc[-1]
         in_fvg = False
         if not np.isnan(fvg_upper) and not np.isnan(fvg_lower):
-            if direction == "long" and fvg_lower < fvg_upper:
+            if direction == "long" and fvg_upper < last_close:
                 in_fvg = fvg_lower <= last_close <= fvg_upper
-            elif direction == "short" and fvg_upper < fvg_lower:
+            elif direction == "short" and fvg_lower > last_close:
                 in_fvg = fvg_upper <= last_close <= fvg_lower
+        else:
+            in_fvg = False  # protection si FVG manquant
 
         # Volume
         avg_volume = df['volume'].rolling(window=20).mean().iloc[-1]
@@ -69,7 +71,11 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df):
         # BOS / COS
         bos_ok, cos = detect_bos_cos(df, direction)
         candle = df.iloc[-1]
-        breakout_confirm = (candle['close'] > candle['open'] and candle['volume'] > avg_volume) if direction == "long" else (candle['close'] < candle['open'] and candle['volume'] > avg_volume)
+        breakout_confirm = (
+            (candle['close'] > candle['open'] and candle['volume'] > avg_volume)
+            if direction == "long"
+            else (candle['close'] < candle['open'] and candle['volume'] > avg_volume)
+        )
         bos_ok = bos_ok and breakout_confirm
         cos_ok = cos and breakout_confirm
 
@@ -80,7 +86,8 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df):
         body = abs(df['close'].iloc[-1] - df['open'].iloc[-1])
         wick = df['high'].iloc[-1] - df['low'].iloc[-1]
         body_ratio = body / wick if wick > 0 else 0
-        candle_ok = body_ratio > 0.5 and last_volume > avg_volume
+        avg_body = abs(df['close'] - df['open']).rolling(window=20).mean().iloc[-1]
+        candle_ok = body_ratio > 0.5 and body > avg_body and last_volume > avg_volume
 
         # ATR
         atr = compute_atr(df)
@@ -88,8 +95,8 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df):
         atr_ok = atr_value > 0.005 * last_close
 
         # Macro TOTAL / BTC
-        total_slope = total_df['close'].diff().rolling(window=5).mean().iloc[-1]
-        btc_slope = btc_df['close'].diff().rolling(window=5).mean().iloc[-1]
+        total_slope = total_df['close'].diff().rolling(window=8).mean().iloc[-1]
+        btc_slope = btc_df['close'].diff().rolling(window=8).mean().iloc[-1]
         market_ok = total_slope > 0 if direction == "long" else total_slope < 0
         btc_ok = btc_slope > 0 if direction == "long" else btc_slope < 0
 
@@ -141,7 +148,8 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df):
             "BOUGIE": 0.5,
             "TOTAL": 1.0,
             "BTC": 1.0,
-            "DIVERGENCE": 0.5
+            "DIVERGENCE": 0.5,
+            "ATR": 1.0
         }
 
         score_total = sum(poids.values())
@@ -162,7 +170,26 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df):
                 "score": score,
                 "rejetes": rejected,
                 "toleres": tolerated,
-                "comment": comment
+                "comment": comment,
+                "debug": {
+                    "last_close": last_close,
+                    "ote": [ote_start, ote_end],
+                    "in_ote": in_ote,
+                    "in_fvg": in_fvg,
+                    "volume": [last_volume, avg_volume],
+                    "ma200": ma200.iloc[-1],
+                    "macd": macd_hist.iloc[-1],
+                    "atr": atr_value,
+                    "sl": sl,
+                    "tp1": tp1,
+                    "tp2": tp2,
+                    "bos": bos_ok,
+                    "cos": cos_ok,
+                    "choch": choch_ok,
+                    "candle_ratio": body_ratio,
+                    "market_total": total_slope,
+                    "market_btc": btc_slope
+                }
             }
 
         # ✅ Génération graphique
