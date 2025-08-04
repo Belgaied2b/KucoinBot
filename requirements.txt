@@ -1,9 +1,6 @@
 python-telegram-bot==20.3
-matplotlib
 pandas
-requests
 numpy
+requests
 apscheduler
-scipy
-ta==0.10.2
-kucoin-python
+matplotlib
