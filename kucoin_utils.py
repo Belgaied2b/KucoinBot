@@ -16,6 +16,8 @@ def get_all_symbols():
             for item in data
             if item.get("symbol", "").endswith("USDTM") and item.get("enableTrading", False)
         ]
+        if not symbols:
+            print("[WARN] Aucun symbole PERP USDTM actif trouvé.")
         return symbols
     except Exception as e:
         print(f"[ERREUR] get_all_symbols → {e}")
@@ -27,19 +29,21 @@ get_perp_symbols = get_all_symbols
 # ✅ Récupère les chandeliers pour un symbole donné
 def get_klines(symbol, interval="1hour", limit=200):
     try:
-        end_time = int(time.time() * 1000)
+        end_time = int(time.time())
         params = {
             "symbol": symbol,
             "granularity": convert_interval(interval),
-            "from": (end_time // 1000) - limit * interval_to_seconds(interval),
-            "to": end_time // 1000,
+            "from": end_time - limit * interval_to_seconds(interval),
+            "to": end_time,
         }
         url = f"{BASE_URL}/api/v1/kline/query"
         response = requests.get(url, params=params)
         response.raise_for_status()
         data = response.json().get("data", [])
         if not data:
+            print(f"[WARN] Pas de données pour {symbol}")
             return pd.DataFrame()
+
         df = pd.DataFrame(data, columns=[
             "timestamp", "open", "high", "low", "close", "volume", "turnover"
         ])
@@ -48,6 +52,7 @@ def get_klines(symbol, interval="1hour", limit=200):
         df = df.astype(float)
         df.name = symbol
         return df
+
     except Exception as e:
         print(f"[ERREUR] get_klines {symbol} → {e}")
         return pd.DataFrame()
@@ -60,7 +65,7 @@ def convert_interval(interval):
         return int(interval.replace("hour", "")) * 3600
     if interval == "1day":
         return 86400
-    return 3600  # défaut 1h
+    return 3600  # par défaut 1h
 
 # 🔧 Convertisseur simple pour usage dans les calculs de timestamp
 def interval_to_seconds(interval):
