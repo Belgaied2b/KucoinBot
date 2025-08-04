@@ -49,11 +49,11 @@ def detect_ote_zone(df, direction):
         if direction == 'long':
             fib_618 = swing_low + 0.618 * (swing_high - swing_low)
             fib_786 = swing_low + 0.786 * (swing_high - swing_low)
-            return (round(fib_786, 4), round(fib_618, 4))  # zone entre fib786 et fib618
+            return (round(fib_786, 4), round(fib_618, 4))
         else:
             fib_1272 = swing_high - 0.272 * (swing_high - swing_low)
             fib_1618 = swing_high - 0.618 * (swing_high - swing_low)
-            return (round(fib_1272, 4), round(fib_1618, 4))  # zone entre fib1272 et fib1618
+            return (round(fib_1272, 4), round(fib_1618, 4))
     except:
         return None
 
@@ -76,3 +76,10 @@ def detect_fvg(df, direction):
         return None
     except:
         return None
+
+def is_price_in_ote_zone(df, ote_zone):
+    if ote_zone is None:
+        return False
+    current_price = df['close'].iloc[-1]
+    lower, upper = ote_zone
+    return lower <= current_price <= upper
