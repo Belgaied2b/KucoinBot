@@ -1,209 +1,97 @@
-import json
 import os
-import time
-from datetime import datetime
-import traceback
-import requests
+import json
+import ccxt
+import asyncio
+import telegram
 import pandas as pd
-from kucoin_utils import fetch_all_symbols, fetch_klines
+from kucoin.client import Trade, Market
+from kucoin.exceptions import KucoinAPIException
 from signal_analysis import analyze_signal
-from config import TOKEN, CHAT_ID
-from telegram import Bot
 
-bot = Bot(token=TOKEN)
+# 📩 Telegram
+BOT_TOKEN = os.getenv("TOKEN")
+CHAT_ID = int(os.getenv("CHAT_ID"))
+bot = telegram.Bot(token=BOT_TOKEN)
 
-# 🔁 Envoi Telegram
-async def send_signal_to_telegram(signal):
-    rejected = signal.get("rejetes", [])
-    tolerated = signal.get("toleres", [])
-    comment = signal.get("comment", "").strip()
+# 🔐 KuCoin API (chargée depuis Railway)
+API_KEY = os.getenv("KUCOIN_API_KEY")
+API_SECRET = os.getenv("KUCOIN_API_SECRET")
+API_PASSPHRASE = os.getenv("KUCOIN_API_PASSPHRASE")
 
-    msg_rejected = f"❌ Rejetés : {', '.join(rejected)}" if rejected else ""
-    msg_tolerated = f"⚠️ Tolérés : {', '.join(tolerated)}" if tolerated else ""
+# ⚙️ Trade parameters
+TRADE_AMOUNT = 20  # en USDT
+TRADE_LEVERAGE = 3
 
-    message = (
-        f"📉 {signal['symbol']} - Signal CONFIRMÉ ({signal['direction']})\n\n"
-        f"🎯 Entry : {signal['entry']:.4f}\n"
-        f"🛑 SL    : {signal['sl']:.4f}\n"
-        f"🎯 TP1   : {signal['tp1']:.4f}\n"
-        f"🎯 TP2   : {signal['tp2']:.4f}\n"
-        f"📈 R:R1  : {signal['rr1']}\n"
-        f"📈 R:R2  : {signal['rr2']}\n"
-        f"🧠 Score : {signal.get('score', '?')}/10\n"
-        f"{comment}\n"
-        f"{msg_tolerated}\n"
-        f"{msg_rejected}"
-    )
+# 📦 KuCoin clients
+market = Market(key=API_KEY, secret=API_SECRET, passphrase=API_PASSPHRASE)
+trade = Trade(key=API_KEY, secret=API_SECRET, passphrase=API_PASSPHRASE, is_sandbox=False)
 
-    print(f"[{signal['symbol']}] 📤 Envoi Telegram en cours...")
-    await bot.send_message(chat_id=CHAT_ID, text=message.strip())
+# 📁 Fichier pour éviter les doublons
+SENT_SIGNALS_FILE = "sent_signals.json"
+if not os.path.exists(SENT_SIGNALS_FILE):
+    with open(SENT_SIGNALS_FILE, "w") as f:
+        json.dump([], f)
 
-# 📂 Gestion des doublons
-sent_signals = {}
-if os.path.exists("sent_signals.json"):
+def load_sent_signals():
+    with open(SENT_SIGNALS_FILE, "r") as f:
+        return json.load(f)
+
+def save_sent_signal(symbol):
+    sent = load_sent_signals()
+    sent.append(symbol)
+    with open(SENT_SIGNALS_FILE, "w") as f:
+        json.dump(sent, f)
+
+# 🚀 Exécution d’un trade KuCoin
+def execute_trade(symbol, direction, entry_price):
     try:
-        with open("sent_signals.json", "r") as f:
-            sent_signals = json.load(f)
-        print("📂 sent_signals.json chargé")
-    except Exception as e:
-        print("⚠️ Erreur lecture sent_signals.json :", e)
-
-# ✅ Requête CoinGecko robuste
-def get_chart(url):
-    headers = {"User-Agent": "Mozilla/5.0"}
-    try:
-        time.sleep(1.5)
-        r = requests.get(url, headers=headers)
-        r.raise_for_status()
-        data = r.json()
-
-        if "prices" not in data:
-            raise ValueError("⚠️ 'prices' absent de la réponse")
-
-        timestamps = [x[0] for x in data["prices"]]
-        closes = [x[1] for x in data["prices"]]
-        volumes = (
-            [x[1] for x in data["total_volumes"]]
-            if "total_volumes" in data and len(data["total_volumes"]) == len(timestamps)
-            else [0 for _ in timestamps]
-        )
-
-        df = pd.DataFrame({
-            "timestamp": timestamps,
-            "close": closes,
-            "high": [c * 1.01 for c in closes],
-            "low": [c * 0.99 for c in closes],
-            "open": closes,
-            "volume": volumes
-        })
-
-        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
-        df = df[["timestamp", "open", "high", "low", "close", "volume"]]
-        df.set_index("timestamp", inplace=False)
-        return df
-
-    except Exception as e:
-        print(f"⚠️ Erreur get_chart ({url}): {e}")
+        side = "buy" if direction == "LONG" else "sell"
+        order = trade.create_market_order(symbol, side, TRADE_AMOUNT, leverage=TRADE_LEVERAGE)
+        return order
+    except KucoinAPIException as e:
+        print(f"❌ Erreur de trade sur {symbol} : {e}")
         return None
 
-# 📊 Chargement des données macro
-def fetch_macro_df():
-    headers = {"User-Agent": "Mozilla/5.0"}
-
-    btc_df = get_chart("https://api.coingecko.com/api/v3/coins/bitcoin/market_chart?vs_currency=usd&days=30")
-    if btc_df is None:
-        raise ValueError("Impossible de charger les données BTC")
-
+# 📊 Récupération des données OHLCV
+def get_ohlcv(symbol):
     try:
-        time.sleep(1.5)
-        response = requests.get("https://api.coingecko.com/api/v3/global", headers=headers)
-        response.raise_for_status()
-        global_data = response.json()
-
-        if "data" not in global_data or "market_cap_percentage" not in global_data["data"]:
-            raise ValueError("Champ 'data' manquant dans la réponse CoinGecko")
-
-        btc_dominance = global_data["data"]["market_cap_percentage"]["btc"] / 100
-        total_market_cap = btc_df["close"] / btc_dominance
-
-        total_df = btc_df.copy()
-        total_df["close"] = total_market_cap
-        total_df["high"] = total_market_cap * 1.01
-        total_df["low"] = total_market_cap * 0.99
-        total_df["open"] = total_market_cap
-
-        btc_d_df = btc_df.copy()
-        btc_d_df["close"] = btc_dominance
-
+        df = pd.DataFrame(market.get_kline(symbol, "1hour", 200))
+        df.columns = ["timestamp", "open", "close", "high", "low", "volume", "turnover"]
+        df["timestamp"] = pd.to_datetime(df["timestamp"], unit='ms')
+        df = df.sort_values("timestamp")
+        df.name = symbol
+        return df
     except Exception as e:
-        raise ValueError(f"Erreur parsing global_data : {e}")
-
-    return btc_df, total_df, btc_d_df
+        print(f"Erreur récupération données {symbol} : {e}")
+        return None
 
 # 🔍 Scan principal
 async def scan_and_send_signals():
-    print(f"🔁 Scan lancé à {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC\n")
-    all_symbols = fetch_all_symbols()
-
     try:
-        btc_df, total_df, btc_d_df = fetch_macro_df()
-    except Exception as e:
-        print(f"⚠️ Erreur macro fetch : {e}")
-        return
+        symbols_raw = market.get_contract_symbols()
+        usdt_perps = [s["symbol"] for s in symbols_raw if s["quoteCurrency"] == "USDT" and s["enableTrading"]]
 
-    for symbol in all_symbols:
-        if not symbol.endswith("USDTM"):
-            continue
+        sent_signals = load_sent_signals()
 
-        try:
-            df = fetch_klines(symbol)
-            if df is None or df.empty or 'timestamp' not in df.columns:
-                print(f"[{symbol}] ⚠️ Données invalides ou vides, ignoré")
+        for symbol in usdt_perps:
+            if symbol in sent_signals:
                 continue
 
-            for direction in ["long", "short"]:
-                print(f"[{symbol}] ➡️ Analyse {direction.upper()}")
+            df = get_ohlcv(symbol)
+            if df is None or df.empty:
+                continue
 
-                df_copy = df.copy()
-                df_copy.name = symbol
+            result = analyze_signal(df, direction="LONG")  # On commence avec LONG
+            if result.get("valid", False):
+                entry_price = result["entry"]
+                current_price = float(df["close"].iloc[-1])
 
-                signal = analyze_signal(
-                    df_copy,
-                    symbol=symbol,
-                    direction=direction,
-                    btc_df=btc_df,
-                    total_df=total_df,
-                    btc_d_df=btc_d_df
-                )
-
-                score = signal.get("score", 0)
-                rejected = signal.get("rejetes", [])
-                tolerated = signal.get("toleres", [])
-                comment = signal.get("comment", "")
-
-                if signal.get("valid"):
-                    suffix = "TOLÉRÉ" if signal.get("tolere_ote") else "CONFIRMÉ"
-                    signal_id = f"{symbol}-{direction.upper()}-{suffix}"
-
-                    if signal_id in sent_signals:
-                        print(f"[{symbol}] 🔁 Signal déjà envoyé ({direction.upper()}-{suffix}), ignoré")
-                        continue
-
-                    print(f"[{symbol}] ✅ Nouveau signal accepté : {direction.upper()} ({suffix})")
-                    print(f"   🧠 Score     : {score}/10")
-                    if tolerated:
-                        print(f"   ⚠️ Tolérés   : {', '.join(tolerated)}")
-                    if rejected:
-                        print(f"   ❌ Rejetés   : {', '.join(rejected)}")
-                    if comment:
-                        print(f"   💬 Commentaire : {comment.strip()}")
-                    print("-" * 60)
-
-                    await send_signal_to_telegram(signal)
-
-                    sent_signals[signal_id] = {
-                        "entry": signal["entry"],
-                        "tp": signal["tp1"],
-                        "sl": signal["sl"],
-                        "sent_at": datetime.utcnow().isoformat(),
-                        "direction": signal["direction"],
-                        "symbol": symbol
-                    }
-
-                    with open("sent_signals.json", "w") as f:
-                        json.dump(sent_signals, f, indent=2)
-
-                else:
-                    print(f"[{symbol}] ❌ Aucun signal détecté ({direction.upper()})")
-                    print(f"   🧠 Score     : {score}/10")
-                    if tolerated:
-                        print(f"   ⚠️ Tolérés   : {', '.join(tolerated)}")
-                    if rejected:
-                        print(f"   ❌ Rejetés   : {', '.join(rejected)}")
-                    if comment:
-                        print(f"   💬 Commentaire : {comment.strip()}")
-                    print("-" * 60)
-
-        except Exception as e:
-            print(f"[{symbol}] ⚠️ Erreur analyse signal : {e}")
-            traceback.print_exc()
+                if abs(current_price - entry_price) / entry_price < 0.01:  # Prix proche de l'entrée
+                    order = execute_trade(symbol, "LONG", entry_price)
+                    if order:
+                        await bot.send_message(chat_id=CHAT_ID, text=f"✅ Trade LONG exécuté sur {symbol}\nPrix : {entry_price} USDT\nMontant : {TRADE_AMOUNT} USDT\nLevier : {TRADE_LEVERAGE}x")
+                        save_sent_signal(symbol)
+                    else:
+                        print(f"❌ Trade échoué sur {symbol}")
+    except Exception as e:
+        print(f"Erreur générale dans le scan : {e}")
