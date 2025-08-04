@@ -6,16 +6,20 @@ import base64
 import json
 import requests
 
+# Récupération des variables d'environnement
 KUCOIN_API_KEY = os.getenv("KUCOIN_API_KEY")
 KUCOIN_API_SECRET = os.getenv("KUCOIN_API_SECRET")
 KUCOIN_API_PASSPHRASE = os.getenv("KUCOIN_API_PASSPHRASE")
+
+if not KUCOIN_API_KEY or not KUCOIN_API_SECRET or not KUCOIN_API_PASSPHRASE:
+    raise ValueError("❌ Variables d’environnement KuCoin manquantes. Vérifie sur Railway.")
 
 BASE_URL = "https://api-futures.kucoin.com"
 
 def generate_signature(endpoint, method, body, timestamp):
     str_to_sign = str(timestamp) + method.upper() + endpoint + (body or "")
     signature = base64.b64encode(
-        hmac.new(KUCOIN_API_SECRET.encode(), str_to_sign.encode(), hashlib.sha256).digest()
+        hmac.new(KUCOIN_API_SECRET.encode("utf-8"), str_to_sign.encode("utf-8"), hashlib.sha256).digest()
     ).decode()
     return signature
 
@@ -25,7 +29,7 @@ def get_headers(endpoint, method="POST", body=None):
     signature = generate_signature(endpoint, method, body_str, timestamp)
 
     passphrase = base64.b64encode(
-        hmac.new(KUCOIN_API_SECRET.encode(), KUCOIN_API_PASSPHRASE.encode(), hashlib.sha256).digest()
+        hmac.new(KUCOIN_API_SECRET.encode("utf-8"), KUCOIN_API_PASSPHRASE.encode("utf-8"), hashlib.sha256).digest()
     ).decode()
 
     return {
