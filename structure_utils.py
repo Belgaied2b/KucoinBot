@@ -40,3 +40,30 @@ def detect_choch(df, direction="long", lookback=20):
         return candle['close'] < prev_low and volume_ok
     else:
         return candle['close'] > prev_high and volume_ok
+
+
+def is_bos_valid(df, direction="long", lookback=20):
+    bos, _ = detect_bos_cos(df, direction, lookback)
+    return bos
+
+
+def is_cos_valid(df, direction="long", lookback=20):
+    _, cos = detect_bos_cos(df, direction, lookback)
+    return cos
+
+
+def is_choch(df, direction="long", lookback=20):
+    return detect_choch(df, direction, lookback)
+
+
+def find_structure_tp(df, direction="long", entry_price=None):
+    if df is None or len(df) < 10 or 'high' not in df.columns or 'low' not in df.columns:
+        return entry_price if entry_price is not None else 0
+
+    highs = df['high'].iloc[-20:]
+    lows = df['low'].iloc[-20:]
+
+    if direction == "long":
+        return highs.max()
+    else:
+        return lows.min()
