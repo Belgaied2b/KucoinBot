@@ -1,7 +1,19 @@
 import numpy as np
-from indicators import *
-from structure_utils import *
+from indicators import (
+    compute_atr, compute_fvg_zones, is_volume_strong,
+    is_above_ma200, is_below_ma200,
+    is_macd_positive, is_macd_negative,
+    is_bullish_divergence, is_bearish_divergence,
+    is_atr_sufficient, is_total_ok, is_btc_ok,
+    get_btc_dominance_trend
+)
+from structure_utils import (
+    is_bos_valid, is_cos_valid, is_choch,
+    is_bullish_engulfing, is_bearish_engulfing,
+    find_structure_tp
+)
 from chart_generator import generate_chart
+
 
 def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df):
     if df is None or df.empty or 'timestamp' not in df.columns:
@@ -21,6 +33,7 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df):
         # Zone OTE
         high_price = df['high'].rolling(window=50).max().iloc[-1]
         low_price = df['low'].rolling(window=50).min().iloc[-1]
+
         if direction == "long":
             ote_start = low_price + 0.618 * (high_price - low_price)
             ote_end = low_price + 0.786 * (high_price - low_price)
@@ -117,7 +130,7 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df):
             f"ℹ️ Seuls OTE, BOUGIE, DIVERGENCE peuvent être tolérés"
         )
 
-        # Si échec → on stop là
+        # Si échec
         if rejected:
             return {
                 "valid": False,
@@ -127,7 +140,7 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df):
                 "comment": comment
             }
 
-        # Génération du graphique
+        # Graphique
         generate_chart(
             df, symbol,
             ote_zone=(ote_start, ote_end),
