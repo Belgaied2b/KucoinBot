@@ -4,34 +4,37 @@ import time
 
 BASE_URL = "https://api-futures.kucoin.com"
 
-# ✅ Récupère la liste des contrats PERP (USDT-M)
-def get_perp_symbols():
-    url = f"{BASE_URL}/api/v1/contracts/active"
+# ✅ Récupère tous les symboles PERP actifs (USDTM)
+def get_all_symbols():
     try:
+        url = f"{BASE_URL}/api/v1/contracts/active"
         response = requests.get(url)
         response.raise_for_status()
-        data = response.json()
+        data = response.json().get("data", [])
         symbols = [
-            x.get("symbol")
-            for x in data.get("data", [])
-            if x.get("symbol", "").endswith("USDTM") and x.get("enableTrading", False)
+            item["symbol"]
+            for item in data
+            if item.get("symbol", "").endswith("USDTM") and item.get("enableTrading", False)
         ]
         return symbols
     except Exception as e:
-        print(f"[ERREUR] get_perp_symbols → {e}")
+        print(f"[ERREUR] get_all_symbols → {e}")
         return []
 
-# ✅ Récupère les chandeliers d'une paire
+# Alias de compatibilité
+get_perp_symbols = get_all_symbols
+
+# ✅ Récupère les chandeliers pour un symbole donné
 def get_klines(symbol, interval="1hour", limit=200):
-    url = f"{BASE_URL}/api/v1/kline/query"
-    end_time = int(time.time() * 1000)
-    params = {
-        "symbol": symbol,
-        "granularity": convert_interval(interval),
-        "from": (end_time // 1000) - limit * interval_to_seconds(interval),
-        "to": end_time // 1000,
-    }
     try:
+        end_time = int(time.time() * 1000)
+        params = {
+            "symbol": symbol,
+            "granularity": convert_interval(interval),
+            "from": (end_time // 1000) - limit * interval_to_seconds(interval),
+            "to": end_time // 1000,
+        }
+        url = f"{BASE_URL}/api/v1/kline/query"
         response = requests.get(url, params=params)
         response.raise_for_status()
         data = response.json().get("data", [])
@@ -49,7 +52,7 @@ def get_klines(symbol, interval="1hour", limit=200):
         print(f"[ERREUR] get_klines {symbol} → {e}")
         return pd.DataFrame()
 
-# 🔧 Convertit un intervalle (ex: '1hour') en secondes
+# 🔧 Convertit un intervalle texte (ex: "1hour") en secondes
 def convert_interval(interval):
     if interval.endswith("min"):
         return int(interval.replace("min", "")) * 60
@@ -57,14 +60,8 @@ def convert_interval(interval):
         return int(interval.replace("hour", "")) * 3600
     if interval == "1day":
         return 86400
-    return 3600  # défaut : 1H
+    return 3600  # défaut 1h
 
-# 🔧 Convertit un intervalle en secondes (identique à convert_interval mais séparé pour clarté)
+# 🔧 Convertisseur simple pour usage dans les calculs de timestamp
 def interval_to_seconds(interval):
-    if interval.endswith("min"):
-        return int(interval.replace("min", "")) * 60
-    if interval.endswith("hour"):
-        return int(interval.replace("hour", "")) * 3600
-    if interval == "1day":
-        return 86400
-    return 3600
+    return convert_interval(interval)
