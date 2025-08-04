@@ -1,153 +1,111 @@
 import numpy as np
 import pandas as pd
-from indicators import calculate_rsi, calculate_macd_histogram, calculate_ma, calculate_atr, calculate_fvg_zones, detect_divergence
+from indicators import (
+    calculate_ma,
+    calculate_macd_histogram,
+    calculate_rsi,
+    calculate_atr,
+    detect_fvg,
+    is_price_in_ote_zone,
+    detect_divergence,
+)
 from structure_utils import detect_bos, detect_cos, detect_choch
-from chart_generator import generate_chart
+from kucoin_utils import get_klines
+import os
+import datetime
 
-# --- Configuration ---
+TRADE_AMOUNT = 20  # 💰 Montant par trade
+TRADE_LEVERAGE = 3  # 📈 Levier
 
-LEVERAGE = 3
-TRADE_AMOUNT = 20
+def confirm_4h_trend(symbol, direction):
+    df_4h = get_klines(symbol, interval='4hour', limit=100)
+    if df_4h is None or len(df_4h) < 50:
+        return False
 
-# --- Analyse d'un signal ---
+    df_4h['ma200'] = calculate_ma(df_4h['close'], 200)
+    last_close = df_4h['close'].iloc[-1]
+    ma200 = df_4h['ma200'].iloc[-1]
 
-def analyze_signal(df, df_4h=None, symbol="", direction="long", context_macro=None):
+    if direction == 'long':
+        return last_close > ma200
+    else:
+        return last_close < ma200
+
+def analyze_signal(df, symbol, direction):
     if df is None or df.empty or 'timestamp' not in df.columns:
         return None
 
-    df = df.copy()
-
-    # INDICATEURS
-    df["rsi"] = calculate_rsi(df)
-    df["macd_histogram"] = calculate_macd_histogram(df)
-    df["ma200"] = calculate_ma(df)
-    df["atr"] = calculate_atr(df)
-
-    fvg_zone = calculate_fvg_zones(df, direction)
+    df['ma200'] = calculate_ma(df['close'], 200)
+    df['macd_histogram'] = calculate_macd_histogram(df)
+    df['rsi'] = calculate_rsi(df['close'])
+    df['atr'] = calculate_atr(df)
+    fvg_zone = detect_fvg(df, direction)
+    ote_zone = is_price_in_ote_zone(df, direction)
     bos = detect_bos(df, direction)
     cos = detect_cos(df, direction)
     choch = detect_choch(df, direction)
     divergence = detect_divergence(df, direction)
 
-    # ZONE OTE (Optimal Trade Entry)
-    last_price = df["close"].iloc[-1]
-    high = df["high"].rolling(50).max().iloc[-1]
-    low = df["low"].rolling(50).min().iloc[-1]
+    confirmation_4h = confirm_4h_trend(symbol, direction)
+    current_price = df['close'].iloc[-1]
+    volume_ok = df['volume'].iloc[-1] > df['volume'].rolling(20).mean().iloc[-1] * 1.2
+    macd_ok = df['macd_histogram'].iloc[-1] > 0 if direction == 'long' else df['macd_histogram'].iloc[-1] < 0
+    ma_ok = current_price > df['ma200'].iloc[-1] if direction == 'long' else current_price < df['ma200'].iloc[-1]
+    in_ote = ote_zone is not None and ote_zone[0] <= current_price <= ote_zone[1]
+    in_fvg = fvg_zone is not None and fvg_zone[0] <= current_price <= fvg_zone[1]
 
-    if direction == "long":
-        fib_618 = low + 0.618 * (high - low)
-        fib_786 = low + 0.786 * (high - low)
-        in_ote = fib_618 <= last_price <= fib_786
-    else:
-        fib_127 = high - 0.272 * (high - low)
-        fib_1618 = high - 0.618 * (high - low)
-        in_ote = fib_127 >= last_price >= fib_1618
+    # SL/TP dynamiques via ATR
+    atr = df['atr'].iloc[-1]
+    sl = current_price - atr if direction == 'long' else current_price + atr
+    tp = current_price + 2 * atr if direction == 'long' else current_price - 2 * atr
 
-    ote_zone = (fib_618, fib_786) if direction == "long" else (fib_127, fib_1618)
+    # Score pondéré
+    score = 0
+    logs = []
+    if fvg_zone: score += 1
+    else: logs.append("❌ FVG")
 
-    # Volume
-    volume_mean = df["volume"].rolling(20).mean().iloc[-1]
-    volume_last = df["volume"].iloc[-1]
-    volume_valid = volume_last > 1.2 * volume_mean
+    if in_ote: score += 1
+    else: logs.append("⚠️ OTE")
 
-    # Bougie de confirmation
-    if direction == "long":
-        candle_valid = df["close"].iloc[-1] > df["open"].iloc[-1]
-    else:
-        candle_valid = df["close"].iloc[-1] < df["open"].iloc[-1]
+    if ma_ok: score += 1
+    else: logs.append("❌ MA200")
 
-    # MACRO : TOTAL et BTC.D
-    macro_valid = True
-    macro_comment = ""
-    if context_macro:
-        total = context_macro.get("TOTAL")
-        btcd = context_macro.get("BTC.D")
-        if direction == "long" and (not total or total["trend"] != "up"):
-            macro_valid = False
-            macro_comment = "❌ TOTAL baissier"
-        elif direction == "short" and (not total or total["trend"] != "down"):
-            macro_valid = False
-            macro_comment = "❌ TOTAL haussier"
+    if macd_ok: score += 1
+    else: logs.append("❌ MACD")
 
-    # Confirmation 4H
-    confirmation_4h = True
-    if df_4h is not None and not df_4h.empty:
-        df_4h["ma200"] = calculate_ma(df_4h)
-        df_4h["volume"] = df_4h["volume"]
-        price_4h = df_4h["close"].iloc[-1]
-        ma200_4h = df_4h["ma200"].iloc[-1]
-        volume_4h = df_4h["volume"].iloc[-1]
-        volume_mean_4h = df_4h["volume"].rolling(20).mean().iloc[-1]
+    if bos: score += 1
+    else: logs.append("❌ BOS")
 
-        if direction == "long":
-            confirmation_4h = price_4h > ma200_4h and volume_4h > volume_mean_4h
-        else:
-            confirmation_4h = price_4h < ma200_4h and volume_4h > volume_mean_4h
+    if cos: score += 1
+    else: logs.append("❌ COS")
 
-    # --- Score pondéré ---
-    valid = []
-    toleres = []
-    rejetes = []
+    if choch: score += 1
+    else: logs.append("❌ CHoCH")
 
-    def check(val, name, tolerable=False):
-        if val:
-            valid.append(name)
-        elif tolerable:
-            toleres.append(name)
-        else:
-            rejetes.append(name)
+    if divergence: score += 1
+    else: logs.append("⚠️ Divergence")
 
-    check(bos, "BOS")
-    check(cos, "COS")
-    check(choch, "CHoCH")
-    check(divergence, "DIVERGENCE", tolerable=True)
-    check(volume_valid, "VOLUME")
-    check(candle_valid, "BOUGIE", tolerable=True)
-    check(macro_valid, "MACRO")
-    check(confirmation_4h, "CONFIRMATION 4H")
-    check(in_ote, "OTE", tolerable=True)
-    check(fvg_zone is not None, "FVG")
+    if volume_ok: score += 1
+    else: logs.append("❌ Volume")
 
-    score = len(valid) + 0.5 * len(toleres)
+    if confirmation_4h: score += 1
+    else: logs.append("❌ 4H")
 
-    if score < 8 or len(rejetes) > 0:
-        return {
-            "valid": False,
-            "score": score,
-            "rejetes": rejetes,
-            "toleres": toleres,
-            "comment": f"⛔ Rejeté : {', '.join(rejetes)}"
-        }
+    if score < 8 or not in_ote or not in_fvg:
+        print(f"[{symbol.upper()} - {direction.upper()}] ❌ Rejeté | Score: {score}/10 | {', '.join(logs)}")
+        return None
 
-    # SL = ATR * 1.5
-    sl = last_price - df["atr"].iloc[-1] * 1.5 if direction == "long" else last_price + df["atr"].iloc[-1] * 1.5
-    rr = 2
-    tp = last_price + (last_price - sl) * rr if direction == "long" else last_price - (sl - last_price) * rr
-
-    # Chart (désactivé si inutilisé)
-    # generate_chart(df, symbol, ote_zone, fvg_zone, last_price, sl, tp, direction)
-
-    comment = f"""
-📈 *{symbol}* — *{direction.upper()}*
-🎯 Entrée : `{last_price:.4f}`
-🎯 SL : `{sl:.4f}`
-🎯 TP : `{tp:.4f}` (R:R {rr})
-⚙️ Levier : {LEVERAGE}x
-💰 Taille : {TRADE_AMOUNT} USDT
-
-❌ Rejetés : {', '.join(rejetes) if rejetes else 'Aucun'}
-⚠️ Tolérés : {', '.join(toleres) if toleres else 'Aucun'}
-"""
+    comment = f"{symbol.upper()} ({direction.upper()})\nScore: {score}/10\nEntrée idéale : {round(current_price, 4)}\nSL: {round(sl, 4)}\nTP: {round(tp, 4)}\n{', '.join(logs)}"
+    print(f"[{symbol.upper()} - {direction.upper()}] ✅ Signal VALIDE | Score: {score}/10")
 
     return {
-        "valid": True,
-        "score": score,
-        "entry": last_price,
-        "sl": sl,
-        "tp": tp,
-        "leverage": LEVERAGE,
-        "amount": TRADE_AMOUNT,
-        "direction": direction,
         "symbol": symbol,
-        "comment": comment
+        "direction": direction,
+        "entry": round(current_price, 4),
+        "sl": round(sl, 4),
+        "tp": round(tp, 4),
+        "comment": comment,
+        "amount": TRADE_AMOUNT,
+        "leverage": TRADE_LEVERAGE,
     }
