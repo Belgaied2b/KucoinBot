@@ -11,6 +11,10 @@ KUCOIN_API_KEY = os.getenv("KUCOIN_API_KEY")
 KUCOIN_API_SECRET = os.getenv("KUCOIN_API_SECRET")
 KUCOIN_API_PASSPHRASE = os.getenv("KUCOIN_API_PASSPHRASE")
 
+# 🔍 Debug (à désactiver une fois tout fonctionne)
+print("🔐 Vérification des variables API...")
+print(f"API_KEY ok: {bool(KUCOIN_API_KEY)}, API_SECRET ok: {bool(KUCOIN_API_SECRET)}, PASSPHRASE ok: {bool(KUCOIN_API_PASSPHRASE)}")
+
 if not KUCOIN_API_KEY or not KUCOIN_API_SECRET or not KUCOIN_API_PASSPHRASE:
     raise ValueError("❌ Variables d’environnement KuCoin manquantes. Vérifie sur Railway.")
 
@@ -53,20 +57,26 @@ def place_order(symbol, side, entry_price):
             "leverage": 3,
             "type": "limit",
             "price": str(entry_price),
-            "size": str(round(20 / entry_price, 3)),
+            "size": str(round(20 / float(entry_price), 3)),  # 🔧 sécurité float
             "timeInForce": "GTC"
         }
 
         headers = get_headers(endpoint, "POST", order_data)
         response = requests.post(url, headers=headers, json=order_data)
+
+        if response.status_code != 200:
+            print(f"❌ Erreur HTTP KuCoin {symbol} : {response.status_code} - {response.text}")
+            return None
+
         data = response.json()
 
         if data.get("code") == "200000":
             print(f"✅ Ordre LIMIT placé ({side.upper()}) sur {symbol} @ {entry_price}")
-            return data["data"]["orderId"]
+            return data["data"].get("orderId")
         else:
             print(f"❌ Échec ordre KuCoin {symbol}: {data}")
             return None
+
     except Exception as e:
         print(f"❌ Exception place_order : {e}")
         return None
