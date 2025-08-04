@@ -1,78 +1,62 @@
-import pandas as pd
 import numpy as np
+import pandas as pd
 
-def compute_rsi(series, period=14):
-    if series is None or len(series) < period:
-        return pd.Series([np.nan] * len(series), index=series.index)
+def is_above_ma200(df):
+    ma200 = df['close'].rolling(window=200).mean()
+    return df['close'].iloc[-1] > ma200.iloc[-1]
 
-    delta = series.diff()
-    gain = delta.where(delta > 0, 0.0)
-    loss = -delta.where(delta < 0, 0.0)
+def is_below_ma200(df):
+    ma200 = df['close'].rolling(window=200).mean()
+    return df['close'].iloc[-1] < ma200.iloc[-1]
 
-    avg_gain = gain.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
+def calculate_atr(df, period=14):
+    df['H-L'] = df['high'] - df['low']
+    df['H-PC'] = abs(df['high'] - df['close'].shift(1))
+    df['L-PC'] = abs(df['low'] - df['close'].shift(1))
+    tr = df[['H-L', 'H-PC', 'L-PC']].max(axis=1)
+    atr = tr.rolling(window=period).mean()
+    return atr.iloc[-1] if not atr.empty else None
 
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    rsi = 100 - (100 / (1 + rs))
-    return rsi.fillna(0)
+def calculate_macd_histogram(df, short_period=12, long_period=26, signal_period=9):
+    exp1 = df['close'].ewm(span=short_period, adjust=False).mean()
+    exp2 = df['close'].ewm(span=long_period, adjust=False).mean()
+    macd = exp1 - exp2
+    signal = macd.ewm(span=signal_period, adjust=False).mean()
+    hist = macd - signal
+    return hist
 
+def detect_ote_zone(df, direction):
+    try:
+        swing_low = df['low'].iloc[-30:-1].min()
+        swing_high = df['high'].iloc[-30:-1].max()
 
-def compute_macd_histogram(series, fast=12, slow=26, signal=9):
-    if series is None or len(series) < slow + signal:
-        return pd.Series([np.nan] * len(series), index=series.index)
+        if direction == 'long':
+            fib_618 = swing_low + 0.618 * (swing_high - swing_low)
+            fib_786 = swing_low + 0.786 * (swing_high - swing_low)
+            return (round(fib_786, 4), round(fib_618, 4))  # zone entre fib786 et fib618
+        else:
+            fib_1272 = swing_high - 0.272 * (swing_high - swing_low)
+            fib_1618 = swing_high - 0.618 * (swing_high - swing_low)
+            return (round(fib_1272, 4), round(fib_1618, 4))  # zone entre fib1272 et fib1618
+    except:
+        return None
 
-    ema_fast = series.ewm(span=fast, min_periods=fast, adjust=False).mean()
-    ema_slow = series.ewm(span=slow, min_periods=slow, adjust=False).mean()
+def detect_fvg(df, direction):
+    try:
+        for i in range(len(df) - 3, 1, -1):
+            prev_low = df['low'].iloc[i - 1]
+            curr_high = df['high'].iloc[i]
+            next_low = df['low'].iloc[i + 1]
+            prev_high = df['high'].iloc[i - 1]
+            curr_low = df['low'].iloc[i]
+            next_high = df['high'].iloc[i + 1]
 
-    macd_line = ema_fast - ema_slow
-    signal_line = macd_line.ewm(span=signal, min_periods=signal, adjust=False).mean()
-    histogram = macd_line - signal_line
-
-    return histogram.fillna(0)
-
-
-def compute_ma(df, period=200):
-    if df is None or 'close' not in df.columns or len(df) < period:
-        return pd.Series([np.nan] * len(df), index=df.index)
-    return df['close'].rolling(window=period, min_periods=period).mean()
-
-
-def compute_atr(df, period=14):
-    if df is None or len(df) < period or not all(x in df.columns for x in ['high', 'low', 'close']):
-        return pd.Series([np.nan] * len(df), index=df.index)
-
-    prev_close = df['close'].shift(1)
-    tr1 = df['high'] - df['low']
-    tr2 = (df['high'] - prev_close).abs()
-    tr3 = (df['low'] - prev_close).abs()
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-
-    atr = tr.rolling(window=period, min_periods=period).mean()
-    return atr.bfill()
-
-
-def compute_fvg_zones(df, lookback=30):
-    if df is None or len(df) < 3 or not all(k in df.columns for k in ['high', 'low']):
-        return pd.DataFrame({'fvg_upper': [np.nan]*len(df), 'fvg_lower': [np.nan]*len(df)}, index=df.index)
-
-    fvg_upper = [np.nan] * len(df)
-    fvg_lower = [np.nan] * len(df)
-
-    for i in range(2, len(df)):
-        prev2 = df.iloc[i - 2]
-        prev1 = df.iloc[i - 1]
-        curr = df.iloc[i]
-
-        # FVG haussier
-        if prev1['high'] < curr['low']:
-            fvg_upper[i] = curr['low']
-            fvg_lower[i] = prev1['high']
-        # FVG baissier
-        elif prev1['low'] > curr['high']:
-            fvg_upper[i] = prev1['low']
-            fvg_lower[i] = curr['high']
-
-    return pd.DataFrame({
-        'fvg_upper': fvg_upper,
-        'fvg_lower': fvg_lower
-    }, index=df.index)
+            if direction == 'long':
+                if curr_low > prev_high and curr_low > next_high:
+                    return (round(prev_high, 4), round(curr_low, 4))
+            else:
+                if curr_high < prev_low and curr_high < next_low:
+                    return (round(curr_high, 4), round(prev_low, 4))
+        return None
+    except:
+        return None
