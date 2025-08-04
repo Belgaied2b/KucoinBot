@@ -9,7 +9,7 @@ from kucoin_utils import fetch_all_symbols, fetch_klines
 from signal_analysis import analyze_signal
 from config import TOKEN, CHAT_ID
 from telegram import Bot
-from kucoin_trader import place_order  # ✅ ajouté ici
+from kucoin_trader import place_order  # ✅ exécution réelle
 
 bot = Bot(token=TOKEN)
 
@@ -182,13 +182,14 @@ async def scan_and_send_signals():
 
                     await send_signal_to_telegram(signal)
 
-                    # ✅ Execution trade réel
-                    entry = signal["entry"]
-                    side = "buy" if direction == "long" else "sell"
-                    place_order(symbol, side, entry)
+                    # ✅ Exécution LIMIT uniquement si OTE toléré
+                    if signal.get("tolere_ote"):
+                        entry = signal["entry"]
+                        side = "buy" if direction == "long" else "sell"
+                        place_order(symbol, side, entry)  # Limit dans la zone OTE
 
                     sent_signals[signal_id] = {
-                        "entry": entry,
+                        "entry": signal["entry"],
                         "tp": signal["tp1"],
                         "sl": signal["sl"],
                         "sent_at": datetime.utcnow().isoformat(),
