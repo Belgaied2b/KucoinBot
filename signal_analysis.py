@@ -9,6 +9,41 @@ from indicators import (
 from structure_utils import detect_bos_cos, detect_choch
 from chart_generator import generate_chart
 
+def find_structure_tp(df, direction, entry):
+    levels = []
+    if direction == "long":
+        for i in range(len(df) - 2, 0, -1):
+            if df['high'].iloc[i] > df['high'].iloc[i-1] and df['high'].iloc[i] > df['high'].iloc[i+1]:
+                levels.append(df['high'].iloc[i])
+        levels = sorted(set([lvl for lvl in levels if lvl > entry]))
+        return levels[0] if levels else entry + (entry * 0.03)
+    else:
+        for i in range(len(df) - 2, 0, -1):
+            if df['low'].iloc[i] < df['low'].iloc[i-1] and df['low'].iloc[i] < df['low'].iloc[i+1]:
+                levels.append(df['low'].iloc[i])
+        levels = sorted(set([lvl for lvl in levels if lvl < entry]), reverse=True)
+        return levels[0] if levels else entry - (entry * 0.03)
+
+def detect_real_divergence(series, indicator, direction):
+    extrema = []
+    for i in range(2, len(series) - 2):
+        if direction == "long":
+            if series[i] < series[i - 1] and series[i] < series[i + 1]:
+                extrema.append((i, series[i], indicator[i]))
+        else:
+            if series[i] > series[i - 1] and series[i] > series[i + 1]:
+                extrema.append((i, series[i], indicator[i]))
+
+    if len(extrema) >= 2:
+        price1, ind1 = extrema[-2][1], extrema[-2][2]
+        price2, ind2 = extrema[-1][1], extrema[-1][2]
+
+        if direction == "long" and price2 < price1 and ind2 > ind1:
+            return True
+        elif direction == "short" and price2 > price1 and ind2 < ind1:
+            return True
+    return False
+
 def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df):
     if df is None or df.empty or 'timestamp' not in df.columns:
         return {
@@ -32,9 +67,9 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df):
             ote_end = low_price + 0.786 * (high_price - low_price)
             in_ote = ote_start <= last_close <= ote_end
         else:
-            ote_start = high_price - 0.618 * (high_price - low_price)
-            ote_end = high_price - 0.786 * (high_price - low_price)
-            in_ote = ote_end <= last_close <= ote_start
+            ote_start = high_price - 0.786 * (high_price - low_price)
+            ote_end = high_price - 0.618 * (high_price - low_price)
+            in_ote = ote_start >= last_close >= ote_end
 
         # FVG
         fvg_df = compute_fvg_zones(df)
@@ -42,12 +77,10 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df):
         fvg_lower = fvg_df['fvg_lower'].iloc[-1]
         in_fvg = False
         if not np.isnan(fvg_upper) and not np.isnan(fvg_lower):
-            if direction == "long" and fvg_upper < last_close:
+            if direction == "long" and fvg_lower < fvg_upper:
                 in_fvg = fvg_lower <= last_close <= fvg_upper
-            elif direction == "short" and fvg_lower > last_close:
+            elif direction == "short" and fvg_upper < fvg_lower:
                 in_fvg = fvg_upper <= last_close <= fvg_lower
-        else:
-            in_fvg = False  # protection si FVG manquant
 
         # Volume
         avg_volume = df['volume'].rolling(window=20).mean().iloc[-1]
@@ -62,20 +95,16 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df):
         macd_hist = compute_macd_histogram(df['close'])
         macd_ok = macd_hist.iloc[-1] > 0 if direction == "long" else macd_hist.iloc[-1] < 0
 
-        # Divergences
+        # RSI divergence
         rsi = compute_rsi(df['close'])
-        rsi_div = rsi.iloc[-3] > rsi.iloc[-2] < rsi.iloc[-1] if direction == "long" else rsi.iloc[-3] < rsi.iloc[-2] > rsi.iloc[-1]
-        macd_div = macd_hist.iloc[-3] > macd_hist.iloc[-2] < macd_hist.iloc[-1] if direction == "long" else macd_hist.iloc[-3] < macd_hist.iloc[-2] > macd_hist.iloc[-1]
+        rsi_div = detect_real_divergence(df['close'], rsi, direction)
+        macd_div = detect_real_divergence(df['close'], macd_hist, direction)
         divergence_ok = rsi_div and macd_div
 
         # BOS / COS
         bos_ok, cos = detect_bos_cos(df, direction)
         candle = df.iloc[-1]
-        breakout_confirm = (
-            (candle['close'] > candle['open'] and candle['volume'] > avg_volume)
-            if direction == "long"
-            else (candle['close'] < candle['open'] and candle['volume'] > avg_volume)
-        )
+        breakout_confirm = (candle['close'] > candle['open'] and candle['volume'] > avg_volume) if direction == "long" else (candle['close'] < candle['open'] and candle['volume'] > avg_volume)
         bos_ok = bos_ok and breakout_confirm
         cos_ok = cos and breakout_confirm
 
@@ -86,8 +115,7 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df):
         body = abs(df['close'].iloc[-1] - df['open'].iloc[-1])
         wick = df['high'].iloc[-1] - df['low'].iloc[-1]
         body_ratio = body / wick if wick > 0 else 0
-        avg_body = abs(df['close'] - df['open']).rolling(window=20).mean().iloc[-1]
-        candle_ok = body_ratio > 0.5 and body > avg_body and last_volume > avg_volume
+        candle_ok = body_ratio > 0.5 and last_volume > avg_volume
 
         # ATR
         atr = compute_atr(df)
@@ -95,8 +123,8 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df):
         atr_ok = atr_value > 0.005 * last_close
 
         # Macro TOTAL / BTC
-        total_slope = total_df['close'].diff().rolling(window=8).mean().iloc[-1]
-        btc_slope = btc_df['close'].diff().rolling(window=8).mean().iloc[-1]
+        total_slope = total_df['close'].diff().rolling(window=5).mean().iloc[-1]
+        btc_slope = btc_df['close'].diff().rolling(window=5).mean().iloc[-1]
         market_ok = total_slope > 0 if direction == "long" else total_slope < 0
         btc_ok = btc_slope > 0 if direction == "long" else btc_slope < 0
 
@@ -107,12 +135,12 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df):
         # SL / TP dynamiques via structure
         if direction == "long":
             sl = min(df['low'].iloc[-10:]) - atr_value * 0.5
-            tp1 = last_close + abs(last_close - sl) * 1.5
-            tp2 = last_close + abs(last_close - sl) * 3
+            tp1 = find_structure_tp(df, direction, last_close)
         else:
             sl = max(df['high'].iloc[-10:]) + atr_value * 0.5
-            tp1 = last_close - abs(last_close - sl) * 1.5
-            tp2 = last_close - abs(last_close - sl) * 3
+            tp1 = find_structure_tp(df, direction, last_close)
+
+        tp2 = last_close + (tp1 - last_close) * 2 if direction == "long" else last_close - (last_close - tp1) * 2
 
         rr1 = round(abs(tp1 - last_close) / abs(sl - last_close), 1)
         rr2 = round(abs(tp2 - last_close) / abs(sl - last_close), 1)
@@ -148,8 +176,7 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df):
             "BOUGIE": 0.5,
             "TOTAL": 1.0,
             "BTC": 1.0,
-            "DIVERGENCE": 0.5,
-            "ATR": 1.0
+            "DIVERGENCE": 0.5
         }
 
         score_total = sum(poids.values())
@@ -161,7 +188,10 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df):
             f"📌 Zone idéale d'entrée :\n"
             f"OTE = {round(ote_start, 4)} → {round(ote_end, 4)}\n"
             f"FVG = {round(fvg_lower, 4)} → {round(fvg_upper, 4)}\n\n"
-            f"📊 BTC Dominance : {btc_d_status}"
+            f"📊 BTC Dominance : {btc_d_status}\n"
+            f"📈 Score : {score}/10\n"
+            f"❌ Rejetés : {', '.join(rejected) if rejected else 'aucun'}\n"
+            f"⚠️ Tolérés : {', '.join(tolerated) if tolerated else 'aucun'}"
         )
 
         if rejected:
@@ -170,26 +200,7 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df):
                 "score": score,
                 "rejetes": rejected,
                 "toleres": tolerated,
-                "comment": comment,
-                "debug": {
-                    "last_close": last_close,
-                    "ote": [ote_start, ote_end],
-                    "in_ote": in_ote,
-                    "in_fvg": in_fvg,
-                    "volume": [last_volume, avg_volume],
-                    "ma200": ma200.iloc[-1],
-                    "macd": macd_hist.iloc[-1],
-                    "atr": atr_value,
-                    "sl": sl,
-                    "tp1": tp1,
-                    "tp2": tp2,
-                    "bos": bos_ok,
-                    "cos": cos_ok,
-                    "choch": choch_ok,
-                    "candle_ratio": body_ratio,
-                    "market_total": total_slope,
-                    "market_btc": btc_slope
-                }
+                "comment": comment
             }
 
         # ✅ Génération graphique
