@@ -37,7 +37,6 @@ def detect_real_divergence(series, indicator, direction):
     if len(extrema) >= 2:
         price1, ind1 = extrema[-2][1], extrema[-2][2]
         price2, ind2 = extrema[-1][1], extrema[-1][2]
-
         if direction == "long" and price2 < price1 and ind2 > ind1:
             return True
         elif direction == "short" and price2 > price1 and ind2 < ind1:
@@ -59,7 +58,7 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df):
         df.sort_index(inplace=True)
         last_close = df['close'].iloc[-1]
 
-        # OTE
+        # OTE zone
         high_price = df['high'].rolling(window=50).max().iloc[-1]
         low_price = df['low'].rolling(window=50).min().iloc[-1]
         if direction == "long":
@@ -91,17 +90,17 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df):
         ma200 = compute_ma(df)
         ma_ok = last_close > ma200.iloc[-1] if direction == "long" else last_close < ma200.iloc[-1]
 
-        # MACD
+        # MACD histogramme
         macd_hist = compute_macd_histogram(df['close'])
         macd_ok = macd_hist.iloc[-1] > 0 if direction == "long" else macd_hist.iloc[-1] < 0
 
-        # RSI divergence
+        # Divergences
         rsi = compute_rsi(df['close'])
         rsi_div = detect_real_divergence(df['close'], rsi, direction)
         macd_div = detect_real_divergence(df['close'], macd_hist, direction)
         divergence_ok = rsi_div and macd_div
 
-        # BOS / COS
+        # BOS / COS avec confirmation bougie
         bos_ok, cos = detect_bos_cos(df, direction)
         candle = df.iloc[-1]
         breakout_confirm = (candle['close'] > candle['open'] and candle['volume'] > avg_volume) if direction == "long" else (candle['close'] < candle['open'] and candle['volume'] > avg_volume)
@@ -111,7 +110,7 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df):
         # CHoCH
         choch_ok = detect_choch(df, direction)
 
-        # Bougie forte
+        # Bougie puissante
         body = abs(df['close'].iloc[-1] - df['open'].iloc[-1])
         wick = df['high'].iloc[-1] - df['low'].iloc[-1]
         body_ratio = body / wick if wick > 0 else 0
@@ -128,11 +127,11 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df):
         market_ok = total_slope > 0 if direction == "long" else total_slope < 0
         btc_ok = btc_slope > 0 if direction == "long" else btc_slope < 0
 
-        # BTC.D
+        # BTC Dominance (info)
         btc_d_change = btc_d_df['close'].diff().rolling(window=5).mean().iloc[-1]
         btc_d_status = "HAUSSIER" if btc_d_change > 0 else "BAISSIER" if btc_d_change < 0 else "STAGNANT"
 
-        # SL / TP dynamiques via structure
+        # SL/TP dynamiques via structure
         if direction == "long":
             sl = min(df['low'].iloc[-10:]) - atr_value * 0.5
             tp1 = find_structure_tp(df, direction, last_close)
@@ -141,11 +140,10 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df):
             tp1 = find_structure_tp(df, direction, last_close)
 
         tp2 = last_close + (tp1 - last_close) * 2 if direction == "long" else last_close - (last_close - tp1) * 2
-
         rr1 = round(abs(tp1 - last_close) / abs(sl - last_close), 1)
         rr2 = round(abs(tp2 - last_close) / abs(sl - last_close), 1)
 
-        # Validation stricte + tolérance intelligente
+        # Validation stricte + tolérance experte
         rejected = []
         tolerated = []
 
@@ -183,7 +181,6 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df):
         score_obtenu = sum(v for k, v in poids.items() if k not in rejected)
         score = round((score_obtenu / score_total) * 10, 1)
 
-        # Commentaire
         comment = (
             f"📌 Zone idéale d'entrée :\n"
             f"OTE = {round(ote_start, 4)} → {round(ote_end, 4)}\n"
@@ -203,7 +200,6 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df):
                 "comment": comment
             }
 
-        # ✅ Génération graphique
         generate_chart(
             df,
             symbol,
