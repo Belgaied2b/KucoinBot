@@ -16,7 +16,7 @@ from kucoin_utils import get_klines
 TRADE_AMOUNT = 20     # 💰 Montant par trade
 TRADE_LEVERAGE = 3    # 📈 Levier
 
-
+# 🔍 Confirmation de tendance sur timeframe 4H
 def confirm_4h_trend(symbol, direction):
     df_4h = get_klines(symbol, interval='4hour', limit=100)
     if df_4h is None or len(df_4h) < 50:
@@ -26,7 +26,7 @@ def confirm_4h_trend(symbol, direction):
     ma200 = df_4h['ma_200'].iloc[-1]
     return last_close > ma200 if direction == 'long' else last_close < ma200
 
-
+# 📈 Analyse complète du signal
 def analyze_signal(df, df_4h, direction):
     if df is None or df.empty or 'timestamp' not in df.columns:
         return None
@@ -60,7 +60,6 @@ def analyze_signal(df, df_4h, direction):
     # --- Score pondéré expert ---
     score = 0
     total_possible = 0
-    logs = []
     rejetes = []
     toleres = []
     valides = []
@@ -97,7 +96,7 @@ def analyze_signal(df, df_4h, direction):
     else:
         rejetes.append("VOLUME")
 
-    # BOS / COS / CHoCH (1 pt chacun)
+    # BOS, COS, CHoCH (1 pt chacun)
     for name, valid in [("BOS", bos), ("COS", cos), ("CHoCH", choch)]:
         total_possible += 1
         if valid:
@@ -122,14 +121,14 @@ def analyze_signal(df, df_4h, direction):
     else:
         rejetes.append("CONFIRM_4H")
 
-    # OTE = toléré, max -0.5 pt
+    # OTE = tolérable uniquement
     if not in_ote:
         score -= 0.5
         toleres.append("OTE")
     else:
         valides.append("OTE")
 
-    # --- Vérification finale ---
+    # --- Message résumé ---
     comment = (
         f"✅ {symbol.upper()} ({direction.upper()})\n"
         f"🎯 Entrée : {round(current_price, 4)}\n"
@@ -141,6 +140,7 @@ def analyze_signal(df, df_4h, direction):
 
     print(f"[{symbol.upper()} - {direction.upper()}] Score: {round(score, 1)}/{round(total_possible, 1)} | ❌ {rejetes} ⚠️ {toleres}")
 
+    # --- Condition stricte d'envoi ---
     if score < 8 or not in_fvg:
         return {
             "valide": False,
