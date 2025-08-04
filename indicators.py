@@ -1,6 +1,10 @@
 import numpy as np
 import pandas as pd
 
+def calculate_ma(df, period=200):
+    df[f"ma_{period}"] = df['close'].rolling(window=period).mean()
+    return df
+
 def is_above_ma200(df):
     ma200 = df['close'].rolling(window=200).mean()
     return df['close'].iloc[-1] > ma200.iloc[-1]
