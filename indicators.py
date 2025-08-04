@@ -4,7 +4,7 @@ import numpy as np
 
 def compute_rsi(series, period=14):
     if series is None or len(series) < period:
-        return pd.Series(np.nan, index=series.index if series is not None else None)
+        return pd.Series([np.nan] * len(series), index=series.index if series is not None else None)
 
     delta = series.diff()
     gain = delta.where(delta > 0, 0.0)
@@ -20,7 +20,7 @@ def compute_rsi(series, period=14):
 
 def compute_macd_histogram(series, fast=12, slow=26, signal=9):
     if series is None or len(series) < slow + signal:
-        return pd.Series(np.nan, index=series.index if series is not None else None)
+        return pd.Series([np.nan] * len(series), index=series.index if series is not None else None)
 
     ema_fast = series.ewm(span=fast, min_periods=fast, adjust=False).mean()
     ema_slow = series.ewm(span=slow, min_periods=slow, adjust=False).mean()
@@ -34,7 +34,7 @@ def compute_macd_histogram(series, fast=12, slow=26, signal=9):
 
 def compute_ma(df, period=200, method='sma'):
     if df is None or 'close' not in df.columns or len(df) < period:
-        return pd.Series(np.nan, index=df.index if df is not None else None)
+        return pd.Series([np.nan] * len(df), index=df.index if df is not None else None)
 
     if method == 'ema':
         return df['close'].ewm(span=period, adjust=False).mean()
@@ -43,7 +43,7 @@ def compute_ma(df, period=200, method='sma'):
 
 def compute_atr(df, period=14):
     if df is None or len(df) < period or not all(x in df.columns for x in ['high', 'low', 'close']):
-        return pd.Series(np.nan, index=df.index if df is not None else None)
+        return pd.Series([np.nan] * len(df), index=df.index if df is not None else None)
 
     prev_close = df['close'].shift(1)
     tr1 = df['high'] - df['low']
@@ -103,3 +103,20 @@ def is_below_ma200(df):
         return False
     ma200 = compute_ma(df, period=200)
     return df['close'].iloc[-1] < ma200.iloc[-1]
+
+
+def is_macd_positive(df):
+    macd_hist = compute_macd_histogram(df['close'])
+    return macd_hist.iloc[-1] > 0
+
+
+def is_macd_negative(df):
+    macd_hist = compute_macd_histogram(df['close'])
+    return macd_hist.iloc[-1] < 0
+
+
+def is_atr_sufficient(df, min_ratio=0.005):
+    atr = compute_atr(df)
+    if atr.isna().all():
+        return False
+    return atr.iloc[-1] > df['close'].iloc[-1] * min_ratio
