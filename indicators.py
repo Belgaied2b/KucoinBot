@@ -4,7 +4,7 @@ import numpy as np
 
 def compute_rsi(series, period=14):
     if series is None or len(series) < period:
-        return pd.Series(np.nan, index=series.index if series is not None else None)
+        return pd.Series([np.nan] * len(series), index=series.index if series is not None else None)
 
     delta = series.diff()
     gain = delta.where(delta > 0, 0.0)
@@ -20,7 +20,7 @@ def compute_rsi(series, period=14):
 
 def compute_macd_histogram(series, fast=12, slow=26, signal=9):
     if series is None or len(series) < slow + signal:
-        return pd.Series(np.nan, index=series.index if series is not None else None)
+        return pd.Series([np.nan] * len(series), index=series.index if series is not None else None)
 
     ema_fast = series.ewm(span=fast, min_periods=fast, adjust=False).mean()
     ema_slow = series.ewm(span=slow, min_periods=slow, adjust=False).mean()
@@ -34,7 +34,7 @@ def compute_macd_histogram(series, fast=12, slow=26, signal=9):
 
 def compute_ma(df, period=200, method='sma'):
     if df is None or 'close' not in df.columns or len(df) < period:
-        return pd.Series(np.nan, index=df.index if df is not None else None)
+        return pd.Series([np.nan] * len(df), index=df.index if df is not None else None)
 
     if method == 'ema':
         return df['close'].ewm(span=period, adjust=False).mean()
@@ -43,7 +43,7 @@ def compute_ma(df, period=200, method='sma'):
 
 def compute_atr(df, period=14):
     if df is None or len(df) < period or not all(x in df.columns for x in ['high', 'low', 'close']):
-        return pd.Series(np.nan, index=df.index if df is not None else None)
+        return pd.Series([np.nan] * len(df), index=df.index if df is not None else None)
 
     prev_close = df['close'].shift(1)
     tr1 = df['high'] - df['low']
@@ -80,3 +80,15 @@ def compute_fvg_zones(df, lookback=30):
         'fvg_upper': fvg_upper,
         'fvg_lower': fvg_lower
     }, index=df.index)
+
+
+def is_volume_strong(df, window=20, multiplier=1.2):
+    """
+    Vérifie si le volume actuel est significativement supérieur à la moyenne mobile du volume.
+    """
+    if df is None or 'volume' not in df.columns or len(df) < window:
+        return False
+
+    avg_volume = df['volume'].rolling(window=window, min_periods=1).mean().iloc[-1]
+    current_volume = df['volume'].iloc[-1]
+    return current_volume > avg_volume * multiplier
