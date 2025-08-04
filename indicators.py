@@ -83,3 +83,17 @@ def is_price_in_ote_zone(df, ote_zone):
     current_price = df['close'].iloc[-1]
     lower, upper = ote_zone
     return lower <= current_price <= upper
+
+def detect_divergence(df):
+    try:
+        rsi = calculate_rsi(df, period=14)
+        lows = df['low']
+        highs = df['high']
+
+        if lows.iloc[-2] < lows.iloc[-4] and rsi.iloc[-2] > rsi.iloc[-4]:
+            return 'bullish'
+        if highs.iloc[-2] > highs.iloc[-4] and rsi.iloc[-2] < rsi.iloc[-4]:
+            return 'bearish'
+        return None
+    except:
+        return None
