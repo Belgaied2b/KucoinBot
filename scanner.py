@@ -1,87 +1,59 @@
-import os
-import json
-import logging
-import asyncio
-import telegram
-from kucoin_utils import get_perp_symbols, get_klines
+import time
+import requests
+import pandas as pd
+from kucoin_utils import get_klines, get_all_symbols
 from signal_analysis import analyze_signal
+from telegram import Bot
+import os
 
-# 📡 Telegram
-BOT_TOKEN = os.getenv("TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")
-bot = telegram.Bot(token=BOT_TOKEN)
+bot = Bot(token=os.getenv("TOKEN"))
+chat_id = os.getenv("CHAT_ID")
 
-# 🧠 Mémoire des signaux envoyés
-SENT_SIGNALS_FILE = "sent_signals.json"
-if not os.path.exists(SENT_SIGNALS_FILE):
-    with open(SENT_SIGNALS_FILE, "w") as f:
-        json.dump([], f)
 
-def load_sent_signals():
-    with open(SENT_SIGNALS_FILE, "r") as f:
-        return json.load(f)
+def send_telegram_message(message):
+    try:
+        bot.send_message(chat_id=chat_id, text=message)
+    except Exception as e:
+        print(f"Erreur envoi Telegram : {e}")
 
-def save_sent_signal(symbol, direction):
-    sent_signals = load_sent_signals()
-    sent_signals.append(f"{symbol}_{direction}")
-    with open(SENT_SIGNALS_FILE, "w") as f:
-        json.dump(sent_signals, f)
 
-def already_sent(symbol, direction):
-    return f"{symbol}_{direction}" in load_sent_signals()
+def scan_and_send_signals():
+    print("🔁 Scan démarré...\n")
 
-# 🚀 Fonction principale
-async def scan_and_send_signals():
-    logging.info("🔍 Scan en cours...")
-    symbols = get_perp_symbols()
+    all_symbols = get_all_symbols()
+    if not all_symbols:
+        print("❌ Impossible de récupérer les symboles.")
+        return
 
-    for symbol in symbols:
-        df_1h = get_klines(symbol, interval="1hour", limit=200)
-        df_4h = get_klines(symbol, interval="4hour", limit=100)
-
-        if df_1h is None or df_1h.empty or df_4h is None or df_4h.empty:
-            logging.info(f"❌ {symbol} → Données manquantes, ignoré.")
-            continue
-
-        df_1h.name = symbol
-
-        for direction in ["long", "short"]:
-            result = analyze_signal(df_1h, df_4h, direction)
-
-            if not result:
-                logging.info(f"❌ {symbol} ({direction.upper()}) → Analyse échouée ou data incomplète.")
+    for symbol in all_symbols:
+        try:
+            df = get_klines(symbol, interval='1hour', limit=150)
+            if df is None or df.empty:
+                print(f"⛔ Données manquantes pour {symbol}")
                 continue
 
-            score = result.get("score", "?")
-            valide = result.get("valide", False)
-            comment = result.get("commentaire", "")
-            rejetes = result.get("rejetes", [])
-            toleres = result.get("toleres", [])
+            df.name = symbol  # Pour analyse
+            df_4h = get_klines(symbol, interval='4hour', limit=100)
 
-            if not valide:
-                logging.info(f"⛔ {symbol} ({direction.upper()}) REJETÉ")
-                logging.info(f"     ↳ Score : {score}/10")
-                logging.info(f"     ↳ ❌ Rejetés : {', '.join(rejetes) if rejetes else 'Aucun'}")
-                logging.info(f"     ↳ ⚠️ Tolérés : {', '.join(toleres) if toleres else 'Aucun'}")
-                logging.info(f"     ↳ Détail : {comment}")
-                continue
+            for direction in ['long', 'short']:
+                result = analyze_signal(df, df_4h, direction)
 
-            if already_sent(symbol, direction):
-                logging.info(f"⏭️ Signal déjà envoyé pour {symbol} ({direction.upper()})")
-                continue
+                if result is None:
+                    print(f"[{symbol.upper()} - {direction.upper()}] ⛔ Analyse impossible (Données incomplètes)\n")
+                    continue
 
-            message = (
-                f"💥 Signal {direction.upper()} détecté sur {symbol}\n\n"
-                f"{comment}\n\n"
-                f"🎯 Entrée : {result['entry']:.4f}\n"
-                f"⛔ SL : {result['sl']:.4f}\n"
-                f"✅ TP : {result['tp']:.4f}\n"
-                f"📊 Score qualité : {score}/10"
-            )
+                # ✅ Log clair dans tous les cas
+                score = result.get("score", 0)
+                rejetes = ", ".join(result.get("rejetes", [])) or "Aucun"
+                toleres = ", ".join(result.get("toleres", [])) or "Aucun"
 
-            try:
-                await bot.send_message(chat_id=CHAT_ID, text=message)
-                logging.info(f"📩 Signal envoyé pour {symbol} ({direction.upper()})")
-                save_sent_signal(symbol, direction)
-            except Exception as e:
-                logging.error(f"❌ Erreur envoi Telegram {symbol} : {e}")
+                if result["valide"]:
+                    print(f"[{symbol.upper()} - {direction.upper()}] ✅ VALIDE | Score: {score}/10 | ❌ {rejetes} | ⚠️ {toleres}\n")
+                    send_telegram_message(result["commentaire"])
+                else:
+                    print(f"[{symbol.upper()} - {direction.upper()}] ❌ REJETÉ | Score: {score}/10 | ❌ {rejetes} | ⚠️ {toleres}\n")
+
+        except Exception as e:
+            print(f"⛔ Erreur avec {symbol}: {e}")
+
+    print("✅ Scan terminé.\n")
