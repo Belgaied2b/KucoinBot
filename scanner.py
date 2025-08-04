@@ -43,19 +43,27 @@ async def scan_and_send_signals():
             logging.info(f"❌ {symbol} → Données manquantes, ignoré.")
             continue
 
-        df_1h.name = symbol  # Utile pour logs ou graphique
+        df_1h.name = symbol
 
         for direction in ["long", "short"]:
             result = analyze_signal(df_1h, df_4h, direction)
 
             if not result:
-                logging.info(f"❌ {symbol} ({direction.upper()}) → Analyse ignorée ou data vide.")
+                logging.info(f"❌ {symbol} ({direction.upper()}) → Analyse échouée ou data incomplète.")
                 continue
 
-            if not result.get("valide"):
-                score = result.get("score", 0)
-                comment = result.get("commentaire", "Aucun commentaire")
-                logging.info(f"⛔ {symbol} ({direction.upper()}) → Rejeté | Score: {score}/10 | {comment}")
+            score = result.get("score", "?")
+            valide = result.get("valide", False)
+            comment = result.get("commentaire", "")
+            rejetes = result.get("rejetes", [])
+            toleres = result.get("toleres", [])
+
+            if not valide:
+                logging.info(f"⛔ {symbol} ({direction.upper()}) REJETÉ")
+                logging.info(f"     ↳ Score : {score}/10")
+                logging.info(f"     ↳ ❌ Rejetés : {', '.join(rejetes) if rejetes else 'Aucun'}")
+                logging.info(f"     ↳ ⚠️ Tolérés : {', '.join(toleres) if toleres else 'Aucun'}")
+                logging.info(f"     ↳ Détail : {comment}")
                 continue
 
             if already_sent(symbol, direction):
@@ -64,11 +72,11 @@ async def scan_and_send_signals():
 
             message = (
                 f"💥 Signal {direction.upper()} détecté sur {symbol}\n\n"
-                f"{result['commentaire']}\n\n"
+                f"{comment}\n\n"
                 f"🎯 Entrée : {result['entry']:.4f}\n"
                 f"⛔ SL : {result['sl']:.4f}\n"
                 f"✅ TP : {result['tp']:.4f}\n"
-                f"📊 Score qualité : {result['score']}/10"
+                f"📊 Score qualité : {score}/10"
             )
 
             try:
