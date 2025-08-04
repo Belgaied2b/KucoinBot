@@ -7,9 +7,9 @@ import json
 import requests
 
 # Récupération des variables d'environnement
-KUCOIN_API_KEY = os.getenv("KUCOIN_API_KEY")
-KUCOIN_API_SECRET = os.getenv("KUCOIN_API_SECRET")
-KUCOIN_API_PASSPHRASE = os.getenv("KUCOIN_API_PASSPHRASE")
+KUCOIN_API_KEY = "6890cfb4dffe710001e6edb0"
+KUCOIN_API_SECRET = "889e4492-c2ff-4c9d-9136-64afe6d5e780"
+KUCOIN_API_PASSPHRASE = "247096"
 
 # 🔍 Debug (à désactiver une fois tout fonctionne)
 print("🔐 Vérification des variables API...")
