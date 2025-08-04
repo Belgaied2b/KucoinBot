@@ -12,11 +12,9 @@ from indicators import (
 )
 from structure_utils import detect_bos, detect_cos, detect_choch
 from kucoin_utils import get_klines
-import os
-import datetime
 
-TRADE_AMOUNT = 20  # 💰 Montant par trade
-TRADE_LEVERAGE = 3  # 📈 Levier
+TRADE_AMOUNT = 20     # 💰 Montant par trade
+TRADE_LEVERAGE = 3    # 📈 Levier
 
 def confirm_4h_trend(symbol, direction):
     df_4h = get_klines(symbol, interval='4hour', limit=100)
@@ -27,10 +25,7 @@ def confirm_4h_trend(symbol, direction):
     last_close = df_4h['close'].iloc[-1]
     ma200 = df_4h['ma_200'].iloc[-1]
 
-    if direction == 'long':
-        return last_close > ma200
-    else:
-        return last_close < ma200
+    return last_close > ma200 if direction == 'long' else last_close < ma200
 
 def analyze_signal(df, symbol, direction):
     if df is None or df.empty or 'timestamp' not in df.columns:
@@ -48,8 +43,8 @@ def analyze_signal(df, symbol, direction):
     cos = detect_cos(df, direction)
     choch = detect_choch(df, direction)
     divergence = detect_divergence(df)
-
     confirmation_4h = confirm_4h_trend(symbol, direction)
+
     current_price = df['close'].iloc[-1]
     volume_ok = df['volume'].iloc[-1] > df['volume'].rolling(20).mean().iloc[-1] * 1.2
     macd_ok = df['macd_histogram'].iloc[-1] > 0 if direction == 'long' else df['macd_histogram'].iloc[-1] < 0
@@ -65,6 +60,7 @@ def analyze_signal(df, symbol, direction):
     # Score pondéré
     score = 0
     logs = []
+
     if fvg_zone: score += 1
     else: logs.append("❌ FVG")
 
@@ -99,16 +95,26 @@ def analyze_signal(df, symbol, direction):
         print(f"[{symbol.upper()} - {direction.upper()}] ❌ Rejeté | Score: {score}/10 | {', '.join(logs)}")
         return None
 
-    comment = f"{symbol.upper()} ({direction.upper()})\nScore: {score}/10\nEntrée idéale : {round(current_price, 4)}\nSL: {round(sl, 4)}\nTP: {round(tp, 4)}\n{', '.join(logs)}"
+    comment = (
+        f"{symbol.upper()} ({direction.upper()})\n"
+        f"Score: {score}/10\n"
+        f"Entrée idéale : {round(current_price, 4)}\n"
+        f"SL: {round(sl, 4)}\n"
+        f"TP: {round(tp, 4)}\n"
+        f"{', '.join(logs)}"
+    )
+
     print(f"[{symbol.upper()} - {direction.upper()}] ✅ Signal VALIDE | Score: {score}/10")
 
     return {
+        "valide": True,
         "symbol": symbol,
         "direction": direction,
         "entry": round(current_price, 4),
         "sl": round(sl, 4),
         "tp": round(tp, 4),
-        "comment": comment,
+        "commentaire": comment,
+        "score": score,
         "amount": TRADE_AMOUNT,
         "leverage": TRADE_LEVERAGE,
     }
