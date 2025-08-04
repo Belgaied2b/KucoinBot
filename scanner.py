@@ -37,21 +37,20 @@ async def scan_and_send_signals():
 
     for symbol in symbols:
         df_1h = get_klines(symbol, interval="1hour", limit=200)
-        df_4h = get_klines(symbol, interval="4hour", limit=100)
-
-        if df_1h.empty or df_4h.empty:
+        if df_1h is None or df_1h.empty or "timestamp" not in df_1h.columns:
+            logging.warning(f"⚠️ Données manquantes pour {symbol}")
             continue
 
-        df_1h.name = symbol  # Utile pour les logs ou graphiques
+        df_1h.name = symbol  # Pour les logs ou graphiques
 
         for direction in ["long", "short"]:
-            result = analyze_signal(df_1h, df_4h, direction)
+            result = analyze_signal(df_1h, symbol, direction)
 
             if not result or not result.get("valide"):
                 continue
 
             if already_sent(symbol, direction):
-                logging.info(f"⏭️ Signal déjà envoyé pour {symbol} ({direction})")
+                logging.info(f"⏭️ Déjà envoyé : {symbol} ({direction})")
                 continue
 
             message = (
@@ -65,7 +64,7 @@ async def scan_and_send_signals():
 
             try:
                 await bot.send_message(chat_id=CHAT_ID, text=message)
-                logging.info(f"📩 Signal envoyé pour {symbol} ({direction})")
+                logging.info(f"📩 Signal envoyé : {symbol} ({direction})")
                 save_sent_signal(symbol, direction)
             except Exception as e:
-                logging.error(f"❌ Erreur envoi Telegram {symbol} : {e}")
+                logging.error(f"❌ Erreur Telegram sur {symbol} : {e}")
