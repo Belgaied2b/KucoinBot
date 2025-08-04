@@ -6,6 +6,12 @@ import telegram
 from kucoin_utils import get_perp_symbols, get_klines
 from signal_analysis import analyze_signal
 
+# ✅ Configuration des logs pour Railway
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
+
 # 📡 Telegram
 BOT_TOKEN = os.getenv("TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
@@ -37,20 +43,23 @@ async def scan_and_send_signals():
 
     for symbol in symbols:
         df_1h = get_klines(symbol, interval="1hour", limit=200)
-        if df_1h is None or df_1h.empty or "timestamp" not in df_1h.columns:
-            logging.warning(f"⚠️ Données manquantes pour {symbol}")
+        df_4h = get_klines(symbol, interval="4hour", limit=100)
+
+        if df_1h is None or df_1h.empty or df_4h is None or df_4h.empty:
+            logging.warning(f"⚠️ Données manquantes pour {symbol}, skip.")
             continue
 
-        df_1h.name = symbol  # Pour les logs ou graphiques
+        df_1h.name = symbol  # Pour logs et graphiques
 
         for direction in ["long", "short"]:
-            result = analyze_signal(df_1h, symbol, direction)
+            result = analyze_signal(df_1h, df_4h, direction)
 
             if not result or not result.get("valide"):
+                logging.info(f"⛔ {symbol} ({direction}) rejeté ou non valide.")
                 continue
 
             if already_sent(symbol, direction):
-                logging.info(f"⏭️ Déjà envoyé : {symbol} ({direction})")
+                logging.info(f"⏭️ Signal déjà envoyé pour {symbol} ({direction})")
                 continue
 
             message = (
@@ -64,7 +73,7 @@ async def scan_and_send_signals():
 
             try:
                 await bot.send_message(chat_id=CHAT_ID, text=message)
-                logging.info(f"📩 Signal envoyé : {symbol} ({direction})")
+                logging.info(f"📩 Signal envoyé pour {symbol} ({direction})")
                 save_sent_signal(symbol, direction)
             except Exception as e:
-                logging.error(f"❌ Erreur Telegram sur {symbol} : {e}")
+                logging.error(f"❌ Erreur envoi Telegram {symbol} : {e}")
