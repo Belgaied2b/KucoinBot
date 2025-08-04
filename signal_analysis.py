@@ -16,6 +16,7 @@ from kucoin_utils import get_klines
 TRADE_AMOUNT = 20     # 💰 Montant par trade
 TRADE_LEVERAGE = 3    # 📈 Levier
 
+
 def confirm_4h_trend(symbol, direction):
     df_4h = get_klines(symbol, interval='4hour', limit=100)
     if df_4h is None or len(df_4h) < 50:
@@ -26,6 +27,7 @@ def confirm_4h_trend(symbol, direction):
     ma200 = df_4h['ma_200'].iloc[-1]
 
     return last_close > ma200 if direction == 'long' else last_close < ma200
+
 
 def analyze_signal(df, symbol, direction):
     if df is None or df.empty or 'timestamp' not in df.columns:
@@ -58,54 +60,80 @@ def analyze_signal(df, symbol, direction):
     sl = current_price - atr if direction == 'long' else current_price + atr
     tp = current_price + 2 * atr if direction == 'long' else current_price - 2 * atr
 
-    # Score pondéré
+    # --- Score pondéré expert ---
     score = 0
+    total_possible = 0
     logs = []
 
-    if fvg_zone: score += 1
-    else: logs.append("❌ FVG")
+    # FVG (2 pts)
+    total_possible += 2
+    if in_fvg:
+        score += 2
+    else:
+        logs.append("❌ FVG")
 
-    if in_ote: score += 1
-    else: logs.append("⚠️ OTE")
+    # MA200 (2 pts)
+    total_possible += 2
+    if ma_ok:
+        score += 2
+    else:
+        logs.append("❌ MA200")
 
-    if ma_ok: score += 1
-    else: logs.append("❌ MA200")
+    # MACD (1.5 pts)
+    total_possible += 1.5
+    if macd_ok:
+        score += 1.5
+    else:
+        logs.append("❌ MACD")
 
-    if macd_ok: score += 1
-    else: logs.append("❌ MACD")
+    # Volume (1.5 pts)
+    total_possible += 1.5
+    if volume_ok:
+        score += 1.5
+    else:
+        logs.append("❌ Volume")
 
-    if bos: score += 1
-    else: logs.append("❌ BOS")
+    # BOS / COS / CHoCH (1 pt chacun)
+    for name, valid in [("BOS", bos), ("COS", cos), ("CHoCH", choch)]:
+        total_possible += 1
+        if valid:
+            score += 1
+        else:
+            logs.append(f"❌ {name}")
 
-    if cos: score += 1
-    else: logs.append("❌ COS")
+    # Divergence (0.5 pt)
+    total_possible += 0.5
+    if divergence:
+        score += 0.5
+    else:
+        logs.append("⚠️ Divergence")
 
-    if choch: score += 1
-    else: logs.append("❌ CHoCH")
+    # Confirmation 4H (1.5 pts)
+    total_possible += 1.5
+    if confirmation_4h:
+        score += 1.5
+    else:
+        logs.append("❌ 4H")
 
-    if divergence: score += 1
-    else: logs.append("⚠️ Divergence")
+    # OTE = toléré, max -0.5 pt
+    if not in_ote:
+        logs.append("⚠️ Hors OTE")
+        score -= 0.5
 
-    if volume_ok: score += 1
-    else: logs.append("❌ Volume")
-
-    if confirmation_4h: score += 1
-    else: logs.append("❌ 4H")
-
-    if score < 8 or not in_ote or not in_fvg:
-        print(f"[{symbol.upper()} - {direction.upper()}] ❌ Rejeté | Score: {score}/10 | {', '.join(logs)}")
+    # --- Seuil d’acceptation : score ≥ 8 ---
+    if score < 8 or not in_fvg:
+        print(f"[{symbol.upper()} - {direction.upper()}] ❌ Rejeté | Score: {round(score, 1)}/{round(total_possible, 1)} | {', '.join(logs)}")
         return None
 
     comment = (
         f"{symbol.upper()} ({direction.upper()})\n"
-        f"Score: {score}/10\n"
+        f"Score: {round(score, 1)}/{round(total_possible, 1)}\n"
         f"Entrée idéale : {round(current_price, 4)}\n"
-        f"SL: {round(sl, 4)}\n"
-        f"TP: {round(tp, 4)}\n"
+        f"SL: {round(sl, 4)} | TP: {round(tp, 4)}\n"
         f"{', '.join(logs)}"
     )
 
-    print(f"[{symbol.upper()} - {direction.upper()}] ✅ Signal VALIDE | Score: {score}/10")
+    print(f"[{symbol.upper()} - {direction.upper()}] ✅ Signal VALIDE | Score: {round(score, 1)}/{round(total_possible, 1)}")
 
     return {
         "valide": True,
@@ -115,7 +143,7 @@ def analyze_signal(df, symbol, direction):
         "sl": round(sl, 4),
         "tp": round(tp, 4),
         "commentaire": comment,
-        "score": score,
+        "score": round(score, 1),
         "amount": TRADE_AMOUNT,
         "leverage": TRADE_LEVERAGE,
     }
