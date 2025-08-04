@@ -47,8 +47,9 @@ def get_klines(symbol, interval="1hour", limit=200):
         df = pd.DataFrame(data, columns=[
             "timestamp", "open", "high", "low", "close", "volume", "turnover"
         ])
-        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
+        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="s")  # ✅ correct
         df.set_index("timestamp", inplace=True)
+        df.sort_index(inplace=True)  # ✅ propre
         df = df.astype(float)
         df.name = symbol
         return df
