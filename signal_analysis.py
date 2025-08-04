@@ -21,20 +21,17 @@ def confirm_4h_trend(symbol, direction):
     df_4h = get_klines(symbol, interval='4hour', limit=100)
     if df_4h is None or len(df_4h) < 50:
         return False
-
     df_4h = calculate_ma(df_4h, 200)
     last_close = df_4h['close'].iloc[-1]
     ma200 = df_4h['ma_200'].iloc[-1]
-
     return last_close > ma200 if direction == 'long' else last_close < ma200
 
 
-def analyze_signal(df, symbol, direction):
+def analyze_signal(df, df_4h, direction):
     if df is None or df.empty or 'timestamp' not in df.columns:
         return None
-    if 'volume' not in df.columns or df['volume'].isnull().any():
-        return None
 
+    symbol = df.name
     df = calculate_ma(df, 200)
     df['macd_histogram'] = calculate_macd_histogram(df)
     df['rsi'] = calculate_rsi(df)
@@ -64,76 +61,96 @@ def analyze_signal(df, symbol, direction):
     score = 0
     total_possible = 0
     logs = []
+    rejetes = []
+    toleres = []
+    valides = []
 
     # FVG (2 pts)
     total_possible += 2
     if in_fvg:
         score += 2
+        valides.append("FVG")
     else:
-        logs.append("❌ FVG")
+        rejetes.append("FVG")
 
     # MA200 (2 pts)
     total_possible += 2
     if ma_ok:
         score += 2
+        valides.append("MA200")
     else:
-        logs.append("❌ MA200")
+        rejetes.append("MA200")
 
     # MACD (1.5 pts)
     total_possible += 1.5
     if macd_ok:
         score += 1.5
+        valides.append("MACD")
     else:
-        logs.append("❌ MACD")
+        rejetes.append("MACD")
 
     # Volume (1.5 pts)
     total_possible += 1.5
     if volume_ok:
         score += 1.5
+        valides.append("VOLUME")
     else:
-        logs.append("❌ Volume")
+        rejetes.append("VOLUME")
 
     # BOS / COS / CHoCH (1 pt chacun)
     for name, valid in [("BOS", bos), ("COS", cos), ("CHoCH", choch)]:
         total_possible += 1
         if valid:
             score += 1
+            valides.append(name)
         else:
-            logs.append(f"❌ {name}")
+            rejetes.append(name)
 
     # Divergence (0.5 pt)
     total_possible += 0.5
     if divergence:
         score += 0.5
+        valides.append("DIVERGENCE")
     else:
-        logs.append("⚠️ Divergence")
+        toleres.append("DIVERGENCE")
 
     # Confirmation 4H (1.5 pts)
     total_possible += 1.5
     if confirmation_4h:
         score += 1.5
+        valides.append("CONFIRM_4H")
     else:
-        logs.append("❌ 4H")
+        rejetes.append("CONFIRM_4H")
 
     # OTE = toléré, max -0.5 pt
     if not in_ote:
-        logs.append("⚠️ Hors OTE")
         score -= 0.5
+        toleres.append("OTE")
+    else:
+        valides.append("OTE")
 
-    # --- Seuil d’acceptation : score ≥ 8 ---
-    if score < 8 or not in_fvg:
-        print(f"[{symbol.upper()} - {direction.upper()}] ❌ Rejeté | Score: {round(score, 1)}/{round(total_possible, 1)} | {', '.join(logs)}")
-        return None
-
+    # --- Vérification finale ---
     comment = (
-        f"{symbol.upper()} ({direction.upper()})\n"
-        f"Score: {round(score, 1)}/{round(total_possible, 1)}\n"
-        f"Entrée idéale : {round(current_price, 4)}\n"
-        f"SL: {round(sl, 4)} | TP: {round(tp, 4)}\n"
-        f"{', '.join(logs)}"
+        f"✅ {symbol.upper()} ({direction.upper()})\n"
+        f"🎯 Entrée : {round(current_price, 4)}\n"
+        f"⛔ SL : {round(sl, 4)} | ✅ TP : {round(tp, 4)}\n"
+        f"📊 Score : {round(score, 1)}/{round(total_possible, 1)}\n"
+        f"❌ Rejetés : {', '.join(rejetes) if rejetes else 'Aucun'}\n"
+        f"⚠️ Tolérés : {', '.join(toleres) if toleres else 'Aucun'}"
     )
 
-    print(f"[{symbol.upper()} - {direction.upper()}] ✅ Signal VALIDE | Score: {round(score, 1)}/{round(total_possible, 1)}")
+    print(f"[{symbol.upper()} - {direction.upper()}] Score: {round(score, 1)}/{round(total_possible, 1)} | ❌ {rejetes} ⚠️ {toleres}")
+
+    if score < 8 or not in_fvg:
+        return {
+            "valide": False,
+            "symbol": symbol,
+            "direction": direction,
+            "score": round(score, 1),
+            "rejetes": rejetes,
+            "toleres": toleres,
+            "commentaire": comment,
+        }
 
     return {
         "valide": True,
@@ -146,4 +163,6 @@ def analyze_signal(df, symbol, direction):
         "score": round(score, 1),
         "amount": TRADE_AMOUNT,
         "leverage": TRADE_LEVERAGE,
+        "rejetes": rejetes,
+        "toleres": toleres,
     }
