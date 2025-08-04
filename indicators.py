@@ -19,7 +19,7 @@ def calculate_atr(df, period=14):
     df['L-PC'] = abs(df['low'] - df['close'].shift(1))
     tr = df[['H-L', 'H-PC', 'L-PC']].max(axis=1)
     atr = tr.rolling(window=period).mean()
-    return atr.iloc[-1] if not atr.empty else None
+    return atr
 
 def calculate_macd_histogram(df, short_period=12, long_period=26, signal_period=9):
     exp1 = df['close'].ewm(span=short_period, adjust=False).mean()
@@ -31,8 +31,8 @@ def calculate_macd_histogram(df, short_period=12, long_period=26, signal_period=
 
 def calculate_rsi(df, period=14):
     delta = df['close'].diff()
-    gain = delta.where(delta > 0, 0.0)
-    loss = -delta.where(delta < 0, 0.0)
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
 
     avg_gain = gain.rolling(window=period, min_periods=period).mean()
     avg_loss = loss.rolling(window=period, min_periods=period).mean()
@@ -49,12 +49,12 @@ def detect_ote_zone(df, direction):
         if direction == 'long':
             fib_618 = swing_low + 0.618 * (swing_high - swing_low)
             fib_786 = swing_low + 0.786 * (swing_high - swing_low)
-            return (round(fib_786, 4), round(fib_618, 4))
+            return (round(fib_786, 4), round(fib_618, 4))  # Zone descendante
         else:
             fib_1272 = swing_high - 0.272 * (swing_high - swing_low)
             fib_1618 = swing_high - 0.618 * (swing_high - swing_low)
-            return (round(fib_1272, 4), round(fib_1618, 4))
-    except:
+            return (round(fib_1618, 4), round(fib_1272, 4))  # Zone montante
+    except Exception:
         return None
 
 def detect_fvg(df, direction):
@@ -74,14 +74,14 @@ def detect_fvg(df, direction):
                 if curr_high < prev_low and curr_high < next_low:
                     return (round(curr_high, 4), round(prev_low, 4))
         return None
-    except:
+    except Exception:
         return None
 
 def is_price_in_ote_zone(df, ote_zone):
     if ote_zone is None:
         return False
     current_price = df['close'].iloc[-1]
-    lower, upper = ote_zone
+    lower, upper = sorted(ote_zone)
     return lower <= current_price <= upper
 
 def detect_divergence(df):
@@ -90,10 +90,14 @@ def detect_divergence(df):
         lows = df['low']
         highs = df['high']
 
+        # Vérifie les index avant d’accéder aux positions
+        if len(df) < 5 or rsi.isna().iloc[-2] or rsi.isna().iloc[-4]:
+            return None
+
         if lows.iloc[-2] < lows.iloc[-4] and rsi.iloc[-2] > rsi.iloc[-4]:
             return 'bullish'
         if highs.iloc[-2] > highs.iloc[-4] and rsi.iloc[-2] < rsi.iloc[-4]:
             return 'bearish'
         return None
-    except:
+    except Exception:
         return None
