@@ -1,5 +1,3 @@
-# kucoin_trader.py
-
 import os
 import time
 import hmac
