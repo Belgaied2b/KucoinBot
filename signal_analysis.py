@@ -33,7 +33,6 @@ def detect_real_divergence(series, indicator, direction):
         else:
             if series[i] > series[i - 1] and series[i] > series[i + 1]:
                 extrema.append((i, series[i], indicator[i]))
-
     if len(extrema) >= 2:
         price1, ind1 = extrema[-2][1], extrema[-2][2]
         price2, ind2 = extrema[-1][1], extrema[-1][2]
@@ -188,7 +187,8 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df):
             f"📊 BTC Dominance : {btc_d_status}\n"
             f"📈 Score : {score}/10\n"
             f"❌ Rejetés : {', '.join(rejected) if rejected else 'aucun'}\n"
-            f"⚠️ Tolérés : {', '.join(tolerated) if tolerated else 'aucun'}"
+            f"⚠️ Tolérés : {', '.join(tolerated) if tolerated else 'aucun'}\n\n"
+            f"ℹ️ Seuls OTE, BOUGIE, DIVERGENCE peuvent être tolérés"
         )
 
         if rejected:
