@@ -57,7 +57,7 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df):
         btc_ok = is_btc_ok(btc_df)
         btc_d_status = get_btc_dominance_trend(btc_d_df)
 
-        # SL / TP basés sur entrée fictive (dans OTE)
+        # SL / TP dynamiques basés sur entrée fictive
         atr = compute_atr(df)
         atr_value = atr.iloc[-1]
         if direction == "long":
@@ -93,7 +93,6 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df):
 
         tolerated = [t for t in tolerated if t in tolerable]
         rejected += [t for t in tolerated if t not in tolerable]
-        tolerated = [t for t in tolerated if t in tolerable]
 
         # SCORE pondéré
         poids = {
@@ -118,7 +117,7 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df):
             f"ℹ️ Seuls OTE, BOUGIE, DIVERGENCE peuvent être tolérés"
         )
 
-        # Si échec → stop ici
+        # Si échec → on stop là
         if rejected:
             return {
                 "valid": False,
@@ -157,10 +156,12 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df):
         }
 
     except Exception as e:
+        import traceback
+        print("Erreur dans analyze_signal:\n", traceback.format_exc())
         return {
             "valid": False,
             "score": 0,
             "rejetes": ["erreur"],
             "toleres": [],
-            "comment": str(e)
+            "comment": f"{type(e).__name__} : {str(e)}"
         }
