@@ -30,6 +30,8 @@ def confirm_4h_trend(symbol, direction):
 def analyze_signal(df, symbol, direction):
     if df is None or df.empty or 'timestamp' not in df.columns:
         return None
+    if 'volume' not in df.columns or df['volume'].isnull().any():
+        return None
 
     df = calculate_ma(df, 200)
     df['macd_histogram'] = calculate_macd_histogram(df)
@@ -52,7 +54,6 @@ def analyze_signal(df, symbol, direction):
     in_ote = is_price_in_ote_zone(df, ote_zone)
     in_fvg = fvg_zone is not None and fvg_zone[0] <= current_price <= fvg_zone[1]
 
-    # SL/TP dynamiques via ATR
     atr = df['atr'].iloc[-1]
     sl = current_price - atr if direction == 'long' else current_price + atr
     tp = current_price + 2 * atr if direction == 'long' else current_price - 2 * atr
