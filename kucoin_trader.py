@@ -51,8 +51,8 @@ def place_order(symbol, side, entry_price):
         endpoint = "/api/v1/orders"
         url = BASE_URL + endpoint
 
-        # Taille en contrats (20 USDT de risque par défaut)
-        size = round(20 / float(entry_price), 3)
+        # Taille en contrats (entier requis par l’API)
+        size = int(20 / float(entry_price))
 
         order_data = {
             "clientOid": str(int(time.time() * 1000)),
@@ -60,7 +60,7 @@ def place_order(symbol, side, entry_price):
             "side": side.lower(),        # "buy" ou "sell"
             "leverage": 3,
             "type": "market",            # Ordre MARKET
-            "size": str(size)            # en contrats
+            "size": str(size)            # en contrats (string entière)
         }
 
         headers = get_headers(endpoint, "POST", order_data)
