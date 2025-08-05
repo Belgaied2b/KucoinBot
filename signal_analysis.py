@@ -106,8 +106,9 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df):
         rejected += [t for t in tolerated if t not in tolerable]
 
         # 🎯 R:R minimum
-        if rr1 < 1.5:
+if rr1 < 1.5:
     tolerated.append("RR")
+
     
         # 📊 Score
         poids = {
