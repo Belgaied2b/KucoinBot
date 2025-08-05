@@ -82,8 +82,8 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df):
         rr1 = round(abs(tp1 - entry_price) / abs(entry_price - sl), 1)
         rr2 = round(abs(tp2 - entry_price) / abs(entry_price - sl), 1)
 
-        # ⚖️ Tolérances
-        tolerable = {"OTE", "BOUGIE", "DIVERGENCE", "RR"}
+        # ⚖️ Tolérances PROVISOIRES ÉTENDUES
+        tolerable = {"OTE", "BOUGIE", "DIVERGENCE", "FVG", "CHoCH", "COS", "RR", "BTC"}
         tolerated = []
         rejected = []
 
@@ -93,7 +93,7 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df):
         if not bos_ok: rejected.append("BOS")
         if not atr_ok: rejected.append("ATR")
         if not market_ok: rejected.append("TOTAL")
-        if not btc_ok: rejected.append("BTC")
+        if not btc_ok: tolerated.append("BTC")  # <== TOLÉRÉ provisoirement
 
         if not cos_ok: tolerated.append("COS")
         if not choch_ok: tolerated.append("CHoCH")
@@ -101,10 +101,7 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df):
         if not in_fvg: tolerated.append("FVG")
         if not in_ote: tolerated.append("OTE")
         if not divergence_ok: tolerated.append("DIVERGENCE")
-
-        # 🎯 R:R minimum
-        if rr1 < 1.5:
-            tolerated.append("RR")
+        if rr1 < 1.5: tolerated.append("RR")
 
         tolerated = [t for t in tolerated if t in tolerable]
         rejected += [t for t in tolerated if t not in tolerable]
@@ -129,7 +126,7 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df):
             f"📈 Score : {score}/10\n"
             f"❌ Rejetés : {', '.join(rejected) if rejected else 'aucun'}\n"
             f"⚠️ Tolérés : {', '.join(tolerated) if tolerated else 'aucun'}\n\n"
-            f"ℹ️ Seuls OTE, BOUGIE, DIVERGENCE peuvent être tolérés"
+            f"ℹ️ Tolérances actives (provisoires) : {', '.join(tolerable)}"
         )
 
         if rejected:
@@ -141,7 +138,6 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df):
                 "comment": comment
             }
 
-        # 📈 Graphique
         generate_chart(
             df, symbol,
             ote_zone=(ote_start, ote_end),
