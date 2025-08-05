@@ -45,7 +45,7 @@ def get_headers(endpoint, method="POST", body=None):
         "Content-Type": "application/json"
     }
 
-# 🔍 Récupère le mark price pour un symbol
+# 🔍 Récupère le mark price pour un symbol (utile au besoin)
 def get_mark_price(symbol):
     try:
         url = f"{BASE_URL}/api/v1/mark-price/{symbol}/current"
@@ -63,24 +63,20 @@ def place_order(symbol, side, entry_price, leverage=3):
         endpoint = "/api/v1/orders"
         url = BASE_URL + endpoint
 
-        mark_price = get_mark_price(symbol)
-        if mark_price is None:
-            print(f"❌ Impossible de récupérer le prix pour {symbol}, annulation de l'ordre.")
-            return None
-
         # ✅ Calcul de la taille basée sur une marge fixe
         margin_usdt = 20
-        size = (margin_usdt * leverage) / mark_price
-        size = max(1, int(size))  # min size = 1 contrat (entier requis)
+        notional_value = margin_usdt * leverage
+        size = notional_value / float(entry_price)
+        size = max(1, int(round(size)))  # Minimum 1 contrat entier
 
         order_data = {
             "clientOid": str(int(time.time() * 1000)),
             "symbol": symbol,
             "side": side.lower(),
             "leverage": leverage,
-            "type": "limit",             # Ordre LIMIT
-            "price": str(entry_price),   # 📌 entrée dans la zone OTE
-            "size": str(size),
+            "type": "limit",              # Ordre LIMIT
+            "price": str(entry_price),   # Prix d'entrée (OTE)
+            "size": str(size),           # Taille en contrats (entier)
             "timeInForce": "GTC"         # Good 'Til Cancelled
         }
 
