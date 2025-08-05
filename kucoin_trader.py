@@ -43,16 +43,13 @@ def get_headers(endpoint, method="POST", body=None):
         "Content-Type": "application/json"
     }
 
-# 📈 Place un ordre LIMIT avec une valeur nominale fixe (valueQty)
-def place_order(symbol, side, entry_price, leverage=3):
+# 📈 Place un ordre LIMIT avec 20 USDT de marge (via valueQty)
+def place_order(symbol, side, entry_price, leverage=10):
     try:
         endpoint = "/api/v1/orders"
         url = BASE_URL + endpoint
 
-        margin_usdt = 20
-        notional_value = margin_usdt * leverage  # valeur de position souhaitée
-
-        print(f"🔢 Utilisation de valueQty = {notional_value} pour viser {margin_usdt} USDT de marge")
+        value_qty = 20 * leverage  # Valeur notionnelle totale (ex: 200 USDT pour levier 10)
 
         order_data = {
             "clientOid": str(int(time.time() * 1000)),
@@ -61,7 +58,7 @@ def place_order(symbol, side, entry_price, leverage=3):
             "leverage": leverage,
             "type": "limit",
             "price": str(entry_price),
-            "valueQty": str(notional_value),
+            "valueQty": str(round(value_qty, 4)),  # Assure un montant précis
             "timeInForce": "GTC"
         }
 
@@ -74,7 +71,7 @@ def place_order(symbol, side, entry_price, leverage=3):
 
         data = response.json()
         if data.get("code") == "200000":
-            print(f"✅ Ordre LIMIT placé ({side.upper()}) sur {symbol} @ {entry_price} | Notional: {notional_value} USDT")
+            print(f"✅ Ordre LIMIT placé ({side.upper()}) sur {symbol} @ {entry_price} | valueQty: {value_qty} USDT (levier {leverage})")
             return data["data"].get("orderId")
         else:
             print(f"❌ Échec ordre KuCoin {symbol}: {data}")
