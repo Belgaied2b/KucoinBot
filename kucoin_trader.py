@@ -43,62 +43,16 @@ def get_headers(endpoint, method="POST", body=None):
         "Content-Type": "application/json"
     }
 
-# 🔍 Récupère le contractSize pour un symbole
-def get_contract_size(symbol):
-    try:
-        url = f"{BASE_URL}/api/v1/contracts/active"
-        headers = get_headers("/api/v1/contracts/active", "GET")
-        response = requests.get(url, headers=headers)
-        response.raise_for_status()
-        data = response.json().get("data", [])
-        for contract in data:
-            if contract.get("symbol") == symbol:
-                cs = contract.get("contractSize")
-                if cs:
-                    return float(cs)
-                else:
-                    print(f"⚠️ 'contractSize' non présent pour {symbol}, fallback sur 1.0")
-                    return 1.0
-        print(f"⚠️ Symbole {symbol} introuvable dans /contracts/active")
-        return 1.0
-    except Exception as e:
-        print(f"⚠️ Erreur récupération contractSize pour {symbol} : {e}")
-        return 1.0
-
-# 🔍 Récupère le mark price pour un symbole
-def get_mark_price(symbol):
-    try:
-        url = f"{BASE_URL}/api/v1/mark-price/{symbol}/current"
-        headers = get_headers(f"/api/v1/mark-price/{symbol}/current", "GET")
-        response = requests.get(url, headers=headers)
-        response.raise_for_status()
-        return float(response.json()["data"]["value"])
-    except Exception as e:
-        print(f"⚠️ Erreur récupération mark price pour {symbol} : {e}")
-        return None
-
-# 📈 Place un ordre LIMIT avec 20 USDT de marge
+# 📈 Place un ordre LIMIT avec une valeur nominale fixe (valueQty)
 def place_order(symbol, side, entry_price, leverage=3):
     try:
         endpoint = "/api/v1/orders"
         url = BASE_URL + endpoint
 
-        mark_price = get_mark_price(symbol)
-        if mark_price is None:
-            print(f"❌ Impossible de récupérer le prix pour {symbol}")
-            return None
-
-        contract_size = get_contract_size(symbol)
         margin_usdt = 20
-        notional = margin_usdt * leverage
+        notional_value = margin_usdt * leverage  # valeur de position souhaitée
 
-        # 📌 Calcul de la taille en contrats
-        size = notional / (mark_price * contract_size)
-        size = max(1, int(round(size)))
-
-        # 🧮 Affiche la marge estimée pour vérification
-        estimated_margin = size * mark_price * contract_size / leverage
-        print(f"🔢 Estimation marge pour {symbol} : {round(estimated_margin, 2)} USDT (cible = 20 USDT)")
+        print(f"🔢 Utilisation de valueQty = {notional_value} pour viser {margin_usdt} USDT de marge")
 
         order_data = {
             "clientOid": str(int(time.time() * 1000)),
@@ -107,7 +61,7 @@ def place_order(symbol, side, entry_price, leverage=3):
             "leverage": leverage,
             "type": "limit",
             "price": str(entry_price),
-            "size": str(size),
+            "valueQty": str(notional_value),
             "timeInForce": "GTC"
         }
 
@@ -120,7 +74,7 @@ def place_order(symbol, side, entry_price, leverage=3):
 
         data = response.json()
         if data.get("code") == "200000":
-            print(f"✅ Ordre LIMIT placé ({side.upper()}) sur {symbol} @ {entry_price} | Size: {size} contrats")
+            print(f"✅ Ordre LIMIT placé ({side.upper()}) sur {symbol} @ {entry_price} | Notional: {notional_value} USDT")
             return data["data"].get("orderId")
         else:
             print(f"❌ Échec ordre KuCoin {symbol}: {data}")
