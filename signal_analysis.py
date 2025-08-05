@@ -82,8 +82,8 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df):
         rr1 = round(abs(tp1 - entry_price) / abs(entry_price - sl), 1)
         rr2 = round(abs(tp2 - entry_price) / abs(entry_price - sl), 1)
 
-        # ⚖️ Tolérances PROVISOIRES ÉTENDUES
-        tolerable = {"OTE", "BOUGIE", "DIVERGENCE", "FVG", "CHoCH", "COS", "RR", "BTC"}
+        # ⚖️ Tolérances limitées
+        tolerable = {"OTE", "BOUGIE", "DIVERGENCE", "COS", "RR"}
         tolerated = []
         rejected = []
 
@@ -93,12 +93,12 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df):
         if not bos_ok: rejected.append("BOS")
         if not atr_ok: rejected.append("ATR")
         if not market_ok: rejected.append("TOTAL")
-        if not btc_ok: tolerated.append("BTC")  # <== TOLÉRÉ provisoirement
+        if not btc_ok: rejected.append("BTC")
 
         if not cos_ok: tolerated.append("COS")
-        if not choch_ok: tolerated.append("CHoCH")
+        if not choch_ok: rejected.append("CHoCH")  # ❌ Non toléré
         if not candle_ok: tolerated.append("BOUGIE")
-        if not in_fvg: tolerated.append("FVG")
+        if not in_fvg: rejected.append("FVG")      # ❌ Non toléré
         if not in_ote: tolerated.append("OTE")
         if not divergence_ok: tolerated.append("DIVERGENCE")
         if rr1 < 1.5: tolerated.append("RR")
