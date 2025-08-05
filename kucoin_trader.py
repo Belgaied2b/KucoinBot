@@ -12,10 +12,9 @@ KUCOIN_API_SECRET = "889e4492-c2ff-4c9d-9136-64afe6d5e780"
 KUCOIN_API_PASSPHRASE = "Nad1703-_"
 BASE_URL = "https://api-futures.kucoin.com"
 
-# ✅ DEBUG : Vérification des variables
+# ✅ DEBUG
 print("🔐 Vérification des variables API...")
 print(f"API_KEY ok: {bool(KUCOIN_API_KEY)}, API_SECRET ok: {bool(KUCOIN_API_SECRET)}, PASSPHRASE ok: {bool(KUCOIN_API_PASSPHRASE)}")
-
 if not KUCOIN_API_KEY or not KUCOIN_API_SECRET or not KUCOIN_API_PASSPHRASE:
     raise ValueError("❌ Variables d’environnement KuCoin manquantes. Vérifie sur Railway.")
 
@@ -35,7 +34,6 @@ def get_headers(endpoint, method="POST", body=None):
     passphrase = base64.b64encode(
         hmac.new(KUCOIN_API_SECRET.encode("utf-8"), KUCOIN_API_PASSPHRASE.encode("utf-8"), hashlib.sha256).digest()
     ).decode()
-
     return {
         "KC-API-KEY": KUCOIN_API_KEY,
         "KC-API-SIGN": signature,
@@ -45,16 +43,21 @@ def get_headers(endpoint, method="POST", body=None):
         "Content-Type": "application/json"
     }
 
-# 🔍 Récupère le mark price pour un symbol (utile au besoin)
-def get_mark_price(symbol):
+# 🔍 Récupère le contractSize (valeur d’1 contrat) pour un symbol
+def get_contract_size(symbol):
     try:
-        url = f"{BASE_URL}/api/v1/mark-price/{symbol}/current"
-        headers = get_headers(f"/api/v1/mark-price/{symbol}/current", "GET")
+        url = f"{BASE_URL}/api/v1/contracts/active"
+        headers = get_headers("/api/v1/contracts/active", "GET")
         response = requests.get(url, headers=headers)
         response.raise_for_status()
-        return float(response.json()["data"]["value"])
+        data = response.json().get("data", [])
+        for contract in data:
+            if contract["symbol"] == symbol:
+                return float(contract["contractSize"])
+        print(f"⚠️ ContractSize introuvable pour {symbol}")
+        return None
     except Exception as e:
-        print(f"⚠️ Erreur récupération mark price pour {symbol} : {e}")
+        print(f"⚠️ Erreur récupération contractSize pour {symbol} : {e}")
         return None
 
 # 📈 Place un ordre LIMIT dans la zone OTE avec 20 USDT de marge
@@ -63,21 +66,26 @@ def place_order(symbol, side, entry_price, leverage=3):
         endpoint = "/api/v1/orders"
         url = BASE_URL + endpoint
 
-        # ✅ Calcul de la taille basée sur une marge fixe
+        contract_size = get_contract_size(symbol)
+        if contract_size is None:
+            print(f"❌ Impossible de récupérer contractSize pour {symbol}")
+            return None
+
+        # ✅ Calcule le nombre de contrats pour viser 20 USDT de marge
         margin_usdt = 20
-        notional_value = margin_usdt * leverage
-        size = notional_value / float(entry_price)
-        size = max(1, int(round(size)))  # Minimum 1 contrat entier
+        notional = margin_usdt * leverage
+        size = notional / (entry_price * contract_size)
+        size = max(1, int(round(size)))  # au moins 1 contrat (entier)
 
         order_data = {
             "clientOid": str(int(time.time() * 1000)),
             "symbol": symbol,
             "side": side.lower(),
             "leverage": leverage,
-            "type": "limit",              # Ordre LIMIT
-            "price": str(entry_price),   # Prix d'entrée (OTE)
-            "size": str(size),           # Taille en contrats (entier)
-            "timeInForce": "GTC"         # Good 'Til Cancelled
+            "type": "limit",
+            "price": str(entry_price),
+            "size": str(size),
+            "timeInForce": "GTC"
         }
 
         headers = get_headers(endpoint, "POST", order_data)
@@ -88,7 +96,6 @@ def place_order(symbol, side, entry_price, leverage=3):
             return None
 
         data = response.json()
-
         if data.get("code") == "200000":
             print(f"✅ Ordre LIMIT placé ({side.upper()}) sur {symbol} @ {entry_price} | Size: {size} contrats")
             return data["data"].get("orderId")
