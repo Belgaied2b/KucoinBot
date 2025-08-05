@@ -9,7 +9,7 @@ import requests
 # 📌 Configuration KuCoin Futures
 KUCOIN_API_KEY = "6890cfb4dffe710001e6edb0"
 KUCOIN_API_SECRET = "889e4492-c2ff-4c9d-9136-64afe6d5e780"
-KUCOIN_API_PASSPHRASE = "247096"
+KUCOIN_API_PASSPHRASE = "Nad1703-_"
 BASE_URL = "https://api-futures.kucoin.com"
 
 # ✅ DEBUG : Vérification des variables
