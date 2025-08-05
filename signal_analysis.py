@@ -83,7 +83,7 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df):
         rr2 = round(abs(tp2 - entry_price) / abs(entry_price - sl), 1)
 
         # ⚖️ Tolérances
-        tolerable = {"OTE", "BOUGIE", "DIVERGENCE"}
+        tolerable = {"OTE", "BOUGIE", "DIVERGENCE", "RR"}
         tolerated = []
         rejected = []
 
@@ -107,8 +107,8 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df):
 
         # 🎯 R:R minimum
         if rr1 < 1.5:
-            rejected.append("RR < 1.5")
-
+    tolerated.append("RR")
+    
         # 📊 Score
         poids = {
             "MA200": 1.5, "MACD": 1.5, "BOS": 1.5,
