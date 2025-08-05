@@ -1,7 +1,7 @@
 import json
 import os
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 import traceback
 import requests
 import pandas as pd
@@ -9,7 +9,7 @@ from kucoin_utils import fetch_all_symbols, fetch_klines
 from signal_analysis import analyze_signal
 from config import TOKEN, CHAT_ID
 from telegram import Bot
-from kucoin_trader import place_order  # ✅ exécution réelle
+from kucoin_trader import place_order
 
 bot = Bot(token=TOKEN)
 
@@ -49,60 +49,51 @@ if os.path.exists("sent_signals.json"):
     except Exception as e:
         print("⚠️ Erreur lecture sent_signals.json :", e)
 
-# ✅ Requête CoinGecko robuste
+# ✅ Chargement des données macro avec cache local
+macro_cache = {"btc_df": None, "total_df": None, "btc_d_df": None, "last_fetch": None}
+
 def get_chart(url):
     headers = {"User-Agent": "Mozilla/5.0"}
-    try:
-        time.sleep(1.5)
-        r = requests.get(url, headers=headers)
-        r.raise_for_status()
-        data = r.json()
+    time.sleep(1.5)
+    r = requests.get(url, headers=headers)
+    r.raise_for_status()
+    data = r.json()
 
-        if "prices" not in data:
-            raise ValueError("⚠️ 'prices' absent de la réponse")
+    if "prices" not in data:
+        raise ValueError("⚠️ 'prices' absent de la réponse")
 
-        timestamps = [x[0] for x in data["prices"]]
-        closes = [x[1] for x in data["prices"]]
-        volumes = (
-            [x[1] for x in data["total_volumes"]]
-            if "total_volumes" in data and len(data["total_volumes"]) == len(timestamps)
-            else [0 for _ in timestamps]
-        )
+    timestamps = [x[0] for x in data["prices"]]
+    closes = [x[1] for x in data["prices"]]
+    volumes = [x[1] for x in data["total_volumes"]] if "total_volumes" in data else [0 for _ in timestamps]
 
-        df = pd.DataFrame({
-            "timestamp": timestamps,
-            "close": closes,
-            "high": [c * 1.01 for c in closes],
-            "low": [c * 0.99 for c in closes],
-            "open": closes,
-            "volume": volumes
-        })
+    df = pd.DataFrame({
+        "timestamp": timestamps,
+        "close": closes,
+        "high": [c * 1.01 for c in closes],
+        "low": [c * 0.99 for c in closes],
+        "open": closes,
+        "volume": volumes
+    })
 
-        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
-        df = df[["timestamp", "open", "high", "low", "close", "volume"]]
-        df.set_index("timestamp", inplace=False)
-        return df
+    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
+    return df[["timestamp", "open", "high", "low", "close", "volume"]]
 
-    except Exception as e:
-        print(f"⚠️ Erreur get_chart ({url}): {e}")
-        return None
-
-# 📊 Chargement des données macro
 def fetch_macro_df():
-    headers = {"User-Agent": "Mozilla/5.0"}
+    global macro_cache
+    now = datetime.utcnow()
+    if macro_cache["last_fetch"] and now - macro_cache["last_fetch"] < timedelta(minutes=10):
+        print("🧠 Utilisation du cache macro (BTC / TOTAL / BTC.D)")
+        return macro_cache["btc_df"], macro_cache["total_df"], macro_cache["btc_d_df"]
 
-    btc_df = get_chart("https://api.coingecko.com/api/v3/coins/bitcoin/market_chart?vs_currency=usd&days=30")
-    if btc_df is None:
-        raise ValueError("Impossible de charger les données BTC")
-
+    print("📡 Récupération des données macro depuis CoinGecko...")
     try:
-        time.sleep(1.5)
-        response = requests.get("https://api.coingecko.com/api/v3/global", headers=headers)
+        btc_df = get_chart("https://api.coingecko.com/api/v3/coins/bitcoin/market_chart?vs_currency=usd&days=30")
+        if btc_df is None:
+            raise ValueError("Impossible de charger les données BTC")
+
+        response = requests.get("https://api.coingecko.com/api/v3/global", headers={"User-Agent": "Mozilla/5.0"})
         response.raise_for_status()
         global_data = response.json()
-
-        if "data" not in global_data or "market_cap_percentage" not in global_data["data"]:
-            raise ValueError("Champ 'data' manquant dans la réponse CoinGecko")
 
         btc_dominance = global_data["data"]["market_cap_percentage"]["btc"] / 100
         total_market_cap = btc_df["close"] / btc_dominance
@@ -116,10 +107,17 @@ def fetch_macro_df():
         btc_d_df = btc_df.copy()
         btc_d_df["close"] = btc_dominance
 
+        macro_cache = {
+            "btc_df": btc_df,
+            "total_df": total_df,
+            "btc_d_df": btc_d_df,
+            "last_fetch": now
+        }
+
+        return btc_df, total_df, btc_d_df
+
     except Exception as e:
         raise ValueError(f"Erreur parsing global_data : {e}")
-
-    return btc_df, total_df, btc_d_df
 
 # 🔍 Scan principal
 async def scan_and_send_signals():
@@ -145,11 +143,8 @@ async def scan_and_send_signals():
             for direction in ["long", "short"]:
                 print(f"[{symbol}] ➡️ Analyse {direction.upper()}")
 
-                df_copy = df.copy()
-                df_copy.name = symbol
-
                 signal = analyze_signal(
-                    df_copy,
+                    df.copy(),
                     symbol=symbol,
                     direction=direction,
                     btc_df=btc_df,
@@ -213,14 +208,3 @@ async def scan_and_send_signals():
         except Exception as e:
             print(f"[{symbol}] ⚠️ Erreur analyse signal : {e}")
             traceback.print_exc()
-
-# ⏱️ Boucle automatique toutes les 5 minutes
-if __name__ == "__main__":
-    import asyncio
-
-    async def run_loop():
-        while True:
-            await scan_and_send_signals()
-            await asyncio.sleep(300)  # 5 minutes
-
-    asyncio.run(run_loop())
