@@ -102,14 +102,13 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df):
         if not in_ote: tolerated.append("OTE")
         if not divergence_ok: tolerated.append("DIVERGENCE")
 
+        # 🎯 R:R minimum
+        if rr1 < 1.5:
+            tolerated.append("RR")
+
         tolerated = [t for t in tolerated if t in tolerable]
         rejected += [t for t in tolerated if t not in tolerable]
 
-        # 🎯 R:R minimum
-if rr1 < 1.5:
-    tolerated.append("RR")
-
-    
         # 📊 Score
         poids = {
             "MA200": 1.5, "MACD": 1.5, "BOS": 1.5,
