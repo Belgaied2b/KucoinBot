@@ -30,7 +30,6 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df):
         df.sort_index(inplace=True)
         last_close = df['close'].iloc[-1]
 
-        # Zone OTE
         high_price = df['high'].rolling(window=50).max().iloc[-1]
         low_price = df['low'].rolling(window=50).min().iloc[-1]
 
@@ -45,7 +44,6 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df):
             in_ote = ote_start >= last_close >= ote_end
             entry_price = ote_end
 
-        # FVG
         fvg_df = compute_fvg_zones(df)
         fvg_upper = fvg_df['fvg_upper'].iloc[-1]
         fvg_lower = fvg_df['fvg_lower'].iloc[-1]
@@ -56,7 +54,7 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df):
             else:
                 in_fvg = fvg_upper >= last_close >= fvg_lower
 
-        # Indicateurs techniques
+        # 🔍 Indicateurs
         volume_ok = is_volume_strong(df)
         ma_ok = is_above_ma200(df) if direction == "long" else is_below_ma200(df)
         macd_ok = is_macd_positive(df) if direction == "long" else is_macd_negative(df)
@@ -70,7 +68,7 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df):
         btc_ok = is_btc_ok(btc_df)
         btc_d_status = get_btc_dominance_trend(btc_d_df)
 
-        # SL / TP dynamiques basés sur entrée fictive
+        # 🛑 SL / TP dynamiques
         atr = compute_atr(df)
         atr_value = atr.iloc[-1]
         if direction == "long":
@@ -84,7 +82,7 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df):
         rr1 = round(abs(tp1 - entry_price) / abs(entry_price - sl), 1)
         rr2 = round(abs(tp2 - entry_price) / abs(entry_price - sl), 1)
 
-        # TOLÉRANCES STRICTES
+        # ⚖️ Tolérances
         tolerable = {"OTE", "BOUGIE", "DIVERGENCE"}
         tolerated = []
         rejected = []
@@ -107,7 +105,11 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df):
         tolerated = [t for t in tolerated if t in tolerable]
         rejected += [t for t in tolerated if t not in tolerable]
 
-        # SCORE pondéré
+        # 🎯 R:R minimum
+        if rr1 < 1.5:
+            rejected.append("RR < 1.5")
+
+        # 📊 Score
         poids = {
             "MA200": 1.5, "MACD": 1.5, "BOS": 1.5,
             "COS": 1.0, "CHoCH": 1.0, "FVG": 1.0,
@@ -118,7 +120,7 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df):
         score_obtenu = sum(v for k, v in poids.items() if k not in rejected)
         score = round((score_obtenu / score_total) * 10, 1)
 
-        # Commentaire
+        # 📝 Commentaire
         comment = (
             f"📌 Zone idéale d'entrée :\n"
             f"OTE = {round(ote_start, 4)} → {round(ote_end, 4)}\n"
@@ -130,7 +132,6 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df):
             f"ℹ️ Seuls OTE, BOUGIE, DIVERGENCE peuvent être tolérés"
         )
 
-        # Si échec
         if rejected:
             return {
                 "valid": False,
@@ -140,7 +141,7 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df):
                 "comment": comment
             }
 
-        # Graphique
+        # 📈 Graphique
         generate_chart(
             df, symbol,
             ote_zone=(ote_start, ote_end),
