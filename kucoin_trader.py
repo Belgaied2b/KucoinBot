@@ -51,14 +51,22 @@ def get_contract_size(symbol):
         response = requests.get(url, headers=headers)
         response.raise_for_status()
         data = response.json().get("data", [])
+
         for contract in data:
-            if contract["symbol"] == symbol:
-                return float(contract["contractSize"])
-        print(f"⚠️ ContractSize introuvable pour {symbol}")
-        return None
+            if contract.get("symbol") == symbol:
+                cs = contract.get("contractSize")
+                if cs:
+                    return float(cs)
+                else:
+                    print(f"⚠️ 'contractSize' non présent pour {symbol}, fallback sur 1.0")
+                    return 1.0
+
+        print(f"⚠️ Symbole {symbol} introuvable dans /contracts/active")
+        return 1.0
+
     except Exception as e:
         print(f"⚠️ Erreur récupération contractSize pour {symbol} : {e}")
-        return None
+        return 1.0
 
 # 📈 Place un ordre LIMIT dans la zone OTE avec 20 USDT de marge
 def place_order(symbol, side, entry_price, leverage=3):
@@ -67,9 +75,6 @@ def place_order(symbol, side, entry_price, leverage=3):
         url = BASE_URL + endpoint
 
         contract_size = get_contract_size(symbol)
-        if contract_size is None:
-            print(f"❌ Impossible de récupérer contractSize pour {symbol}")
-            return None
 
         # ✅ Calcule le nombre de contrats pour viser 20 USDT de marge
         margin_usdt = 20
