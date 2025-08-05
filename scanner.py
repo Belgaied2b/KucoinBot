@@ -182,11 +182,10 @@ async def scan_and_send_signals():
 
                     await send_signal_to_telegram(signal)
 
-                    # ✅ Exécution LIMIT uniquement si OTE toléré
                     if signal.get("tolere_ote"):
                         entry = signal["entry"]
                         side = "buy" if direction == "long" else "sell"
-                        place_order(symbol, side, entry)  # Limit dans la zone OTE
+                        place_order(symbol, side, entry)
 
                     sent_signals[signal_id] = {
                         "entry": signal["entry"],
@@ -214,3 +213,14 @@ async def scan_and_send_signals():
         except Exception as e:
             print(f"[{symbol}] ⚠️ Erreur analyse signal : {e}")
             traceback.print_exc()
+
+# ⏱️ Boucle automatique toutes les 5 minutes
+if __name__ == "__main__":
+    import asyncio
+
+    async def run_loop():
+        while True:
+            await scan_and_send_signals()
+            await asyncio.sleep(300)  # 5 minutes
+
+    asyncio.run(run_loop())
