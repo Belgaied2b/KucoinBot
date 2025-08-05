@@ -71,7 +71,7 @@ def place_order(symbol, side, entry_price, leverage=3):
         # ✅ Calcul de la taille basée sur une marge fixe
         margin_usdt = 20
         size = (margin_usdt * leverage) / mark_price
-        size = max(1, int(size))  # min size = 1 contrat
+        size = max(1, int(size))  # min size = 1 contrat (entier requis)
 
         order_data = {
             "clientOid": str(int(time.time() * 1000)),
