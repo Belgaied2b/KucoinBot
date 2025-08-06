@@ -77,14 +77,18 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df, total2_df=
         btc_level_ok = is_btc_at_key_level(btc_df)
         btc_d_status = get_btc_dominance_trend(btc_d_df)
 
-        atr = compute_atr(df)
-        atr_value = atr.iloc[-1]
-        if direction == "long":
-            sl = min(df['low'].iloc[-10:]) - atr_value * 0.5
-            tp1 = find_structure_tp(df, direction, entry_price)
-        else:
-            sl = max(df['high'].iloc[-10:]) + atr_value * 0.5
-            tp1 = find_structure_tp(df, direction, entry_price)
+    atr = compute_atr(df)
+atr_value = atr.iloc[-1]
+
+# 🔍 Zone de liquidité détectée
+liq_price = has_liquidity_zone(df, direction)
+
+if direction == "long":
+    sl = liq_price - atr_value * 0.25 if liq_price else min(df['low'].iloc[-10:]) - atr_value * 0.5
+    tp1 = find_structure_tp(df, direction, entry_price)
+else:
+    sl = liq_price + atr_value * 0.25 if liq_price else max(df['high'].iloc[-10:]) + atr_value * 0.5
+    tp1 = find_structure_tp(df, direction, entry_price)
 
         tp2 = entry_price + (tp1 - entry_price) * 2 if direction == "long" else entry_price - (entry_price - tp1) * 2
         rr1 = round(abs(tp1 - entry_price) / abs(entry_price - sl), 1)
