@@ -123,11 +123,10 @@ def is_bearish_engulfing(df):
         curr['close'] < prev['open']
     )
 
-# 🧪 Tests unitaires simples
-if __name__ == "__main__":
-    print("🔍 Lancement des tests unitaires...")
+# ✅ Fonction exportable pour tests via Railway
+def run_structure_tests():
+    print("🔍 Lancement des tests structure_utils...\n")
 
-    # Génération d’un mini DataFrame pour test
     data = {
         'open': [100, 101, 102, 103, 104, 106, 105],
         'high': [102, 103, 104, 106, 108, 109, 110],
@@ -143,3 +142,8 @@ if __name__ == "__main__":
     print("✅ TP long :", find_structure_tp(df_test, "long", entry_price=105))
     print("✅ Engulfing haussier :", is_bullish_engulfing(df_test))
     print("✅ Engulfing baissier :", is_bearish_engulfing(df_test))
+    print("-" * 50 + "\n")
+
+# Exécution directe (pour test local uniquement)
+if __name__ == "__main__":
+    run_structure_tests()
