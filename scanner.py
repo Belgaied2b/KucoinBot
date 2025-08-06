@@ -21,20 +21,35 @@ async def send_signal_to_telegram(signal):
     rejected = signal.get("rejetes", [])
     tolerated = signal.get("toleres", [])
     comment = signal.get("comment", "").strip()
+    score = signal.get("score", "?")
+    rr1 = signal.get("rr1", "?")
+    rr2 = signal.get("rr2", "?")
+    tp1 = signal.get("tp1", 0)
+    tp2 = signal.get("tp2", 0)
+    entry = signal.get("entry", 0)
+    sl = signal.get("sl", 0)
+    direction = signal.get("direction", "").upper()
 
-    msg_rejected = f"❌ Rejetés : {', '.join(rejected)}" if rejected else ""
-    msg_tolerated = f"⚠️ Tolérés : {', '.join(tolerated)}" if tolerated else ""
+    # Affichage spécial si SL ajusté selon une zone de liquidité
+    sl_note = " 🔐 SL basé sur zone de liquidité" if "LIQUIDITE" in tolerated else ""
+
+    # Format tolérances et rejets sans doublon
+    tolerated_clean = sorted(set(tolerated))
+    rejected_clean = sorted(set(rejected) - set(tolerated))
+
+    msg_tolerated = f"⚠️ Tolérés : {', '.join(tolerated_clean)}" if tolerated_clean else ""
+    msg_rejected = f"❌ Rejetés : {', '.join(rejected_clean)}" if rejected_clean else ""
 
     message = (
-        f"📉 {signal['symbol']} - Signal CONFIRMÉ ({signal['direction']})\n\n"
-        f"🎯 Entry : {signal['entry']:.4f}\n"
-        f"🔚 SL    : {signal['sl']:.4f}\n"
-        f"🎯 TP1   : {signal['tp1']:.4f}\n"
-        f"🎯 TP2   : {signal['tp2']:.4f}\n"
-        f"📈 R:R1  : {signal['rr1']}\n"
-        f"📈 R:R2  : {signal['rr2']}\n"
-        f"🧠 Score : {signal.get('score', '?')}/10\n"
-        f"{comment}\n"
+        f"📉 {signal['symbol']} - Signal CONFIRMÉ ({direction})\n\n"
+        f"🎯 Entry : {entry:.4f}\n"
+        f"🔚 SL    : {sl:.4f}{sl_note}\n"
+        f"🎯 TP1   : {tp1:.4f}\n"
+        f"🎯 TP2   : {tp2:.4f}\n"
+        f"📈 R:R1  : {rr1}\n"
+        f"📈 R:R2  : {rr2}\n"
+        f"🧠 Score : {score}/10\n\n"
+        f"{comment.strip()}\n\n"
         f"{msg_tolerated}\n"
         f"{msg_rejected}"
     )
