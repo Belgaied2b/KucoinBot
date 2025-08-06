@@ -7,7 +7,7 @@ from indicators import (
     is_bullish_divergence, is_bearish_divergence,
     is_atr_sufficient, is_total_ok, is_btc_ok,
     is_btc_at_key_level, get_btc_dominance_trend,
-    is_aggressive_volume_ok, is_liquidity_zone_present
+    is_aggressive_volume_ok, has_liquidity_zone
 )
 from structure_utils import (
     is_choch,
@@ -65,7 +65,7 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df, total2_df=
         divergence_ok = is_bullish_divergence(df) if direction == "long" else is_bearish_divergence(df)
         atr_ok = is_atr_sufficient(df)
         volume_aggressif_ok = is_aggressive_volume_ok(df, direction)
-        liquidity_zone_ok = is_liquidity_zone_present(df, direction)
+        liquidity_zone_ok = has_liquidity_zone(df, direction)
 
         # 🔍 Validation H4 (si dispo)
         ema_trend_h4 = is_ema_trend_ok(df_higher_tf, direction) if df_higher_tf is not None else True
@@ -90,6 +90,7 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df, total2_df=
         rr1 = round(abs(tp1 - entry_price) / abs(entry_price - sl), 1)
         rr2 = round(abs(tp2 - entry_price) / abs(entry_price - sl), 1)
 
+        # ⚖️ Tolérances
         tolerable = {"OTE", "BOUGIE", "DIVERGENCE", "CHoCH", "RR", "FVG", "CVD", "LIQUIDITE"}
         tolerated = []
         rejected = []
@@ -116,6 +117,7 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df, total2_df=
         tolerated = [t for t in tolerated if t in tolerable]
         rejected += [t for t in tolerated if t not in tolerable]
 
+        # 🎯 Score
         poids = {
             "EMA": 1.0, "MOMENTUM": 1.5, "BOS": 1.5,
             "COS": 1.0, "CHoCH": 1.0, "FVG": 1.0,
@@ -127,6 +129,7 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df, total2_df=
         score_obtenu = sum(v for k, v in poids.items() if k not in rejected)
         score = round((score_obtenu / score_total) * 10, 1)
 
+        # 📝 Commentaire
         comment = (
             f"📌 Zone idéale d'entrée :\n"
             f"OTE = {round(ote_start, 4)} → {round(ote_end, 4)}\n"
