@@ -188,3 +188,28 @@ def get_btc_dominance_trend(btc_d_df):
         return "EN BAISSE"
     else:
         return "STAGNANT"
+
+# 💥 Volume agressif (delta * volume)
+def is_aggressive_volume_ok(df, direction="long", window=20):
+    if df is None or len(df) < window + 1:
+        return False
+    df = df.copy()
+    df['delta'] = df['close'] - df['open']
+    df['aggressive'] = df['delta'] * df['volume']
+    recent = df['aggressive'].iloc[-window:]
+    avg = recent.mean()
+    return avg > 0 if direction == "long" else avg < 0
+
+# 💧 Détection zone de liquidité (equal highs/lows)
+def has_liquidity_zone(df, direction="long", window=20, tolerance=0.002):
+    if df is None or len(df) < window:
+        return False
+    values = df['high'] if direction == "short" else df['low']
+    recent = values.iloc[-window:]
+    for i in range(len(recent) - 2):
+        for j in range(i + 1, len(recent)):
+            v1 = recent.iloc[i]
+            v2 = recent.iloc[j]
+            if abs(v1 - v2) / v1 < tolerance:
+                return True
+    return False
