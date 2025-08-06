@@ -94,8 +94,8 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df):
         if not atr_ok: rejected.append("ATR")
         if not market_ok: rejected.append("TOTAL")
         if not btc_ok: rejected.append("BTC")
+        if not cos_ok: rejected.append("COS")
 
-        if not cos_ok: rejected.append("COS")  # ❌ Non toléré
         if not choch_ok: tolerated.append("CHoCH")
         if not candle_ok: tolerated.append("BOUGIE")
         if not in_fvg: tolerated.append("FVG")
@@ -126,7 +126,7 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df):
             f"📈 Score : {score}/10\n"
             f"❌ Rejetés : {', '.join(rejected) if rejected else 'aucun'}\n"
             f"⚠️ Tolérés : {', '.join(tolerated) if tolerated else 'aucun'}\n\n"
-            f"ℹ️ Tolérances actives (provisoires) : {', '.join(tolerable)}"
+            f"ℹ️ Tolérances actives : {', '.join(tolerable)}"
         )
 
         if rejected:
