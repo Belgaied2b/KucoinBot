@@ -57,12 +57,74 @@ def compute_fvg_zones(df, lookback=30):
             fvg_lower[i] = curr['high']
     return pd.DataFrame({'fvg_upper': fvg_upper, 'fvg_lower': fvg_lower}, index=df.index)
 
+# 🔄 VOLUME ou Open Interest
 def is_volume_strong(df, window=20, multiplier=1.2):
-    if df is None or 'volume' not in df.columns or len(df) < window:
+    column = 'open_interest' if 'open_interest' in df.columns else 'volume'
+    if df is None or column not in df.columns or len(df) < window:
         return False
-    avg_volume = df['volume'].rolling(window=window, min_periods=1).mean().iloc[-1]
-    return df['volume'].iloc[-1] > avg_volume * multiplier
+    avg = df[column].rolling(window=window, min_periods=1).mean().iloc[-1]
+    return df[column].iloc[-1] > avg * multiplier
 
+# 📉 EMA20 / EMA50 trend
+def is_ema_trend_ok(df, direction="long"):
+    if df is None or 'close' not in df.columns:
+        return False
+    ema20 = compute_ma(df, period=20, method='ema')
+    ema50 = compute_ma(df, period=50, method='ema')
+    if direction == "long":
+        return ema20.iloc[-1] > ema50.iloc[-1]
+    else:
+        return ema20.iloc[-1] < ema50.iloc[-1]
+
+# 🧠 MACD + RSI + Volume
+def is_momentum_ok(df, direction="long"):
+    macd = compute_macd_histogram(df['close']).iloc[-1]
+    rsi = compute_rsi(df['close']).iloc[-1]
+    vol_ok = is_volume_strong(df)
+    if direction == "long":
+        return macd > 0 and rsi > 50 and vol_ok
+    else:
+        return macd < 0 and rsi < 50 and vol_ok
+
+# 💥 BOS + volume
+def is_bos_with_strength(df, direction="long", lookback=20):
+    if df is None or len(df) < lookback + 3:
+        return False
+    recent = df.iloc[-(lookback + 3):-3]
+    prev_high = recent['high'].max()
+    prev_low = recent['low'].min()
+    candle = df.iloc[-1]
+    vol_ok = is_volume_strong(df)
+    if direction == "long":
+        return candle['close'] > prev_high and vol_ok
+    else:
+        return candle['close'] < prev_low and vol_ok
+
+# 🌀 COS + divergence ou volume
+def is_cos_enhanced(df, direction="long", lookback=20):
+    if df is None or len(df) < lookback + 3:
+        return False
+    recent = df.iloc[-(lookback + 3):-3]
+    prev_high = recent['high'].max()
+    prev_low = recent['low'].min()
+    candle = df.iloc[-1]
+    divergence = is_bullish_divergence(df) if direction == "long" else is_bearish_divergence(df)
+    vol_ok = is_volume_strong(df)
+    if direction == "long":
+        return candle['close'] < prev_low and (divergence or vol_ok)
+    else:
+        return candle['close'] > prev_high and (divergence or vol_ok)
+
+# 🪙 BTC key level
+def is_btc_at_key_level(df, threshold_percent=0.01):
+    if df is None or len(df) < 20:
+        return False
+    high = df['high'].rolling(window=20).max().iloc[-1]
+    low = df['low'].rolling(window=20).min().iloc[-1]
+    current = df['close'].iloc[-1]
+    return abs(current - high) / high < threshold_percent or abs(current - low) / low < threshold_percent
+
+# ✅ Restants
 def is_above_ma200(df):
     if df is None or 'close' not in df.columns or len(df) < 200:
         return False
