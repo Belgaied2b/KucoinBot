@@ -213,3 +213,6 @@ def has_liquidity_zone(df, direction="long", window=20, tolerance=0.002):
             if abs(v1 - v2) / v1 < tolerance:
                 return True
     return False
+
+# ✅ Alias pour compatibilité
+is_liquidity_zone_present = has_liquidity_zone
