@@ -11,6 +11,9 @@ from config import TOKEN, CHAT_ID
 from telegram import Bot
 from kucoin_trader import place_order
 
+# 🔁 Import pour test des structures
+from structure_utils import run_structure_tests
+
 bot = Bot(token=TOKEN)
 
 # 🔁 Envoi Telegram
@@ -116,21 +119,18 @@ def fetch_macro_df():
         btc_market_cap = btc_df["close"]
         total2_market_cap = total_market_cap - btc_market_cap
 
-        # TOTAL
         total_df = btc_df.copy()
         total_df["close"] = total_market_cap
         total_df["high"] = total_market_cap * 1.01
         total_df["low"] = total_market_cap * 0.99
         total_df["open"] = total_market_cap
 
-        # TOTAL2
         total2_df = btc_df.copy()
         total2_df["close"] = total2_market_cap
         total2_df["high"] = total2_market_cap * 1.01
         total2_df["low"] = total2_market_cap * 0.99
         total2_df["open"] = total2_market_cap
 
-        # BTC Dominance
         btc_d_df = btc_df.copy()
         btc_d_df["close"] = btc_dominance
 
@@ -151,6 +151,10 @@ def fetch_macro_df():
 # 🔍 Scan principal
 async def scan_and_send_signals():
     print(f"🔁 Scan lancé à {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC\n")
+
+    # 🚨 Appel temporaire des tests unitaires structurels
+    run_structure_tests()
+
     all_symbols = fetch_all_symbols()
 
     try:
@@ -179,7 +183,7 @@ async def scan_and_send_signals():
                     btc_df=btc_df,
                     total_df=total_df,
                     btc_d_df=btc_d_df,
-                    total2_df=total2_df  # 🔁 Ajout TOTAL2
+                    total2_df=total2_df
                 )
 
                 score = signal.get("score", 0)
