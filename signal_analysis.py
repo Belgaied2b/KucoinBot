@@ -55,7 +55,6 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df, total2_df=
             else:
                 in_fvg = fvg_upper >= last_close >= fvg_lower
 
-        # 🔍 Indicateurs H1
         momentum_ok = is_momentum_ok(df, direction)
         ema_trend_ok = is_ema_trend_ok(df, direction)
         bos_ok = is_bos_with_strength(df, direction)
@@ -67,7 +66,6 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df, total2_df=
         volume_aggressif_ok = is_aggressive_volume_ok(df, direction)
         liquidity_zone_ok = has_liquidity_zone(df, direction)
 
-        # 🔍 Validation H4 (si dispo)
         ema_trend_h4 = is_ema_trend_ok(df_higher_tf, direction) if df_higher_tf is not None else True
         momentum_h4 = is_momentum_ok(df_higher_tf, direction) if df_higher_tf is not None else True
 
@@ -77,27 +75,28 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df, total2_df=
         btc_level_ok = is_btc_at_key_level(btc_df)
         btc_d_status = get_btc_dominance_trend(btc_d_df)
 
-        # 🧮 SL/TP avec zone de liquidité
         atr = compute_atr(df)
         atr_value = atr.iloc[-1]
-
-        liq_zone_price = None
-        if has_liquidity_zone(df, direction):
-            liq_zone_price = df['low'].iloc[-1] if direction == "long" else df['high'].iloc[-1]
+        liq_zone = None
 
         if direction == "long":
-            sl = liq_zone_price - atr_value * 0.25 if liq_zone_price else min(df['low'].iloc[-10:]) - atr_value * 0.5
+            sl = min(df['low'].iloc[-10:]) - atr_value * 0.5
+            if liquidity_zone_ok:
+                liq_zone = df['low'].iloc[-20:].min()
+                sl = liq_zone - atr_value * 0.25
             tp1 = find_structure_tp(df, direction, entry_price)
         else:
-            sl = liq_zone_price + atr_value * 0.25 if liq_zone_price else max(df['high'].iloc[-10:]) + atr_value * 0.5
+            sl = max(df['high'].iloc[-10:]) + atr_value * 0.5
+            if liquidity_zone_ok:
+                liq_zone = df['high'].iloc[-20:].max()
+                sl = liq_zone + atr_value * 0.25
             tp1 = find_structure_tp(df, direction, entry_price)
 
         tp2 = entry_price + (tp1 - entry_price) * 2 if direction == "long" else entry_price - (entry_price - tp1) * 2
         rr1 = round(abs(tp1 - entry_price) / abs(entry_price - sl), 1)
         rr2 = round(abs(tp2 - entry_price) / abs(entry_price - sl), 1)
 
-        # ⚖️ Tolérances
-        tolerable = {"OTE", "BOUGIE", "DIVERGENCE", "CHoCH", "RR", "FVG", "CVD", "LIQUIDITE"}
+        tolerable = {"CHoCH", "BOUGIE", "DIVERGENCE", "FVG", "OTE", "CVD", "LIQUIDITE", "BTC", "TOTAL", "BTC_NIVEAU"}
         tolerated = []
         rejected = []
 
@@ -123,19 +122,19 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df, total2_df=
         tolerated = [t for t in tolerated if t in tolerable]
         rejected += [t for t in tolerated if t not in tolerable]
 
-        # 🎯 Score
         poids = {
-            "EMA": 1.0, "MOMENTUM": 1.5, "BOS": 1.5,
-            "COS": 1.0, "CHoCH": 1.0, "FVG": 1.0,
-            "BOUGIE": 0.5, "DIVERGENCE": 0.5,
-            "TOTAL": 1.0, "TOTAL2": 1.0, "BTC": 1.0,
-            "ATR": 1.0, "BTC_NIVEAU": 0.5
+            "MOMENTUM": 2.0, "EMA": 1.5, "BOS": 1.5,
+            "COS": 1.0, "ATR": 1.0,
+            "TOTAL": 0.5, "TOTAL2": 0.5, "BTC": 0.5,
+            "BTC_NIVEAU": 0.5, "CHoCH": 0.5, "DIVERGENCE": 0.5,
+            "FVG": 0.5, "OTE": 0.5, "CVD": 0.5,
+            "LIQUIDITE": 0.5, "BOUGIE": 0.2
         }
+
         score_total = sum(poids.values())
         score_obtenu = sum(v for k, v in poids.items() if k not in rejected)
         score = round((score_obtenu / score_total) * 10, 1)
 
-        # 📝 Commentaire
         comment = (
             f"📌 Zone idéale d'entrée :\n"
             f"OTE = {round(ote_start, 4)} → {round(ote_end, 4)}\n"
@@ -147,7 +146,7 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df, total2_df=
             f"ℹ️ Tolérances actives : {', '.join(tolerable)}"
         )
 
-        if rejected:
+        if score < 6.0:
             return {
                 "valid": False,
                 "score": score,
