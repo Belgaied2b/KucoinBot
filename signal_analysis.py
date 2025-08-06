@@ -77,26 +77,19 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df, total2_df=
 
         atr = compute_atr(df)
         atr_value = atr.iloc[-1]
-        liq_zone = None
 
         if direction == "long":
-            sl = min(df['low'].iloc[-10:]) - atr_value * 0.5
-            if liquidity_zone_ok:
-                liq_zone = df['low'].iloc[-20:].min()
-                sl = liq_zone - atr_value * 0.25
+            sl = (df['low'].min() - atr_value * 0.25) if liquidity_zone_ok else min(df['low'].iloc[-10:]) - atr_value * 0.5
             tp1 = find_structure_tp(df, direction, entry_price)
         else:
-            sl = max(df['high'].iloc[-10:]) + atr_value * 0.5
-            if liquidity_zone_ok:
-                liq_zone = df['high'].iloc[-20:].max()
-                sl = liq_zone + atr_value * 0.25
+            sl = (df['high'].max() + atr_value * 0.25) if liquidity_zone_ok else max(df['high'].iloc[-10:]) + atr_value * 0.5
             tp1 = find_structure_tp(df, direction, entry_price)
 
         tp2 = entry_price + (tp1 - entry_price) * 2 if direction == "long" else entry_price - (entry_price - tp1) * 2
         rr1 = round(abs(tp1 - entry_price) / abs(entry_price - sl), 1)
         rr2 = round(abs(tp2 - entry_price) / abs(entry_price - sl), 1)
 
-        tolerable = {"CHoCH", "BOUGIE", "DIVERGENCE", "FVG", "OTE", "CVD", "LIQUIDITE", "BTC", "TOTAL", "BTC_NIVEAU"}
+        tolerable = {"OTE", "BOUGIE", "DIVERGENCE", "CHoCH", "RR", "FVG", "CVD", "LIQUIDITE"}
         tolerated = []
         rejected = []
 
@@ -120,17 +113,15 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df, total2_df=
         if not liquidity_zone_ok: tolerated.append("LIQUIDITE")
 
         tolerated = [t for t in tolerated if t in tolerable]
-        rejected += [t for t in tolerated if t not in tolerable]
+        rejected = [r for r in rejected if r not in tolerated]
 
         poids = {
-            "MOMENTUM": 2.0, "EMA": 1.5, "BOS": 1.5,
-            "COS": 1.0, "ATR": 1.0,
-            "TOTAL": 0.5, "TOTAL2": 0.5, "BTC": 0.5,
-            "BTC_NIVEAU": 0.5, "CHoCH": 0.5, "DIVERGENCE": 0.5,
-            "FVG": 0.5, "OTE": 0.5, "CVD": 0.5,
-            "LIQUIDITE": 0.5, "BOUGIE": 0.2
+            "EMA": 1.0, "MOMENTUM": 1.5, "BOS": 1.5,
+            "COS": 1.0, "CHoCH": 1.0, "FVG": 1.0,
+            "BOUGIE": 0.5, "DIVERGENCE": 0.5,
+            "TOTAL": 1.0, "TOTAL2": 1.0, "BTC": 1.0,
+            "ATR": 1.0, "BTC_NIVEAU": 0.5
         }
-
         score_total = sum(poids.values())
         score_obtenu = sum(v for k, v in poids.items() if k not in rejected)
         score = round((score_obtenu / score_total) * 10, 1)
@@ -143,10 +134,10 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df, total2_df=
             f"📈 Score : {score}/10\n"
             f"❌ Rejetés : {', '.join(rejected) if rejected else 'aucun'}\n"
             f"⚠️ Tolérés : {', '.join(tolerated) if tolerated else 'aucun'}\n\n"
-            f"ℹ️ Tolérances actives : {', '.join(tolerable)}"
+            f"ℹ️ Tolérances actives : {', '.join(sorted(tolerable))}"
         )
 
-        if score < 6.0:
+        if rejected:
             return {
                 "valid": False,
                 "score": score,
