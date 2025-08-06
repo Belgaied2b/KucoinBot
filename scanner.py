@@ -50,7 +50,13 @@ if os.path.exists("sent_signals.json"):
         print("⚠️ Erreur lecture sent_signals.json :", e)
 
 # ✅ Chargement des données macro avec cache local
-macro_cache = {"btc_df": None, "total_df": None, "btc_d_df": None, "last_fetch": None}
+macro_cache = {
+    "btc_df": None,
+    "total_df": None,
+    "btc_d_df": None,
+    "total2_df": None,
+    "last_fetch": None
+}
 
 def get_chart(url):
     headers = {"User-Agent": "Mozilla/5.0"}
@@ -83,35 +89,48 @@ def fetch_macro_df():
     now = datetime.utcnow()
 
     if macro_cache["last_fetch"] and now - macro_cache["last_fetch"] < timedelta(minutes=10):
-        print("🧠 Utilisation du cache macro (BTC / TOTAL / BTC.D)")
-        return macro_cache["btc_df"], macro_cache["total_df"], macro_cache["btc_d_df"]
+        print("🧠 Utilisation du cache macro (BTC / TOTAL / BTC.D / TOTAL2)")
+        return (
+            macro_cache["btc_df"],
+            macro_cache["total_df"],
+            macro_cache["btc_d_df"],
+            macro_cache["total2_df"]
+        )
 
     print("📡 Récupération des données macro depuis CoinGecko...")
 
     try:
-        # Données BTC
         time.sleep(1.5)
         btc_df = get_chart("https://api.coingecko.com/api/v3/coins/bitcoin/market_chart?vs_currency=usd&days=30")
         if btc_df is None or btc_df.empty:
             raise ValueError("Impossible de charger les données BTC")
 
-        # Données globales
         time.sleep(1.5)
         headers = {"User-Agent": "Mozilla/5.0"}
         response = requests.get("https://api.coingecko.com/api/v3/global", headers=headers)
         response.raise_for_status()
         global_data = response.json()
 
-        # Extraction
         btc_dominance = global_data["data"]["market_cap_percentage"]["btc"] / 100
         total_market_cap = btc_df["close"] / btc_dominance
+        btc_market_cap = btc_df["close"]
+        total2_market_cap = total_market_cap - btc_market_cap
 
+        # TOTAL
         total_df = btc_df.copy()
         total_df["close"] = total_market_cap
         total_df["high"] = total_market_cap * 1.01
         total_df["low"] = total_market_cap * 0.99
         total_df["open"] = total_market_cap
 
+        # TOTAL2
+        total2_df = btc_df.copy()
+        total2_df["close"] = total2_market_cap
+        total2_df["high"] = total2_market_cap * 1.01
+        total2_df["low"] = total2_market_cap * 0.99
+        total2_df["open"] = total2_market_cap
+
+        # BTC Dominance
         btc_d_df = btc_df.copy()
         btc_d_df["close"] = btc_dominance
 
@@ -119,15 +138,15 @@ def fetch_macro_df():
             "btc_df": btc_df,
             "total_df": total_df,
             "btc_d_df": btc_d_df,
+            "total2_df": total2_df,
             "last_fetch": now
         }
 
-        return btc_df, total_df, btc_d_df
+        return btc_df, total_df, btc_d_df, total2_df
 
     except Exception as e:
         print(f"⚠️ Erreur macro fetch : {e}")
-        # ⚠️ Retourne des DataFrames vides pour éviter le crash de l’analyse
-        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
 # 🔍 Scan principal
 async def scan_and_send_signals():
@@ -135,7 +154,7 @@ async def scan_and_send_signals():
     all_symbols = fetch_all_symbols()
 
     try:
-        btc_df, total_df, btc_d_df = fetch_macro_df()
+        btc_df, total_df, btc_d_df, total2_df = fetch_macro_df()
     except Exception as e:
         print(f"⚠️ Erreur macro fetch : {e}")
         return
@@ -159,7 +178,8 @@ async def scan_and_send_signals():
                     direction=direction,
                     btc_df=btc_df,
                     total_df=total_df,
-                    btc_d_df=btc_d_df
+                    btc_d_df=btc_d_df,
+                    total2_df=total2_df  # 🔁 Ajout TOTAL2
                 )
 
                 score = signal.get("score", 0)
