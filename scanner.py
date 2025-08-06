@@ -81,20 +81,28 @@ def get_chart(url):
 def fetch_macro_df():
     global macro_cache
     now = datetime.utcnow()
+
     if macro_cache["last_fetch"] and now - macro_cache["last_fetch"] < timedelta(minutes=10):
         print("🧠 Utilisation du cache macro (BTC / TOTAL / BTC.D)")
         return macro_cache["btc_df"], macro_cache["total_df"], macro_cache["btc_d_df"]
 
     print("📡 Récupération des données macro depuis CoinGecko...")
+
     try:
+        # Données BTC
+        time.sleep(1.5)
         btc_df = get_chart("https://api.coingecko.com/api/v3/coins/bitcoin/market_chart?vs_currency=usd&days=30")
-        if btc_df is None:
+        if btc_df is None or btc_df.empty:
             raise ValueError("Impossible de charger les données BTC")
 
-        response = requests.get("https://api.coingecko.com/api/v3/global", headers={"User-Agent": "Mozilla/5.0"})
+        # Données globales
+        time.sleep(1.5)
+        headers = {"User-Agent": "Mozilla/5.0"}
+        response = requests.get("https://api.coingecko.com/api/v3/global", headers=headers)
         response.raise_for_status()
         global_data = response.json()
 
+        # Extraction
         btc_dominance = global_data["data"]["market_cap_percentage"]["btc"] / 100
         total_market_cap = btc_df["close"] / btc_dominance
 
@@ -117,7 +125,9 @@ def fetch_macro_df():
         return btc_df, total_df, btc_d_df
 
     except Exception as e:
-        raise ValueError(f"Erreur parsing global_data : {e}")
+        print(f"⚠️ Erreur macro fetch : {e}")
+        # ⚠️ Retourne des DataFrames vides pour éviter le crash de l’analyse
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
 # 🔍 Scan principal
 async def scan_and_send_signals():
