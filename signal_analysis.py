@@ -16,7 +16,7 @@ from structure_utils import (
 from chart_generator import generate_chart
 
 
-def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df):
+def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df, total2_df=None):
     if df is None or df.empty or 'timestamp' not in df.columns:
         return {
             "valid": False,
@@ -65,6 +65,7 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df):
         divergence_ok = is_bullish_divergence(df) if direction == "long" else is_bearish_divergence(df)
         atr_ok = is_atr_sufficient(df)
         market_ok = is_total_ok(total_df, direction)
+        total2_ok = is_total_ok(total2_df, direction) if total2_df is not None else True
         btc_ok = is_btc_ok(btc_df)
         btc_level_ok = is_btc_at_key_level(btc_df)
         btc_d_status = get_btc_dominance_trend(btc_d_df)
@@ -93,6 +94,7 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df):
         if not bos_ok: rejected.append("BOS")
         if not atr_ok: rejected.append("ATR")
         if not market_ok: rejected.append("TOTAL")
+        if not total2_ok: rejected.append("TOTAL2")
         if not btc_ok: rejected.append("BTC")
         if not cos_ok: rejected.append("COS")
         if not btc_level_ok: rejected.append("BTC_NIVEAU")
@@ -112,8 +114,8 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df):
             "EMA": 1.0, "MOMENTUM": 1.5, "BOS": 1.5,
             "COS": 1.0, "CHoCH": 1.0, "FVG": 1.0,
             "BOUGIE": 0.5, "DIVERGENCE": 0.5,
-            "TOTAL": 1.0, "BTC": 1.0, "ATR": 1.0,
-            "BTC_NIVEAU": 0.5
+            "TOTAL": 1.0, "TOTAL2": 1.0, "BTC": 1.0,
+            "ATR": 1.0, "BTC_NIVEAU": 0.5
         }
         score_total = sum(poids.values())
         score_obtenu = sum(v for k, v in poids.items() if k not in rejected)
