@@ -1,4 +1,6 @@
 import pandas as pd
+import numpy as np
+from indicators import compute_atr
 
 def detect_bos_cos(df, direction="long", lookback=20):
     if df is None or len(df) < lookback + 3 or not all(col in df.columns for col in ['high', 'low', 'close', 'volume']):
@@ -38,32 +40,27 @@ def detect_choch(df, direction="long", lookback=20):
     volume_ok = candle['volume'] > volume_avg * 1.2
 
     if direction == "long":
-        # Un CHoCH haussier implique une cassure haussière après une structure baissière
         return candle['close'] > prev_high and volume_ok
     else:
         return candle['close'] < prev_low and volume_ok
 
 def is_bos_valid(df, direction="long", lookback=20):
     bos, _ = detect_bos_cos(df, direction, lookback)
-
     if not bos:
         return False
 
-    # Vérifie que le corps de la bougie dépasse un seuil (style institutional)
     candle = df.iloc[-1]
-    atr = df['high'].rolling(14).max() - df['low'].rolling(14).min()
-    atr_val = atr.iloc[-1] if not atr.isna().all() else 0
-
+    atr_series = compute_atr(df)
+    atr_val = atr_series.iloc[-1] if not atr_series.isna().all() else 0
     body = abs(candle['close'] - candle['open'])
+
     return body > (atr_val * 0.5) if atr_val > 0 else True
 
 def is_cos_valid(df, direction="long", lookback=20):
     _, cos = detect_bos_cos(df, direction, lookback)
-
     if not cos:
         return False
 
-    # Détection d’un COS = réintégration rapide dans la structure
     candle = df.iloc[-1]
     previous = df.iloc[-2]
 
@@ -73,6 +70,15 @@ def is_cos_valid(df, direction="long", lookback=20):
         return previous['close'] < previous['high'] and candle['close'] > previous['high']
 
 def is_choch(df, direction="long", lookback=20):
+    # CHoCH valide seulement si un BOS opposé a été détecté récemment
+    opposite_direction = "short" if direction == "long" else "long"
+    recent_bos_found = any(
+        is_bos_valid(df.iloc[i - lookback:i], direction=opposite_direction, lookback=int(lookback / 2))
+        for i in range(lookback, len(df))
+    )
+    if not recent_bos_found:
+        return False
+
     return detect_choch(df, direction, lookback)
 
 def find_structure_tp(df, direction="long", entry_price=None):
@@ -91,21 +97,14 @@ def find_structure_tp(df, direction="long", entry_price=None):
                 swings.append(hl.iloc[i])
 
     if not swings:
-        # fallback : structure simple
-        if direction == "long":
-            return df['high'].iloc[-20:].max()
-        else:
-            return df['low'].iloc[-20:].min()
+        return df['high'].iloc[-20:].max() if direction == "long" else df['low'].iloc[-20:].min()
 
     return max(swings) if direction == "long" else min(swings)
 
 def is_bullish_engulfing(df):
     if df is None or len(df) < 2:
         return False
-
-    prev = df.iloc[-2]
-    curr = df.iloc[-1]
-
+    prev, curr = df.iloc[-2], df.iloc[-1]
     return (
         prev['close'] < prev['open'] and
         curr['close'] > curr['open'] and
@@ -116,13 +115,31 @@ def is_bullish_engulfing(df):
 def is_bearish_engulfing(df):
     if df is None or len(df) < 2:
         return False
-
-    prev = df.iloc[-2]
-    curr = df.iloc[-1]
-
+    prev, curr = df.iloc[-2], df.iloc[-1]
     return (
         prev['close'] > prev['open'] and
         curr['close'] < curr['open'] and
         curr['open'] > prev['close'] and
         curr['close'] < prev['open']
     )
+
+# 🧪 Tests unitaires simples
+if __name__ == "__main__":
+    print("🔍 Lancement des tests unitaires...")
+
+    # Génération d’un mini DataFrame pour test
+    data = {
+        'open': [100, 101, 102, 103, 104, 106, 105],
+        'high': [102, 103, 104, 106, 108, 109, 110],
+        'low': [98, 99, 100, 101, 102, 104, 103],
+        'close': [101, 102, 103, 105, 107, 108, 109],
+        'volume': [100, 120, 130, 150, 180, 200, 210]
+    }
+    df_test = pd.DataFrame(data)
+
+    print("✅ BOS long :", is_bos_valid(df_test, "long"))
+    print("✅ COS short :", is_cos_valid(df_test, "short"))
+    print("✅ CHoCH long :", is_choch(df_test, "long"))
+    print("✅ TP long :", find_structure_tp(df_test, "long", entry_price=105))
+    print("✅ Engulfing haussier :", is_bullish_engulfing(df_test))
+    print("✅ Engulfing baissier :", is_bearish_engulfing(df_test))
