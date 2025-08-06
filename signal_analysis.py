@@ -6,7 +6,8 @@ from indicators import (
     is_above_ma200, is_below_ma200,
     is_bullish_divergence, is_bearish_divergence,
     is_atr_sufficient, is_total_ok, is_btc_ok,
-    is_btc_at_key_level, get_btc_dominance_trend
+    is_btc_at_key_level, get_btc_dominance_trend,
+    is_aggressive_volume_ok, is_liquidity_zone_present
 )
 from structure_utils import (
     is_choch,
@@ -63,6 +64,8 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df, total2_df=
         candle_ok = is_bullish_engulfing(df) if direction == "long" else is_bearish_engulfing(df)
         divergence_ok = is_bullish_divergence(df) if direction == "long" else is_bearish_divergence(df)
         atr_ok = is_atr_sufficient(df)
+        volume_aggressif_ok = is_aggressive_volume_ok(df, direction)
+        liquidity_zone_ok = is_liquidity_zone_present(df, direction)
 
         # 🔍 Validation H4 (si dispo)
         ema_trend_h4 = is_ema_trend_ok(df_higher_tf, direction) if df_higher_tf is not None else True
@@ -87,7 +90,7 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df, total2_df=
         rr1 = round(abs(tp1 - entry_price) / abs(entry_price - sl), 1)
         rr2 = round(abs(tp2 - entry_price) / abs(entry_price - sl), 1)
 
-        tolerable = {"OTE", "BOUGIE", "DIVERGENCE", "CHoCH", "RR", "FVG"}
+        tolerable = {"OTE", "BOUGIE", "DIVERGENCE", "CHoCH", "RR", "FVG", "CVD", "LIQUIDITE"}
         tolerated = []
         rejected = []
 
@@ -107,6 +110,8 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df, total2_df=
         if not in_ote: tolerated.append("OTE")
         if not divergence_ok: tolerated.append("DIVERGENCE")
         if rr1 < 1.5: tolerated.append("RR")
+        if not volume_aggressif_ok: tolerated.append("CVD")
+        if not liquidity_zone_ok: tolerated.append("LIQUIDITE")
 
         tolerated = [t for t in tolerated if t in tolerable]
         rejected += [t for t in tolerated if t not in tolerable]
