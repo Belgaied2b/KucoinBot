@@ -81,13 +81,15 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df, total2_df=
         atr = compute_atr(df)
         atr_value = atr.iloc[-1]
 
+        liq_zone_price = None
+        if has_liquidity_zone(df, direction):
+            liq_zone_price = df['low'].iloc[-1] if direction == "long" else df['high'].iloc[-1]
+
         if direction == "long":
-            liq_zone = df['low'].rolling(window=20).apply(lambda x: x[-1] if has_liquidity_zone(df, direction) else np.nan).iloc[-1]
-            sl = liq_zone - atr_value * 0.25 if not np.isnan(liq_zone) else min(df['low'].iloc[-10:]) - atr_value * 0.5
+            sl = liq_zone_price - atr_value * 0.25 if liq_zone_price else min(df['low'].iloc[-10:]) - atr_value * 0.5
             tp1 = find_structure_tp(df, direction, entry_price)
         else:
-            liq_zone = df['high'].rolling(window=20).apply(lambda x: x[-1] if has_liquidity_zone(df, direction) else np.nan).iloc[-1]
-            sl = liq_zone + atr_value * 0.25 if not np.isnan(liq_zone) else max(df['high'].iloc[-10:]) + atr_value * 0.5
+            sl = liq_zone_price + atr_value * 0.25 if liq_zone_price else max(df['high'].iloc[-10:]) + atr_value * 0.5
             tp1 = find_structure_tp(df, direction, entry_price)
 
         tp2 = entry_price + (tp1 - entry_price) * 2 if direction == "long" else entry_price - (entry_price - tp1) * 2
