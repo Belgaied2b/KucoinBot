@@ -1,14 +1,15 @@
 import numpy as np
 from indicators import (
-    compute_atr, compute_fvg_zones, is_volume_strong,
+    compute_atr, compute_fvg_zones,
+    is_momentum_ok, is_ema_trend_ok,
+    is_bos_with_strength, is_cos_enhanced,
     is_above_ma200, is_below_ma200,
-    is_macd_positive, is_macd_negative,
     is_bullish_divergence, is_bearish_divergence,
     is_atr_sufficient, is_total_ok, is_btc_ok,
-    get_btc_dominance_trend
+    is_btc_at_key_level, get_btc_dominance_trend
 )
 from structure_utils import (
-    is_bos_valid, is_cos_valid, is_choch,
+    is_choch,
     is_bullish_engulfing, is_bearish_engulfing,
     find_structure_tp
 )
@@ -54,18 +55,18 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df):
             else:
                 in_fvg = fvg_upper >= last_close >= fvg_lower
 
-        # 🔍 Indicateurs
-        volume_ok = is_volume_strong(df)
-        ma_ok = is_above_ma200(df) if direction == "long" else is_below_ma200(df)
-        macd_ok = is_macd_positive(df) if direction == "long" else is_macd_negative(df)
-        bos_ok = is_bos_valid(df, direction)
-        cos_ok = is_cos_valid(df, direction)
+        # 🔍 Indicateurs mis à jour
+        momentum_ok = is_momentum_ok(df, direction)
+        ema_trend_ok = is_ema_trend_ok(df, direction)
+        bos_ok = is_bos_with_strength(df, direction)
+        cos_ok = is_cos_enhanced(df, direction)
         choch_ok = is_choch(df, direction)
         candle_ok = is_bullish_engulfing(df) if direction == "long" else is_bearish_engulfing(df)
         divergence_ok = is_bullish_divergence(df) if direction == "long" else is_bearish_divergence(df)
         atr_ok = is_atr_sufficient(df)
         market_ok = is_total_ok(total_df, direction)
         btc_ok = is_btc_ok(btc_df)
+        btc_level_ok = is_btc_at_key_level(btc_df)
         btc_d_status = get_btc_dominance_trend(btc_d_df)
 
         # 🛑 SL / TP dynamiques
@@ -87,14 +88,14 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df):
         tolerated = []
         rejected = []
 
-        if not volume_ok: rejected.append("VOLUME")
-        if not ma_ok: rejected.append("MA200")
-        if not macd_ok: rejected.append("MACD")
+        if not ema_trend_ok: rejected.append("EMA")
+        if not momentum_ok: rejected.append("MOMENTUM")
         if not bos_ok: rejected.append("BOS")
         if not atr_ok: rejected.append("ATR")
         if not market_ok: rejected.append("TOTAL")
         if not btc_ok: rejected.append("BTC")
         if not cos_ok: rejected.append("COS")
+        if not btc_level_ok: rejected.append("BTC_NIVEAU")
 
         if not choch_ok: tolerated.append("CHoCH")
         if not candle_ok: tolerated.append("BOUGIE")
@@ -108,10 +109,11 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df):
 
         # 📊 Score
         poids = {
-            "MA200": 1.5, "MACD": 1.5, "BOS": 1.5,
+            "EMA": 1.0, "MOMENTUM": 1.5, "BOS": 1.5,
             "COS": 1.0, "CHoCH": 1.0, "FVG": 1.0,
-            "VOLUME": 1.5, "BOUGIE": 0.5, "TOTAL": 1.0,
-            "BTC": 1.0, "DIVERGENCE": 0.5
+            "BOUGIE": 0.5, "DIVERGENCE": 0.5,
+            "TOTAL": 1.0, "BTC": 1.0, "ATR": 1.0,
+            "BTC_NIVEAU": 0.5
         }
         score_total = sum(poids.values())
         score_obtenu = sum(v for k, v in poids.items() if k not in rejected)
