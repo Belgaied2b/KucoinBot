@@ -28,7 +28,7 @@ async def send_signal_to_telegram(signal):
     message = (
         f"📉 {signal['symbol']} - Signal CONFIRMÉ ({signal['direction']})\n\n"
         f"🎯 Entry : {signal['entry']:.4f}\n"
-        f"🛑 SL    : {signal['sl']:.4f}\n"
+        f"🔚 SL    : {signal['sl']:.4f}\n"
         f"🎯 TP1   : {signal['tp1']:.4f}\n"
         f"🎯 TP2   : {signal['tp2']:.4f}\n"
         f"📈 R:R1  : {signal['rr1']}\n"
@@ -100,7 +100,7 @@ def fetch_macro_df():
             macro_cache["total2_df"]
         )
 
-    print("📡 Récupération des données macro depuis CoinGecko...")
+    print("📱 Récupération des données macro depuis CoinGecko...")
 
     try:
         time.sleep(1.5)
@@ -152,9 +152,7 @@ def fetch_macro_df():
 async def scan_and_send_signals():
     print(f"🔁 Scan lancé à {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC\n")
 
-    # 🚨 Appel temporaire des tests unitaires structurels
     run_structure_tests()
-
     all_symbols = fetch_all_symbols()
 
     try:
@@ -168,22 +166,24 @@ async def scan_and_send_signals():
             continue
 
         try:
-            df = fetch_klines(symbol)
-            if df is None or df.empty or 'timestamp' not in df.columns:
-                print(f"[{symbol}] ⚠️ Données invalides ou vides, ignoré")
+            df_h1 = fetch_klines(symbol, interval="1h")
+            df_h4 = fetch_klines(symbol, interval="4h")
+            if df_h1 is None or df_h1.empty or 'timestamp' not in df_h1.columns:
+                print(f"[{symbol}] ⚠️ Données H1 invalides, ignoré")
                 continue
 
             for direction in ["long", "short"]:
-                print(f"[{symbol}] ➡️ Analyse {direction.upper()}")
+                print(f"[{symbol}] ➡️ Analyse {direction.upper()} (H1 + H4)")
 
                 signal = analyze_signal(
-                    df.copy(),
+                    df_h1.copy(),
                     symbol=symbol,
                     direction=direction,
                     btc_df=btc_df,
                     total_df=total_df,
                     btc_d_df=btc_d_df,
-                    total2_df=total2_df
+                    total2_df=total2_df,
+                    df_higher_tf=df_h4.copy()
                 )
 
                 score = signal.get("score", 0)
