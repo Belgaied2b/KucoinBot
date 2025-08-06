@@ -15,8 +15,7 @@ from structure_utils import (
 )
 from chart_generator import generate_chart
 
-
-def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df, total2_df=None):
+def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df, total2_df=None, df_higher_tf=None):
     if df is None or df.empty or 'timestamp' not in df.columns:
         return {
             "valid": False,
@@ -55,7 +54,7 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df, total2_df=
             else:
                 in_fvg = fvg_upper >= last_close >= fvg_lower
 
-        # 🔍 Indicateurs mis à jour
+        # 🔍 Indicateurs H1
         momentum_ok = is_momentum_ok(df, direction)
         ema_trend_ok = is_ema_trend_ok(df, direction)
         bos_ok = is_bos_with_strength(df, direction)
@@ -64,13 +63,17 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df, total2_df=
         candle_ok = is_bullish_engulfing(df) if direction == "long" else is_bearish_engulfing(df)
         divergence_ok = is_bullish_divergence(df) if direction == "long" else is_bearish_divergence(df)
         atr_ok = is_atr_sufficient(df)
+
+        # 🔍 Validation H4 (si dispo)
+        ema_trend_h4 = is_ema_trend_ok(df_higher_tf, direction) if df_higher_tf is not None else True
+        momentum_h4 = is_momentum_ok(df_higher_tf, direction) if df_higher_tf is not None else True
+
         market_ok = is_total_ok(total_df, direction)
         total2_ok = is_total_ok(total2_df, direction) if total2_df is not None else True
         btc_ok = is_btc_ok(btc_df)
         btc_level_ok = is_btc_at_key_level(btc_df)
         btc_d_status = get_btc_dominance_trend(btc_d_df)
 
-        # 🛑 SL / TP dynamiques
         atr = compute_atr(df)
         atr_value = atr.iloc[-1]
         if direction == "long":
@@ -84,13 +87,12 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df, total2_df=
         rr1 = round(abs(tp1 - entry_price) / abs(entry_price - sl), 1)
         rr2 = round(abs(tp2 - entry_price) / abs(entry_price - sl), 1)
 
-        # ⚖️ Tolérances limitées
         tolerable = {"OTE", "BOUGIE", "DIVERGENCE", "CHoCH", "RR", "FVG"}
         tolerated = []
         rejected = []
 
-        if not ema_trend_ok: rejected.append("EMA")
-        if not momentum_ok: rejected.append("MOMENTUM")
+        if not ema_trend_ok or not ema_trend_h4: rejected.append("EMA")
+        if not momentum_ok or not momentum_h4: rejected.append("MOMENTUM")
         if not bos_ok: rejected.append("BOS")
         if not atr_ok: rejected.append("ATR")
         if not market_ok: rejected.append("TOTAL")
@@ -109,7 +111,6 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df, total2_df=
         tolerated = [t for t in tolerated if t in tolerable]
         rejected += [t for t in tolerated if t not in tolerable]
 
-        # 📊 Score
         poids = {
             "EMA": 1.0, "MOMENTUM": 1.5, "BOS": 1.5,
             "COS": 1.0, "CHoCH": 1.0, "FVG": 1.0,
@@ -121,7 +122,6 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df, total2_df=
         score_obtenu = sum(v for k, v in poids.items() if k not in rejected)
         score = round((score_obtenu / score_total) * 10, 1)
 
-        # 📝 Commentaire
         comment = (
             f"📌 Zone idéale d'entrée :\n"
             f"OTE = {round(ote_start, 4)} → {round(ote_end, 4)}\n"
