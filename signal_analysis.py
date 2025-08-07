@@ -79,11 +79,12 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df, total2_df=
         btc_level_ok = is_btc_at_key_level(btc_df)
         btc_d_status = get_btc_dominance_trend(btc_d_df)
 
-        # Institutional data
-        institutional_score, institutional_details = get_institutional_score(df, symbol_binance=symbol.replace("USDTM", "USDT"))
-        institutional_ok = institutional_score >= 2  # Seuil arbitraire (sur 4), ajustable
+        # Institutionnel
+        symbol_binance = symbol.replace("USDTM", "USDT")
+        institutional_score, institutional_details = get_institutional_score(df, symbol_binance)
+        institutional_ok = institutional_score >= 2
 
-        # SL, TP
+        # SL & TP
         atr = compute_atr(df)
         atr_value = atr.iloc[-1]
 
@@ -100,7 +101,7 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df, total2_df=
         rr1 = round(abs(tp1 - entry_price) / abs(entry_price - sl), 1)
         rr2 = round(abs(tp2 - entry_price) / abs(entry_price - sl), 1)
 
-        # Conditions tolérées
+        # Tolerances
         tolerable = {"OTE", "BOUGIE", "DIVERGENCE", "CHoCH", "RR", "FVG", "CVD", "LIQUIDITE"}
         tolerated = []
         rejected = []
