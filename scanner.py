@@ -24,6 +24,15 @@ async def send_signal_to_telegram(signal):
     rejected_clean = sorted(set(rejected) - set(tolerated_clean))
     sl_note = " 🔐 SL basé sur zone de liquidité" if "LIQUIDITE" in tolerated_clean else ""
 
+    try:
+        ote = signal.get('ote_zone', [None, None])
+        fvg = signal.get('fvg_zone', [None, None])
+        ote_str = f"{float(ote[0]):.4f} → {float(ote[1]):.4f}" if None not in ote else "inconnu"
+        fvg_str = f"{float(fvg[0]):.4f} → {float(fvg[1]):.4f}" if None not in fvg else "inconnu"
+    except Exception:
+        ote_str = "inconnu"
+        fvg_str = "inconnu"
+
     message = (
         f"📉 {signal['symbol']} - Signal CONFIRMÉ ({signal['direction']})\n\n"
         f"🎯 Entry : {signal['entry']:.4f}\n"
@@ -34,8 +43,8 @@ async def send_signal_to_telegram(signal):
         f"📈 R:R2  : {signal['rr2']}\n"
         f"🧠 Score : {signal.get('score', '?')}/10\n\n"
         f"📌 Zone idéale d'entrée :\n"
-        f"OTE = {signal.get('ote_zone', ['?','?'])[0]:.4f} → {signal.get('ote_zone', ['?','?'])[1]:.4f}\n"
-        f"FVG = {signal.get('fvg_zone', ['?','?'])[0]:.4f} → {signal.get('fvg_zone', ['?','?'])[1]:.4f}\n\n"
+        f"OTE = {ote_str}\n"
+        f"FVG = {fvg_str}\n\n"
         f"📊 BTC Dominance : {signal.get('btc_dominance', 'INCONNU')}\n"
         f"❌ Rejetés : {', '.join(rejected_clean) if rejected_clean else 'aucun'}\n"
         f"⚠️ Tolérés : {', '.join(tolerated_clean) if tolerated_clean else 'aucun'}\n"
@@ -44,7 +53,6 @@ async def send_signal_to_telegram(signal):
 
     print(f"[{signal['symbol']}] 📤 Envoi Telegram en cours...")
     await bot.send_message(chat_id=CHAT_ID, text=message.strip())
-
 
 # 📂 Gestion des doublons
 sent_signals = {}
