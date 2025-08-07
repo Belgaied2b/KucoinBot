@@ -124,7 +124,7 @@ def is_btc_at_key_level(df, threshold_percent=0.01):
     current = df['close'].iloc[-1]
     return abs(current - high) / high < threshold_percent or abs(current - low) / low < threshold_percent
 
-# ✅ Restants
+# ✅ MA200 helpers
 def is_above_ma200(df):
     if df is None or 'close' not in df.columns or len(df) < 200:
         return False
@@ -137,14 +137,22 @@ def is_below_ma200(df):
     ma200 = compute_ma(df, period=200)
     return df['close'].iloc[-1] < ma200.iloc[-1]
 
-def is_macd_positive(df):
-    macd_hist = compute_macd_histogram(df['close'])
-    return macd_hist.iloc[-1] > 0
+# ✅ Divergences RSI
+def is_bullish_divergence(df):
+    if df is None or len(df) < 20:
+        return False
+    rsi = compute_rsi(df['close'])
+    price_low = df['low']
+    return price_low.iloc[-1] < price_low.iloc[-5] and rsi.iloc[-1] > rsi.iloc[-5]
 
-def is_macd_negative(df):
-    macd_hist = compute_macd_histogram(df['close'])
-    return macd_hist.iloc[-1] < 0
+def is_bearish_divergence(df):
+    if df is None or len(df) < 20:
+        return False
+    rsi = compute_rsi(df['close'])
+    price_high = df['high']
+    return price_high.iloc[-1] > price_high.iloc[-5] and rsi.iloc[-1] < rsi.iloc[-5]
 
+# ✅ Macro
 def is_atr_sufficient(df, min_ratio=0.005):
     atr = compute_atr(df)
     if atr.isna().all():
@@ -163,20 +171,6 @@ def is_btc_ok(btc_df):
         return False
     close = btc_df['close']
     return close.iloc[-1] > close.iloc[-2] > close.iloc[-3] or close.iloc[-1] < close.iloc[-2] < close.iloc[-3]
-
-def is_bullish_divergence(df):
-    if df is None or len(df) < 20:
-        return False
-    rsi = compute_rsi(df['close'])
-    price_low = df['low']
-    return price_low.iloc[-1] < price_low.iloc[-5] and rsi.iloc[-1] > rsi.iloc[-5]
-
-def is_bearish_divergence(df):
-    if df is None or len(df) < 20:
-        return False
-    rsi = compute_rsi(df['close'])
-    price_high = df['high']
-    return price_high.iloc[-1] > price_high.iloc[-5] and rsi.iloc[-1] < rsi.iloc[-5]
 
 def get_btc_dominance_trend(btc_d_df):
     if btc_d_df is None or len(btc_d_df) < 3 or 'close' not in btc_d_df.columns:
@@ -200,7 +194,7 @@ def is_aggressive_volume_ok(df, direction="long", window=20):
     avg = recent.mean()
     return avg > 0 if direction == "long" else avg < 0
 
-# 💧 Détection zone de liquidité (equal highs/lows)
+# 💧 Liquidité (equal highs/lows)
 def has_liquidity_zone(df, direction="long", window=20, tolerance=0.002):
     if df is None or len(df) < window:
         return False
@@ -214,5 +208,5 @@ def has_liquidity_zone(df, direction="long", window=20, tolerance=0.002):
                 return True
     return False
 
-# ✅ Alias pour compatibilité
+# ✅ Alias
 is_liquidity_zone_present = has_liquidity_zone
