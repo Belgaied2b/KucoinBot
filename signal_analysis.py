@@ -137,7 +137,8 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df, total2_df=
             f"ℹ️ Tolérances actives : {', '.join(sorted(tolerable))}"
         )
 
-        if rejected:
+        # 👉 Nouvelle logique : autoriser les signaux avec rejet si score >= 8.0
+        if rejected and score < 8.0:
             return {
                 "valid": False,
                 "score": score,
