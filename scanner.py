@@ -24,11 +24,12 @@ async def send_signal_to_telegram(signal):
     rejected_clean = sorted(set(rejected) - set(tolerated_clean))
     sl_note = " 🔐 SL basé sur zone de liquidité" if "LIQUIDITE" in tolerated_clean else ""
 
+    # ✅ Gestion sécurisée des zones OTE et FVG
     try:
         ote = signal.get('ote_zone', [None, None])
         fvg = signal.get('fvg_zone', [None, None])
-        ote_str = f"{float(ote[0]):.4f} → {float(ote[1]):.4f}" if None not in ote else "inconnu"
-        fvg_str = f"{float(fvg[0]):.4f} → {float(fvg[1]):.4f}" if None not in fvg else "inconnu"
+        ote_str = f"{float(ote[0]):.4f} → {float(ote[1]):.4f}" if all(isinstance(x, (int, float)) for x in ote) else "inconnu"
+        fvg_str = f"{float(fvg[0]):.4f} → {float(fvg[1]):.4f}" if all(isinstance(x, (int, float)) for x in fvg) else "inconnu"
     except Exception:
         ote_str = "inconnu"
         fvg_str = "inconnu"
@@ -54,6 +55,7 @@ async def send_signal_to_telegram(signal):
     print(f"[{signal['symbol']}] 📤 Envoi Telegram en cours...")
     await bot.send_message(chat_id=CHAT_ID, text=message.strip())
 
+
 # 📂 Gestion des doublons
 sent_signals = {}
 if os.path.exists("sent_signals.json"):
@@ -64,7 +66,7 @@ if os.path.exists("sent_signals.json"):
     except Exception as e:
         print("⚠️ Erreur lecture sent_signals.json :", e)
 
-# ✅ Chargement des données macro avec cache local
+# ✅ Cache macro
 macro_cache = {
     "btc_df": None,
     "total_df": None,
