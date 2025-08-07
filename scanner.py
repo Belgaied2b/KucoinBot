@@ -10,8 +10,6 @@ from signal_analysis import analyze_signal
 from config import TOKEN, CHAT_ID
 from telegram import Bot
 from kucoin_trader import place_order
-
-# 🔁 Import pour test des structures
 from structure_utils import run_structure_tests
 
 bot = Bot(token=TOKEN)
@@ -22,10 +20,8 @@ async def send_signal_to_telegram(signal):
     tolerated = signal.get("toleres", [])
     comment = signal.get("comment", "").strip()
 
-    # Nettoyage des doublons
     tolerated_clean = sorted(set(tolerated))
     rejected_clean = sorted(set(rejected) - set(tolerated_clean))
-
     sl_note = " 🔐 SL basé sur zone de liquidité" if "LIQUIDITE" in tolerated_clean else ""
 
     message = (
@@ -81,7 +77,7 @@ def get_chart(url):
 
     timestamps = [x[0] for x in data["prices"]]
     closes = [x[1] for x in data["prices"]]
-    volumes = [x[1] for x in data["total_volumes"]] if "total_volumes" in data else [0 for _ in timestamps]
+    volumes = [x[1] for x in data.get("total_volumes", [])] or [0 for _ in timestamps]
 
     df = pd.DataFrame({
         "timestamp": timestamps,
@@ -156,7 +152,6 @@ def fetch_macro_df():
         print(f"⚠️ Erreur macro fetch : {e}")
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
-
 # 🔍 Scan principal
 async def scan_and_send_signals():
     print(f"🔁 Scan lancé à {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC\n")
@@ -177,8 +172,11 @@ async def scan_and_send_signals():
         try:
             df_h1 = fetch_klines(symbol, interval="1h")
             df_h4 = fetch_klines(symbol, interval="4h")
-            if df_h1 is None or df_h1.empty or 'timestamp' not in df_h1.columns:
-                print(f"[{symbol}] ⚠️ Données H1 invalides, ignoré")
+            if (
+                df_h1 is None or df_h1.empty or 'timestamp' not in df_h1.columns or
+                df_h4 is None or df_h4.empty or 'timestamp' not in df_h4.columns
+            ):
+                print(f"[{symbol}] ⚠️ Données H1 ou H4 invalides, ignoré")
                 continue
 
             for direction in ["long", "short"]:
