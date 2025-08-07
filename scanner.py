@@ -21,45 +21,34 @@ async def send_signal_to_telegram(signal):
     rejected = signal.get("rejetes", [])
     tolerated = signal.get("toleres", [])
     comment = signal.get("comment", "").strip()
-    score = signal.get("score", "?")
-    rr1 = signal.get("rr1", "?")
-    rr2 = signal.get("rr2", "?")
-    tp1 = signal.get("tp1", 0)
-    tp2 = signal.get("tp2", 0)
-    entry = signal.get("entry", 0)
-    sl = signal.get("sl", 0)
-    direction = signal.get("direction", "").upper()
 
-    # Affichage spécial si SL ajusté selon une zone de liquidité
-    sl_note = " 🔐 SL basé sur zone de liquidité" if "LIQUIDITE" in tolerated else ""
-
-    # Format tolérances et rejets sans doublon
+    # Nettoyage des doublons
     tolerated_clean = sorted(set(tolerated))
-    rejected_clean = sorted(set(rejected) - set(tolerated))
+    rejected_clean = sorted(set(rejected) - set(tolerated_clean))
 
-    msg_tolerated = f"⚠️ Tolérés : {', '.join(tolerated_clean)}" if tolerated_clean else ""
-    msg_rejected = f"❌ Rejetés : {', '.join(rejected_clean)}" if rejected_clean else ""
+    sl_note = " 🔐 SL basé sur zone de liquidité" if "LIQUIDITE" in tolerated_clean else ""
 
-   message = (
-    f"📉 {signal['symbol']} - Signal CONFIRMÉ ({signal['direction']})\n\n"
-    f"🎯 Entry : {signal['entry']:.4f}\n"
-    f"🔚 SL    : {signal['sl']:.4f}\n"
-    f"🎯 TP1   : {signal['tp1']:.4f}\n"
-    f"🎯 TP2   : {signal['tp2']:.4f}\n"
-    f"📈 R:R1  : {signal['rr1']}\n"
-    f"📈 R:R2  : {signal['rr2']}\n"
-    f"🧠 Score : {signal.get('score', '?')}/10\n\n"
-    f"📌 Zone idéale d'entrée :\n"
-    f"OTE = {signal.get('ote_zone', ['?','?'])[0]:.4f} → {signal.get('ote_zone', ['?','?'])[1]:.4f}\n"
-    f"FVG = {signal.get('fvg_zone', ['?','?'])[0]:.4f} → {signal.get('fvg_zone', ['?','?'])[1]:.4f}\n\n"
-    f"📊 BTC Dominance : {signal.get('btc_dominance', 'INCONNU')}\n"
-    f"❌ Rejetés : {', '.join(signal.get('rejetes', [])) or 'aucun'}\n"
-    f"⚠️ Tolérés : {', '.join(signal.get('toleres', [])) or 'aucun'}\n"
-    f"ℹ️ Tolérances actives : {', '.join(signal.get('tolerances', [])) or 'aucune'}"
-)
+    message = (
+        f"📉 {signal['symbol']} - Signal CONFIRMÉ ({signal['direction']})\n\n"
+        f"🎯 Entry : {signal['entry']:.4f}\n"
+        f"🔚 SL    : {signal['sl']:.4f}{sl_note}\n"
+        f"🎯 TP1   : {signal['tp1']:.4f}\n"
+        f"🎯 TP2   : {signal['tp2']:.4f}\n"
+        f"📈 R:R1  : {signal['rr1']}\n"
+        f"📈 R:R2  : {signal['rr2']}\n"
+        f"🧠 Score : {signal.get('score', '?')}/10\n\n"
+        f"📌 Zone idéale d'entrée :\n"
+        f"OTE = {signal.get('ote_zone', ['?','?'])[0]:.4f} → {signal.get('ote_zone', ['?','?'])[1]:.4f}\n"
+        f"FVG = {signal.get('fvg_zone', ['?','?'])[0]:.4f} → {signal.get('fvg_zone', ['?','?'])[1]:.4f}\n\n"
+        f"📊 BTC Dominance : {signal.get('btc_dominance', 'INCONNU')}\n"
+        f"❌ Rejetés : {', '.join(rejected_clean) if rejected_clean else 'aucun'}\n"
+        f"⚠️ Tolérés : {', '.join(tolerated_clean) if tolerated_clean else 'aucun'}\n"
+        f"ℹ️ Tolérances actives : {', '.join(signal.get('tolerances', [])) if signal.get('tolerances') else 'aucune'}"
+    )
 
     print(f"[{signal['symbol']}] 📤 Envoi Telegram en cours...")
     await bot.send_message(chat_id=CHAT_ID, text=message.strip())
+
 
 # 📂 Gestion des doublons
 sent_signals = {}
@@ -166,6 +155,7 @@ def fetch_macro_df():
     except Exception as e:
         print(f"⚠️ Erreur macro fetch : {e}")
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
 
 # 🔍 Scan principal
 async def scan_and_send_signals():
