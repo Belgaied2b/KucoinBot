@@ -15,9 +15,9 @@ def fetch_binance_open_interest(symbol="BTCUSDT", interval="5m", limit=50):
         r = requests.get(url, params=params, timeout=10)
         data = r.json()
         df = pd.DataFrame(data)
-        df["openInterest"] = pd.to_numeric(df["openInterest"], errors='coerce')
+        df["sumOpenInterest"] = pd.to_numeric(df["sumOpenInterest"], errors='coerce')
         df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
-        df = df.dropna(subset=["openInterest"])
+        df = df.dropna(subset=["sumOpenInterest"])
         return df
     except Exception as e:
         print(f"[{symbol}] Erreur Open Interest : {e}")
@@ -65,9 +65,11 @@ def compute_liquidation_spike(liqs, threshold_usd=50000):
         print(f"Erreur dans compute_liquidation_spike : {e}")
     return False
 
-# 📊 CVD (Cumulative Volume Delta) simple proxy
+# 📊 CVD (Cumulative Volume Delta)
 def compute_cvd(df):
     try:
+        if df is None or len(df) < 10:
+            return False
         df = df.copy()
         df["delta"] = df["close"] - df["open"]
         df["cvd"] = df["delta"].cumsum()
@@ -86,13 +88,21 @@ def get_institutional_score(df_binance, symbol_binance="BTCUSDT"):
     score = 0
     details = []
 
-    if not open_interest_df.empty and open_interest_df["openInterest"].iloc[-1] > open_interest_df["openInterest"].iloc[-5]:
-        score += 1
-        details.append("OI↑")
+    if not open_interest_df.empty:
+        try:
+            if open_interest_df["sumOpenInterest"].iloc[-1] > open_interest_df["sumOpenInterest"].iloc[-5]:
+                score += 1
+                details.append("OI↑")
+        except Exception as e:
+            print(f"[{symbol_binance}] Erreur OI check : {e}")
 
-    if not funding_df.empty and funding_df["fundingRate"].iloc[-1] <= 0.0001:
-        score += 1
-        details.append("Funding OK")
+    if not funding_df.empty:
+        try:
+            if funding_df["fundingRate"].iloc[-1] <= 0.0001:
+                score += 1
+                details.append("Funding OK")
+        except Exception as e:
+            print(f"[{symbol_binance}] Erreur Funding check : {e}")
 
     if compute_liquidation_spike(liquidations):
         score += 1
