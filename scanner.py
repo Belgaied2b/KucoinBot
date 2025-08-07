@@ -41,7 +41,33 @@ async def send_signal_to_telegram(signal):
     msg_rejected = f"❌ Rejetés : {', '.join(rejected_clean)}" if rejected_clean else ""
 
     message = (
-        f"📉 {signal['symbol']} - Signal CONFIRMÉ ({direction})\n\n"
+        f"📉 {signal['symbol']} - Signal CONFIRMÉ ({signal['direction']})
+
+"
+        f"🎯 Entry : {signal['entry']:.4f}
+"
+        f"🔚 SL    : {signal['sl']:.4f}
+"
+        f"🎯 TP1   : {signal['tp1']:.4f}
+"
+        f"🎯 TP2   : {signal['tp2']:.4f}
+"
+        f"📈 R:R1  : {signal['rr1']}
+"
+        f"📈 R:R2  : {signal['rr2']}
+"
+        f"🧠 Score : {signal.get('score', '?')}/10
+
+"
+        f"{comment}
+
+"
+        f"⚠️ Tolérés : {', '.join(tolerated) if tolerated else 'aucun'}
+"
+        f"❌ Rejetés : {', '.join(rejected) if rejected else 'aucun'}
+"
+        f"ℹ️ Tolérances actives : {', '.join(signal.get('tolerable', []))}"
+    )\n\n"
         f"🎯 Entry : {entry:.4f}\n"
         f"🔚 SL    : {sl:.4f}{sl_note}\n"
         f"🎯 TP1   : {tp1:.4f}\n"
