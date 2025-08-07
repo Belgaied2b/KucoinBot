@@ -87,7 +87,6 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df, total2_df=
         # SL & TP
         atr = compute_atr(df)
         atr_value = atr.iloc[-1]
-
         if direction == "long":
             sl = (df['low'].min() - atr_value * 0.25) if liquidity_zone_ok else min(df['low'].iloc[-10:]) - atr_value * 0.5
         else:
@@ -122,7 +121,7 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df, total2_df=
         if not in_fvg: tolerated.append("FVG")
         if not in_ote: tolerated.append("OTE")
         if not divergence_ok: tolerated.append("DIVERGENCE")
-        if rr1 < 1.5: tolerated.append("RR")
+        if rr1 < 1.2: tolerated.append("RR")
         if not volume_aggressif_ok: tolerated.append("CVD")
         if not liquidity_zone_ok: tolerated.append("LIQUIDITE")
 
@@ -153,6 +152,29 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df, total2_df=
             f"ℹ️ Tolérances actives : {', '.join(sorted(tolerable))}"
         )
 
+        # 🚨 PRIORITÉ INSTITUTIONNELLE
+        if institutional_ok and rr1 >= 1.2:
+            generate_chart(df, symbol, ote_zone=(ote_start, ote_end), fvg_zone=(fvg_lower, fvg_upper), entry=entry_price, sl=sl, tp=tp1, direction=direction)
+            return {
+                "valid": True,
+                "symbol": symbol,
+                "direction": direction.upper(),
+                "entry": round(entry_price, 4),
+                "sl": round(sl, 4),
+                "tp1": round(tp1, 4),
+                "tp2": round(tp2, 4),
+                "rr1": rr1,
+                "rr2": rr2,
+                "score": score,
+                "toleres": tolerated,
+                "rejetes": rejected,
+                "comment": comment,
+                "tolere_ote": "OTE" in tolerated,
+                "ote_zone": (round(ote_start, 4), round(ote_end, 4)),
+                "fvg_zone": (round(fvg_lower, 4), round(fvg_upper, 4)),
+                "btc_dominance": btc_d_status
+            }
+
         if rejected and score < 8.0:
             return {
                 "valid": False,
@@ -162,15 +184,7 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df, total2_df=
                 "comment": comment
             }
 
-        generate_chart(
-            df, symbol,
-            ote_zone=(ote_start, ote_end),
-            fvg_zone=(fvg_lower, fvg_upper),
-            entry=entry_price,
-            sl=sl,
-            tp=tp1,
-            direction=direction
-        )
+        generate_chart(df, symbol, ote_zone=(ote_start, ote_end), fvg_zone=(fvg_lower, fvg_upper), entry=entry_price, sl=sl, tp=tp1, direction=direction)
 
         return {
             "valid": True,
