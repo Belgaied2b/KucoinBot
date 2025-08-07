@@ -14,11 +14,16 @@ def fetch_binance_open_interest(symbol="BTCUSDT", interval="5m", limit=50):
         }
         r = requests.get(url, params=params, timeout=10)
         data = r.json()
+
+        if not isinstance(data, list):
+            raise ValueError(f"Données invalides (Open Interest): {data}")
+
         df = pd.DataFrame(data)
         if "sumOpenInterest" in df.columns:
             df["sumOpenInterest"] = pd.to_numeric(df["sumOpenInterest"], errors='coerce')
         else:
             raise KeyError("sumOpenInterest absent des données")
+
         df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
         df = df.dropna(subset=["sumOpenInterest"])
         return df
@@ -33,11 +38,16 @@ def fetch_binance_funding_rate(symbol="BTCUSDT", limit=100):
         params = {"symbol": symbol, "limit": limit}
         r = requests.get(url, params=params, timeout=10)
         data = r.json()
+
+        if not isinstance(data, list):
+            raise ValueError(f"Données invalides (Funding Rate): {data}")
+
         df = pd.DataFrame(data)
         if "fundingRate" in df.columns:
             df["fundingRate"] = pd.to_numeric(df["fundingRate"], errors='coerce')
         else:
             raise KeyError("fundingRate absent des données")
+
         df["fundingTime"] = pd.to_datetime(df["fundingTime"], unit="ms")
         df = df.dropna(subset=["fundingRate"])
         return df
@@ -87,6 +97,9 @@ def compute_cvd(df):
 
 # 🧠 Score institutionnel global
 def get_institutional_score(df_binance, symbol_binance="BTCUSDT"):
+    # ✅ Corriger les symboles pour Binance si nécessaire
+    symbol_binance = symbol_binance.replace("USDTM", "USDT").replace("XBT", "BTC")
+
     open_interest_df = fetch_binance_open_interest(symbol_binance)
     funding_df = fetch_binance_funding_rate(symbol_binance)
     liquidations = fetch_binance_liquidations(symbol_binance)
@@ -103,6 +116,8 @@ def get_institutional_score(df_binance, symbol_binance="BTCUSDT"):
                 details.append("OI↑")
         except Exception as e:
             print(f"[{symbol_binance}] Erreur OI check : {e}")
+    else:
+        print(f"[{symbol_binance}] Erreur Open Interest : 'sumOpenInterest absent des données'")
 
     # 🔍 Funding Rate
     if not funding_df.empty:
@@ -112,6 +127,8 @@ def get_institutional_score(df_binance, symbol_binance="BTCUSDT"):
                 details.append("Funding OK")
         except Exception as e:
             print(f"[{symbol_binance}] Erreur Funding check : {e}")
+    else:
+        print(f"[{symbol_binance}] Erreur Funding Rate : 'fundingRate absent des données'")
 
     # 🔍 Liquidations
     if compute_liquidation_spike(liquidations):
