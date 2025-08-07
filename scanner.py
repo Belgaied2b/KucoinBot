@@ -40,45 +40,23 @@ async def send_signal_to_telegram(signal):
     msg_tolerated = f"⚠️ Tolérés : {', '.join(tolerated_clean)}" if tolerated_clean else ""
     msg_rejected = f"❌ Rejetés : {', '.join(rejected_clean)}" if rejected_clean else ""
 
-    message = (
-        f"📉 {signal['symbol']} - Signal CONFIRMÉ ({signal['direction']})
-
-"
-        f"🎯 Entry : {signal['entry']:.4f}
-"
-        f"🔚 SL    : {signal['sl']:.4f}
-"
-        f"🎯 TP1   : {signal['tp1']:.4f}
-"
-        f"🎯 TP2   : {signal['tp2']:.4f}
-"
-        f"📈 R:R1  : {signal['rr1']}
-"
-        f"📈 R:R2  : {signal['rr2']}
-"
-        f"🧠 Score : {signal.get('score', '?')}/10
-
-"
-        f"{comment}
-
-"
-        f"⚠️ Tolérés : {', '.join(tolerated) if tolerated else 'aucun'}
-"
-        f"❌ Rejetés : {', '.join(rejected) if rejected else 'aucun'}
-"
-        f"ℹ️ Tolérances actives : {', '.join(signal.get('tolerable', []))}"
-    )\n\n"
-        f"🎯 Entry : {entry:.4f}\n"
-        f"🔚 SL    : {sl:.4f}{sl_note}\n"
-        f"🎯 TP1   : {tp1:.4f}\n"
-        f"🎯 TP2   : {tp2:.4f}\n"
-        f"📈 R:R1  : {rr1}\n"
-        f"📈 R:R2  : {rr2}\n"
-        f"🧠 Score : {score}/10\n\n"
-        f"{comment.strip()}\n\n"
-        f"{msg_tolerated}\n"
-        f"{msg_rejected}"
-    )
+   message = (
+    f"📉 {signal['symbol']} - Signal CONFIRMÉ ({signal['direction']})\n\n"
+    f"🎯 Entry : {signal['entry']:.4f}\n"
+    f"🔚 SL    : {signal['sl']:.4f}\n"
+    f"🎯 TP1   : {signal['tp1']:.4f}\n"
+    f"🎯 TP2   : {signal['tp2']:.4f}\n"
+    f"📈 R:R1  : {signal['rr1']}\n"
+    f"📈 R:R2  : {signal['rr2']}\n"
+    f"🧠 Score : {signal.get('score', '?')}/10\n\n"
+    f"📌 Zone idéale d'entrée :\n"
+    f"OTE = {signal.get('ote_zone', ['?','?'])[0]:.4f} → {signal.get('ote_zone', ['?','?'])[1]:.4f}\n"
+    f"FVG = {signal.get('fvg_zone', ['?','?'])[0]:.4f} → {signal.get('fvg_zone', ['?','?'])[1]:.4f}\n\n"
+    f"📊 BTC Dominance : {signal.get('btc_dominance', 'INCONNU')}\n"
+    f"❌ Rejetés : {', '.join(signal.get('rejetes', [])) or 'aucun'}\n"
+    f"⚠️ Tolérés : {', '.join(signal.get('toleres', [])) or 'aucun'}\n"
+    f"ℹ️ Tolérances actives : {', '.join(signal.get('tolerances', [])) or 'aucune'}"
+)
 
     print(f"[{signal['symbol']}] 📤 Envoi Telegram en cours...")
     await bot.send_message(chat_id=CHAT_ID, text=message.strip())
