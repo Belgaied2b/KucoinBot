@@ -152,8 +152,15 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df, total2_df=
             f"ℹ️ Tolérances actives : {', '.join(sorted(tolerable))}"
         )
 
-        # 🚨 PRIORITÉ INSTITUTIONNELLE
-        if institutional_ok and rr1 >= 1.2:
+        # 🚨 PRIORITÉ INSTITUTIONNELLE avec critères techniques renforcés
+        critical_oks = sum([
+            ema_trend_ok and ema_trend_h4,
+            momentum_ok and momentum_h4,
+            bos_ok,
+            cos_ok
+        ])
+
+        if institutional_ok and rr1 >= 1.2 and critical_oks >= 2:
             generate_chart(df, symbol, ote_zone=(ote_start, ote_end), fvg_zone=(fvg_lower, fvg_upper), entry=entry_price, sl=sl, tp=tp1, direction=direction)
             return {
                 "valid": True,
@@ -175,7 +182,8 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df, total2_df=
                 "btc_dominance": btc_d_status
             }
 
-        if rejected and score < 8.0:
+        # Si score trop faible ou trop de rejets critiques → rejet
+        if score < 8.0 or len(rejected) > 4:
             return {
                 "valid": False,
                 "score": score,
@@ -184,6 +192,7 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df, total2_df=
                 "comment": comment
             }
 
+        # Validation normale
         generate_chart(df, symbol, ote_zone=(ote_start, ote_end), fvg_zone=(fvg_lower, fvg_upper), entry=entry_price, sl=sl, tp=tp1, direction=direction)
 
         return {
