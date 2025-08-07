@@ -9,6 +9,7 @@ from indicators import (
     is_btc_at_key_level, get_btc_dominance_trend,
     is_aggressive_volume_ok, has_liquidity_zone
 )
+from institutional_data import get_institutional_score
 from structure_utils import (
     is_choch,
     is_bullish_engulfing, is_bearish_engulfing,
@@ -78,6 +79,10 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df, total2_df=
         btc_level_ok = is_btc_at_key_level(btc_df)
         btc_d_status = get_btc_dominance_trend(btc_d_df)
 
+        # Institutional data
+        institutional_score = get_institutional_score(symbol, direction)
+        institutional_ok = institutional_score >= 0.5
+
         # SL, TP
         atr = compute_atr(df)
         atr_value = atr.iloc[-1]
@@ -109,6 +114,7 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df, total2_df=
         if not btc_ok: rejected.append("BTC")
         if not cos_ok: rejected.append("COS")
         if not btc_level_ok: rejected.append("BTC_NIVEAU")
+        if not institutional_ok: rejected.append("FUNDING")
 
         if not choch_ok: tolerated.append("CHoCH")
         if not candle_ok: tolerated.append("BOUGIE")
@@ -127,7 +133,8 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df, total2_df=
             "COS": 1.0, "CHoCH": 1.0, "FVG": 1.0,
             "BOUGIE": 0.5, "DIVERGENCE": 0.5,
             "TOTAL": 1.0, "TOTAL2": 1.0, "BTC": 1.0,
-            "ATR": 1.0, "BTC_NIVEAU": 0.5
+            "ATR": 1.0, "BTC_NIVEAU": 0.5,
+            "FUNDING": 1.0
         }
         score_total = sum(poids.values())
         score_obtenu = sum(v for k, v in poids.items() if k not in rejected)
