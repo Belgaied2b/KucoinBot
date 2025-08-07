@@ -3,7 +3,6 @@ from indicators import (
     compute_atr, compute_fvg_zones,
     is_momentum_ok, is_ema_trend_ok,
     is_bos_with_strength, is_cos_enhanced,
-    is_above_ma200, is_below_ma200,
     is_bullish_divergence, is_bearish_divergence,
     is_atr_sufficient, is_total_ok, is_btc_ok,
     is_btc_at_key_level, get_btc_dominance_trend,
@@ -100,60 +99,13 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df, total2_df=
         rr1 = round(abs(tp1 - entry_price) / abs(entry_price - sl), 1)
         rr2 = round(abs(tp2 - entry_price) / abs(entry_price - sl), 1)
 
-        # Tolerances
-        tolerable = {"OTE", "BOUGIE", "DIVERGENCE", "CHoCH", "RR", "FVG", "CVD", "LIQUIDITE"}
-        tolerated = []
-        rejected = []
+        # Vérification institutionnelle renforcée
+        nb_tech_ok = sum([
+            ema_trend_ok, momentum_ok, bos_ok, cos_ok,
+            divergence_ok, candle_ok, choch_ok
+        ])
 
-        if not ema_trend_ok or not ema_trend_h4: rejected.append("EMA")
-        if not momentum_ok or not momentum_h4: rejected.append("MOMENTUM")
-        if not bos_ok: rejected.append("BOS")
-        if not atr_ok: rejected.append("ATR")
-        if not market_ok: rejected.append("TOTAL")
-        if not total2_ok: rejected.append("TOTAL2")
-        if not btc_ok: rejected.append("BTC")
-        if not cos_ok: rejected.append("COS")
-        if not btc_level_ok: rejected.append("BTC_NIVEAU")
-        if not institutional_ok: rejected.append("FUNDING")
-
-        if not choch_ok: tolerated.append("CHoCH")
-        if not candle_ok: tolerated.append("BOUGIE")
-        if not in_fvg: tolerated.append("FVG")
-        if not in_ote: tolerated.append("OTE")
-        if not divergence_ok: tolerated.append("DIVERGENCE")
-        if rr1 < 1.2: tolerated.append("RR")
-        if not volume_aggressif_ok: tolerated.append("CVD")
-        if not liquidity_zone_ok: tolerated.append("LIQUIDITE")
-
-        tolerated = [t for t in tolerated if t in tolerable]
-        rejected = [r for r in rejected if r not in tolerated]
-
-        poids = {
-            "EMA": 1.0, "MOMENTUM": 1.5, "BOS": 1.5,
-            "COS": 1.0, "CHoCH": 1.0, "FVG": 1.0,
-            "BOUGIE": 0.5, "DIVERGENCE": 0.5,
-            "TOTAL": 1.0, "TOTAL2": 1.0, "BTC": 1.0,
-            "ATR": 1.0, "BTC_NIVEAU": 0.5,
-            "FUNDING": 1.0
-        }
-        score_total = sum(poids.values())
-        score_obtenu = sum(v for k, v in poids.items() if k not in rejected)
-        score = round((score_obtenu / score_total) * 10, 1)
-
-        comment = (
-            f"📌 Zone idéale d'entrée :\n"
-            f"OTE = {round(ote_start, 4)} → {round(ote_end, 4)}\n"
-            f"FVG = {round(fvg_lower, 4)} → {round(fvg_upper, 4)}\n\n"
-            f"📊 BTC Dominance : {btc_d_status}\n"
-            f"📈 Score : {score}/10\n"
-            f"🏦 Institutionnel : {' / '.join(institutional_details) if institutional_details else 'aucun'}\n"
-            f"❌ Rejetés : {', '.join(rejected) if rejected else 'aucun'}\n"
-            f"⚠️ Tolérés : {', '.join(tolerated) if tolerated else 'aucun'}\n\n"
-            f"ℹ️ Tolérances actives : {', '.join(sorted(tolerable))}"
-        )
-
-        # 🚨 PRIORITÉ INSTITUTIONNELLE
-        if institutional_ok and rr1 >= 1.2:
+        if institutional_ok and rr1 >= 1.5 and liquidity_zone_ok and atr_ok and nb_tech_ok >= 4:
             generate_chart(df, symbol, ote_zone=(ote_start, ote_end), fvg_zone=(fvg_lower, fvg_upper), entry=entry_price, sl=sl, tp=tp1, direction=direction)
             return {
                 "valid": True,
@@ -165,45 +117,27 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df, total2_df=
                 "tp2": round(tp2, 4),
                 "rr1": rr1,
                 "rr2": rr2,
-                "score": score,
-                "toleres": tolerated,
-                "rejetes": rejected,
-                "comment": comment,
-                "tolere_ote": "OTE" in tolerated,
+                "score": 10.0,
+                "toleres": [],
+                "rejetes": [],
+                "comment": f"✅ Signal institutionnel : confluence validée\n🏦 Institutionnel : {' / '.join(institutional_details)}\n📈 RR: {rr1}, ATR OK, Zone de liquidité détectée\n🎯 Nb indicateurs techniques validés : {nb_tech_ok}/7",
+                "tolere_ote": False,
                 "ote_zone": (round(ote_start, 4), round(ote_end, 4)),
                 "fvg_zone": (round(fvg_lower, 4), round(fvg_upper, 4)),
                 "btc_dominance": btc_d_status
             }
 
-        if rejected and score < 8.0:
-            return {
-                "valid": False,
-                "score": score,
-                "rejetes": rejected,
-                "toleres": tolerated,
-                "comment": comment
-            }
-
-        generate_chart(df, symbol, ote_zone=(ote_start, ote_end), fvg_zone=(fvg_lower, fvg_upper), entry=entry_price, sl=sl, tp=tp1, direction=direction)
-
         return {
-            "valid": True,
-            "symbol": symbol,
-            "direction": direction.upper(),
-            "entry": round(entry_price, 4),
-            "sl": round(sl, 4),
-            "tp1": round(tp1, 4),
-            "tp2": round(tp2, 4),
-            "rr1": rr1,
-            "rr2": rr2,
-            "score": score,
-            "toleres": tolerated,
-            "rejetes": rejected,
-            "comment": comment,
-            "tolere_ote": "OTE" in tolerated,
-            "ote_zone": (round(ote_start, 4), round(ote_end, 4)),
-            "fvg_zone": (round(fvg_lower, 4), round(fvg_upper, 4)),
-            "btc_dominance": btc_d_status
+            "valid": False,
+            "score": 0,
+            "rejetes": ["Conditions institutionnelles non remplies"],
+            "toleres": [],
+            "comment": (
+                f"❌ Signal institutionnel rejeté\n"
+                f"🏦 Institutionnel : {' / '.join(institutional_details) if institutional_details else 'aucun'}\n"
+                f"📉 RR: {rr1}, ATR OK : {atr_ok}, Liquidité : {liquidity_zone_ok}\n"
+                f"🎯 Nb indicateurs techniques validés : {nb_tech_ok}/7"
+            )
         }
 
     except Exception as e:
