@@ -55,6 +55,7 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df, total2_df=
             else:
                 in_fvg = fvg_upper >= last_close >= fvg_lower
 
+        # Analyse technique
         momentum_ok = is_momentum_ok(df, direction)
         ema_trend_ok = is_ema_trend_ok(df, direction)
         bos_ok = is_bos_with_strength(df, direction)
@@ -66,29 +67,35 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df, total2_df=
         volume_aggressif_ok = is_aggressive_volume_ok(df, direction)
         liquidity_zone_ok = has_liquidity_zone(df, direction)
 
+        # Analyse H4
         ema_trend_h4 = is_ema_trend_ok(df_higher_tf, direction) if df_higher_tf is not None else True
         momentum_h4 = is_momentum_ok(df_higher_tf, direction) if df_higher_tf is not None else True
 
+        # Macro
         market_ok = is_total_ok(total_df, direction)
         total2_ok = is_total_ok(total2_df, direction) if total2_df is not None else True
         btc_ok = is_btc_ok(btc_df)
         btc_level_ok = is_btc_at_key_level(btc_df)
         btc_d_status = get_btc_dominance_trend(btc_d_df)
 
+        # SL, TP
         atr = compute_atr(df)
         atr_value = atr.iloc[-1]
 
         if direction == "long":
             sl = (df['low'].min() - atr_value * 0.25) if liquidity_zone_ok else min(df['low'].iloc[-10:]) - atr_value * 0.5
-            tp1 = find_structure_tp(df, direction, entry_price)
         else:
             sl = (df['high'].max() + atr_value * 0.25) if liquidity_zone_ok else max(df['high'].iloc[-10:]) + atr_value * 0.5
-            tp1 = find_structure_tp(df, direction, entry_price)
+
+        tp1 = find_structure_tp(df, direction, entry_price)
+        if tp1 is None or np.isnan(tp1):
+            tp1 = entry_price + (entry_price - sl) * 1.5 if direction == "long" else entry_price - (sl - entry_price) * 1.5
 
         tp2 = entry_price + (tp1 - entry_price) * 2 if direction == "long" else entry_price - (entry_price - tp1) * 2
         rr1 = round(abs(tp1 - entry_price) / abs(entry_price - sl), 1)
         rr2 = round(abs(tp2 - entry_price) / abs(entry_price - sl), 1)
 
+        # Conditions tolérées
         tolerable = {"OTE", "BOUGIE", "DIVERGENCE", "CHoCH", "RR", "FVG", "CVD", "LIQUIDITE"}
         tolerated = []
         rejected = []
@@ -137,7 +144,6 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df, total2_df=
             f"ℹ️ Tolérances actives : {', '.join(sorted(tolerable))}"
         )
 
-        # 👉 Nouvelle logique : autoriser les signaux avec rejet si score >= 8.0
         if rejected and score < 8.0:
             return {
                 "valid": False,
@@ -171,7 +177,10 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df, total2_df=
             "toleres": tolerated,
             "rejetes": rejected,
             "comment": comment,
-            "tolere_ote": "OTE" in tolerated
+            "tolere_ote": "OTE" in tolerated,
+            "ote_zone": (round(ote_start, 4), round(ote_end, 4)),
+            "fvg_zone": (round(fvg_lower, 4), round(fvg_upper, 4)),
+            "btc_dominance": btc_d_status
         }
 
     except Exception as e:
