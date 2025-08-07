@@ -12,12 +12,12 @@ def fetch_binance_open_interest(symbol="BTCUSDT", interval="5m", limit=50):
             "period": interval,
             "limit": limit
         }
-        r = requests.get(url, params=params)
+        r = requests.get(url, params=params, timeout=10)
         data = r.json()
-
         df = pd.DataFrame(data)
-        df["sumOpenInterest"] = pd.to_numeric(df["sumOpenInterest"])
+        df["openInterest"] = pd.to_numeric(df["openInterest"], errors='coerce')
         df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
+        df = df.dropna(subset=["openInterest"])
         return df
     except Exception as e:
         print(f"[{symbol}] Erreur Open Interest : {e}")
@@ -28,56 +28,65 @@ def fetch_binance_funding_rate(symbol="BTCUSDT", limit=100):
     try:
         url = f"{BINANCE_BASE}/fapi/v1/fundingRate"
         params = {"symbol": symbol, "limit": limit}
-        r = requests.get(url, params=params)
+        r = requests.get(url, params=params, timeout=10)
         data = r.json()
-
         df = pd.DataFrame(data)
-        df["fundingRate"] = pd.to_numeric(df["fundingRate"])
+        df["fundingRate"] = pd.to_numeric(df["fundingRate"], errors='coerce')
         df["fundingTime"] = pd.to_datetime(df["fundingTime"], unit="ms")
+        df = df.dropna(subset=["fundingRate"])
         return df
     except Exception as e:
         print(f"[{symbol}] Erreur Funding Rate : {e}")
         return pd.DataFrame()
 
 # 💥 Liquidations Binance
-def fetch_binance_liquidations(symbol):
+def fetch_binance_liquidations(symbol="BTCUSDT"):
     try:
-        url = f"{BINANCE_BASE}/fapi/v1/allForceOrders?symbol={symbol}&limit=200"
-        r = requests.get(url)
-        return r.json()
+        url = f"{BINANCE_BASE}/fapi/v1/allForceOrders"
+        params = {"symbol": symbol, "limit": 200}
+        r = requests.get(url, params=params, timeout=10)
+        data = r.json()
+        return data if isinstance(data, list) else []
     except Exception as e:
         print(f"[{symbol}] Erreur liquidations Binance : {e}")
         return []
 
 def compute_liquidation_spike(liqs, threshold_usd=50000):
-    for order in liqs[-10:]:
-        qty = float(order.get("origQty", 0))
-        price = float(order.get("price", 0))
-        if qty * price >= threshold_usd:
-            return True
+    try:
+        if not isinstance(liqs, list):
+            return False
+        recent_liqs = liqs[-10:] if len(liqs) >= 10 else liqs
+        for order in recent_liqs:
+            qty = float(order.get("origQty", 0) or 0)
+            price = float(order.get("price", 0) or 0)
+            if qty * price >= threshold_usd:
+                return True
+    except Exception as e:
+        print(f"Erreur dans compute_liquidation_spike : {e}")
     return False
 
 # 📊 CVD (Cumulative Volume Delta) simple proxy
 def compute_cvd(df):
     try:
+        df = df.copy()
         df["delta"] = df["close"] - df["open"]
-        cvd = df["delta"].cumsum()
-        return cvd.iloc[-1] > cvd.iloc[-5]
+        df["cvd"] = df["delta"].cumsum()
+        return df["cvd"].iloc[-1] > df["cvd"].iloc[-5]
     except Exception as e:
         print(f"Erreur CVD : {e}")
         return False
 
 # 🧠 Score institutionnel global
-def get_institutional_score(df, symbol_binance="BTCUSDT"):
+def get_institutional_score(df_binance, symbol_binance="BTCUSDT"):
     open_interest_df = fetch_binance_open_interest(symbol_binance)
     funding_df = fetch_binance_funding_rate(symbol_binance)
     liquidations = fetch_binance_liquidations(symbol_binance)
-    cvd_ok = compute_cvd(df)
+    cvd_ok = compute_cvd(df_binance)
 
     score = 0
     details = []
 
-    if not open_interest_df.empty and open_interest_df["sumOpenInterest"].iloc[-1] > open_interest_df["sumOpenInterest"].iloc[-5]:
+    if not open_interest_df.empty and open_interest_df["openInterest"].iloc[-1] > open_interest_df["openInterest"].iloc[-5]:
         score += 1
         details.append("OI↑")
 
