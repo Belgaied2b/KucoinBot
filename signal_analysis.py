@@ -80,8 +80,8 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df, total2_df=
         btc_d_status = get_btc_dominance_trend(btc_d_df)
 
         # Institutional data
-        institutional_score = get_institutional_score(symbol, direction)
-        institutional_ok = institutional_score >= 0.5
+        institutional_score, institutional_details = get_institutional_score(df, symbol_binance=symbol.replace("USDTM", "USDT"))
+        institutional_ok = institutional_score >= 2  # Seuil arbitraire (sur 4), ajustable
 
         # SL, TP
         atr = compute_atr(df)
@@ -146,6 +146,7 @@ def analyze_signal(df, symbol, direction, btc_df, total_df, btc_d_df, total2_df=
             f"FVG = {round(fvg_lower, 4)} → {round(fvg_upper, 4)}\n\n"
             f"📊 BTC Dominance : {btc_d_status}\n"
             f"📈 Score : {score}/10\n"
+            f"🏦 Institutionnel : {' / '.join(institutional_details) if institutional_details else 'aucun'}\n"
             f"❌ Rejetés : {', '.join(rejected) if rejected else 'aucun'}\n"
             f"⚠️ Tolérés : {', '.join(tolerated) if tolerated else 'aucun'}\n\n"
             f"ℹ️ Tolérances actives : {', '.join(sorted(tolerable))}"
