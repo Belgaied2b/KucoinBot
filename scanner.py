@@ -13,7 +13,7 @@ from config import TOKEN, CHAT_ID
 from telegram import Bot
 from kucoin_trader import place_order
 from structure_utils import run_structure_tests
-from institutional_data import live_data  # 🔁 Intégration live
+from institutional_data import live_data
 
 bot = Bot(token=TOKEN)
 
@@ -192,21 +192,20 @@ async def scan_and_send_signals():
             for direction in ["long", "short"]:
                 print(f"[{symbol}] ➡️ Analyse {direction.upper()} (H1 + H4)")
 
-                symbol_binance = symbol.replace("USDTM", "").lower()
-                score_inst = live_data.get(symbol_binance, {}).get("last_score", 0)
-                if score_inst >= 3:
-                    print(f"[{symbol}] 🚀 Signal institutionnel détecté ({direction.upper()}) - Score={score_inst}/4")
-
                 signal = analyze_signal(
-                    symbol,
-                    df_h1.copy(),
-                    df_h4.copy(),
-                    btc_df,
-                    total_df,
-                    total2_df,
-                    btc_d_df,
+                    symbol=symbol,
+                    df_h1=df_h1.copy(),
+                    df_h4=df_h4.copy(),
+                    df_btc=btc_df,
+                    df_total=total_df,
+                    df_total2=total2_df,
+                    df_dominance=btc_d_df,
                     direction=direction
                 )
+
+                if not signal:
+                    print(f"[{symbol}] ⚠️ Erreur : signal None")
+                    continue
 
                 score = signal.get("score", 0)
                 rejected = signal.get("rejetes", [])
