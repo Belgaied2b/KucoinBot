@@ -8,7 +8,7 @@ from indicators import (
     is_atr_sufficient
 )
 from structure_utils import (
-    is_bos_valid, is_cos_valid, is_choch, find_structure_tp
+    is_bos_valid, is_cos_valid, is_choch_multi_tf, find_structure_tp
 )
 from institutional_live import live_data
 
@@ -19,6 +19,7 @@ def analyze_signal(symbol, df_h1, df_h4, df_btc, df_total, df_total2, df_dominan
 
     score = 0
     tolerances = []
+    rejected = []
     comments = []
 
     # ⚠️ Intégration institutionnelle en priorité
@@ -31,6 +32,7 @@ def analyze_signal(symbol, df_h1, df_h4, df_btc, df_total, df_total2, df_dominan
         comments.append(f"💼 INSTITUTIONNEL OK ({inst_score}/4: {', '.join(inst_details)})")
     else:
         comments.append("❌ Score institutionnel insuffisant")
+        rejected.append("INSTITUTIONNEL")
 
     # ✅ Analyse technique seulement si institutionnel > 1
     if inst_score >= 2:
@@ -39,18 +41,21 @@ def analyze_signal(symbol, df_h1, df_h4, df_btc, df_total, df_total2, df_dominan
             comments.append("✅ EMA20/EMA50 OK")
         else:
             tolerances.append("EMA")
+            rejected.append("EMA")
 
         if is_momentum_ok(df_h1, direction):
             score += 1
             comments.append("✅ Momentum MACD/RSI OK")
         else:
             tolerances.append("MOMENTUM")
+            rejected.append("MOMENTUM")
 
         if is_bos_with_strength(df_h1, direction):
             score += 1
             comments.append("✅ BOS avec volume OK")
         else:
             tolerances.append("BOS")
+            rejected.append("BOS")
 
         if is_cos_enhanced(df_h1, direction):
             score += 1
@@ -59,14 +64,20 @@ def analyze_signal(symbol, df_h1, df_h4, df_btc, df_total, df_total2, df_dominan
         if is_bullish_engulfing(df_h1) if direction == "long" else is_bearish_engulfing(df_h1):
             score += 1
             comments.append("✅ Bougie engulfing")
+        else:
+            rejected.append("BOUGIE")
 
         if is_bullish_divergence(df_h1) if direction == "long" else is_bearish_divergence(df_h1):
             score += 1
             comments.append("✅ Divergence RSI")
+        else:
+            rejected.append("DIVERGENCE")
 
         if is_volume_strong(df_h1):
             score += 1
             comments.append("✅ Volume fort")
+        else:
+            rejected.append("VOLUME")
 
         if is_liquidity_zone_present(df_h1, direction):
             tolerances.append("LIQUIDITE")
@@ -75,17 +86,22 @@ def analyze_signal(symbol, df_h1, df_h4, df_btc, df_total, df_total2, df_dominan
         if is_aggressive_volume_ok(df_h1, direction):
             score += 1
             comments.append("✅ Volume agressif OK")
+        else:
+            rejected.append("DELTA")
 
         if not is_atr_sufficient(df_h1):
             tolerances.append("ATR")
+            rejected.append("ATR")
             comments.append("⚠️ ATR insuffisant")
 
         if not is_btc_ok(df_btc):
             tolerances.append("BTC")
+            rejected.append("BTC")
             comments.append("⚠️ BTC pas aligné")
 
         if not is_total_ok(df_total, direction) and not is_total_ok(df_total2, direction):
             tolerances.append("TOTAL")
+            rejected.append("TOTAL")
             comments.append("⚠️ TOTAL pas aligné")
 
         if is_btc_at_key_level(df_btc):
@@ -95,18 +111,21 @@ def analyze_signal(symbol, df_h1, df_h4, df_btc, df_total, df_total2, df_dominan
             comments.append("📈 BOS détecté")
         if is_cos_valid(df_h1, direction):
             comments.append("📉 COS détecté")
-        if is_choch(df_h1, direction):
+        if is_choch_multi_tf(df_h1, df_h4, direction):
             comments.append("🔄 CHoCH détecté")
 
-    # 🧮 Résultat final
+    # ✅ Résultat final
     valid = score >= 4
+
     return {
         "symbol": symbol,
         "direction": direction,
         "score": score,
         "valid": valid,
         "tolerances": tolerances,
-        "comments": comments,
+        "rejetes": rejected,
+        "toleres": tolerances,
+        "comment": "\n".join(comments),
         "entry": df_h1["close"].iloc[-1],
         "sl": df_h1["low"].iloc[-3] if direction == "long" else df_h1["high"].iloc[-3],
         "tp": find_structure_tp(df_h1, direction)
