@@ -70,7 +70,6 @@ def is_cos_valid(df, direction="long", lookback=20):
         return previous['close'] < previous['high'] and candle['close'] > previous['high']
 
 def is_choch(df, direction="long", lookback=20):
-    # CHoCH valide seulement si un BOS opposé a été détecté récemment
     opposite_direction = "short" if direction == "long" else "long"
     recent_bos_found = any(
         is_bos_valid(df.iloc[i - lookback:i], direction=opposite_direction, lookback=int(lookback / 2))
@@ -78,8 +77,15 @@ def is_choch(df, direction="long", lookback=20):
     )
     if not recent_bos_found:
         return False
-
     return detect_choch(df, direction, lookback)
+
+def is_choch_multi_tf(df_lower, df_higher, direction="long", lookback=20):
+    """
+    Valide CHoCH sur le TF inférieur uniquement si BOS opposé confirmé sur TF supérieur
+    """
+    choch = is_choch(df_lower, direction, lookback)
+    bos_opposite = is_bos_valid(df_higher, "short" if direction == "long" else "long", lookback)
+    return choch and bos_opposite
 
 def find_structure_tp(df, direction="long", entry_price=None):
     if df is None or len(df) < 10 or not all(col in df.columns for col in ['high', 'low']):
@@ -123,7 +129,6 @@ def is_bearish_engulfing(df):
         curr['close'] < prev['open']
     )
 
-# ✅ Fonction exportable pour tests via Railway
 def run_structure_tests():
     print("🔍 Lancement des tests structure_utils...\n")
 
@@ -139,11 +144,11 @@ def run_structure_tests():
     print("✅ BOS long :", is_bos_valid(df_test, "long"))
     print("✅ COS short :", is_cos_valid(df_test, "short"))
     print("✅ CHoCH long :", is_choch(df_test, "long"))
+    print("✅ CHoCH multi-TF long :", is_choch_multi_tf(df_test, df_test, "long"))
     print("✅ TP long :", find_structure_tp(df_test, "long", entry_price=105))
     print("✅ Engulfing haussier :", is_bullish_engulfing(df_test))
     print("✅ Engulfing baissier :", is_bearish_engulfing(df_test))
     print("-" * 50 + "\n")
 
-# Exécution directe (pour test local uniquement)
 if __name__ == "__main__":
     run_structure_tests()
