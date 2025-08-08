@@ -38,7 +38,7 @@ async def send_signal_to_telegram(signal):
         fvg_str = "inconnu"
 
     message = (
-        f"📉 {signal['symbol']} - Signal CONFIRMÉ ({signal['direction']})
+        f"📉 {signal['symbol']} - Signal CONFIRMÉ ({signal['direction']})"
 
 "
         f"🎯 Entry : {signal['entry']:.4f}
