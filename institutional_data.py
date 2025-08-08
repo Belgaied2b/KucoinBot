@@ -1,132 +1,87 @@
 import asyncio
-import json
 import websockets
+import json
 import time
-from collections import deque, defaultdict
-from datetime import datetime
-import requests
-import numpy as np
+from collections import deque
 
-# ✅ Configuration
-BINANCE_WS = "wss://fstream.binance.com/stream"
-BINANCE_REST = "https://fapi.binance.com"
-SYMBOLS = ["btcusdt", "ethusdt"]  # Tu peux étendre ici
-OI_CACHE = {}
-COOLDOWNS = defaultdict(lambda: 0)
+# Stockage local du CVD et volume par symbole
+live_data = {}
 
-# 💾 Données temps réel
-live_data = {
-    symbol: {
-        "cvd": 0,
-        "oi_ok": False,
-        "funding_ok": False,
-        "liq_spike": False,
-        "cvd_ok": False,
-        "last_score": 0,
-        "last_signal_time": 0
-    } for symbol in SYMBOLS
-}
+# Configuration des symboles à suivre (USDT uniquement pour futures)
+SYMBOLS = ["btcusdt", "ethusdt", "solusdt", "linkusdt", "avaxusdt"]
 
-# 📊 CVD
-cvd_buffers = {symbol: deque(maxlen=1000) for symbol in SYMBOLS}
+# Taille de la fenêtre pour le calcul du CVD
+WINDOW = 100
 
-# 🔄 Récupère l'OI par REST
-def fetch_open_interest(symbol):
-    try:
-        url = f"{BINANCE_REST}/futures/data/openInterestHist"
-        params = {"symbol": symbol.upper(), "period": "5m", "limit": 10}
-        r = requests.get(url, params=params, timeout=10)
-        r.raise_for_status()
-        data = r.json()
-        if not isinstance(data, list) or len(data) < 2:
-            return False
-        prev = float(data[-2]["sumOpenInterest"])
-        curr = float(data[-1]["sumOpenInterest"])
-        return curr > prev * 1.01
-    except:
-        return False
+def init_symbol(symbol):
+    if symbol not in live_data:
+        live_data[symbol] = {
+            "cvd": deque(maxlen=WINDOW),
+            "volume": deque(maxlen=WINDOW),
+            "delta": deque(maxlen=WINDOW),
+            "last_cvd": 0
+        }
 
-# 🔄 Funding
-def fetch_funding(symbol):
-    try:
-        url = f"{BINANCE_REST}/fapi/v1/fundingRate"
-        params = {"symbol": symbol.upper(), "limit": 2}
-        r = requests.get(url, params=params, timeout=10)
-        r.raise_for_status()
-        data = r.json()
-        return float(data[-1]["fundingRate"]) < 0.0001
-    except:
-        return False
+async def process_message(msg):
+    if "s" not in msg or "p" not in msg or "q" not in msg:
+        return
+    symbol = msg["s"].lower()
+    price = float(msg["p"])
+    quantity = float(msg["q"])
+    side = msg["m"]  # True = sell, False = buy
 
-# 🔄 Liquidations
-def fetch_liquidations(symbol):
-    try:
-        url = f"{BINANCE_REST}/fapi/v1/allForceOrders"
-        r = requests.get(url, params={"symbol": symbol.upper(), "limit": 50}, timeout=10)
-        r.raise_for_status()
-        data = r.json()
-        total = 0
-        for d in data:
-            price = float(d.get("price", 0))
-            qty = float(d.get("origQty", 0))
-            total += price * qty
-        return total > 50000
-    except:
-        return False
+    init_symbol(symbol)
 
-# 📡 Websocket
-async def start_ws():
-    streams = "/".join([f"{s}@trade" for s in SYMBOLS])
-    async with websockets.connect(f"{BINANCE_WS}?streams={streams}") as ws:
-        async for msg in ws:
-            data = json.loads(msg)
-            symbol = data["stream"].split("@")[0]
-            price = float(data["data"]["p"])
-            qty = float(data["data"]["q"])
-            is_buyer_maker = data["data"]["m"]
-            signed_qty = -qty if is_buyer_maker else qty
-            cvd_buffers[symbol].append(signed_qty)
-            live_data[symbol]["cvd"] = sum(cvd_buffers[symbol])
+    delta = -quantity if side else quantity
+    last_cvd = live_data[symbol]["last_cvd"] + delta
+    live_data[symbol]["last_cvd"] = last_cvd
 
-# 🧠 Analyse institutionnelle live
-async def institutional_loop():
+    live_data[symbol]["cvd"].append(last_cvd)
+    live_data[symbol]["volume"].append(quantity)
+    live_data[symbol]["delta"].append(delta)
+
+    # Debug CVD
+    if len(live_data[symbol]["cvd"]) == WINDOW:
+        recent_cvd = list(live_data[symbol]["cvd"])
+        if recent_cvd[-1] > recent_cvd[0]:
+            trend = "CVD UP"
+        elif recent_cvd[-1] < recent_cvd[0]:
+            trend = "CVD DOWN"
+        else:
+            trend = "CVD FLAT"
+        print(f"[{symbol.upper()}] {trend} | Δ: {round(recent_cvd[-1] - recent_cvd[0], 2)}")
+
+async def subscribe_trades(ws):
+    params = [f"{symbol}@trade" for symbol in SYMBOLS]
+    payload = {
+        "method": "SUBSCRIBE",
+        "params": params,
+        "id": 1
+    }
+    await ws.send(json.dumps(payload))
+
+async def run_websocket():
+    uri = "wss://fstream.binance.com/ws"
+    async with websockets.connect(uri) as ws:
+        await subscribe_trades(ws)
+        print("✅ WebSocket connecté aux symboles :", SYMBOLS)
+
+        while True:
+            try:
+                message = await asyncio.wait_for(ws.recv(), timeout=30)
+                data = json.loads(message)
+                await process_message(data)
+            except asyncio.TimeoutError:
+                print("⏱️ Timeout WebSocket, tentative de reconnexion...")
+                break
+            except Exception as e:
+                print("❌ Erreur WebSocket :", e)
+                break
+
+# Lancement auto en tâche de fond
+def start_live_stream():
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     while True:
-        for symbol in SYMBOLS:
-            oi_ok = fetch_open_interest(symbol)
-            funding_ok = fetch_funding(symbol)
-            liq_spike = fetch_liquidations(symbol)
-            cvd_now = live_data[symbol]["cvd"]
-            cvd_ok = cvd_now > 0
-
-            score = sum([
-                oi_ok,
-                funding_ok,
-                liq_spike,
-                cvd_ok
-            ])
-
-            live_data[symbol].update({
-                "oi_ok": oi_ok,
-                "funding_ok": funding_ok,
-                "liq_spike": liq_spike,
-                "cvd_ok": cvd_ok,
-                "last_score": score
-            })
-
-            # ⏱️ Cooldown anti-spam (10 min)
-            now = time.time()
-            if score >= 3 and now - live_data[symbol]["last_signal_time"] > 600:
-                print(f"📈 Signal institutionnel détecté sur {symbol.upper()} (score={score}/4)")
-                live_data[symbol]["last_signal_time"] = now
-
-        await asyncio.sleep(60)
-
-# 🚀 Lance le bot
-async def launch():
-    await asyncio.gather(
-        start_ws(),
-        institutional_loop()
-    )
-
-if __name__ == "__main__":
-    asyncio.run(launch())
+        loop.run_until_complete(run_websocket())
+        time.sleep(5)
