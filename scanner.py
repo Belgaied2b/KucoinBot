@@ -14,7 +14,7 @@ from config import TOKEN, CHAT_ID
 from telegram import Bot
 from kucoin_trader import place_order
 from structure_utils import run_structure_tests
-from institutional_live import live_data  # 🔁 Intégration live
+from institutional_data import live_data  # 🔁 Intégration live
 
 bot = Bot(token=TOKEN)
 
