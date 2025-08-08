@@ -1,13 +1,13 @@
 import pandas as pd
 from indicators import (
     is_ema_trend_ok, is_momentum_ok, is_bos_with_strength,
-    is_cos_enhanced, is_bullish_engulfing, is_bearish_engulfing,
-    is_bullish_divergence, is_bearish_divergence,
+    is_cos_enhanced, is_bullish_divergence, is_bearish_divergence,
     is_volume_strong, is_btc_ok, is_total_ok,
     is_btc_at_key_level, is_liquidity_zone_present, is_aggressive_volume_ok,
     is_atr_sufficient
 )
 from structure_utils import (
+    is_bullish_engulfing, is_bearish_engulfing,
     is_bos_valid, is_cos_valid, is_choch_multi_tf, find_structure_tp
 )
 from institutional_live import live_data
