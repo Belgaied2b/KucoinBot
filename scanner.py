@@ -6,7 +6,6 @@ import traceback
 import requests
 import pandas as pd
 import asyncio
-import threading
 
 from kucoin_utils import fetch_all_symbols, fetch_klines
 from signal_analysis import analyze_signal
@@ -57,7 +56,6 @@ async def send_signal_to_telegram(signal):
 
     print(f"[{signal['symbol']}] 📤 Envoi Telegram en cours...")
     await bot.send_message(chat_id=CHAT_ID, text=message.strip())
-
 
 # 📂 Gestion des doublons
 sent_signals = {}
@@ -168,7 +166,6 @@ def fetch_macro_df():
 # 🔍 Scan principal
 async def scan_and_send_signals():
     print(f"🔁 Scan lancé à {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC\n")
-
     run_structure_tests()
     all_symbols = fetch_all_symbols()
 
@@ -201,14 +198,14 @@ async def scan_and_send_signals():
                     print(f"[{symbol}] 🚀 Signal institutionnel détecté ({direction.upper()}) - Score={score_inst}/4")
 
                 signal = analyze_signal(
+                    symbol,
                     df_h1.copy(),
-                    symbol=symbol,
-                    direction=direction,
-                    btc_df=btc_df,
-                    total_df=total_df,
-                    btc_d_df=btc_d_df,
-                    total2_df=total2_df,
-                    df_higher_tf=df_h4.copy()
+                    df_h4.copy(),
+                    btc_df,
+                    total_df,
+                    total2_df,
+                    btc_d_df,
+                    direction=direction
                 )
 
                 score = signal.get("score", 0)
