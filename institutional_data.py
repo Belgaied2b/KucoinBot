@@ -3,6 +3,7 @@ import websockets
 import json
 import time
 from collections import deque
+import threading
 
 # Stockage local du CVD et volume par symbole
 live_data = {}
@@ -19,8 +20,32 @@ def init_symbol(symbol):
             "cvd": deque(maxlen=WINDOW),
             "volume": deque(maxlen=WINDOW),
             "delta": deque(maxlen=WINDOW),
-            "last_cvd": 0
+            "last_cvd": 0,
+            "last_score": 0
         }
+
+def compute_score(symbol):
+    data = live_data[symbol]
+    if len(data["cvd"]) < WINDOW:
+        return 0
+
+    delta_cvd = data["cvd"][-1] - data["cvd"][0]
+    delta_volume = sum(data["volume"]) / WINDOW
+
+    # Exemple simple de scoring
+    score = 0
+    if delta_cvd > 0:
+        score += 1
+    if delta_cvd > delta_volume:
+        score += 1
+    if sum(data["delta"][-5:]) > 0:
+        score += 1
+    if data["delta"][-1] > 0:
+        score += 1
+
+    live_data[symbol]["last_score"] = score
+
+    print(f"[{symbol.upper()}] 🔍 Score live = {score}/4 | ΔCVD: {round(delta_cvd,2)} | ΔVol moy: {round(delta_volume,2)}")
 
 async def process_message(msg):
     if "s" not in msg or "p" not in msg or "q" not in msg:
@@ -40,16 +65,8 @@ async def process_message(msg):
     live_data[symbol]["volume"].append(quantity)
     live_data[symbol]["delta"].append(delta)
 
-    # Debug CVD
     if len(live_data[symbol]["cvd"]) == WINDOW:
-        recent_cvd = list(live_data[symbol]["cvd"])
-        if recent_cvd[-1] > recent_cvd[0]:
-            trend = "CVD UP"
-        elif recent_cvd[-1] < recent_cvd[0]:
-            trend = "CVD DOWN"
-        else:
-            trend = "CVD FLAT"
-        print(f"[{symbol.upper()}] {trend} | Δ: {round(recent_cvd[-1] - recent_cvd[0], 2)}")
+        compute_score(symbol)
 
 async def subscribe_trades(ws):
     params = [f"{symbol}@trade" for symbol in SYMBOLS]
@@ -78,10 +95,16 @@ async def run_websocket():
                 print("❌ Erreur WebSocket :", e)
                 break
 
-# Lancement auto en tâche de fond
+# Lancement automatique du WebSocket en tâche de fond
 def start_live_stream():
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    while True:
-        loop.run_until_complete(run_websocket())
-        time.sleep(5)
+    def runner():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        while True:
+            loop.run_until_complete(run_websocket())
+            time.sleep(5)
+    thread = threading.Thread(target=runner, daemon=True)
+    thread.start()
+
+# Lancer dès l'import
+start_live_stream()
