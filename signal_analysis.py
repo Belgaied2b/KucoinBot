@@ -10,7 +10,7 @@ from structure_utils import (
     is_bullish_engulfing, is_bearish_engulfing,
     is_bos_valid, is_cos_valid, is_choch_multi_tf, find_structure_tp
 )
-from institutional_live import live_data
+from institutional_data import live_data
 
 # 🧠 Analyse complète d’un signal
 def analyze_signal(symbol, df_h1, df_h4, df_btc, df_total, df_total2, df_dominance, direction="long"):
