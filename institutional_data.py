@@ -29,27 +29,31 @@ def compute_score(symbol):
     if len(data["cvd"]) < WINDOW:
         return 0
 
-    delta_cvd = data["cvd"][-1] - data["cvd"][0]
+    recent_cvd = list(data["cvd"])
+    recent_delta = list(data["delta"])
+
+    delta_cvd = recent_cvd[-1] - recent_cvd[0]
     delta_volume = sum(data["volume"]) / WINDOW
 
-    # Exemple simple de scoring
+    # Scoring simple basé sur la tendance CVD et delta
     score = 0
     if delta_cvd > 0:
         score += 1
     if delta_cvd > delta_volume:
         score += 1
-    if sum(data["delta"][-5:]) > 0:
+    if sum(recent_delta[-5:]) > 0:
         score += 1
-    if data["delta"][-1] > 0:
+    if recent_delta[-1] > 0:
         score += 1
 
-    live_data[symbol]["last_score"] = score
+    data["last_score"] = score
 
     print(f"[{symbol.upper()}] 🔍 Score live = {score}/4 | ΔCVD: {round(delta_cvd,2)} | ΔVol moy: {round(delta_volume,2)}")
 
 async def process_message(msg):
     if "s" not in msg or "p" not in msg or "q" not in msg:
         return
+
     symbol = msg["s"].lower()
     price = float(msg["p"])
     quantity = float(msg["q"])
@@ -106,5 +110,5 @@ def start_live_stream():
     thread = threading.Thread(target=runner, daemon=True)
     thread.start()
 
-# Lancer dès l'import
+# Démarrer automatiquement le stream à l'import
 start_live_stream()
