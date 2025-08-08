@@ -38,37 +38,20 @@ async def send_signal_to_telegram(signal):
         fvg_str = "inconnu"
 
     message = (
-        f"📉 {signal['symbol']} - Signal CONFIRMÉ ({signal['direction']})"
-
-"
-        f"🎯 Entry : {signal['entry']:.4f}
-"
-        f"🔚 SL    : {signal['sl']:.4f}{sl_note}
-"
-        f"🎯 TP1   : {signal['tp1']:.4f}
-"
-        f"🎯 TP2   : {signal['tp2']:.4f}
-"
-        f"📈 R:R1  : {signal['rr1']}
-"
-        f"📈 R:R2  : {signal['rr2']}
-"
-        f"🧠 Score : {signal.get('score', '?')}/10
-
-"
-        f"📌 Zone idéale d'entrée :
-"
-        f"OTE = {ote_str}
-"
-        f"FVG = {fvg_str}
-
-"
-        f"📊 BTC Dominance : {signal.get('btc_dominance', 'INCONNU')}
-"
-        f"❌ Rejetés : {', '.join(rejected_clean) if rejected_clean else 'aucun'}
-"
-        f"⚠️ Tolérés : {', '.join(tolerated_clean) if tolerated_clean else 'aucun'}
-"
+        f"📉 {signal['symbol']} - Signal CONFIRMÉ ({signal['direction']})\n"
+        f"🎯 Entry : {signal['entry']:.4f}\n"
+        f"🔚 SL    : {signal['sl']:.4f}{sl_note}\n"
+        f"🎯 TP1   : {signal['tp1']:.4f}\n"
+        f"🎯 TP2   : {signal['tp2']:.4f}\n"
+        f"📈 R:R1  : {signal['rr1']}\n"
+        f"📈 R:R2  : {signal['rr2']}\n"
+        f"🧠 Score : {signal.get('score', '?')}/10\n\n"
+        f"📌 Zone idéale d'entrée :\n"
+        f"OTE = {ote_str}\n"
+        f"FVG = {fvg_str}\n\n"
+        f"📊 BTC Dominance : {signal.get('btc_dominance', 'INCONNU')}\n"
+        f"❌ Rejetés : {', '.join(rejected_clean) if rejected_clean else 'aucun'}\n"
+        f"⚠️ Tolérés : {', '.join(tolerated_clean) if tolerated_clean else 'aucun'}\n"
         f"ℹ️ Tolérances actives : {', '.join(signal.get('tolerances', [])) if signal.get('tolerances') else 'aucune'}"
     )
 
@@ -184,8 +167,7 @@ def fetch_macro_df():
 
 # 🔍 Scan principal
 async def scan_and_send_signals():
-    print(f"🔁 Scan lancé à {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC
-")
+    print(f"🔁 Scan lancé à {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC\n")
 
     run_structure_tests()
     all_symbols = fetch_all_symbols()
@@ -213,7 +195,6 @@ async def scan_and_send_signals():
             for direction in ["long", "short"]:
                 print(f"[{symbol}] ➡️ Analyse {direction.upper()} (H1 + H4)")
 
-                # 🔁 Score institutionnel live
                 symbol_binance = symbol.replace("USDTM", "").lower()
                 score_inst = live_data.get(symbol_binance, {}).get("last_score", 0)
                 if score_inst >= 3:
