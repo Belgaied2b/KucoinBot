@@ -10,13 +10,12 @@ def detect_bos_cos(df, direction="long", lookback=20):
     recent = df.iloc[-(lookback + 3):-3]
     prev_high = recent['high'].max()
     prev_low = recent['low'].min()
-
     candle = df.iloc[-1]
+
     volume_avg = df['volume'].rolling(window=20, min_periods=1).mean().iloc[-1]
     volume_ok = candle['volume'] > volume_avg * 1.2
 
     bos = cos = False
-
     if direction == "long":
         bos = candle['close'] > prev_high and volume_ok and (candle['close'] - candle['open']) > 0
         cos = candle['close'] < prev_low and volume_ok
@@ -34,8 +33,8 @@ def detect_choch(df, direction="long", lookback=20):
     recent = df.iloc[-(lookback + 5):-5]
     prev_high = recent['high'].max()
     prev_low = recent['low'].min()
-
     candle = df.iloc[-1]
+
     volume_avg = df['volume'].rolling(window=20, min_periods=1).mean().iloc[-1]
     volume_ok = candle['volume'] > volume_avg * 1.2
 
@@ -71,13 +70,11 @@ def is_cos_valid(df, direction="long", lookback=20):
 
 def is_choch(df, direction="long", lookback=20):
     opposite_direction = "short" if direction == "long" else "long"
-    recent_bos_found = any(
-        is_bos_valid(df.iloc[i - lookback:i], direction=opposite_direction, lookback=int(lookback / 2))
-        for i in range(lookback, len(df))
-    )
-    if not recent_bos_found:
-        return False
-    return detect_choch(df, direction, lookback)
+    for i in range(lookback, len(df)):
+        sub_df = df.iloc[i - lookback:i]
+        if is_bos_valid(sub_df, direction=opposite_direction, lookback=int(lookback / 2)):
+            return detect_choch(df, direction, lookback)
+    return False
 
 def is_choch_multi_tf(df_lower, df_higher, direction="long", lookback=20):
     """
@@ -94,7 +91,7 @@ def find_structure_tp(df, direction="long", entry_price=None):
     swings = []
     window = 5
     for i in range(window, len(df) - window):
-        hl = df['high' if direction == "long" else 'low']
+        hl = df['high'] if direction == "long" else df['low']
         if direction == "long":
             if hl.iloc[i] > hl.iloc[i - window:i].max() and hl.iloc[i] > hl.iloc[i + 1:i + window + 1].max():
                 swings.append(hl.iloc[i])
