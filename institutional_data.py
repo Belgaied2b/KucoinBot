@@ -1,143 +1,132 @@
+import asyncio
+import json
+import websockets
+import time
+from collections import deque, defaultdict
+from datetime import datetime
 import requests
-import pandas as pd
+import numpy as np
 
-BINANCE_BASE = "https://fapi.binance.com"
+# ✅ Configuration
+BINANCE_WS = "wss://fstream.binance.com/stream"
+BINANCE_REST = "https://fapi.binance.com"
+SYMBOLS = ["btcusdt", "ethusdt"]  # Tu peux étendre ici
+OI_CACHE = {}
+COOLDOWNS = defaultdict(lambda: 0)
 
-# ⏱️ Open Interest Binance
-def fetch_binance_open_interest(symbol="BTCUSDT", interval="5m", limit=50):
+# 💾 Données temps réel
+live_data = {
+    symbol: {
+        "cvd": 0,
+        "oi_ok": False,
+        "funding_ok": False,
+        "liq_spike": False,
+        "cvd_ok": False,
+        "last_score": 0,
+        "last_signal_time": 0
+    } for symbol in SYMBOLS
+}
+
+# 📊 CVD
+cvd_buffers = {symbol: deque(maxlen=1000) for symbol in SYMBOLS}
+
+# 🔄 Récupère l'OI par REST
+def fetch_open_interest(symbol):
     try:
-        url = f"{BINANCE_BASE}/futures/data/openInterestHist"
-        params = {
-            "symbol": symbol,
-            "period": interval,
-            "limit": limit
-        }
+        url = f"{BINANCE_REST}/futures/data/openInterestHist"
+        params = {"symbol": symbol.upper(), "period": "5m", "limit": 10}
         r = requests.get(url, params=params, timeout=10)
+        r.raise_for_status()
         data = r.json()
-
-        if not isinstance(data, list):
-            raise ValueError(f"Données invalides (Open Interest): {data}")
-
-        df = pd.DataFrame(data)
-        if "sumOpenInterest" in df.columns:
-            df["sumOpenInterest"] = pd.to_numeric(df["sumOpenInterest"], errors='coerce')
-        else:
-            raise KeyError("sumOpenInterest absent des données")
-
-        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
-        df = df.dropna(subset=["sumOpenInterest"])
-        return df
-    except Exception as e:
-        print(f"[{symbol}] Erreur Open Interest : {e}")
-        return pd.DataFrame()
-
-# 💰 Funding Rate Binance
-def fetch_binance_funding_rate(symbol="BTCUSDT", limit=100):
-    try:
-        url = f"{BINANCE_BASE}/fapi/v1/fundingRate"
-        params = {"symbol": symbol, "limit": limit}
-        r = requests.get(url, params=params, timeout=10)
-        data = r.json()
-
-        if not isinstance(data, list):
-            raise ValueError(f"Données invalides (Funding Rate): {data}")
-
-        df = pd.DataFrame(data)
-        if "fundingRate" in df.columns:
-            df["fundingRate"] = pd.to_numeric(df["fundingRate"], errors='coerce')
-        else:
-            raise KeyError("fundingRate absent des données")
-
-        df["fundingTime"] = pd.to_datetime(df["fundingTime"], unit="ms")
-        df = df.dropna(subset=["fundingRate"])
-        return df
-    except Exception as e:
-        print(f"[{symbol}] Erreur Funding Rate : {e}")
-        return pd.DataFrame()
-
-# 💥 Liquidations Binance
-def fetch_binance_liquidations(symbol="BTCUSDT"):
-    try:
-        url = f"{BINANCE_BASE}/fapi/v1/allForceOrders"
-        params = {"symbol": symbol, "limit": 200}
-        r = requests.get(url, params=params, timeout=10)
-        data = r.json()
-        return data if isinstance(data, list) else []
-    except Exception as e:
-        print(f"[{symbol}] Erreur liquidations Binance : {e}")
-        return []
-
-# 💣 Spike de liquidations
-def compute_liquidation_spike(liqs, threshold_usd=50000):
-    try:
-        if not isinstance(liqs, list):
+        if not isinstance(data, list) or len(data) < 2:
             return False
-        recent_liqs = liqs[-10:] if len(liqs) >= 10 else liqs
-        for order in recent_liqs:
-            qty = float(order.get("origQty", 0) or 0)
-            price = float(order.get("price", 0) or 0)
-            if qty * price >= threshold_usd:
-                return True
-    except Exception as e:
-        print(f"Erreur dans compute_liquidation_spike : {e}")
-    return False
-
-# 📊 CVD (Cumulative Volume Delta)
-def compute_cvd(df):
-    try:
-        if df is None or len(df) < 10:
-            return False
-        df = df.copy()
-        df["delta"] = df["close"] - df["open"]
-        df["cvd"] = df["delta"].cumsum()
-        return df["cvd"].iloc[-1] > df["cvd"].iloc[-5]
-    except Exception as e:
-        print(f"Erreur CVD : {e}")
+        prev = float(data[-2]["sumOpenInterest"])
+        curr = float(data[-1]["sumOpenInterest"])
+        return curr > prev * 1.01
+    except:
         return False
 
-# 🧠 Score institutionnel global
-def get_institutional_score(df_binance, symbol_binance="BTCUSDT"):
-    # ✅ Corriger les symboles pour Binance si nécessaire
-    symbol_binance = symbol_binance.replace("USDTM", "USDT").replace("XBT", "BTC")
+# 🔄 Funding
+def fetch_funding(symbol):
+    try:
+        url = f"{BINANCE_REST}/fapi/v1/fundingRate"
+        params = {"symbol": symbol.upper(), "limit": 2}
+        r = requests.get(url, params=params, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        return float(data[-1]["fundingRate"]) < 0.0001
+    except:
+        return False
 
-    open_interest_df = fetch_binance_open_interest(symbol_binance)
-    funding_df = fetch_binance_funding_rate(symbol_binance)
-    liquidations = fetch_binance_liquidations(symbol_binance)
-    cvd_ok = compute_cvd(df_binance)
+# 🔄 Liquidations
+def fetch_liquidations(symbol):
+    try:
+        url = f"{BINANCE_REST}/fapi/v1/allForceOrders"
+        r = requests.get(url, params={"symbol": symbol.upper(), "limit": 50}, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        total = 0
+        for d in data:
+            price = float(d.get("price", 0))
+            qty = float(d.get("origQty", 0))
+            total += price * qty
+        return total > 50000
+    except:
+        return False
 
-    score = 0
-    details = []
+# 📡 Websocket
+async def start_ws():
+    streams = "/".join([f"{s}@trade" for s in SYMBOLS])
+    async with websockets.connect(f"{BINANCE_WS}?streams={streams}") as ws:
+        async for msg in ws:
+            data = json.loads(msg)
+            symbol = data["stream"].split("@")[0]
+            price = float(data["data"]["p"])
+            qty = float(data["data"]["q"])
+            is_buyer_maker = data["data"]["m"]
+            signed_qty = -qty if is_buyer_maker else qty
+            cvd_buffers[symbol].append(signed_qty)
+            live_data[symbol]["cvd"] = sum(cvd_buffers[symbol])
 
-    # 🔍 Open Interest
-    if not open_interest_df.empty:
-        try:
-            if open_interest_df["sumOpenInterest"].iloc[-1] > open_interest_df["sumOpenInterest"].iloc[-5]:
-                score += 1
-                details.append("OI↑")
-        except Exception as e:
-            print(f"[{symbol_binance}] Erreur OI check : {e}")
-    else:
-        print(f"[{symbol_binance}] Erreur Open Interest : 'sumOpenInterest absent des données'")
+# 🧠 Analyse institutionnelle live
+async def institutional_loop():
+    while True:
+        for symbol in SYMBOLS:
+            oi_ok = fetch_open_interest(symbol)
+            funding_ok = fetch_funding(symbol)
+            liq_spike = fetch_liquidations(symbol)
+            cvd_now = live_data[symbol]["cvd"]
+            cvd_ok = cvd_now > 0
 
-    # 🔍 Funding Rate
-    if not funding_df.empty:
-        try:
-            if funding_df["fundingRate"].iloc[-1] <= 0.0001:
-                score += 1
-                details.append("Funding OK")
-        except Exception as e:
-            print(f"[{symbol_binance}] Erreur Funding check : {e}")
-    else:
-        print(f"[{symbol_binance}] Erreur Funding Rate : 'fundingRate absent des données'")
+            score = sum([
+                oi_ok,
+                funding_ok,
+                liq_spike,
+                cvd_ok
+            ])
 
-    # 🔍 Liquidations
-    if compute_liquidation_spike(liquidations):
-        score += 1
-        details.append("Liq Spike")
+            live_data[symbol].update({
+                "oi_ok": oi_ok,
+                "funding_ok": funding_ok,
+                "liq_spike": liq_spike,
+                "cvd_ok": cvd_ok,
+                "last_score": score
+            })
 
-    # 🔍 CVD
-    if cvd_ok:
-        score += 1
-        details.append("CVD OK")
+            # ⏱️ Cooldown anti-spam (10 min)
+            now = time.time()
+            if score >= 3 and now - live_data[symbol]["last_signal_time"] > 600:
+                print(f"📈 Signal institutionnel détecté sur {symbol.upper()} (score={score}/4)")
+                live_data[symbol]["last_signal_time"] = now
 
-    return score, details
+        await asyncio.sleep(60)
+
+# 🚀 Lance le bot
+async def launch():
+    await asyncio.gather(
+        start_ws(),
+        institutional_loop()
+    )
+
+if __name__ == "__main__":
+    asyncio.run(launch())
