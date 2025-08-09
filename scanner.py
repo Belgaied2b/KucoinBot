@@ -13,7 +13,15 @@ from institutional_data import get_macro_total_mcap, get_macro_total2, get_macro
 from adverse_selection import should_cancel_or_requote
 from logger_utils import get_logger
 
+# >>> DEBUG BINANCE (ajout) <<<
+from institutional_data import (
+    get_open_interest, get_funding_rate, get_recent_liquidations, map_symbol_to_binance
+)
+
 rootlog = get_logger("scanner")
+
+# Active le debug raw des métriques Binance (mets à 0 pour désactiver)
+INSTIT_DEBUG_EVERY_SEC = 30
 
 class MacroCache:
     def __init__(self): self.last=0; self.data={}
@@ -80,7 +88,8 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: MacroCache, meta:
     om=OrderManager()
 
     started_at = time.time()
-    last_hb = 0.0  # heartbeat
+    last_hb = 0.0
+    last_dbg = 0.0  # >>> debug Binance
 
     def on_order(msg):
         oid = msg.get("clientOid") or ""
@@ -123,10 +132,22 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: MacroCache, meta:
             price=float(df["close"].iloc[-1])
             macro_data = macro.refresh()
 
-            # heartbeat toutes les 30s
+            # heartbeat 30s
             if time.time() - last_hb > 30:
                 last_hb = time.time()
                 logger.info(f"hb price={price:.4f} score={score:.2f} spread={inst.get('spread')} mid={inst.get('mid')}", extra={"symbol": symbol})
+
+            # >>> DEBUG BINANCE RAW METRICS (toutes les 30s) <<<
+            if INSTIT_DEBUG_EVERY_SEC > 0 and (time.time() - last_dbg) > INSTIT_DEBUG_EVERY_SEC:
+                last_dbg = time.time()
+                bsym = map_symbol_to_binance(symbol)
+                try:
+                    oi  = get_open_interest(symbol)
+                    fr  = get_funding_rate(symbol)
+                    liq = get_recent_liquidations(symbol, minutes=5)
+                    logger.info(f"[BINANCE RAW] {symbol}->{bsym} OI={oi} Funding={fr} Liq5m={liq}", extra={"symbol": symbol})
+                except Exception as e:
+                    logger.exception(f"[BINANCE RAW] fetch error: {e}", extra={"symbol": symbol})
 
             # warmup
             if (time.time() - started_at) < SETTINGS.warmup_seconds:
@@ -168,17 +189,13 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: MacroCache, meta:
             if symbol not in om.pos and symbol not in om.pending_by_symbol:
                 dec: Decision = analyze_signal(price, df, {"score":score, **inst}, macro=macro_data)
 
-                # >>>>>> LOG DÉTAILLÉ DE LA DÉCISION <<<<<<
                 if dec.side == "NONE":
-                    # on affiche le diagnostic complet toutes les 10 secondes pour éviter le spam
                     if SETTINGS.log_signals and int(time.time()) % 10 == 0:
                         logger.info(f"Decision:\n{dec.reason}", extra={"symbol": symbol})
                     continue
                 else:
-                    # signal accepté → toujours log le diagnostic complet
                     logger.info(f"Decision:\n{dec.reason}", extra={"symbol": symbol})
 
-                # Anti-adverse selection après décision
                 adv = should_cancel_or_requote("LONG" if dec.side=="LONG" else "SHORT", inst, SETTINGS)
                 if adv!="OK" and SETTINGS.cancel_on_adverse:
                     logger.warning(f"entry blocked: {adv}", extra={"symbol": symbol})
