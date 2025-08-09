@@ -13,15 +13,19 @@ from institutional_data import get_macro_total_mcap, get_macro_total2, get_macro
 from adverse_selection import should_cancel_or_requote
 from logger_utils import get_logger
 
-# >>> DEBUG BINANCE (ajout) <<<
+# >>> DEBUG BINANCE (existant) <<<
 from institutional_data import (
     get_open_interest, get_funding_rate, get_recent_liquidations, map_symbol_to_binance
 )
+# >>> LIQ PACK (ajout) <<<
+from institutional_data import get_liq_pack
 
 rootlog = get_logger("scanner")
 
 # Active le debug raw des métriques Binance (mets à 0 pour désactiver)
 INSTIT_DEBUG_EVERY_SEC = 30
+# Rafraîchissement du liq pack (évite le spam HTTP)
+LIQ_REFRESH_SEC = getattr(SETTINGS, "liq_refresh_sec", 30)
 
 class MacroCache:
     def __init__(self): self.last=0; self.data={}
@@ -90,6 +94,8 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: MacroCache, meta:
     started_at = time.time()
     last_hb = 0.0
     last_dbg = 0.0  # >>> debug Binance
+    last_liq_fetch = 0.0
+    liq_pack_cache = {}
 
     def on_order(msg):
         oid = msg.get("clientOid") or ""
@@ -132,6 +138,23 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: MacroCache, meta:
             price=float(df["close"].iloc[-1])
             macro_data = macro.refresh()
 
+            # >>> rafraîchir liq_new_score (HTTP throttlé) <<<
+            if (time.time() - last_liq_fetch) > LIQ_REFRESH_SEC:
+                last_liq_fetch = time.time()
+                try:
+                    liq_pack_cache = get_liq_pack(symbol)
+                    # log léger pour sanity-check
+                    if liq_pack_cache.get("liq_source") != "none":
+                        logger.info(
+                            f"[LIQ PACK] src={liq_pack_cache.get('liq_source')} "
+                            f"score={liq_pack_cache.get('liq_new_score', 0.0):.3f} "
+                            f"notional={liq_pack_cache.get('liq_notional_5m', 0.0):.2f} "
+                            f"imb={liq_pack_cache.get('liq_imbalance_5m', 0.0):.3f}",
+                            extra={"symbol": symbol}
+                        )
+                except Exception as e:
+                    logger.exception(f"[LIQ PACK] fetch error: {e}", extra={"symbol": symbol})
+
             # heartbeat 30s
             if time.time() - last_hb > 30:
                 last_hb = time.time()
@@ -153,9 +176,15 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: MacroCache, meta:
             if (time.time() - started_at) < SETTINGS.warmup_seconds:
                 continue
 
+            # ---- merge inst avec liq pack (sans écraser le score global) ----
+            inst_merged = {**inst, **(liq_pack_cache or {})}
+
             pos=om.pos.get(symbol)
             if pos:
-                atr=compute_atr(df).iloc[-1]
+                try:
+                    atr=float(compute_atr(df).iloc[-1])
+                except Exception:
+                    atr=0.0
                 if not pos.tp1_done:
                     if (pos.side=="LONG" and price>=pos.tp1) or (pos.side=="SHORT" and price<=pos.tp1):
                         ro_side="sell" if pos.side=="LONG" else "buy"
@@ -187,7 +216,7 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: MacroCache, meta:
                         if ok: om.close_all(symbol,"TP2"); send_msg(f"🎯 {symbol} TP2 — clôture")
 
             if symbol not in om.pos and symbol not in om.pending_by_symbol:
-                dec: Decision = analyze_signal(price, df, {"score":score, **inst}, macro=macro_data)
+                dec: Decision = analyze_signal(price, df, {"score":score, **inst_merged}, macro=macro_data)
 
                 if dec.side == "NONE":
                     if SETTINGS.log_signals and int(time.time()) % 10 == 0:
@@ -196,7 +225,7 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: MacroCache, meta:
                 else:
                     logger.info(f"Decision:\n{dec.reason}", extra={"symbol": symbol})
 
-                adv = should_cancel_or_requote("LONG" if dec.side=="LONG" else "SHORT", inst, SETTINGS)
+                adv = should_cancel_or_requote("LONG" if dec.side=="LONG" else "SHORT", inst_merged, SETTINGS)
                 if adv!="OK" and SETTINGS.cancel_on_adverse:
                     logger.warning(f"entry blocked: {adv}", extra={"symbol": symbol})
                     continue
@@ -243,7 +272,7 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: MacroCache, meta:
 
                     if i==0 and len(stage_fracs)==2:
                         await asyncio.sleep(0.8)
-                        adv2 = should_cancel_or_requote("LONG" if dec.side=="LONG" else "SHORT", inst, SETTINGS)
+                        adv2 = should_cancel_or_requote("LONG" if dec.side=="LONG" else "SHORT", inst_merged, SETTINGS)
                         if adv2!="OK" and SETTINGS.cancel_on_adverse:
                             logger.warning(f"ABORT stage2 ({adv2})", extra={"symbol": symbol})
                             break
