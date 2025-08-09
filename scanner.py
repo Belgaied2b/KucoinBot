@@ -7,7 +7,7 @@ from kucoin_trader import KucoinTrader
 from kucoin_ws import KucoinPrivateWS
 from order_manager import OrderManager
 from orderflow_features import compute_atr
-from kucoin_utils import fetch_klines, fetch_symbol_meta, round_price
+from kucoin_utils import fetch_klines, fetch_symbol_meta, round_price, common_usdt_symbols
 from telegram_notifier import send_msg
 from institutional_data import get_macro_total_mcap, get_macro_total2, get_macro_btc_dominance
 from adverse_selection import should_cancel_or_requote
@@ -36,10 +36,8 @@ class OHLCV1m:
         if sym not in self.df: self.bootstrap(sym)
         df=self.df[sym]
         minute=(ts//60000)*60000
-        # si on est toujours sur la même minute -> MAJ propre sans chained assignment
         if int(df.iloc[-1]["time"]) == minute:
             idx = df.index[-1]
-            # cast sûrs
             current_high = float(df.at[idx, "high"])
             current_low  = float(df.at[idx, "low"])
             current_vol  = float(df.at[idx, "volume"])
@@ -51,14 +49,7 @@ class OHLCV1m:
         else:
             last_close = float(df.iloc[-1]["close"])
             p = float(price)
-            new_row = {
-                "time": minute,
-                "open": last_close,
-                "high": p,
-                "low":  p,
-                "close":p,
-                "volume": float(vol),
-            }
+            new_row = {"time": minute,"open": last_close,"high": p,"low":  p,"close":p,"volume": float(vol)}
             self.df[sym]=pd.concat([df, pd.DataFrame([new_row])], ignore_index=True).tail(2000)
     def frame(self, sym):
         if sym not in self.df: self.bootstrap(sym)
@@ -74,6 +65,8 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: MacroCache, meta:
     trader=KucoinTrader()
     ohlc=OHLCV1m()
     om=OrderManager()
+
+    started_at = time.time()  # warmup timer
 
     def on_order(msg):
         oid = msg.get("clientOid") or ""
@@ -109,6 +102,13 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: MacroCache, meta:
         price=float(df["close"].iloc[-1])
         macro_data = macro.refresh()
 
+        # --- Warm-up: on évite de spammer & d’entrer avant que le flux ne soit “réel” ---
+        warm = (time.time() - started_at) < SETTINGS.warmup_seconds
+        if warm:
+            # ne pas logguer “Score insuffisant” pendant warmup
+            # et ne pas générer d'ordres
+            continue
+
         pos=om.pos.get(symbol)
         if pos:
             atr=compute_atr(df).iloc[-1]
@@ -141,7 +141,9 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: MacroCache, meta:
         if symbol not in om.pos and symbol not in om.pending_by_symbol:
             dec: Decision = analyze_signal(price, df, {"score":score, **inst}, macro=macro_data)
             if dec.side=="NONE":
-                if SETTINGS.log_signals: print(f"[{symbol}] score={score:.2f} :: {dec.name} / {dec.reason}")
+                # on log moins verbeux (toutes les X sec côté Railway)
+                if SETTINGS.log_signals and int(time.time()) % 10 == 0:
+                    print(f"[{symbol}] score={score:.2f} :: {dec.name} / {dec.reason}")
                 continue
 
             adv = should_cancel_or_requote("LONG" if dec.side=="LONG" else "SHORT", inst, SETTINGS)
@@ -192,6 +194,12 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: MacroCache, meta:
                         print(f"[{symbol}] ABORT stage2 ({adv2})"); break
 
 async def main():
+    # Auto-discovery des symboles si activé
+    if SETTINGS.auto_symbols:
+        discovered = common_usdt_symbols(limit=SETTINGS.symbols_max, exclude_csv=SETTINGS.exclude_symbols)
+        if discovered:
+            SETTINGS.symbols = discovered
+            print(f"[SCAN] Auto-symbols activé — {len(discovered)} paires chargées.")
     kws=KucoinPrivateWS()
     meta = fetch_symbol_meta()
     macro=MacroCache()
