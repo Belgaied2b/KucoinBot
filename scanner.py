@@ -167,11 +167,18 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: MacroCache, meta:
 
             if symbol not in om.pos and symbol not in om.pending_by_symbol:
                 dec: Decision = analyze_signal(price, df, {"score":score, **inst}, macro=macro_data)
-                if dec.side=="NONE":
-                    if SETTINGS.log_signals and int(time.time()) % 10 == 0:
-                        logger.debug(f"no-trade: score={score:.2f} reason={dec.reason}", extra={"symbol": symbol})
-                    continue
 
+                # >>>>>> LOG DÉTAILLÉ DE LA DÉCISION <<<<<<
+                if dec.side == "NONE":
+                    # on affiche le diagnostic complet toutes les 10 secondes pour éviter le spam
+                    if SETTINGS.log_signals and int(time.time()) % 10 == 0:
+                        logger.info(f"Decision:\n{dec.reason}", extra={"symbol": symbol})
+                    continue
+                else:
+                    # signal accepté → toujours log le diagnostic complet
+                    logger.info(f"Decision:\n{dec.reason}", extra={"symbol": symbol})
+
+                # Anti-adverse selection après décision
                 adv = should_cancel_or_requote("LONG" if dec.side=="LONG" else "SHORT", inst, SETTINGS)
                 if adv!="OK" and SETTINGS.cancel_on_adverse:
                     logger.warning(f"entry blocked: {adv}", extra={"symbol": symbol})
