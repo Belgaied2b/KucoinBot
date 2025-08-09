@@ -32,6 +32,7 @@ def fetch_symbol_meta() -> Dict[str, Dict[str, Any]]:
     """
     Récupère tickSize / pricePrecision pour les contrats actifs KuCoin Futures.
     Normalise en symbole 'BTCUSDT' (remplace 'USDTM' -> 'USDT').
+    Ajoute 'symbol_api' pour fetch_klines().
     """
     url = f"{BASE}/api/v1/contracts/active"
     r = httpx.get(url, timeout=10.0)
@@ -44,7 +45,11 @@ def fetch_symbol_meta() -> Dict[str, Dict[str, Any]]:
         base_sym = sym.replace("USDTM", "USDT")
         tick = float(it.get("tickSize") or it.get("priceIncrement") or 0.1)
         prec = int(it.get("pricePrecision") or max(0, len(str(tick).split(".")[-1])))
-        meta[base_sym] = {"tickSize": tick, "pricePrecision": prec}
+        meta[base_sym] = {
+            "tickSize": tick,
+            "pricePrecision": prec,
+            "symbol_api": sym  # utilisé pour fetch_klines
+        }
     return meta
 
 def round_price(symbol: str, price: float, meta: Dict[str, Dict[str, Any]], default_tick: float = 0.1) -> float:
