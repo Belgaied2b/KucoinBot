@@ -27,15 +27,22 @@ class MacroCache:
         self.last=now; return self.data
 
 class OHLCV1m:
-    def __init__(self): self.df={}
-    def bootstrap(self, sym):
+    def __init__(self, meta: dict):
+        self.df = {}
+        self.meta = meta  # mapping display_symbol -> {symbol_api, tickSize, pricePrecision}
+
+    def bootstrap(self, sym: str):
+        logger = get_logger("scanner.bootstrap", sym)
         try:
-            df = fetch_klines(meta[symbol]["symbol_api"], granularity=1, limit=300)
+            sym_api = self.meta[sym]["symbol_api"]
+            df = fetch_klines(sym_api, granularity=1, limit=300)
+            self.df[sym] = df
         except Exception as e:
-            get_logger("scanner.bootstrap", sym).warning(f"Bootstrap klines fallback: {e}", extra={"symbol": sym})
+            logger.warning(f"Bootstrap klines fallback: {e}", extra={"symbol": sym})
             now=int(time.time()*1000); base=50000.0
             rows=[{"time":now-(299-i)*60_000,"open":base,"high":base,"low":base,"close":base,"volume":0.0} for i in range(300)]
             self.df[sym]=pd.DataFrame(rows)
+
     def on_price(self, sym, price, ts, vol=0.0):
         if sym not in self.df: self.bootstrap(sym)
         df=self.df[sym]
@@ -55,6 +62,7 @@ class OHLCV1m:
             p = float(price)
             new_row = {"time": minute,"open": last_close,"high": p,"low":  p,"close":p,"volume": float(vol)}
             self.df[sym]=pd.concat([df, pd.DataFrame([new_row])], ignore_index=True).tail(2000)
+
     def frame(self, sym):
         if sym not in self.df: self.bootstrap(sym)
         return self.df[sym]
@@ -68,7 +76,7 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: MacroCache, meta:
     w_cfg=(SETTINGS.w_oi, SETTINGS.w_funding, SETTINGS.w_delta, SETTINGS.w_liq, SETTINGS.w_book_imbal)
     agg=InstitutionalAggregator(symbol, w_cfg)
     trader=KucoinTrader()
-    ohlc=OHLCV1m()
+    ohlc=OHLCV1m(meta)
     om=OrderManager()
 
     started_at = time.time()
