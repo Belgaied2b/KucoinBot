@@ -34,12 +34,32 @@ class OHLCV1m:
             self.df[sym]=pd.DataFrame(rows)
     def on_price(self, sym, price, ts, vol=0.0):
         if sym not in self.df: self.bootstrap(sym)
-        df=self.df[sym]; minute=(ts//60000)*60000; last=df.iloc[-1]
-        if int(last["time"])==minute:
-            last["close"]=price; last["high"]=max(last["high"],price); last["low"]=min(last["low"],price); last["volume"]+=vol
-            df.iloc[-1]=last
+        df=self.df[sym]
+        minute=(ts//60000)*60000
+        # si on est toujours sur la même minute -> MAJ propre sans chained assignment
+        if int(df.iloc[-1]["time"]) == minute:
+            idx = df.index[-1]
+            # cast sûrs
+            current_high = float(df.at[idx, "high"])
+            current_low  = float(df.at[idx, "low"])
+            current_vol  = float(df.at[idx, "volume"])
+            p = float(price)
+            df.at[idx, "close"]  = p
+            df.at[idx, "high"]   = max(current_high, p)
+            df.at[idx, "low"]    = min(current_low,  p)
+            df.at[idx, "volume"] = current_vol + float(vol)
         else:
-            self.df[sym]=pd.concat([df,pd.DataFrame([{"time":minute,"open":last['close'],"high":price,"low":price,"close":price,"volume":vol}])]).tail(2000)
+            last_close = float(df.iloc[-1]["close"])
+            p = float(price)
+            new_row = {
+                "time": minute,
+                "open": last_close,
+                "high": p,
+                "low":  p,
+                "close":p,
+                "volume": float(vol),
+            }
+            self.df[sym]=pd.concat([df, pd.DataFrame([new_row])], ignore_index=True).tail(2000)
     def frame(self, sym):
         if sym not in self.df: self.bootstrap(sym)
         return self.df[sym]
@@ -143,7 +163,7 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: MacroCache, meta:
 
                 om.add_pending(oid, symbol, side, px_maker)
                 om.open_position(symbol, dec.side, dec.entry, dec.sl, dec.tp1, dec.tp2)
-                send_msg(f"🚀 {symbol} {dec.side} stage {i+1}/{len(stage_fracs)} post‑only @ {px_maker}")
+                send_msg(f"🚀 {symbol} {dec.side} stage {i+1}/{len(stage_fracs)} post-only @ {px_maker}")
 
                 t0=time.time(); rq=0
                 while time.time()-t0 < SETTINGS.entry_timeout_sec:
