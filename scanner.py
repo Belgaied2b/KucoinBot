@@ -102,11 +102,8 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: MacroCache, meta:
         price=float(df["close"].iloc[-1])
         macro_data = macro.refresh()
 
-        # --- Warm-up: on évite de spammer & d’entrer avant que le flux ne soit “réel” ---
-        warm = (time.time() - started_at) < SETTINGS.warmup_seconds
-        if warm:
-            # ne pas logguer “Score insuffisant” pendant warmup
-            # et ne pas générer d'ordres
+        # Warm-up: on évite de logguer/entrer avant que le flux soit chaud
+        if (time.time() - started_at) < SETTINGS.warmup_seconds:
             continue
 
         pos=om.pos.get(symbol)
@@ -141,7 +138,6 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: MacroCache, meta:
         if symbol not in om.pos and symbol not in om.pending_by_symbol:
             dec: Decision = analyze_signal(price, df, {"score":score, **inst}, macro=macro_data)
             if dec.side=="NONE":
-                # on log moins verbeux (toutes les X sec côté Railway)
                 if SETTINGS.log_signals and int(time.time()) % 10 == 0:
                     print(f"[{symbol}] score={score:.2f} :: {dec.name} / {dec.reason}")
                 continue
@@ -194,9 +190,9 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: MacroCache, meta:
                         print(f"[{symbol}] ABORT stage2 ({adv2})"); break
 
 async def main():
-    # Auto-discovery des symboles si activé
+    # Auto-discovery des symboles sans limite
     if SETTINGS.auto_symbols:
-        discovered = common_usdt_symbols(limit=SETTINGS.symbols_max, exclude_csv=SETTINGS.exclude_symbols)
+        discovered = common_usdt_symbols(limit=0, exclude_csv=SETTINGS.exclude_symbols)  # 0 => pas de limite
         if discovered:
             SETTINGS.symbols = discovered
             print(f"[SCAN] Auto-symbols activé — {len(discovered)} paires chargées.")
@@ -204,7 +200,13 @@ async def main():
     meta = fetch_symbol_meta()
     macro=MacroCache()
     asyncio.create_task(kws.run())
-    await asyncio.gather(*(run_symbol(sym, kws, macro, meta) for sym in SETTINGS.symbols))
+
+    # Lancement des tâches étalé (évite les bursts réseau)
+    tasks = []
+    for i, sym in enumerate(SETTINGS.symbols):
+        tasks.append(asyncio.create_task(run_symbol(sym, kws, macro, meta)))
+        await asyncio.sleep(0.05)  # petite pause entre créations
+    await asyncio.gather(*tasks)
 
 if __name__=="__main__":
     asyncio.run(main())
