@@ -1,26 +1,55 @@
 import time
 import httpx
+from typing import Optional
 from logger_utils import get_logger
 
-_logger = get_logger("institutional_data")
+# --------------------------------------------------------------------------------------
+# Logger: on loggue via logger; on ne tombe sur print QUE si le logger échoue.
+# --------------------------------------------------------------------------------------
+try:
+    _logger = get_logger("institutional_data")
+except Exception:
+    _logger = None  # fallback -> print
 
 def _log_info(msg: str):
-    try: _logger.info(msg)
-    except Exception: pass
+    if _logger:
+        try:
+            _logger.info(msg)
+            return
+        except Exception:
+            pass
     print(msg, flush=True)
 
 def _log_warn(msg: str):
-    try: _logger.warning(msg)
-    except Exception: pass
+    if _logger:
+        try:
+            _logger.warning(msg)
+            return
+        except Exception:
+            pass
     print(msg, flush=True)
 
 def _log_exc(prefix: str, e: Exception):
-    try: _logger.exception(f"{prefix} error: {e}")
-    except Exception: pass
+    if _logger:
+        try:
+            _logger.exception(f"{prefix} error: {e}")
+            return
+        except Exception:
+            pass
     print(f"{prefix} error: {e}", flush=True)
 
+# --------------------------------------------------------------------------------------
+# HTTP
+# --------------------------------------------------------------------------------------
 BASE = "https://fapi.binance.com"  # Binance Futures (USDT-M)
+CG   = "https://api.coingecko.com/api/v3"
 
+def _get(url: str, params: Optional[dict] = None, timeout: float = 6.0) -> httpx.Response:
+    return httpx.get(url, params=params or {}, timeout=timeout, headers={"Accept": "application/json"})
+
+# --------------------------------------------------------------------------------------
+# Utils
+# --------------------------------------------------------------------------------------
 def map_symbol_to_binance(sym: str) -> str:
     s = (sym or "").upper()
     if s.endswith("USDTM"):
@@ -29,11 +58,14 @@ def map_symbol_to_binance(sym: str) -> str:
         s = s.replace(".P", "")
     return s
 
+# --------------------------------------------------------------------------------------
+# Funding / OI
+# --------------------------------------------------------------------------------------
 def get_funding_rate(symbol: str) -> float:
     b_symbol = map_symbol_to_binance(symbol)
     try:
         t0 = time.time()
-        r = httpx.get(f"{BASE}/fapi/v1/premiumIndex", params={"symbol": b_symbol}, timeout=6.0)
+        r = _get(f"{BASE}/fapi/v1/premiumIndex", {"symbol": b_symbol}, timeout=6.0)
         ms = (time.time() - t0) * 1000
         if r.status_code == 200:
             data = r.json()
@@ -46,13 +78,13 @@ def get_funding_rate(symbol: str) -> float:
 
 def get_open_interest(symbol: str) -> float:
     """
-    OI instantané (contrats) — endpoint simple & public.
-    Doc: GET /fapi/v1/openInterest -> {"openInterest":"12345.678","symbol":"BTCUSDT","time":...}
+    OI instantané (contrats) — endpoint public.
+    GET /fapi/v1/openInterest -> {"openInterest":"12345.678","symbol":"BTCUSDT","time":...}
     """
     b_symbol = map_symbol_to_binance(symbol)
     try:
         t0 = time.time()
-        r = httpx.get(f"{BASE}/fapi/v1/openInterest", params={"symbol": b_symbol}, timeout=6.0)
+        r = _get(f"{BASE}/fapi/v1/openInterest", {"symbol": b_symbol}, timeout=6.0)
         ms = (time.time() - t0) * 1000
         if r.status_code == 200:
             data = r.json()
@@ -63,10 +95,13 @@ def get_open_interest(symbol: str) -> float:
         _log_exc(f"[OI] {b_symbol}", e)
     return 0.0
 
+# --------------------------------------------------------------------------------------
+# Liq — Legacy + Proxy
+# --------------------------------------------------------------------------------------
 def _mark_price(symbol_binance: str) -> float:
     """Mark price helper (for the liq proxy)."""
     try:
-        r = httpx.get(f"{BASE}/fapi/v1/premiumIndex", params={"symbol": symbol_binance}, timeout=5.0)
+        r = _get(f"{BASE}/fapi/v1/premiumIndex", {"symbol": symbol_binance}, timeout=5.0)
         if r.status_code == 200:
             return float((r.json().get("markPrice")) or 0.0)
     except Exception:
@@ -78,6 +113,8 @@ def get_recent_liquidations(symbol: str, minutes: int = 5) -> float:
     Liquidations récentes (notionnel approx).
     1) Tente l'endpoint historique (souvent 400 désormais)
     2) Fallback PROXY via taker long/short ratio 5m * markPrice
+
+    Proxy = |buyVol - sellVol| * markPrice  (aligne tes logs: notionnel≈... )
     """
     b_symbol = map_symbol_to_binance(symbol)
 
@@ -86,9 +123,9 @@ def get_recent_liquidations(symbol: str, minutes: int = 5) -> float:
         now = int(time.time() * 1000)
         start = now - minutes * 60 * 1000
         t0 = time.time()
-        r = httpx.get(
+        r = _get(
             f"{BASE}/fapi/v1/allForceOrders",
-            params={"symbol": b_symbol, "startTime": start, "limit": 1000},
+            {"symbol": b_symbol, "startTime": start, "limit": 1000},
             timeout=6.0,
         )
         ms = (time.time() - t0) * 1000
@@ -105,6 +142,7 @@ def get_recent_liquidations(symbol: str, minutes: int = 5) -> float:
             _log_info(f"[Liq] {b_symbol} {len(data)} orders, notionnel≈{tot:.2f} ({ms:.1f} ms)")
             return tot
         else:
+            # on garde en WARNING, mais plus d'impression en double
             _log_warn(f"[Liq] {b_symbol} HTTP {r.status_code} resp={r.text}")
     except Exception as e:
         _log_exc(f"[Liq] {b_symbol}", e)
@@ -112,9 +150,9 @@ def get_recent_liquidations(symbol: str, minutes: int = 5) -> float:
     # --- Fallback PROXY via takerLongShortRatio (5m) ---
     try:
         t0 = time.time()
-        rr = httpx.get(
+        rr = _get(
             f"{BASE}/futures/data/takerlongshortRatio",
-            params={"symbol": b_symbol, "period": "5m", "limit": 1},
+            {"symbol": b_symbol, "period": "5m", "limit": 1},
             timeout=6.0,
         )
         ms = (time.time() - t0) * 1000
@@ -124,10 +162,14 @@ def get_recent_liquidations(symbol: str, minutes: int = 5) -> float:
                 rec = arr[-1]
                 buy_vol  = float(rec.get("buyVol",  0.0) or 0.0)
                 sell_vol = float(rec.get("sellVol", 0.0) or 0.0)
-                imb = abs(buy_vol - sell_vol)  # déséquilibre taker
-                px  = _mark_price(b_symbol)
-                proxy = imb * (px if px > 0 else 1.0)
-                _log_info(f"[Liq-PROXY] {b_symbol} buyVol={buy_vol} sellVol={sell_vol} mark={px} -> notionnel≈{proxy:.2f} ({ms:.1f} ms)")
+                # Proxy notionnel = imbalance * mark
+                imb_abs  = abs(buy_vol - sell_vol)
+                px       = _mark_price(b_symbol)
+                proxy    = imb_abs * (px if px > 0 else 1.0)
+                _log_info(
+                    f"[Liq-PROXY] {b_symbol} buyVol={buy_vol} sellVol={sell_vol} "
+                    f"mark={px} -> notionnel≈{proxy:.2f} ({ms:.1f} ms)"
+                )
                 return proxy
         _log_warn(f"[Liq-PROXY] {b_symbol} HTTP {rr.status_code} resp={rr.text}")
     except Exception as e:
@@ -135,13 +177,13 @@ def get_recent_liquidations(symbol: str, minutes: int = 5) -> float:
 
     return 0.0
 
-# --- MACRO (CoinGecko gratuit) ---
-CG = "https://api.coingecko.com/api/v3"
-
+# --------------------------------------------------------------------------------------
+# MACRO (CoinGecko gratuit)
+# --------------------------------------------------------------------------------------
 def get_macro_total_mcap() -> float:
     try:
         t0 = time.time()
-        r = httpx.get(f"{CG}/global", timeout=8.0)
+        r = _get(f"{CG}/global", timeout=8.0)
         ms = (time.time() - t0) * 1000
         if r.status_code == 200:
             data = r.json()
@@ -155,7 +197,7 @@ def get_macro_total_mcap() -> float:
 def get_macro_btc_dominance() -> float:
     try:
         t0 = time.time()
-        r = httpx.get(f"{CG}/global", timeout=8.0)
+        r = _get(f"{CG}/global", timeout=8.0)
         ms = (time.time() - t0) * 1000
         if r.status_code == 200:
             data = r.json()
