@@ -30,7 +30,7 @@ class OHLCV1m:
     def __init__(self): self.df={}
     def bootstrap(self, sym):
         try:
-            df=fetch_klines(sym, granularity=1, limit=300); self.df[sym]=df
+            df = fetch_klines(meta[symbol]["symbol_api"], granularity=1, limit=300)
         except Exception as e:
             get_logger("scanner.bootstrap", sym).warning(f"Bootstrap klines fallback: {e}", extra={"symbol": sym})
             now=int(time.time()*1000); base=50000.0
