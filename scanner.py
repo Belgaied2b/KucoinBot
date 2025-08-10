@@ -83,6 +83,49 @@ def _tick_shift(symbol: str, px: float, ticks: int, meta, default_tick: float) -
     tick = float(meta.get(symbol,{}).get("tickSize", default_tick))
     return px + ticks * tick
 
+# ------ NEW: score global calculé depuis les sous-scores disponibles ------
+def _compute_global_score(inst: dict) -> float:
+    """
+    Calcule un score global pondéré à partir des sous-scores présents dans inst.
+    Priorise liq_new_score, ignore les composantes absentes et respecte use_book_imbal.
+    """
+    w_oi   = float(getattr(SETTINGS, "w_oi", 1.0))
+    w_fund = float(getattr(SETTINGS, "w_funding", 1.0))
+    w_delta= float(getattr(SETTINGS, "w_delta", 1.0))
+    w_liq  = float(getattr(SETTINGS, "w_liq", 1.0))
+    w_book = float(getattr(SETTINGS, "w_book_imbal", 1.0))
+    use_book = bool(getattr(SETTINGS, "use_book_imbal", True))
+
+    num = 0.0
+    den = 0.0
+
+    def add(key: str, w: float):
+        nonlocal num, den
+        if w <= 0: return
+        v = inst.get(key, None)
+        if v is None: return
+        try:
+            fv = float(v)
+        except Exception:
+            return
+        num += w * fv
+        den += w
+
+    add("oi_score", w_oi)
+    add("delta_score", w_delta)
+    add("funding_score", w_fund)
+
+    # Liquidity score : priorité au nouveau
+    if "liq_new_score" in inst:
+        add("liq_new_score", w_liq)
+    elif "liq_score" in inst:
+        add("liq_score", w_liq)
+
+    if use_book:
+        add("book_imbal_score", w_book)
+
+    return float(num / den) if den > 0 else 0.0
+
 async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: MacroCache, meta: dict):
     logger = get_logger("scanner.symbol", symbol)
     w_cfg=(SETTINGS.w_oi, SETTINGS.w_funding, SETTINGS.w_delta, SETTINGS.w_liq, SETTINGS.w_book_imbal)
@@ -155,6 +198,13 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: MacroCache, meta:
                 except Exception as e:
                     logger.exception(f"[LIQ PACK] fetch error: {e}", extra={"symbol": symbol})
 
+            # ---- merge inst avec liq pack ----
+            inst_merged = {**inst, **(liq_pack_cache or {})}
+
+            # ---- (re)calcule le score global avec les bonnes données (incl. liq_new_score) ----
+            score = _compute_global_score(inst_merged)
+            inst_merged["score"] = score
+
             # heartbeat 30s
             if time.time() - last_hb > 30:
                 last_hb = time.time()
@@ -175,9 +225,6 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: MacroCache, meta:
             # warmup
             if (time.time() - started_at) < SETTINGS.warmup_seconds:
                 continue
-
-            # ---- merge inst avec liq pack (sans écraser le score global) ----
-            inst_merged = {**inst, **(liq_pack_cache or {})}
 
             pos=om.pos.get(symbol)
             if pos:
