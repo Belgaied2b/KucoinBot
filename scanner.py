@@ -70,11 +70,11 @@ def _fetch_oi_score_binance(symbol: str) -> float | None:
       GET /futures/data/openInterestHist?symbol=SYMBOL&period=5m&limit=2
       score = min(1, |ΔOI%| / OI_DELTA_REF)
     """
-    b = map_symbol_to_binance(symbol)
+    bsym = map_symbol_to_binance(symbol)
     try:
         r = httpx.get(
             f"{BINANCE_BASE}/futures/data/openInterestHist",
-            params={"symbol": b, "period": "5m", "limit": 2},
+            params={"symbol": bsym, "period": "5m", "limit": 2},
             timeout=HTTP_TIMEOUT,
             headers={"Accept": "application/json"}
         )
@@ -86,7 +86,7 @@ def _fetch_oi_score_binance(symbol: str) -> float | None:
         a, b2 = arr[-2], arr[-1]
         oi1 = float(a.get("sumOpenInterest", a.get("openInterest", 0.0)) or 0.0)
         oi2 = float(b2.get("sumOpenInterest", b2.get("openInterest", 0.0)) or 0.0)
-        if oi1 <= 0: 
+        if oi1 <= 0:
             return None
         delta_pct = abs((oi2 - oi1) / oi1)
         return _norm01(delta_pct, OI_DELTA_REF)
