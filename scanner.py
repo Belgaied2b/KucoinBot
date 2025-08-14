@@ -1,6 +1,8 @@
 import asyncio, time, uuid
 from collections import deque
 import pandas as pd
+import httpx
+
 from config import SETTINGS
 from institutional_aggregator import InstitutionalAggregator
 from analyze_signal import analyze_signal, Decision
@@ -14,7 +16,7 @@ from institutional_data import get_macro_total_mcap, get_macro_total2, get_macro
 from adverse_selection import should_cancel_or_requote
 from logger_utils import get_logger
 
-# --- APIs externes déjà utilisées (aucun calcul local ajouté) ---
+# --- APIs externes déjà utilisées ---
 from institutional_data import (
     get_open_interest, get_funding_rate, get_recent_liquidations, map_symbol_to_binance,
     get_liq_pack
@@ -28,7 +30,7 @@ INSTIT_DEBUG_EVERY_SEC = 0
 LIQ_REFRESH_SEC = getattr(SETTINGS, "liq_refresh_sec", 30)
 
 # ---------------- Params par défaut (si absents dans SETTINGS) ----------------
-# Important: comme on passe à une **SOMME pondérée**, un seuil autour de 2.0–2.2 est cohérent (si les poids ~1.0)
+# Score global = SOMME pondérée ⇒ seuil ~2.0–2.2 si poids ~1.0
 REQ_SCORE_MIN        = float(getattr(SETTINGS, "req_score_min", 2.2))
 INST_COMPONENTS_MIN  = int(getattr(SETTINGS, "inst_components_min", 2))
 OI_MIN               = float(getattr(SETTINGS, "oi_req_min", 0.40))
@@ -47,6 +49,62 @@ SYMBOL_COOLDOWN_SEC  = int(getattr(SETTINGS, "symbol_cooldown_sec", 900))
 
 # Filtre d’activité min (optionnel, via liq_pack si dispo)
 MIN_LIQ_NORM         = float(getattr(SETTINGS, "min_liq_norm", 0.0))  # 0 = désactivé
+
+# ----------- ENRICH OI/FUND depuis Binance (léger, sans historique local) -----------
+BINANCE_BASE = "https://fapi.binance.com"
+OI_FUND_REFRESH_SEC = int(getattr(SETTINGS, "oi_fund_refresh_sec", 45))
+FUND_REF = float(getattr(SETTINGS, "funding_ref", 0.00025))   # 0.025% ⇒ score 1.0
+OI_DELTA_REF = float(getattr(SETTINGS, "oi_delta_ref", 0.02)) # 2% ΔOI ⇒ score 1.0
+HTTP_TIMEOUT = float(getattr(SETTINGS, "http_timeout_sec", 6.0))
+
+def _norm01(x: float, ref: float) -> float:
+    if ref <= 0: return 0.0
+    try:
+        return max(0.0, min(1.0, float(x) / float(ref)))
+    except Exception:
+        return 0.0
+
+def _fetch_oi_score_binance(symbol: str) -> float | None:
+    """
+    Score OI ∈ [0..1] via ΔOI% sur 5 minutes (API officielle):
+      GET /futures/data/openInterestHist?symbol=SYMBOL&period=5m&limit=2
+      score = min(1, |ΔOI%| / OI_DELTA_REF)
+    """
+    b = map_symbol_to_binance(symbol)
+    try:
+        r = httpx.get(
+            f"{BINANCE_BASE}/futures/data/openInterestHist",
+            params={"symbol": b, "period": "5m", "limit": 2},
+            timeout=HTTP_TIMEOUT,
+            headers={"Accept": "application/json"}
+        )
+        if r.status_code != 200:
+            return None
+        arr = r.json() or []
+        if len(arr) < 2:
+            return None
+        a, b2 = arr[-2], arr[-1]
+        oi1 = float(a.get("sumOpenInterest", a.get("openInterest", 0.0)) or 0.0)
+        oi2 = float(b2.get("sumOpenInterest", b2.get("openInterest", 0.0)) or 0.0)
+        if oi1 <= 0: 
+            return None
+        delta_pct = abs((oi2 - oi1) / oi1)
+        return _norm01(delta_pct, OI_DELTA_REF)
+    except Exception:
+        return None
+
+def _fetch_funding_score_binance(symbol: str) -> float | None:
+    """
+    Score Funding ∈ [0..1] via |lastFundingRate| / FUND_REF
+    (on exploite get_funding_rate déjà importé).
+    """
+    try:
+        r = get_funding_rate(symbol)
+        if r is None:
+            return None
+        return _norm01(abs(float(r)), FUND_REF)
+    except Exception:
+        return None
 
 class MacroCache:
     def __init__(self): self.last=0; self.data={}
@@ -101,13 +159,8 @@ def _tick_shift(symbol: str, px: float, ticks: int, meta, default_tick: float) -
     tick = float(meta.get(symbol,{}).get("tickSize", default_tick))
     return px + ticks * tick
 
-# ------ CORRECTION MAJEURE: Score global = **SOMME** pondérée, pas moyenne ------
+# ------ Score global = SOMME pondérée ------
 def _compute_global_score_sum(inst: dict) -> float:
-    """
-    Agrège **uniquement** les sous-scores déjà présents (provenant de tes sources existantes),
-    en **somme pondérée**. AUCUN calcul local de métriques (pas d'analytique maison ici).
-    Compatible avec req_score_min ≈ 2.0–2.2 si les poids ~1.0.
-    """
     w_oi   = float(getattr(SETTINGS, "w_oi", 1.0))
     w_fund = float(getattr(SETTINGS, "w_funding", 1.0))
     w_delta= float(getattr(SETTINGS, "w_delta", 1.0))
@@ -130,7 +183,6 @@ def _compute_global_score_sum(inst: dict) -> float:
     add("delta_score", w_delta)
     add("funding_score", w_fund)
 
-    # Liquidity: priorité au nouveau score s'il est présent
     if "liq_new_score" in inst:
         add("liq_new_score", w_liq)
     elif "liq_score" in inst:
@@ -166,7 +218,11 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: MacroCache, meta:
     liq_pack_cache = {}
     last_trade_ts = 0.0
 
-    # Persistance locale 2/3 fenêtres (pas de calculs métriques, juste la gate)
+    # enrich cache pour oi/funding
+    last_oi_fund_fetch = 0.0
+    oi_fund_cache = {}  # {"oi_score": x, "funding_score": y}
+
+    # Persistance 2/3 fenêtres
     persist_buf = deque(maxlen=PERSIST_WIN)
 
     def on_order(msg):
@@ -205,7 +261,7 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: MacroCache, meta:
     while True:
         try:
             await asyncio.sleep(1.1)
-            score_from_agg, inst = agg.get_meta_score()   # on garde inst tel quel (aucun calcul local ajouté)
+            score_from_agg, inst = agg.get_meta_score()   # inst brut de l'aggregator
             df = ohlc.frame(symbol)
             price=float(df["close"].iloc[-1])
             macro_data = macro.refresh()
@@ -214,8 +270,7 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: MacroCache, meta:
             if (time.time() - last_liq_fetch) > LIQ_REFRESH_SEC:
                 last_liq_fetch = time.time()
                 try:
-                    liq_pack_cache = get_liq_pack(symbol)  # fournit liq_new_score, notional, imb, norm, etc.
-                    # log compact
+                    liq_pack_cache = get_liq_pack(symbol)
                     if liq_pack_cache.get("liq_source") != "none":
                         logger.info(
                             f"[LIQ] src={liq_pack_cache.get('liq_source')} "
@@ -228,8 +283,26 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: MacroCache, meta:
                 except Exception as e:
                     logger.exception(f"[LIQ PACK] fetch error: {e}", extra={"symbol": symbol})
 
-            # ---- merge inst avec liq pack (AUCUN recalcul de sous-scores ici) ----
-            inst_merged = {**inst, **(liq_pack_cache or {})}
+            # --- Refresh OI/Funding scores via Binance (léger, throttlé) ---
+            if (time.time() - last_oi_fund_fetch) > OI_FUND_REFRESH_SEC:
+                last_oi_fund_fetch = time.time()
+                try:
+                    oi_sc = _fetch_oi_score_binance(symbol)
+                    if oi_sc is not None:
+                        oi_fund_cache["oi_score"] = float(oi_sc)
+                    fund_sc = _fetch_funding_score_binance(symbol)
+                    if fund_sc is not None:
+                        oi_fund_cache["funding_score"] = float(fund_sc)
+                    if oi_fund_cache:
+                        logger.info(
+                            f"[OI/FUND] oi={oi_fund_cache.get('oi_score')} fund={oi_fund_cache.get('funding_score')}",
+                            extra={"symbol": symbol}
+                        )
+                except Exception as e:
+                    logger.exception(f"[OI/FUND ENRICH] error: {e}", extra={"symbol": symbol})
+
+            # ---- merge inst avec liq pack + OI/Funding enrichis ----
+            inst_merged = {**inst, **(liq_pack_cache or {}), **(oi_fund_cache or {})}
 
             # ---- Liquidity floor optionnel ----
             if MIN_LIQ_NORM > 0:
@@ -240,11 +313,11 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: MacroCache, meta:
                         logger.info(f"hb illiq p={price:.4f} norm={liq_norm:.0f}", extra={"symbol": symbol})
                     continue
 
-            # ---- CORRECTION: (re)score = **SOMME pondérée** sur les sous-scores disponibles ----
+            # ---- Score global = SOMME pondérée ----
             score = _compute_global_score_sum(inst_merged)
             inst_merged["score"] = score
 
-            # heartbeat 30s — affiche VRAI score (plus 0.01 bloqué)
+            # heartbeat 30s — affiche VRAI score & sous-scores enrichis
             if time.time() - last_hb > 30:
                 last_hb = time.time()
                 logger.info(
@@ -307,7 +380,6 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: MacroCache, meta:
             if symbol not in om.pending_by_symbol:
                 dec: Decision = analyze_signal(price, df, {"score":score, **inst_merged}, macro=macro_data)
                 if dec.side == "NONE":
-                    # log compact de rejet (pour diagnostiquer)
                     logger.info(f"rej s={score:.2f} ok={comps_ok}/{INST_COMPONENTS_MIN}", extra={"symbol": symbol})
                     continue
 
