@@ -1,0 +1,4 @@
+sent_signals.csv
+__pycache__/
+*.pyc
+.env
