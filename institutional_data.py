@@ -60,7 +60,7 @@ def map_symbol_to_binance(sym: str) -> str:
     return s
 
 # --------------------------------------------------------------------------------------
-# Funding / OI
+# Funding / OI (valeurs brutes)
 # --------------------------------------------------------------------------------------
 def get_funding_rate(symbol: str) -> float:
     b_symbol = map_symbol_to_binance(symbol)
@@ -311,6 +311,101 @@ def get_liq_pack(symbol: str) -> dict:
         "liq_imbalance_5m": 0.0,
         "liq_source": "none",
     }
+
+# --------------------------------------------------------------------------------------
+# OI & FUNDING -> SCORES (AJOUT)
+# --------------------------------------------------------------------------------------
+def _clamp(x: float, lo: float = 0.0, hi: float = 1.0) -> float:
+    if x < lo: return lo
+    if x > hi: return hi
+    return x
+
+def _float_any(d: dict, *keys: str, default: float = 0.0) -> float:
+    for k in keys:
+        v = d.get(k)
+        if v is None:
+            continue
+        try:
+            return float(v)
+        except Exception:
+            continue
+    return float(default)
+
+def get_open_interest_hist(symbol: str, period: str = "5m", limit: int = 2) -> list:
+    """
+    Historique d'Open Interest (USDT-M).
+    Binance: GET /futures/data/openInterestHist
+      -> clés: sumOpenInterest, sumOpenInterestValue, timestamp
+    """
+    b_symbol = map_symbol_to_binance(symbol)
+    try:
+        t0 = time.time()
+        r = _get(
+            f"{BASE}/futures/data/openInterestHist",
+            {"symbol": b_symbol, "period": period, "limit": max(2, min(500, limit))},
+            timeout=6.0,
+        )
+        ms = (time.time() - t0) * 1000
+        if r.status_code == 200:
+            arr = r.json() or []
+            _log_info(f"[OI-HIST] {b_symbol} period={period} len={len(arr)} ({ms:.1f} ms)")
+            return arr
+        _log_warn(f"[OI-HIST] {b_symbol} HTTP {r.status_code} resp={r.text}")
+    except Exception as e:
+        _log_exc(f"[OI-HIST] {b_symbol}", e)
+    return []
+
+def get_oi_score(symbol: str, ref: Optional[float] = None) -> Optional[float]:
+    """
+    Score OI basé sur la variation % du dernier intervalle 5m.
+    oi_score = clamp( |ΔOI| / OI_PREV / oi_delta_ref , 0..1 )
+    - Utilise 'sumOpenInterest' si dispo, sinon 'openInterest'.
+    - Retourne None si impossible de calculer (manque de données).
+    """
+    if ref is None:
+        try:
+            ref = float(getattr(SETTINGS, "oi_delta_ref", 0.02))  # 2% -> score 1.0
+        except Exception:
+            ref = 0.02
+    hist = get_open_interest_hist(symbol, period="5m", limit=2)
+    if len(hist) < 2:
+        return None
+    prev = hist[-2]
+    last = hist[-1]
+    oi_prev = _float_any(prev, "sumOpenInterest", "openInterest", default=0.0)
+    oi_last = _float_any(last, "sumOpenInterest", "openInterest", default=0.0)
+    if oi_prev <= 0.0:
+        return None
+    delta_pct = abs(oi_last - oi_prev) / oi_prev
+    score = _clamp(delta_pct / (ref if ref and ref > 0 else 1e-6))
+    return float(score)
+
+def get_funding_score(symbol: str, ref: Optional[float] = None) -> Optional[float]:
+    """
+    Score Funding basé sur lastFundingRate (premiumIndex).
+    funding_score = clamp( |funding| / funding_ref , 0..1 )
+    - Retourne None si erreur API.
+    """
+    if ref is None:
+        try:
+            ref = float(getattr(SETTINGS, "funding_ref", 0.00025))  # 0.025% -> score 1.0
+        except Exception:
+            ref = 0.00025
+    b_symbol = map_symbol_to_binance(symbol)
+    try:
+        t0 = time.time()
+        r = _get(f"{BASE}/fapi/v1/premiumIndex", {"symbol": b_symbol}, timeout=6.0)
+        ms = (time.time() - t0) * 1000
+        if r.status_code == 200:
+            data = r.json() or {}
+            fr = float(data.get("lastFundingRate", 0.0) or 0.0)
+            score = _clamp(abs(fr) / (ref if ref and ref > 0 else 1e-6))
+            _log_info(f"[FundingScore] {b_symbol} fr={fr} -> score={score:.3f} ({ms:.1f} ms)")
+            return float(score)
+        _log_warn(f"[FundingScore] {b_symbol} HTTP {r.status_code} resp={r.text}")
+    except Exception as e:
+        _log_exc(f"[FundingScore] {b_symbol}", e)
+    return None
 
 # --------------------------------------------------------------------------------------
 # MACRO (CoinGecko gratuit)
