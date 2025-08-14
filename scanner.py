@@ -1,4 +1,5 @@
 import asyncio, time, uuid
+from collections import deque
 import pandas as pd
 from config import SETTINGS
 from institutional_aggregator import InstitutionalAggregator
@@ -13,27 +14,47 @@ from institutional_data import get_macro_total_mcap, get_macro_total2, get_macro
 from adverse_selection import should_cancel_or_requote
 from logger_utils import get_logger
 
-# >>> DEBUG BINANCE (existant) <<<
+# --- APIs externes déjà utilisées (aucun calcul local ajouté) ---
 from institutional_data import (
-    get_open_interest, get_funding_rate, get_recent_liquidations, map_symbol_to_binance
+    get_open_interest, get_funding_rate, get_recent_liquidations, map_symbol_to_binance,
+    get_liq_pack
 )
-# >>> LIQ PACK (ajout) <<<
-from institutional_data import get_liq_pack
 
 rootlog = get_logger("scanner")
 
-# Active le debug raw des métriques Binance (mets à 0 pour désactiver)
-INSTIT_DEBUG_EVERY_SEC = 30
-# Rafraîchissement du liq pack (évite le spam HTTP)
+# Debug périodique (mets à 0 pour off)
+INSTIT_DEBUG_EVERY_SEC = 0
+# Rafraîchissement du liq pack (HTTP throttle)
 LIQ_REFRESH_SEC = getattr(SETTINGS, "liq_refresh_sec", 30)
+
+# ---------------- Params par défaut (si absents dans SETTINGS) ----------------
+# Important: comme on passe à une **SOMME pondérée**, un seuil autour de 2.0–2.2 est cohérent (si les poids ~1.0)
+REQ_SCORE_MIN        = float(getattr(SETTINGS, "req_score_min", 2.2))
+INST_COMPONENTS_MIN  = int(getattr(SETTINGS, "inst_components_min", 2))
+OI_MIN               = float(getattr(SETTINGS, "oi_req_min", 0.40))
+DELTA_MIN            = float(getattr(SETTINGS, "delta_req_min", 0.40))
+FUND_MIN             = float(getattr(SETTINGS, "funding_req_min", 0.20))
+LIQ_MIN              = float(getattr(SETTINGS, "liq_req_min", 0.50))
+BOOK_MIN             = float(getattr(SETTINGS, "book_req_min", 0.30))
+USE_BOOK             = bool(getattr(SETTINGS, "use_book_imbal", False))
+
+# Persistance: 2 sur 3 fenêtres
+PERSIST_WIN          = int(getattr(SETTINGS, "persist_win", 3))
+PERSIST_MIN_OK       = int(getattr(SETTINGS, "persist_min_ok", 2))
+
+# Cooldown par symbole (sec)
+SYMBOL_COOLDOWN_SEC  = int(getattr(SETTINGS, "symbol_cooldown_sec", 900))
+
+# Filtre d’activité min (optionnel, via liq_pack si dispo)
+MIN_LIQ_NORM         = float(getattr(SETTINGS, "min_liq_norm", 0.0))  # 0 = désactivé
 
 class MacroCache:
     def __init__(self): self.last=0; self.data={}
     def refresh(self):
         now=time.time()
-        if now - self.last < SETTINGS.macro_refresh_minutes*60: return self.data
+        if now - self.last < getattr(SETTINGS, "macro_refresh_minutes", 5)*60: return self.data
         total=get_macro_total_mcap()
-        total2=get_macro_total2() if SETTINGS.use_total2 else 0.0
+        total2=get_macro_total2() if getattr(SETTINGS, "use_total2", True) else 0.0
         dom=get_macro_btc_dominance()
         self.data={"TOTAL":total,"TOTAL2":total2,"BTC_DOM":dom, "TOTAL_PCT":0.0, "TOTAL2_PCT":0.0}
         self.last=now; return self.data
@@ -41,7 +62,7 @@ class MacroCache:
 class OHLCV1m:
     def __init__(self, meta: dict):
         self.df = {}
-        self.meta = meta  # mapping display_symbol -> {symbol_api, tickSize, pricePrecision}
+        self.meta = meta  # display_symbol -> {symbol_api, tickSize, pricePrecision}
 
     def bootstrap(self, sym: str):
         logger = get_logger("scanner.bootstrap", sym)
@@ -61,14 +82,11 @@ class OHLCV1m:
         minute=(ts//60000)*60000
         if int(df.iloc[-1]["time"]) == minute:
             idx = df.index[-1]
-            current_high = float(df.at[idx, "high"])
-            current_low  = float(df.at[idx, "low"])
-            current_vol  = float(df.at[idx, "volume"])
             p = float(price)
             df.at[idx, "close"]  = p
-            df.at[idx, "high"]   = max(current_high, p)
-            df.at[idx, "low"]    = min(current_low,  p)
-            df.at[idx, "volume"] = current_vol + float(vol)
+            df.at[idx, "high"]   = max(float(df.at[idx, "high"]), p)
+            df.at[idx, "low"]    = min(float(df.at[idx, "low"]),  p)
+            df.at[idx, "volume"] = float(df.at[idx, "volume"]) + float(vol)
         else:
             last_close = float(df.iloc[-1]["close"])
             p = float(price)
@@ -83,39 +101,36 @@ def _tick_shift(symbol: str, px: float, ticks: int, meta, default_tick: float) -
     tick = float(meta.get(symbol,{}).get("tickSize", default_tick))
     return px + ticks * tick
 
-# ------ NEW: score global calculé depuis les sous-scores disponibles ------
-def _compute_global_score(inst: dict) -> float:
+# ------ CORRECTION MAJEURE: Score global = **SOMME** pondérée, pas moyenne ------
+def _compute_global_score_sum(inst: dict) -> float:
     """
-    Calcule un score global pondéré à partir des sous-scores présents dans inst.
-    Priorise liq_new_score, ignore les composantes absentes et respecte use_book_imbal.
+    Agrège **uniquement** les sous-scores déjà présents (provenant de tes sources existantes),
+    en **somme pondérée**. AUCUN calcul local de métriques (pas d'analytique maison ici).
+    Compatible avec req_score_min ≈ 2.0–2.2 si les poids ~1.0.
     """
     w_oi   = float(getattr(SETTINGS, "w_oi", 1.0))
     w_fund = float(getattr(SETTINGS, "w_funding", 1.0))
     w_delta= float(getattr(SETTINGS, "w_delta", 1.0))
     w_liq  = float(getattr(SETTINGS, "w_liq", 1.0))
     w_book = float(getattr(SETTINGS, "w_book_imbal", 1.0))
-    use_book = bool(getattr(SETTINGS, "use_book_imbal", True))
+    use_book = bool(getattr(SETTINGS, "use_book_imbal", USE_BOOK))
 
-    num = 0.0
-    den = 0.0
+    total = 0.0
 
     def add(key: str, w: float):
-        nonlocal num, den
+        nonlocal total
         if w <= 0: return
-        v = inst.get(key, None)
-        if v is None: return
+        if key not in inst or inst[key] is None: return
         try:
-            fv = float(v)
+            total += w * float(inst[key])
         except Exception:
-            return
-        num += w * fv
-        den += w
+            pass
 
     add("oi_score", w_oi)
     add("delta_score", w_delta)
     add("funding_score", w_fund)
 
-    # Liquidity score : priorité au nouveau
+    # Liquidity: priorité au nouveau score s'il est présent
     if "liq_new_score" in inst:
         add("liq_new_score", w_liq)
     elif "liq_score" in inst:
@@ -124,7 +139,18 @@ def _compute_global_score(inst: dict) -> float:
     if use_book:
         add("book_imbal_score", w_book)
 
-    return float(num / den) if den > 0 else 0.0
+    return float(total)
+
+def _components_ok(inst: dict) -> int:
+    oi_ok    = float(inst.get("oi_score",0.0))    >= OI_MIN
+    dlt_ok   = float(inst.get("delta_score",0.0)) >= DELTA_MIN
+    fund_ok  = float(inst.get("funding_score",0.0))>= FUND_MIN
+    liq_val  = float(inst.get("liq_new_score", inst.get("liq_score",0.0)))
+    liq_ok   = liq_val >= LIQ_MIN
+    if USE_BOOK:
+        book_ok = float(inst.get("book_imbal_score",0.0)) >= BOOK_MIN
+        return int(oi_ok)+int(dlt_ok)+int(fund_ok)+int(liq_ok)+int(book_ok)
+    return int(oi_ok)+int(dlt_ok)+int(fund_ok)+int(liq_ok)
 
 async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: MacroCache, meta: dict):
     logger = get_logger("scanner.symbol", symbol)
@@ -136,9 +162,12 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: MacroCache, meta:
 
     started_at = time.time()
     last_hb = 0.0
-    last_dbg = 0.0  # >>> debug Binance
     last_liq_fetch = 0.0
     liq_pack_cache = {}
+    last_trade_ts = 0.0
+
+    # Persistance locale 2/3 fenêtres (pas de calculs métriques, juste la gate)
+    persist_buf = deque(maxlen=PERSIST_WIN)
 
     def on_order(msg):
         oid = msg.get("clientOid") or ""
@@ -176,117 +205,127 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: MacroCache, meta:
     while True:
         try:
             await asyncio.sleep(1.1)
-            score, inst = agg.get_meta_score()
+            score_from_agg, inst = agg.get_meta_score()   # on garde inst tel quel (aucun calcul local ajouté)
             df = ohlc.frame(symbol)
             price=float(df["close"].iloc[-1])
             macro_data = macro.refresh()
 
-            # >>> rafraîchir liq_new_score (HTTP throttlé) <<<
+            # --- Refresh liq pack (externe) ---
             if (time.time() - last_liq_fetch) > LIQ_REFRESH_SEC:
                 last_liq_fetch = time.time()
                 try:
-                    liq_pack_cache = get_liq_pack(symbol)
-                    # log léger pour sanity-check
+                    liq_pack_cache = get_liq_pack(symbol)  # fournit liq_new_score, notional, imb, norm, etc.
+                    # log compact
                     if liq_pack_cache.get("liq_source") != "none":
                         logger.info(
-                            f"[LIQ PACK] src={liq_pack_cache.get('liq_source')} "
-                            f"score={liq_pack_cache.get('liq_new_score', 0.0):.3f} "
-                            f"notional={liq_pack_cache.get('liq_notional_5m', 0.0):.2f} "
-                            f"imb={liq_pack_cache.get('liq_imbalance_5m', 0.0):.3f}",
+                            f"[LIQ] src={liq_pack_cache.get('liq_source')} "
+                            f"sc={liq_pack_cache.get('liq_new_score',0.0):.3f} "
+                            f"N5m={liq_pack_cache.get('liq_notional_5m',0.0):.0f} "
+                            f"imb={liq_pack_cache.get('liq_imbalance_5m',0.0):.3f} "
+                            f"norm={liq_pack_cache.get('liq_norm',0.0):.0f}",
                             extra={"symbol": symbol}
                         )
                 except Exception as e:
                     logger.exception(f"[LIQ PACK] fetch error: {e}", extra={"symbol": symbol})
 
-            # ---- merge inst avec liq pack ----
+            # ---- merge inst avec liq pack (AUCUN recalcul de sous-scores ici) ----
             inst_merged = {**inst, **(liq_pack_cache or {})}
 
-            # ---- (re)calcule le score global avec les bonnes données (incl. liq_new_score) ----
-            score = _compute_global_score(inst_merged)
+            # ---- Liquidity floor optionnel ----
+            if MIN_LIQ_NORM > 0:
+                liq_norm = float(inst_merged.get("liq_norm", 0.0) or 0.0)
+                if liq_norm and liq_norm < MIN_LIQ_NORM:
+                    if time.time() - last_hb > 30:
+                        last_hb = time.time()
+                        logger.info(f"hb illiq p={price:.4f} norm={liq_norm:.0f}", extra={"symbol": symbol})
+                    continue
+
+            # ---- CORRECTION: (re)score = **SOMME pondérée** sur les sous-scores disponibles ----
+            score = _compute_global_score_sum(inst_merged)
             inst_merged["score"] = score
 
-            # heartbeat 30s
+            # heartbeat 30s — affiche VRAI score (plus 0.01 bloqué)
             if time.time() - last_hb > 30:
                 last_hb = time.time()
-                logger.info(f"hb price={price:.4f} score={score:.2f} spread={inst.get('spread')} mid={inst.get('mid')}", extra={"symbol": symbol})
-
-            # >>> DEBUG BINANCE RAW METRICS (toutes les 30s) <<<
-            if INSTIT_DEBUG_EVERY_SEC > 0 and (time.time() - last_dbg) > INSTIT_DEBUG_EVERY_SEC:
-                last_dbg = time.time()
-                bsym = map_symbol_to_binance(symbol)
-                try:
-                    oi  = get_open_interest(symbol)
-                    fr  = get_funding_rate(symbol)
-                    liq = get_recent_liquidations(symbol, minutes=5)
-                    logger.info(f"[BINANCE RAW] {symbol}->{bsym} OI={oi} Funding={fr} Liq5m={liq}", extra={"symbol": symbol})
-                except Exception as e:
-                    logger.exception(f"[BINANCE RAW] fetch error: {e}", extra={"symbol": symbol})
+                logger.info(
+                    f"hb p={price:.4f} s={score:.2f} oi={inst_merged.get('oi_score',0):.2f} "
+                    f"dlt={inst_merged.get('delta_score',0):.2f} fund={inst_merged.get('funding_score',0):.2f} "
+                    f"liq={inst_merged.get('liq_new_score', inst_merged.get('liq_score',0)):.2f}",
+                    extra={"symbol": symbol}
+                )
 
             # warmup
-            if (time.time() - started_at) < SETTINGS.warmup_seconds:
+            if (time.time() - started_at) < getattr(SETTINGS, "warmup_seconds", 0):
                 continue
 
+            # ---- Gate “institutionnelle” + persistance 2/3 ----
+            comps_ok = _components_ok(inst_merged)
+            gate_now = (score >= REQ_SCORE_MIN) and (comps_ok >= INST_COMPONENTS_MIN)
+            persist_buf.append(1 if gate_now else 0)
+            if sum(persist_buf) < PERSIST_MIN_OK:
+                continue
+
+            # ---- Cooldown par symbole ----
+            if (time.time() - last_trade_ts) < SYMBOL_COOLDOWN_SEC:
+                continue
+
+            # ---- Gestion position existante ----
             pos=om.pos.get(symbol)
             if pos:
-                try:
-                    atr=float(compute_atr(df).iloc[-1])
-                except Exception:
-                    atr=0.0
+                try: atr=float(compute_atr(df).iloc[-1])
+                except Exception: atr=0.0
                 if not pos.tp1_done:
                     if (pos.side=="LONG" and price>=pos.tp1) or (pos.side=="SHORT" and price<=pos.tp1):
                         ro_side="sell" if pos.side=="LONG" else "buy"
                         ok,_=trader.close_reduce_market(symbol, ro_side, value_qty=pos.qty_value*SETTINGS.tp1_part)
-                        logger.info(f"TP1 hit → BE set={SETTINGS.breakeven_after_tp1}", extra={"symbol": symbol})
-                        if ok: om.close_half_at_tp1(symbol); send_msg(f"✅ {symbol} TP1 — BE")
+                        if ok:
+                            om.close_half_at_tp1(symbol); send_msg(f"✅ {symbol} TP1 — BE")
+                            logger.info("TP1 hit → BE", extra={"symbol": symbol})
                 else:
-                    trail=SETTINGS.trail_mult_atr*float(atr)
+                    trail=getattr(SETTINGS, "trail_mult_atr", 1.2)*float(atr)
                     if pos.side=="LONG":
                         pos.sl=max(pos.sl, price-trail)
                         if price<=pos.sl:
                             ok,_=trader.close_reduce_market(symbol,"sell", value_qty=pos.qty_value*(1.0-SETTINGS.tp1_part))
-                            logger.info("Trailing stop LONG executed", extra={"symbol": symbol})
                             if ok: om.close_all(symbol,"TRAIL_LONG"); send_msg(f"🛑 {symbol} Trailing stop LONG")
                     else:
                         pos.sl=min(pos.sl, price+trail)
                         if price>=pos.sl:
                             ok,_=trader.close_reduce_market(symbol,"buy", value_qty=pos.qty_value*(1.0-SETTINGS.tp1_part))
-                            logger.info("Trailing stop SHORT executed", extra={"symbol": symbol})
                             if ok: om.close_all(symbol,"TRAIL_SHORT"); send_msg(f"🛑 {symbol} Trailing stop SHORT")
 
                 if symbol in om.pos:
                     pos=om.pos[symbol]
                     if (pos.side=="LONG" and price>=pos.tp2) or (pos.side=="SHORT" and price<=pos.tp2):
                         ro_side="sell" if pos.side=="LONG" else "buy"
-                        rem=pos.qty_value*(1.0-(SETTINGS.tp1_part if pos.tp1_done else 0.0))
+                        rem=pos.qty_value*(1.0-(getattr(SETTINGS,"tp1_part",0.5) if pos.tp1_done else 0.0))
                         ok,_=trader.close_reduce_market(symbol, ro_side, value_qty=rem)
-                        logger.info("TP2 hit — position closed", extra={"symbol": symbol})
                         if ok: om.close_all(symbol,"TP2"); send_msg(f"🎯 {symbol} TP2 — clôture")
+                continue  # pas d'entrées si déjà en position
 
-            if symbol not in om.pos and symbol not in om.pending_by_symbol:
+            # ---- Pas de position/pending -> décision & exécution ----
+            if symbol not in om.pending_by_symbol:
                 dec: Decision = analyze_signal(price, df, {"score":score, **inst_merged}, macro=macro_data)
-
                 if dec.side == "NONE":
-                    if SETTINGS.log_signals and int(time.time()) % 10 == 0:
-                        logger.info(f"Decision:\n{dec.reason}", extra={"symbol": symbol})
+                    # log compact de rejet (pour diagnostiquer)
+                    logger.info(f"rej s={score:.2f} ok={comps_ok}/{INST_COMPONENTS_MIN}", extra={"symbol": symbol})
                     continue
-                else:
-                    logger.info(f"Decision:\n{dec.reason}", extra={"symbol": symbol})
 
                 adv = should_cancel_or_requote("LONG" if dec.side=="LONG" else "SHORT", inst_merged, SETTINGS)
-                if adv!="OK" and SETTINGS.cancel_on_adverse:
-                    logger.warning(f"entry blocked: {adv}", extra={"symbol": symbol})
+                if adv!="OK" and getattr(SETTINGS, "cancel_on_adverse", True):
+                    logger.info(f"block adverse={adv}", extra={"symbol": symbol})
                     continue
 
                 side="buy" if dec.side=="LONG" else "sell"
-                entry_px = round_price(symbol, dec.entry, meta, SETTINGS.default_tick_size)
-                px_maker = _tick_shift(symbol, entry_px, -1 if side=="buy" else +1, meta, SETTINGS.default_tick_size)
-                px_maker = round_price(symbol, px_maker, meta, SETTINGS.default_tick_size)
+                entry_px = round_price(symbol, dec.entry, meta, getattr(SETTINGS,"default_tick_size", 0.001))
+                px_maker = _tick_shift(symbol, entry_px, -1 if side=="buy" else +1, meta, getattr(SETTINGS,"default_tick_size", 0.001))
+                px_maker = round_price(symbol, px_maker, meta, getattr(SETTINGS,"default_tick_size", 0.001))
 
-                stage_fracs = [SETTINGS.stage1_fraction, 1.0-SETTINGS.stage1_fraction] if SETTINGS.two_stage_entry else [1.0]
+                stage_fracs = [getattr(SETTINGS,"stage1_fraction",0.5), 1.0-getattr(SETTINGS,"stage1_fraction",0.5)] if getattr(SETTINGS,"two_stage_entry", False) else [1.0]
                 for i, frac in enumerate(stage_fracs):
                     oid = str(uuid.uuid4())+f"-s{i+1}"
-                    ok,res = trader.place_limit(symbol, side, px_maker, oid, post_only=SETTINGS.post_only_entries)
-                    logger.info(f"place_limit post_only={SETTINGS.post_only_entries} side={side} px={px_maker} stage={i+1}/{len(stage_fracs)} ok={ok}", extra={"symbol": symbol})
+                    ok,res = trader.place_limit(symbol, side, px_maker, oid, post_only=getattr(SETTINGS,"post_only_entries", True))
+                    logger.info(f"ENTRY {side} px={px_maker} stg={i+1}/{len(stage_fracs)} ok={ok}", extra={"symbol": symbol})
                     if not ok:
                         logger.error(f"ENTRY FAIL stage{i+1} resp={res}", extra={"symbol": symbol})
                         break
@@ -294,34 +333,36 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: MacroCache, meta:
                     om.add_pending(oid, symbol, side, px_maker)
                     om.open_position(symbol, dec.side, dec.entry, dec.sl, dec.tp1, dec.tp2)
                     send_msg(f"🚀 {symbol} {dec.side} stage {i+1}/{len(stage_fracs)} post-only @ {px_maker}")
+                    last_trade_ts = time.time()
 
+                    # attente fill / re-quotes
                     t0=time.time(); rq=0
-                    while time.time()-t0 < SETTINGS.entry_timeout_sec:
+                    while time.time()-t0 < getattr(SETTINGS,"entry_timeout_sec", 6):
                         await asyncio.sleep(0.2)
-                    while rq < SETTINGS.max_requotes:
+                    while rq < getattr(SETTINGS,"max_requotes", 2):
                         rq += 1
-                        px_maker = _tick_shift(symbol, px_maker, +1 if side=='buy' else -1, meta, SETTINGS.default_tick_size)
-                        px_maker = round_price(symbol, px_maker, meta, SETTINGS.default_tick_size)
+                        px_maker = _tick_shift(symbol, px_maker, +1 if side=='buy' else -1, meta, getattr(SETTINGS,"default_tick_size", 0.001))
+                        px_maker = round_price(symbol, px_maker, meta, getattr(SETTINGS,"default_tick_size", 0.001))
                         trader.cancel_by_client_oid(oid)
                         oid = str(uuid.uuid4())+f"-rq{rq}"
-                        ok,_ = trader.place_limit(symbol, side, px_maker, oid, post_only=SETTINGS.post_only_entries)
-                        logger.info(f"re-quote {rq}/{SETTINGS.max_requotes} px={px_maker} ok={ok}", extra={"symbol": symbol})
+                        ok,_ = trader.place_limit(symbol, side, px_maker, oid, post_only=getattr(SETTINGS,"post_only_entries", True))
+                        logger.info(f"REQUOTE {rq}/{getattr(SETTINGS,'max_requotes',2)} px={px_maker} ok={ok}", extra={"symbol": symbol})
                         if not ok: break
                         om.add_pending(oid, symbol, side, px_maker)
                         t0=time.time()
-                        while time.time()-t0 < SETTINGS.entry_timeout_sec:
+                        while time.time()-t0 < getattr(SETTINGS,"entry_timeout_sec", 6):
                             await asyncio.sleep(0.2)
 
-                    if SETTINGS.use_ioc_fallback:
+                    if getattr(SETTINGS,"use_ioc_fallback", True):
                         ok,_ = trader.place_limit_ioc(symbol, side, entry_px)
-                        logger.info(f"IOC fallback tried ok={ok} px={entry_px}", extra={"symbol": symbol})
+                        logger.info(f"IOC tried ok={ok} px={entry_px}", extra={"symbol": symbol})
                         if ok: send_msg(f"⚡ {symbol} IOC fallback déclenché")
 
                     if i==0 and len(stage_fracs)==2:
                         await asyncio.sleep(0.8)
                         adv2 = should_cancel_or_requote("LONG" if dec.side=="LONG" else "SHORT", inst_merged, SETTINGS)
-                        if adv2!="OK" and SETTINGS.cancel_on_adverse:
-                            logger.warning(f"ABORT stage2 ({adv2})", extra={"symbol": symbol})
+                        if adv2!="OK" and getattr(SETTINGS, "cancel_on_adverse", True):
+                            logger.info(f"ABORT stage2 adverse={adv2}", extra={"symbol": symbol})
                             break
         except Exception:
             logger.exception("run_symbol loop error", extra={"symbol": symbol})
@@ -329,9 +370,8 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: MacroCache, meta:
 
 async def main():
     rootlog.info("Starting scanner...")
-    # Auto-discovery des symboles sans limite
-    if SETTINGS.auto_symbols:
-        discovered = common_usdt_symbols(limit=0, exclude_csv=SETTINGS.exclude_symbols)  # 0 => pas de limite
+    if getattr(SETTINGS, "auto_symbols", False):
+        discovered = common_usdt_symbols(limit=0, exclude_csv=getattr(SETTINGS,"exclude_symbols",""))
         if discovered:
             SETTINGS.symbols = discovered
             rootlog.info(f"[SCAN] Auto-symbols activé — {len(discovered)} paires chargées.")
