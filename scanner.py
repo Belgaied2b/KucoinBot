@@ -10,7 +10,7 @@ from kucoin_trader import KucoinTrader
 from kucoin_ws import KucoinPrivateWS
 from order_manager import OrderManager
 from orderflow_features import compute_atr
-from kucoin_utils import fetch_klines, fetch_symbol_meta, round_price, common_usdt_symbols
+from kucoin_utils import fetch_klines, fetch_symbol_meta, round_price, common_usdt_symbols, kucoin_active_usdt_symbols
 from telegram_notifier import send_msg
 from institutional_data import get_macro_total_mcap, get_macro_total2, get_macro_btc_dominance
 from adverse_selection import should_cancel_or_requote
@@ -20,6 +20,21 @@ from institutional_data import (
 )
 
 rootlog = get_logger("scanner")
+
+# Registry for last signal keys & timestamps to avoid duplicates
+_LAST_SIGNAL_KEY = {}
+_LAST_SIGNAL_TS = {}
+
+def _is_duplicate_signal(symbol: str, key: str, cooldown_sec: int) -> bool:
+    now = time.time()
+    last_key = _LAST_SIGNAL_KEY.get(symbol)
+    last_ts = _LAST_SIGNAL_TS.get(symbol, 0)
+    if last_key == key and (now - last_ts) < cooldown_sec:
+        return True
+    _LAST_SIGNAL_KEY[symbol] = key
+    _LAST_SIGNAL_TS[symbol] = now
+    return False
+
 
 # ---------------------------------------------------------------------
 # Config locaux & constantes
@@ -595,7 +610,16 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: MacroCache, meta:
                     logger.info(f"rej s={score:.2f} ok={comps_ok}/{INST_COMPONENTS_MIN}", extra={"symbol": symbol})
                     continue
 
-                adv = should_cancel_or_requote("LONG" if dec.side == "LONG" else "SHORT", inst_merged, SETTINGS)
+                
+# Build a signal key to deduplicate (side+entry+sl+tp1+tp2)
+try:
+    _key = f"{dec.side}:{round_price(symbol, dec.entry, meta, getattr(SETTINGS, 'default_tick_size', 0.001))}:{round_price(symbol, dec.sl, meta, getattr(SETTINGS, 'default_tick_size', 0.001))}:{round_price(symbol, dec.tp1, meta, getattr(SETTINGS, 'default_tick_size', 0.001))}:{round_price(symbol, dec.tp2, meta, getattr(SETTINGS, 'default_tick_size', 0.001))}"
+except Exception:
+    _key = f"{dec.side}:{dec.entry}:{dec.sl}:{dec.tp1}:{dec.tp2}"
+if _is_duplicate_signal(symbol, _key, getattr(SETTINGS, "symbol_cooldown_sec", 45)):
+    logger.info("Duplicate signal suppressed by cooldown", extra={"symbol": symbol})
+    continue
+adv = should_cancel_or_requote("LONG" if dec.side == "LONG" else "SHORT", inst_merged, SETTINGS)
                 if adv != "OK" and getattr(SETTINGS, "cancel_on_adverse", True):
                     logger.info(f"block adverse={adv}", extra={"symbol": symbol})
                     continue
@@ -707,11 +731,28 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: MacroCache, meta:
 # ---------------------------------------------------------------------
 async def main():
     rootlog.info("Starting scanner...")
-    if getattr(SETTINGS, "auto_symbols", False):
-        discovered = common_usdt_symbols(limit=0, exclude_csv=getattr(SETTINGS, "exclude_symbols", ""))
-        if discovered:
-            SETTINGS.symbols = discovered
-            rootlog.info(f"[SCAN] Auto-symbols activé — {len(discovered)} paires chargées.")
+    
+if getattr(SETTINGS, "auto_symbols", False):
+    # Prefer full KuCoin USDT-M universe, then apply max cap and exclusions
+    discovered = kucoin_active_usdt_symbols()
+    # Apply exclusions
+    excl = getattr(SETTINGS, "exclude_symbols", "")
+    if excl:
+        ex = {x.strip().upper() for x in excl.split(",") if x.strip()}
+        discovered = [s for s in discovered if s not in ex]
+    # Respect symbols_max
+    maxn = getattr(SETTINGS, "symbols_max", 0)
+    if maxn and maxn > 0:
+        discovered = discovered[:maxn]
+    # De-duplicate (preserve order)
+    seen = set()
+    deduped = []
+    for s in discovered:
+        if s not in seen:
+            seen.add(s)
+            deduped.append(s)
+    SETTINGS.symbols = deduped
+rootlog.info(f"[SCAN] Auto-symbols activé — {len(discovered)} paires chargées.")
     kws = KucoinPrivateWS()
     meta = fetch_symbol_meta()
     macro = MacroCache()
