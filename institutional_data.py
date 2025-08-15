@@ -112,40 +112,52 @@ def _mark_price(symbol_binance: str) -> float:
 def get_recent_liquidations(symbol: str, minutes: int = 5) -> float:
     """
     Liquidations récentes (notionnel approx).
-    1) Tente l'endpoint historique (souvent 400 désormais)
+    1) (optionnel) Endpoint legacy /fapi/v1/allForceOrders — souvent 400 désormais
     2) Fallback PROXY via taker long/short ratio 5m * markPrice
 
     Proxy = |buyVol - sellVol| * markPrice  (aligne tes logs: notionnel≈... )
     """
     b_symbol = map_symbol_to_binance(symbol)
 
-    # --- Try legacy allForceOrders (souvent 400 "out of maintenance") ---
+    # Flag pour contrôler l'usage de l'endpoint legacy (déconseillé)
     try:
-        now = int(time.time() * 1000)
-        start = now - minutes * 60 * 1000
-        t0 = time.time()
-        r = _get(
-            f"{BASE}/fapi/v1/allForceOrders",
-            {"symbol": b_symbol, "startTime": start, "limit": 1000},
-            timeout=6.0,
-        )
-        ms = (time.time() - t0) * 1000
-        if r.status_code == 200:
-            data = r.json()
-            tot = 0.0
-            for it in data:
-                try:
-                    qty = float(it.get("origQty", 0.0) or 0.0)
-                    px  = float(it.get("price",   0.0) or 0.0)
-                    tot += qty * px
-                except Exception:
-                    continue
-            _log_info(f"[Liq] {b_symbol} {len(data)} orders, notionnel≈{tot:.2f} ({ms:.1f} ms)")
-            return tot
-        else:
-            _log_warn(f"[Liq] {b_symbol} HTTP {r.status_code} resp={r.text}")
-    except Exception as e:
-        _log_exc(f"[Liq] {b_symbol}", e)
+        from config import SETTINGS
+        use_legacy = bool(getattr(SETTINGS, "use_legacy_binance_liq", False))
+    except Exception:
+        use_legacy = False
+
+    # --- Try legacy allForceOrders (souvent 400 "out of maintenance") ---
+    if use_legacy:
+        try:
+            now = int(time.time() * 1000)
+            start = now - minutes * 60 * 1000
+            t0 = time.time()
+            r = _get(
+                f"{BASE}/fapi/v1/allForceOrders",
+                {"symbol": b_symbol, "startTime": start, "limit": 1000},
+                timeout=6.0,
+            )
+            ms = (time.time() - t0) * 1000
+            if r.status_code == 200:
+                data = r.json()
+                tot = 0.0
+                for it in data:
+                    try:
+                        qty = float(it.get("origQty", 0.0) or 0.0)
+                        px  = float(it.get("price",   0.0) or 0.0)
+                        tot += qty * px
+                    except Exception:
+                        continue
+                _log_info(f"[Liq] {b_symbol} {len(data)} orders, notionnel≈{tot:.2f} ({ms:.1f} ms)")
+                return tot
+            else:
+                # 400 -> ne pas spammer en WARNING
+                if r.status_code == 400:
+                    _log_info(f"[Liq] {b_symbol} HTTP {r.status_code} resp={r.text}")
+                else:
+                    _log_warn(f"[Liq] {b_symbol} HTTP {r.status_code} resp={r.text}")
+        except Exception as e:
+            _log_exc(f"[Liq] {b_symbol}", e)
 
     # --- Fallback PROXY via takerLongShortRatio (5m) ---
     try:
@@ -185,6 +197,7 @@ try:
 except Exception:
     # Defaults si SETTINGS indisponible (tests locaux)
     SETTINGS = type("S", (), {})()
+    setattr(SETTINGS, "use_legacy_binance_liq", False)
     setattr(SETTINGS, "liq_notional_norm", 150_000.0)  # norme globale
     setattr(SETTINGS, "liq_notional_overrides", {})    # ex: {"BTCUSDT": 3_000_000.0}
     setattr(SETTINGS, "liq_imbal_weight", 0.35)        # poids imbalance
@@ -243,42 +256,59 @@ def get_liq_pack(symbol: str) -> dict:
     """
     b_symbol = map_symbol_to_binance(symbol)
 
-    # 1) Essai legacy allForceOrders (souvent 400)
+    # 1) Essai legacy allForceOrders (optionnel, souvent 400)
     try:
-        now = int(time.time() * 1000)
-        start = now - 5 * 60 * 1000
-        t0 = time.time()
-        r = _get(f"{BASE}/fapi/v1/allForceOrders", {"symbol": b_symbol, "startTime": start, "limit": 1000}, timeout=6.0)
-        ms = (time.time() - t0) * 1000
-        if r.status_code == 200:
-            data = r.json()
-            tot = 0.0
-            for it in data:
-                try:
-                    qty = float(it.get("origQty", 0.0) or 0.0)
-                    px  = float(it.get("price",   0.0) or 0.0)
-                    tot += qty * px
-                except Exception:
-                    continue
-            norm = _norm_for_symbol(b_symbol)
-            score = min(1.0, tot / max(1.0, norm))
-            _log_info(f"[Liq] {b_symbol} {len(data)} orders, notionnel≈{tot:.2f} ({ms:.1f} ms)")
-            return {
-                "liq_new_score": float(score),
-                "liq_score":     float(score),
-                "liq_notional_5m": float(tot),
-                "liq_imbalance_5m": 0.0,
-                "liq_source": "primary",
-            }
-        else:
-            _log_warn(f"[Liq] {b_symbol} HTTP {r.status_code} resp={r.text}")
-    except Exception as e:
-        _log_exc(f"[Liq] {b_symbol}", e)
+        use_legacy = bool(getattr(SETTINGS, "use_legacy_binance_liq", False))
+    except Exception:
+        use_legacy = False
+
+    if use_legacy:
+        try:
+            now = int(time.time() * 1000)
+            start = now - 5 * 60 * 1000
+            t0 = time.time()
+            r = _get(
+                f"{BASE}/fapi/v1/allForceOrders",
+                {"symbol": b_symbol, "startTime": start, "limit": 1000},
+                timeout=6.0
+            )
+            ms = (time.time() - t0) * 1000
+            if r.status_code == 200:
+                data = r.json()
+                tot = 0.0
+                for it in data:
+                    try:
+                        qty = float(it.get("origQty", 0.0) or 0.0)
+                        px  = float(it.get("price",   0.0) or 0.0)
+                        tot += qty * px
+                    except Exception:
+                        continue
+                norm  = _norm_for_symbol(b_symbol)
+                score = min(1.0, tot / max(1.0, norm))
+                _log_info(f"[Liq] {b_symbol} {len(data)} orders, notionnel≈{tot:.2f} ({ms:.1f} ms)")
+                return {
+                    "liq_new_score": float(score),
+                    "liq_score":     float(score),
+                    "liq_notional_5m": float(tot),
+                    "liq_imbalance_5m": 0.0,
+                    "liq_source": "primary",
+                }
+            else:
+                if r.status_code == 400:
+                    _log_info(f"[Liq] {b_symbol} HTTP {r.status_code} resp={r.text}")
+                else:
+                    _log_warn(f"[Liq] {b_symbol} HTTP {r.status_code} resp={r.text}")
+        except Exception as e:
+            _log_exc(f"[Liq] {b_symbol}", e)
 
     # 2) Fallback PROXY via takerLongShortRatio + markPrice
     try:
         t0 = time.time()
-        rr = _get(f"{BASE}/futures/data/takerlongshortRatio", {"symbol": b_symbol, "period": "5m", "limit": 1}, timeout=6.0)
+        rr = _get(
+            f"{BASE}/futures/data/takerlongshortRatio",
+            {"symbol": b_symbol, "period": "5m", "limit": 1},
+            timeout=6.0
+        )
         ms = (time.time() - t0) * 1000
         if rr.status_code == 200:
             arr = rr.json() or []
