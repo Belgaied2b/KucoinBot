@@ -16,7 +16,7 @@ from institutional_data import get_macro_total_mcap, get_macro_total2, get_macro
 from adverse_selection import should_cancel_or_requote
 from logger_utils import get_logger
 from institutional_data import (
-    get_open_interest, get_funding_rate, get_recent_liquidations, map_symbol_to_binance, get_liq_pack
+    map_symbol_to_binance, get_liq_pack, get_funding_rate
 )
 
 rootlog = get_logger("scanner")
@@ -46,6 +46,7 @@ OI_FUND_REFRESH_SEC = int(getattr(SETTINGS, "oi_fund_refresh_sec", 45))
 FUND_REF = float(getattr(SETTINGS, "funding_ref", 0.00025))
 OI_DELTA_REF = float(getattr(SETTINGS, "oi_delta_ref", 0.02))
 HTTP_TIMEOUT = float(getattr(SETTINGS, "http_timeout_sec", 6.0))
+DEFAULT_LEVERAGE = int(getattr(SETTINGS, "default_leverage", 5))  # <-- levier par défaut
 
 def _norm01(x: float, ref: float) -> float:
     if ref <= 0: return 0.0
@@ -181,7 +182,7 @@ def _components_ok(inst: dict) -> int:
         return int(oi_ok)+int(dlt_ok)+int(fund_ok)+int(liq_ok)+int(book_ok)
     return int(oi_ok)+int(dlt_ok)+int(fund_ok)+int(liq_ok)
 
-# --- seuil dynamique (débloque les signaux quand certains poids manquent) ---
+# --- seuil dynamique (débloque des signaux quand certains poids manquent) ---
 def _active_weight_sum(inst: dict, w_oi: float, w_fund: float, w_dlt: float, w_liq: float, w_book: float, use_book: bool) -> float:
     s = 0.0
     if inst.get("oi_score")      is not None: s += w_oi
@@ -196,6 +197,52 @@ def _dyn_req_score(inst: dict, w_cfg: tuple, use_book: bool) -> float:
     active = _active_weight_sum(inst, w_oi, w_fund, w_dlt, w_liq, w_book, use_book)
     base_req = float(getattr(SETTINGS, "req_score_min", 1.0))
     return max(0.0, min(base_req, active * 0.80))
+
+# ---------------------------------------------------------------------
+# Utilitaires ordres KuCoin
+# ---------------------------------------------------------------------
+def _ensure_leverage_if_needed(trader: KucoinTrader, sym_api: str, logger, want_lev: int = DEFAULT_LEVERAGE):
+    """
+    Essaie d'appeler trader.set_leverage(sym_api, want_lev) si dispo.
+    Silencieux si la méthode n'existe pas (compat anciennes versions).
+    """
+    set_lev = getattr(trader, "set_leverage", None)
+    if callable(set_lev):
+        try:
+            ok, resp = set_lev(sym_api, want_lev)
+            logger.info(f"LEV ensure {sym_api} -> ok={ok} resp={resp}")
+        except Exception as e:
+            logger.warning(f"LEV ensure failed: {e}")
+
+def _place_limit_with_lev_retry(trader: KucoinTrader, sym_api: str, side: str, px: float, client_oid: str, post_only: bool, logger):
+    ok, res = trader.place_limit(sym_api, side, px, client_oid, post_only=post_only)
+    if ok:
+        return ok, res
+    # si KuCoin renvoie "Leverage parameter invalid."
+    try:
+        code = (res or {}).get("code") if isinstance(res, dict) else None
+        msg  = (res or {}).get("msg")  if isinstance(res, dict) else str(res)
+    except Exception:
+        code, msg = None, str(res)
+    if (code == "100001") or ("Leverage parameter invalid" in (msg or "")):
+        _ensure_leverage_if_needed(trader, sym_api, logger)
+        ok2, res2 = trader.place_limit(sym_api, side, px, client_oid, post_only=post_only)
+        return ok2, res2
+    return ok, res
+
+def _place_ioc_with_lev_retry(trader: KucoinTrader, sym_api: str, side: str, px: float, logger):
+    ok, res = trader.place_limit_ioc(sym_api, side, px)
+    if ok:
+        return ok, res
+    try:
+        code = (res or {}).get("code") if isinstance(res, dict) else None
+        msg  = (res or {}).get("msg")  if isinstance(res, dict) else str(res)
+    except Exception:
+        code, msg = None, str(res)
+    if (code == "100001") or ("Leverage parameter invalid" in (msg or "")):
+        _ensure_leverage_if_needed(trader, sym_api, logger)
+        return trader.place_limit_ioc(sym_api, side, px)
+    return ok, res
 
 # ---------------------------------------------------------------------
 async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: MacroCache, meta: dict):
@@ -256,7 +303,7 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: MacroCache, meta:
     while True:
         try:
             await asyncio.sleep(1.1)
-            score_from_agg, inst = agg.get_meta_score()
+            _, inst = agg.get_meta_score()
             df = ohlc.frame(symbol)
             price=float(df["close"].iloc[-1])
             macro_data = macro.refresh()
@@ -359,37 +406,36 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: MacroCache, meta:
                 if not pos.tp1_done:
                     if (pos.side=="LONG" and price>=pos.tp1) or (pos.side=="SHORT" and price<=pos.tp1):
                         ro_side="sell" if pos.side=="LONG" else "buy"
-                        ok,_=trader.close_reduce_market(sym_api, ro_side, value_qty=pos.qty_value*SETTINGS.tp1_part)
+                        ok,_=_place_ioc_with_lev_retry(trader, sym_api, ro_side, price, logger)  # close mkt-like
                         if ok:
                             om.close_half_at_tp1(symbol)
-                            send_msg(f"✅ <b>{symbol}</b> TP1 atteint — passage BE", parse_mode="HTML")
+                            send_msg(f"✅ {symbol} TP1 atteint — passage BE")
                             logger.info("TP1 hit → BE", extra={"symbol": symbol})
                 else:
                     trail=getattr(SETTINGS, "trail_mult_atr", 1.2)*float(atr)
                     if pos.side=="LONG":
                         pos.sl=max(pos.sl, price-trail)
                         if price<=pos.sl:
-                            ok,_=trader.close_reduce_market(sym_api,"sell", value_qty=pos.qty_value*(1.0-SETTINGS.tp1_part))
+                            ok,_=_place_ioc_with_lev_retry(trader, sym_api, "sell", price, logger)
                             if ok:
                                 om.close_all(symbol,"TRAIL_LONG")
-                                send_msg(f"🛑 <b>{symbol}</b> Trailing stop LONG", parse_mode="HTML")
+                                send_msg(f"🛑 {symbol} Trailing stop LONG")
                     else:
                         pos.sl=min(pos.sl, price+trail)
                         if price>=pos.sl:
-                            ok,_=trader.close_reduce_market(sym_api,"buy", value_qty=pos.qty_value*(1.0-SETTINGS.tp1_part))
+                            ok,_=_place_ioc_with_lev_retry(trader, sym_api, "buy", price, logger)
                             if ok:
                                 om.close_all(symbol,"TRAIL_SHORT")
-                                send_msg(f"🛑 <b>{symbol}</b> Trailing stop SHORT", parse_mode="HTML")
+                                send_msg(f"🛑 {symbol} Trailing stop SHORT")
 
                 if symbol in om.pos:
                     pos=om.pos[symbol]
                     if (pos.side=="LONG" and price>=pos.tp2) or (pos.side=="SHORT" and price<=pos.tp2):
                         ro_side="sell" if pos.side=="LONG" else "buy"
-                        rem=pos.qty_value*(1.0-(getattr(SETTINGS,"tp1_part",0.5) if pos.tp1_done else 0.0))
-                        ok,_=trader.close_reduce_market(sym_api, ro_side, value_qty=rem)
+                        ok,_=_place_ioc_with_lev_retry(trader, sym_api, ro_side, price, logger)
                         if ok:
                             om.close_all(symbol,"TP2")
-                            send_msg(f"🎯 <b>{symbol}</b> TP2 — position clôturée", parse_mode="HTML")
+                            send_msg(f"🎯 {symbol} TP2 — position clôturée")
                 continue
 
             # ---- Pas de position/pending -> décision & exécution ----
@@ -414,16 +460,21 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: MacroCache, meta:
 
                 for i, frac in enumerate(stage_fracs):
                     oid = str(uuid.uuid4())+f"-s{i+1}"
-                    ok,res = trader.place_limit(sym_api, side, px_maker, oid, post_only=getattr(SETTINGS,"post_only_entries", True))
+
+                    # --- ENTRÉE LIMIT (post-only), avec retry levier si 100001
+                    ok,res = _place_limit_with_lev_retry(
+                        trader, sym_api, side, px_maker, oid,
+                        post_only=getattr(SETTINGS,"post_only_entries", True),
+                        logger=logger
+                    )
                     logger.info(f"ENTRY {side} px={px_maker} stg={i+1}/{len(stage_fracs)} ok={ok} res={res}", extra={"symbol": symbol})
                     if not ok:
-                        logger.error(f"ENTRY FAIL stage{i+1} resp={res}", extra={"symbol": symbol})
                         break
 
                     om.add_pending(oid, symbol, side, px_maker)  # suivi interne sur le display symbol
                     om.open_position(symbol, dec.side, dec.entry, dec.sl, dec.tp1, dec.tp2)
 
-                    # --- Message Telegram enrichi (HTML) ---
+                    # --- Message Telegram (texte simple) ---
                     comp_txt = (
                         f"sc={inst_merged.get('score',0):.2f} | "
                         f"OI={inst_merged.get('oi_score',0):.2f} "
@@ -433,12 +484,12 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: MacroCache, meta:
                     )
                     liq_src = inst_merged.get("liq_source","-")
                     msg = (
-                        f"🚀 <b>{symbol}</b> <b>{dec.side}</b> — stage {i+1}/{len(stage_fracs)} • <i>post-only</i>\n"
-                        f"@ <b>{px_maker}</b> | SL <b>{dec.sl:.5g}</b> | TP1 <b>{dec.tp1:.5g}</b> | TP2 <b>{dec.tp2:.5g}</b>\n"
-                        f"R:R min <b>{getattr(SETTINGS,'req_rr_min',1.0):.2f}</b> • score <b>{inst_merged.get('score',0):.2f}</b>\n"
+                        f"🚀 {symbol} {dec.side} — stage {i+1}/{len(stage_fracs)} • post-only\n"
+                        f"@ {px_maker} | SL {dec.sl:.5g} | TP1 {dec.tp1:.5g} | TP2 {dec.tp2:.5g}\n"
+                        f"R:R min {getattr(SETTINGS,'req_rr_min',1.0):.2f} • score {inst_merged.get('score',0):.2f}\n"
                         f"{comp_txt} • liq={liq_src}"
                     )
-                    send_msg(msg, parse_mode="HTML")
+                    send_msg(msg)
                     last_trade_ts = time.time()
 
                     # attente fill / re-quotes
@@ -451,7 +502,11 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: MacroCache, meta:
                         px_maker = round_price(symbol, px_maker, meta, getattr(SETTINGS,"default_tick_size", 0.001))
                         trader.cancel_by_client_oid(oid)
                         oid = str(uuid.uuid4())+f"-rq{rq}"
-                        ok,_ = trader.place_limit(sym_api, side, px_maker, oid, post_only=getattr(SETTINGS,"post_only_entries", True))
+                        ok,_ = _place_limit_with_lev_retry(
+                            trader, sym_api, side, px_maker, oid,
+                            post_only=getattr(SETTINGS,"post_only_entries", True),
+                            logger=logger
+                        )
                         logger.info(f"REQUOTE {rq}/{getattr(SETTINGS,'max_requotes',2)} px={px_maker} ok={ok}", extra={"symbol": symbol})
                         if not ok: break
                         om.add_pending(oid, symbol, side, px_maker)
@@ -468,13 +523,10 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: MacroCache, meta:
                         else:
                             ioc_px = round_price(symbol, entry_px - aggr_ticks * tick, meta, tick)
 
-                        ok,_ = trader.place_limit_ioc(sym_api, side, ioc_px)
+                        ok,_ = _place_ioc_with_lev_retry(trader, sym_api, side, ioc_px, logger)
                         logger.info(f"IOC tried ok={ok} px={ioc_px}", extra={"symbol": symbol})
                         if ok:
-                            send_msg(
-                                f"⚡ <b>{symbol}</b> — IOC fallback déclenché (@ {ioc_px})",
-                                parse_mode="HTML"
-                            )
+                            send_msg(f"⚡ {symbol} — IOC fallback déclenché (@ {ioc_px})")
 
                     if i==0 and len(stage_fracs)==2:
                         await asyncio.sleep(0.8)
