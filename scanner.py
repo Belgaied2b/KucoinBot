@@ -462,11 +462,13 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: MacroCache, meta:
                     oid = str(uuid.uuid4())+f"-s{i+1}"
 
                     # --- ENTRÉE LIMIT (post-only), avec retry levier si 100001
-                    ok,res = _place_limit_with_lev_retry(
-                        trader, sym_api, side, px_maker, oid,
-                        post_only=getattr(SETTINGS,"post_only_entries", True),
-                        logger=logger
-                    )
+                    ok, res = _place_limit_with_lev_retry(
+                    trader, sym_api, side, px_maker, oid,
+                    post_only=getattr(SETTINGS, "post_only_entries", True),
+                    value_qty=20.0,
+                    leverage=10,
+                    logger=logger
+                )
                     logger.info(f"ENTRY {side} px={px_maker} stg={i+1}/{len(stage_fracs)} ok={ok} res={res}", extra={"symbol": symbol})
                     if not ok:
                         break
