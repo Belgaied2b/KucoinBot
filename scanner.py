@@ -48,6 +48,80 @@ OI_DELTA_REF = float(getattr(SETTINGS, "oi_delta_ref", 0.02))
 HTTP_TIMEOUT = float(getattr(SETTINGS, "http_timeout_sec", 6.0))
 DEFAULT_LEVERAGE = int(getattr(SETTINGS, "default_leverage", 10))  # levier par défaut = 10
 
+# ---------------------------------------------------------------------
+# CVD Binance tick-by-tick pour alimenter delta_score
+# ---------------------------------------------------------------------
+BINANCE_FUTURES_API = "https://fapi.binance.com"
+
+class BinanceCVD:
+    """
+    Maintient un CVD (buy - sell) en notionnel (USDT) sur une fenêtre glissante.
+    Source: /fapi/v1/aggTrades (champ 'm' = isBuyerMaker -> True => agresseur = SELL).
+    """
+    def __init__(self, window_sec: int = 300, http_timeout: float = 5.0, ref_notional: float = 150_000.0):
+        from collections import deque
+        self.window_ms = int(window_sec * 1000)
+        self.timeout = http_timeout
+        self.ref = float(ref_notional)
+        self.state = {}  # bsym -> {last_id:int|None, deq:deque[(ts:int, signed_notional:float)]}
+
+    def _trim(self, deq):
+        cutoff = int(time.time() * 1000) - self.window_ms
+        while deq and deq[0][0] < cutoff:
+            deq.popleft()
+
+    def _fetch_aggtrades(self, bsym: str, from_id: int | None):
+        params = {"symbol": bsym, "limit": 1000}
+        if from_id is not None:
+            params["fromId"] = int(from_id)
+        r = httpx.get(f"{BINANCE_FUTURES_API}/fapi/v1/aggTrades", params=params, timeout=self.timeout)
+        if r.status_code != 200:
+            return []
+        return r.json() or []
+
+    def update(self, bsym: str):
+        st = self.state.get(bsym)
+        if st is None:
+            from collections import deque
+            st = {"last_id": None, "deq": deque()}
+            self.state[bsym] = st
+
+        trades = self._fetch_aggtrades(bsym, st["last_id"] + 1 if st["last_id"] is not None else None)
+        for t in trades:
+            tid = int(t.get("a"))
+            ts = int(t.get("T"))
+            p = float(t.get("p", 0.0))
+            q = float(t.get("q", 0.0))
+            is_buyer_maker = bool(t.get("m", False))  # True => maker côté acheteur => agressif = SELL
+            notion = p * q
+            signed = -notion if is_buyer_maker else +notion
+            st["deq"].append((ts, signed))
+            st["last_id"] = tid
+
+        self._trim(st["deq"])
+
+        total = 0.0
+        buy_n = 0.0
+        sell_n = 0.0
+        for ts, val in st["deq"]:
+            total += val
+            if val >= 0:
+                buy_n += val
+            else:
+                sell_n += (-val)
+
+        score = 0.0
+        if self.ref > 0:
+            score = max(0.0, min(1.0, abs(total) / self.ref))
+
+        return {
+            "cvd_notional": total,
+            "buy_notional": buy_n,
+            "sell_notional": sell_n,
+            "delta_score": score
+        }
+
+# ---------------------------------------------------------------------
 def _norm01(x: float, ref: float) -> float:
     if ref <= 0:
         return 0.0
@@ -203,7 +277,7 @@ def _components_ok(inst: dict) -> int:
         return int(oi_ok) + int(dlt_ok) + int(fund_ok) + int(liq_ok) + int(book_ok)
     return int(oi_ok) + int(dlt_ok) + int(fund_ok) + int(liq_ok)
 
-# --- seuil dynamique (débloque des signaux quand certains poids manquent) ---
+# --- seuil dynamique ---
 def _active_weight_sum(inst: dict, w_oi: float, w_fund: float, w_dlt: float, w_liq: float, w_book: float, use_book: bool) -> float:
     s = 0.0
     if inst.get("oi_score")      is not None: s += w_oi
@@ -223,10 +297,6 @@ def _dyn_req_score(inst: dict, w_cfg: tuple, use_book: bool) -> float:
 # Utilitaires ordres KuCoin
 # ---------------------------------------------------------------------
 def _ensure_leverage_if_needed(trader: KucoinTrader, sym_api: str, logger, want_lev: int = DEFAULT_LEVERAGE):
-    """
-    Essaie d'appeler trader.set_leverage(sym_api, want_lev) si dispo.
-    Silencieux si la méthode n'existe pas (compat anciennes versions).
-    """
     set_lev = getattr(trader, "set_leverage", None)
     if callable(set_lev):
         try:
@@ -249,7 +319,6 @@ def _place_limit_with_lev_retry(
     ok, res = trader.place_limit(sym_api, side, px, client_oid, post_only=post_only)
     if ok:
         return ok, res
-    # si KuCoin renvoie "Leverage parameter invalid."
     try:
         code = (res or {}).get("code") if isinstance(res, dict) else None
         msg  = (res or {}).get("msg")  if isinstance(res, dict) else str(res)
@@ -292,8 +361,15 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: MacroCache, meta:
     ohlc = OHLCV1m(meta)
     om = OrderManager()
 
-    # --- symbole KuCoin API (ex: BONKUSDTM) pour les appels trader ---
+    # --- symbole KuCoin API (ex: BONKUSDTM) ---
     sym_api = meta.get(symbol, {}).get("symbol_api", symbol)
+
+    # --- CVD Binance pour Δ ---
+    cvd = BinanceCVD(
+        window_sec=int(getattr(SETTINGS, "delta_window_sec", 300)),
+        http_timeout=float(getattr(SETTINGS, "http_timeout_sec", 6.0)),
+        ref_notional=float(getattr(SETTINGS, "delta_notional_ref", 150_000.0)),
+    )
 
     started_at = time.time()
     last_hb = 0.0
@@ -391,6 +467,18 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: MacroCache, meta:
             # ---- merge inst + liq + oi/fund ----
             inst_merged = {**inst, **(liq_pack_cache or {}), **(oi_fund_cache or {})}
 
+            # ---- Delta tick-by-tick (CVD Binance) ----
+            try:
+                bsym = map_symbol_to_binance(symbol)
+                cvd_stats = cvd.update(bsym)
+                if cvd_stats:
+                    inst_merged["delta_score"] = float(cvd_stats["delta_score"])
+                    inst_merged["delta_cvd_usd"] = float(cvd_stats["cvd_notional"])
+                    inst_merged["delta_buy_usd"] = float(cvd_stats["buy_notional"])
+                    inst_merged["delta_sell_usd"] = float(cvd_stats["sell_notional"])
+            except Exception:
+                logger.exception("CVD update failed", extra={"symbol": symbol})
+
             # ---- Liquidity floor optionnel ----
             if MIN_LIQ_NORM > 0:
                 liq_norm = float(inst_merged.get("liq_norm", 0.0) or 0.0)
@@ -427,7 +515,7 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: MacroCache, meta:
                 logger.info(
                     f"hb p={price:.4f} s={score:.2f} oi={inst_merged.get('oi_score',0):.2f} "
                     f"dlt={inst_merged.get('delta_score',0):.2f} fund={inst_merged.get('funding_score',0):.2f} "
-                    f"liq={liq_val:.2f}",
+                    f"liq={liq_val:.2f} cvd={inst_merged.get('delta_cvd_usd',0):.0f}",
                     extra={"symbol": symbol}
                 )
 
@@ -538,7 +626,7 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: MacroCache, meta:
                     if not ok:
                         break
 
-                    om.add_pending(oid, symbol, side, px_maker)  # suivi interne sur le display symbol
+                    om.add_pending(oid, symbol, side, px_maker)
                     om.open_position(symbol, dec.side, dec.entry, dec.sl, dec.tp1, dec.tp2)
 
                     # --- Message Telegram (texte simple) ---
@@ -546,6 +634,7 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: MacroCache, meta:
                         f"sc={inst_merged.get('score', 0):.2f} | "
                         f"OI={inst_merged.get('oi_score', 0):.2f} "
                         f"Δ={inst_merged.get('delta_score', 0):.2f} "
+                        f"CVD={int(inst_merged.get('delta_cvd_usd',0))} "
                         f"F={inst_merged.get('funding_score', 0):.2f} "
                         f"Liq={inst_merged.get('liq_new_score', inst_merged.get('liq_score', 0)):.2f}"
                     )
@@ -594,7 +683,7 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: MacroCache, meta:
                     # --- Fallback IOC agressif (traverse le spread) ---
                     if getattr(SETTINGS, "use_ioc_fallback", True):
                         tick = float(meta.get(symbol, {}).get("tickSize", getattr(SETTINGS, "default_tick_size", 0.001)))
-                        aggr_ticks = 50  # agressivité; ajuste si besoin
+                        aggr_ticks = 50
                         if side == "buy":
                             ioc_px = round_price(symbol, entry_px + aggr_ticks * tick, meta, tick)
                         else:
