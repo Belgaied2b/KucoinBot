@@ -60,8 +60,8 @@ class Settings(BaseModel):
 
     # --- SCORING (Institution 2/4) ---
     # Seuil global relativement bas pour laisser passer des configs 2/4
-    req_score_min: float   = Field(default_factory=lambda: _get_float("REQ_SCORE_MIN", 0.9))
-    req_rr_min: float      = Field(default_factory=lambda: _get_float("REQ_RR_MIN", 1.0))
+    req_score_min: float   = Field(default_factory=lambda: _get_float("REQ_SCORE_MIN", 1.2))
+    req_rr_min: float      = Field(default_factory=lambda: _get_float("REQ_RR_MIN", 1.2))
     allow_tol_rr: bool     = Field(default_factory=lambda: _get_bool("ALLOW_TOLERANCE_RR", True))
 
     # Pondérations (donne du poids à OI/Liq, Δ modéré, funding léger)
@@ -74,11 +74,11 @@ class Settings(BaseModel):
 
     # Exige 2 composantes OK (sur OI/Δ/Funding/Liq)
     inst_components_min: int = Field(default_factory=lambda: _get_int("INST_COMPONENTS_MIN", 2))
-    # Minima “institutionnels permissifs”
-    oi_req_min: float        = Field(default_factory=lambda: _get_float("OI_REQ_MIN", 0.08))
-    delta_req_min: float     = Field(default_factory=lambda: _get_float("DELTA_REQ_MIN", 0.08))
-    funding_req_min: float   = Field(default_factory=lambda: _get_float("FUNDING_REQ_MIN", 0.03))
-    liq_req_min: float       = Field(default_factory=lambda: _get_float("LIQ_REQ_MIN", 0.08))
+    # Minima “institutionnels” (corrigés)
+    oi_req_min: float        = Field(default_factory=lambda: _get_float("OI_REQ_MIN", 0.25))  # au lieu de 0.08
+    delta_req_min: float     = Field(default_factory=lambda: _get_float("DELTA_REQ_MIN", 0.30))  # au lieu de 0.08
+    funding_req_min: float   = Field(default_factory=lambda: _get_float("FUNDING_REQ_MIN", 0.05))  # au lieu de 0.03
+    liq_req_min: float       = Field(default_factory=lambda: _get_float("LIQ_REQ_MIN", 0.20))  # au lieu de 0.08
 
     # Normalisation pour éviter les scores ≈ 0
     funding_ref: float       = Field(default_factory=lambda: _get_float("FUNDING_REF", 0.00008))  # 0.008%
