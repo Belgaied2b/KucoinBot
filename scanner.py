@@ -46,12 +46,15 @@ OI_FUND_REFRESH_SEC = int(getattr(SETTINGS, "oi_fund_refresh_sec", 45))
 FUND_REF = float(getattr(SETTINGS, "funding_ref", 0.00025))
 OI_DELTA_REF = float(getattr(SETTINGS, "oi_delta_ref", 0.02))
 HTTP_TIMEOUT = float(getattr(SETTINGS, "http_timeout_sec", 6.0))
-DEFAULT_LEVERAGE = int(getattr(SETTINGS, "default_leverage", 5))  # <-- levier par défaut
+DEFAULT_LEVERAGE = int(getattr(SETTINGS, "default_leverage", 10))  # levier par défaut = 10
 
 def _norm01(x: float, ref: float) -> float:
-    if ref <= 0: return 0.0
-    try: return max(0.0, min(1.0, float(x) / float(ref)))
-    except Exception: return 0.0
+    if ref <= 0:
+        return 0.0
+    try:
+        return max(0.0, min(1.0, float(x) / float(ref)))
+    except Exception:
+        return 0.0
 
 def _fetch_oi_score_binance(symbol: str) -> float | None:
     """Score OI ∈ [0..1] via ΔOI% (5m)."""
@@ -63,13 +66,16 @@ def _fetch_oi_score_binance(symbol: str) -> float | None:
             timeout=HTTP_TIMEOUT,
             headers={"Accept": "application/json"}
         )
-        if r.status_code != 200: return None
+        if r.status_code != 200:
+            return None
         arr = r.json() or []
-        if len(arr) < 2: return None
+        if len(arr) < 2:
+            return None
         a, b2 = arr[-2], arr[-1]
         oi1 = float(a.get("sumOpenInterest", a.get("openInterest", 0.0)) or 0.0)
         oi2 = float(b2.get("sumOpenInterest", b2.get("openInterest", 0.0)) or 0.0)
-        if oi1 <= 0: return None
+        if oi1 <= 0:
+            return None
         delta_pct = abs((oi2 - oi1) / oi1)
         return _norm01(delta_pct, OI_DELTA_REF)
     except Exception:
@@ -79,7 +85,8 @@ def _fetch_funding_score_binance(symbol: str) -> float | None:
     """Score Funding ∈ [0..1] via |lastFundingRate| / FUND_REF."""
     try:
         r = get_funding_rate(symbol)
-        if r is None: return None
+        if r is None:
+            return None
         return _norm01(abs(float(r)), FUND_REF)
     except Exception:
         return None
@@ -88,15 +95,19 @@ def _fetch_funding_score_binance(symbol: str) -> float | None:
 # Macro cache
 # ---------------------------------------------------------------------
 class MacroCache:
-    def __init__(self): self.last=0; self.data={}
+    def __init__(self):
+        self.last = 0
+        self.data = {}
     def refresh(self):
-        now=time.time()
-        if now - self.last < getattr(SETTINGS, "macro_refresh_minutes", 5)*60: return self.data
-        total=get_macro_total_mcap()
-        total2=get_macro_total2() if getattr(SETTINGS, "use_total2", True) else 0.0
-        dom=get_macro_btc_dominance()
-        self.data={"TOTAL":total,"TOTAL2":total2,"BTC_DOM":dom, "TOTAL_PCT":0.0, "TOTAL2_PCT":0.0}
-        self.last=now; return self.data
+        now = time.time()
+        if now - self.last < getattr(SETTINGS, "macro_refresh_minutes", 5) * 60:
+            return self.data
+        total = get_macro_total_mcap()
+        total2 = get_macro_total2() if getattr(SETTINGS, "use_total2", True) else 0.0
+        dom = get_macro_btc_dominance()
+        self.data = {"TOTAL": total, "TOTAL2": total2, "BTC_DOM": dom, "TOTAL_PCT": 0.0, "TOTAL2_PCT": 0.0}
+        self.last = now
+        return self.data
 
 # ---------------------------------------------------------------------
 # OHLC local 1m
@@ -114,14 +125,16 @@ class OHLCV1m:
             self.df[sym] = df
         except Exception as e:
             logger.warning(f"Bootstrap klines fallback: {e}", extra={"symbol": sym})
-            now=int(time.time()*1000); base=50000.0
-            rows=[{"time":now-(299-i)*60_000,"open":base,"high":base,"low":base,"close":base,"volume":0.0} for i in range(300)]
-            self.df[sym]=pd.DataFrame(rows)
+            now = int(time.time() * 1000)
+            base = 50000.0
+            rows = [{"time": now - (299 - i) * 60_000, "open": base, "high": base, "low": base, "close": base, "volume": 0.0} for i in range(300)]
+            self.df[sym] = pd.DataFrame(rows)
 
     def on_price(self, sym, price, ts, vol=0.0):
-        if sym not in self.df: self.bootstrap(sym)
-        df=self.df[sym]
-        minute=(ts//60000)*60000
+        if sym not in self.df:
+            self.bootstrap(sym)
+        df = self.df[sym]
+        minute = (ts // 60000) * 60000
         if int(df.iloc[-1]["time"]) == minute:
             idx = df.index[-1]
             p = float(price)
@@ -132,16 +145,17 @@ class OHLCV1m:
         else:
             last_close = float(df.iloc[-1]["close"])
             p = float(price)
-            new_row = {"time": minute,"open": last_close,"high": p,"low":  p,"close":p,"volume": float(vol)}
-            self.df[sym]=pd.concat([df, pd.DataFrame([new_row])], ignore_index=True).tail(2000)
+            new_row = {"time": minute, "open": last_close, "high": p, "low": p, "close": p, "volume": float(vol)}
+            self.df[sym] = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True).tail(2000)
 
     def frame(self, sym):
-        if sym not in self.df: self.bootstrap(sym)
+        if sym not in self.df:
+            self.bootstrap(sym)
         return self.df[sym]
 
 # ---------------------------------------------------------------------
 def _tick_shift(symbol: str, px: float, ticks: int, meta, default_tick: float) -> float:
-    tick = float(meta.get(symbol,{}).get("tickSize", default_tick))
+    tick = float(meta.get(symbol, {}).get("tickSize", default_tick))
     return px + ticks * tick
 
 # ---------------------------------------------------------------------
@@ -158,29 +172,36 @@ def _compute_global_score_sum(inst: dict) -> float:
     total = 0.0
     def add(key: str, w: float):
         nonlocal total
-        if w <= 0: return
-        if key not in inst or inst[key] is None: return
-        try: total += w * float(inst[key])
-        except Exception: pass
+        if w <= 0:
+            return
+        if key not in inst or inst[key] is None:
+            return
+        try:
+            total += w * float(inst[key])
+        except Exception:
+            pass
 
     add("oi_score", w_oi)
     add("delta_score", w_delta)
     add("funding_score", w_fund)
-    if "liq_new_score" in inst: add("liq_new_score", w_liq)
-    elif "liq_score" in inst:   add("liq_score", w_liq)
-    if use_book: add("book_imbal_score", w_book)
+    if "liq_new_score" in inst:
+        add("liq_new_score", w_liq)
+    elif "liq_score" in inst:
+        add("liq_score", w_liq)
+    if use_book:
+        add("book_imbal_score", w_book)
     return float(total)
 
 def _components_ok(inst: dict) -> int:
-    oi_ok    = float(inst.get("oi_score",0.0))    >= OI_MIN
-    dlt_ok   = float(inst.get("delta_score",0.0)) >= DELTA_MIN
-    fund_ok  = float(inst.get("funding_score",0.0))>= FUND_MIN
-    liq_val  = float(inst.get("liq_new_score", inst.get("liq_score",0.0)))
+    oi_ok    = float(inst.get("oi_score", 0.0))    >= OI_MIN
+    dlt_ok   = float(inst.get("delta_score", 0.0)) >= DELTA_MIN
+    fund_ok  = float(inst.get("funding_score", 0.0)) >= FUND_MIN
+    liq_val  = float(inst.get("liq_new_score", inst.get("liq_score", 0.0)))
     liq_ok   = liq_val >= LIQ_MIN
     if USE_BOOK:
-        book_ok = float(inst.get("book_imbal_score",0.0)) >= BOOK_MIN
-        return int(oi_ok)+int(dlt_ok)+int(fund_ok)+int(liq_ok)+int(book_ok)
-    return int(oi_ok)+int(dlt_ok)+int(fund_ok)+int(liq_ok)
+        book_ok = float(inst.get("book_imbal_score", 0.0)) >= BOOK_MIN
+        return int(oi_ok) + int(dlt_ok) + int(fund_ok) + int(liq_ok) + int(book_ok)
+    return int(oi_ok) + int(dlt_ok) + int(fund_ok) + int(liq_ok)
 
 # --- seuil dynamique (débloque des signaux quand certains poids manquent) ---
 def _active_weight_sum(inst: dict, w_oi: float, w_fund: float, w_dlt: float, w_liq: float, w_book: float, use_book: bool) -> float:
@@ -214,7 +235,17 @@ def _ensure_leverage_if_needed(trader: KucoinTrader, sym_api: str, logger, want_
         except Exception as e:
             logger.warning(f"LEV ensure failed: {e}")
 
-def _place_limit_with_lev_retry(trader: KucoinTrader, sym_api: str, side: str, px: float, client_oid: str, post_only: bool, logger):
+def _place_limit_with_lev_retry(
+    trader: KucoinTrader,
+    sym_api: str,
+    side: str,
+    px: float,
+    client_oid: str,
+    post_only: bool,
+    logger,
+    value_qty: float | None = None,
+    leverage: int | None = None,
+):
     ok, res = trader.place_limit(sym_api, side, px, client_oid, post_only=post_only)
     if ok:
         return ok, res
@@ -225,12 +256,20 @@ def _place_limit_with_lev_retry(trader: KucoinTrader, sym_api: str, side: str, p
     except Exception:
         code, msg = None, str(res)
     if (code == "100001") or ("Leverage parameter invalid" in (msg or "")):
-        _ensure_leverage_if_needed(trader, sym_api, logger)
+        _ensure_leverage_if_needed(trader, sym_api, logger, want_lev=(leverage or DEFAULT_LEVERAGE))
         ok2, res2 = trader.place_limit(sym_api, side, px, client_oid, post_only=post_only)
         return ok2, res2
     return ok, res
 
-def _place_ioc_with_lev_retry(trader: KucoinTrader, sym_api: str, side: str, px: float, logger):
+def _place_ioc_with_lev_retry(
+    trader: KucoinTrader,
+    sym_api: str,
+    side: str,
+    px: float,
+    logger,
+    value_qty: float | None = None,
+    leverage: int | None = None,
+):
     ok, res = trader.place_limit_ioc(sym_api, side, px)
     if ok:
         return ok, res
@@ -240,18 +279,18 @@ def _place_ioc_with_lev_retry(trader: KucoinTrader, sym_api: str, side: str, px:
     except Exception:
         code, msg = None, str(res)
     if (code == "100001") or ("Leverage parameter invalid" in (msg or "")):
-        _ensure_leverage_if_needed(trader, sym_api, logger)
+        _ensure_leverage_if_needed(trader, sym_api, logger, want_lev=(leverage or DEFAULT_LEVERAGE))
         return trader.place_limit_ioc(sym_api, side, px)
     return ok, res
 
 # ---------------------------------------------------------------------
 async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: MacroCache, meta: dict):
     logger = get_logger("scanner.symbol", symbol)
-    w_cfg=(SETTINGS.w_oi, SETTINGS.w_funding, SETTINGS.w_delta, SETTINGS.w_liq, SETTINGS.w_book_imbal)
-    agg=InstitutionalAggregator(symbol, w_cfg)
-    trader=KucoinTrader()
-    ohlc=OHLCV1m(meta)
-    om=OrderManager()
+    w_cfg = (SETTINGS.w_oi, SETTINGS.w_funding, SETTINGS.w_delta, SETTINGS.w_liq, SETTINGS.w_book_imbal)
+    agg = InstitutionalAggregator(symbol, w_cfg)
+    trader = KucoinTrader()
+    ohlc = OHLCV1m(meta)
+    om = OrderManager()
 
     # --- symbole KuCoin API (ex: BONKUSDTM) pour les appels trader ---
     sym_api = meta.get(symbol, {}).get("symbol_api", symbol)
@@ -269,27 +308,33 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: MacroCache, meta:
 
     def on_order(msg):
         oid = msg.get("clientOid") or ""
-        sym = msg.get("symbol","")
-        status = msg.get("status","")
+        sym = msg.get("symbol", "")
+        status = msg.get("status", "")
         avgp = None
-        try: avgp = float(msg.get("avgFillPrice", msg.get("matchPrice", 0.0)) or 0.0)
-        except: pass
+        try:
+            avgp = float(msg.get("avgFillPrice", msg.get("matchPrice", 0.0)) or 0.0)
+        except:
+            pass
         filled_value = None
-        try: filled_value = float(msg.get("filledValue", 0.0))
-        except: pass
+        try:
+            filled_value = float(msg.get("filledValue", 0.0))
+        except:
+            pass
         if oid:
             logger.debug(f"WS order event status={status} avgFill={avgp} filledValue={filled_value}", extra={"symbol": symbol})
             om.set_pending_status(oid, status, avg_fill_price=avgp, filled_value=filled_value)
-            if status in ("filled","partialFilled","match") and sym:
-                if avgp and sym in om.pos: om.update_entry_with_fill(sym, avgp)
-            if status in ("filled","cancel"): om.remove_pending(oid)
+            if status in ("filled", "partialFilled", "match") and sym:
+                if avgp and sym in om.pos:
+                    om.update_entry_with_fill(sym, avgp)
+            if status in ("filled", "cancel"):
+                om.remove_pending(oid)
     kws.on("order", on_order)
 
     async def feed_ohlc():
         while True:
             try:
                 if agg.state.price is not None:
-                    ohlc.on_price(symbol, agg.state.price, int(time.time()*1000), vol=abs(agg.state.delta))
+                    ohlc.on_price(symbol, agg.state.price, int(time.time() * 1000), vol=abs(agg.state.delta))
                 await asyncio.sleep(0.2)
             except Exception:
                 logger.exception("feed_ohlc loop error", extra={"symbol": symbol})
@@ -305,7 +350,7 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: MacroCache, meta:
             await asyncio.sleep(1.1)
             _, inst = agg.get_meta_score()
             df = ohlc.frame(symbol)
-            price=float(df["close"].iloc[-1])
+            price = float(df["close"].iloc[-1])
             macro_data = macro.refresh()
 
             # --- LIQ PACK (HTTP) ---
@@ -316,10 +361,10 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: MacroCache, meta:
                     if liq_pack_cache.get("liq_source") != "none":
                         logger.info(
                             f"[LIQ] src={liq_pack_cache.get('liq_source')} "
-                            f"sc={liq_pack_cache.get('liq_new_score',0.0):.3f} "
-                            f"N5m={liq_pack_cache.get('liq_notional_5m',0.0):.0f} "
-                            f"imb={liq_pack_cache.get('liq_imbalance_5m',0.0):.3f} "
-                            f"norm={liq_pack_cache.get('liq_norm',0.0):.0f}",
+                            f"sc={liq_pack_cache.get('liq_new_score', 0.0):.3f} "
+                            f"N5m={liq_pack_cache.get('liq_notional_5m', 0.0):.0f} "
+                            f"imb={liq_pack_cache.get('liq_imbalance_5m', 0.0):.3f} "
+                            f"norm={liq_pack_cache.get('liq_norm', 0.0):.0f}",
                             extra={"symbol": symbol}
                         )
                 except Exception as e:
@@ -330,9 +375,11 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: MacroCache, meta:
                 last_oi_fund_fetch = time.time()
                 try:
                     oi_sc = _fetch_oi_score_binance(symbol)
-                    if oi_sc is not None: oi_fund_cache["oi_score"] = float(oi_sc)
+                    if oi_sc is not None:
+                        oi_fund_cache["oi_score"] = float(oi_sc)
                     fund_sc = _fetch_funding_score_binance(symbol)
-                    if fund_sc is not None: oi_fund_cache["funding_score"] = float(fund_sc)
+                    if fund_sc is not None:
+                        oi_fund_cache["funding_score"] = float(fund_sc)
                     if oi_fund_cache:
                         logger.info(
                             f"[OI/FUND] oi={oi_fund_cache.get('oi_score')} fund={oi_fund_cache.get('funding_score')}",
@@ -379,7 +426,7 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: MacroCache, meta:
                 last_hb = time.time()
                 logger.info(
                     f"hb p={price:.4f} s={score:.2f} oi={inst_merged.get('oi_score',0):.2f} "
-                    f"dlt={inst_merged.get('delta_score',0):.2f} fund={inst_merged.get('funding_score',0):.2f} "
+                    f"dlt={inst_erged.get('delta_score',0):.2f} fund={inst_merged.get('funding_score',0):.2f} "
                     f"liq={liq_val:.2f}",
                     extra={"symbol": symbol}
                 )
@@ -399,77 +446,95 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: MacroCache, meta:
                 continue
 
             # ---- Gestion position existante ----
-            pos=om.pos.get(symbol)
+            pos = om.pos.get(symbol)
             if pos:
-                try: atr=float(compute_atr(df).iloc[-1])
-                except Exception: atr=0.0
+                try:
+                    atr = float(compute_atr(df).iloc[-1])
+                except Exception:
+                    atr = 0.0
+
+                # TP1 -> close partiel reduceOnly
                 if not pos.tp1_done:
-                    if (pos.side=="LONG" and price>=pos.tp1) or (pos.side=="SHORT" and price<=pos.tp1):
-                        ro_side="sell" if pos.side=="LONG" else "buy"
-                        ok,_=_place_ioc_with_lev_retry(trader, sym_api, ro_side, price, logger)  # close mkt-like
+                    if (pos.side == "LONG" and price >= pos.tp1) or (pos.side == "SHORT" and price <= pos.tp1):
+                        ro_side = "sell" if pos.side == "LONG" else "buy"
+                        part_val = pos.qty_value * getattr(SETTINGS, "tp1_part", 0.5)
+                        ok, _ = trader.close_reduce_market(symbol, ro_side, value_qty=part_val)
                         if ok:
                             om.close_half_at_tp1(symbol)
                             send_msg(f"✅ {symbol} TP1 atteint — passage BE")
                             logger.info("TP1 hit → BE", extra={"symbol": symbol})
                 else:
-                    trail=getattr(SETTINGS, "trail_mult_atr", 1.2)*float(atr)
-                    if pos.side=="LONG":
-                        pos.sl=max(pos.sl, price-trail)
-                        if price<=pos.sl:
-                            ok,_=_place_ioc_with_lev_retry(trader, sym_api, "sell", price, logger)
+                    # Trailing après TP1
+                    trail = getattr(SETTINGS, "trail_mult_atr", 1.2) * float(atr)
+                    if pos.side == "LONG":
+                        pos.sl = max(pos.sl, price - trail)
+                        if price <= pos.sl:
+                            ro_side = "sell"
+                            rem_val = pos.qty_value * (1.0 - getattr(SETTINGS, "tp1_part", 0.5))
+                            ok, _ = trader.close_reduce_market(symbol, ro_side, value_qty=rem_val)
                             if ok:
-                                om.close_all(symbol,"TRAIL_LONG")
+                                om.close_all(symbol, "TRAIL_LONG")
                                 send_msg(f"🛑 {symbol} Trailing stop LONG")
                     else:
-                        pos.sl=min(pos.sl, price+trail)
-                        if price>=pos.sl:
-                            ok,_=_place_ioc_with_lev_retry(trader, sym_api, "buy", price, logger)
+                        pos.sl = min(pos.sl, price + trail)
+                        if price >= pos.sl:
+                            ro_side = "buy"
+                            rem_val = pos.qty_value * (1.0 - getattr(SETTINGS, "tp1_part", 0.5))
+                            ok, _ = trader.close_reduce_market(symbol, ro_side, value_qty=rem_val)
                             if ok:
-                                om.close_all(symbol,"TRAIL_SHORT")
+                                om.close_all(symbol, "TRAIL_SHORT")
                                 send_msg(f"🛑 {symbol} Trailing stop SHORT")
 
+                # TP2 -> close total reduceOnly
                 if symbol in om.pos:
-                    pos=om.pos[symbol]
-                    if (pos.side=="LONG" and price>=pos.tp2) or (pos.side=="SHORT" and price<=pos.tp2):
-                        ro_side="sell" if pos.side=="LONG" else "buy"
-                        ok,_=_place_ioc_with_lev_retry(trader, sym_api, ro_side, price, logger)
+                    pos = om.pos[symbol]
+                    if (pos.side == "LONG" and price >= pos.tp2) or (pos.side == "SHORT" and price <= pos.tp2):
+                        ro_side = "sell" if pos.side == "LONG" else "buy"
+                        if pos.tp1_done:
+                            rem_val = pos.qty_value * (1.0 - getattr(SETTINGS, "tp1_part", 0.5))
+                        else:
+                            rem_val = pos.qty_value
+                        ok, _ = trader.close_reduce_market(symbol, ro_side, value_qty=rem_val)
                         if ok:
-                            om.close_all(symbol,"TP2")
+                            om.close_all(symbol, "TP2")
                             send_msg(f"🎯 {symbol} TP2 — position clôturée")
                 continue
 
             # ---- Pas de position/pending -> décision & exécution ----
             if symbol not in om.pending_by_symbol:
-                dec: Decision = analyze_signal(price, df, {"score":score, **inst_merged}, macro=macro_data)
+                dec: Decision = analyze_signal(price, df, {"score": score, **inst_merged}, macro=macro_data)
                 if dec.side == "NONE":
                     logger.info(f"rej s={score:.2f} ok={comps_ok}/{INST_COMPONENTS_MIN}", extra={"symbol": symbol})
                     continue
 
-                adv = should_cancel_or_requote("LONG" if dec.side=="LONG" else "SHORT", inst_merged, SETTINGS)
-                if adv!="OK" and getattr(SETTINGS, "cancel_on_adverse", True):
+                adv = should_cancel_or_requote("LONG" if dec.side == "LONG" else "SHORT", inst_merged, SETTINGS)
+                if adv != "OK" and getattr(SETTINGS, "cancel_on_adverse", True):
                     logger.info(f"block adverse={adv}", extra={"symbol": symbol})
                     continue
 
-                side="buy" if dec.side=="LONG" else "sell"
-                entry_px = round_price(symbol, dec.entry, meta, getattr(SETTINGS,"default_tick_size", 0.001))
-                px_maker = _tick_shift(symbol, entry_px, -1 if side=="buy" else +1, meta, getattr(SETTINGS,"default_tick_size", 0.001))
-                px_maker = round_price(symbol, px_maker, meta, getattr(SETTINGS,"default_tick_size", 0.001))
+                side = "buy" if dec.side == "LONG" else "sell"
+                entry_px = round_price(symbol, dec.entry, meta, getattr(SETTINGS, "default_tick_size", 0.001))
+                px_maker = _tick_shift(symbol, entry_px, -1 if side == "buy" else +1, meta, getattr(SETTINGS, "default_tick_size", 0.001))
+                px_maker = round_price(symbol, px_maker, meta, getattr(SETTINGS, "default_tick_size", 0.001))
 
                 # taille des étapes (si 2-stages activé)
-                stage_fracs = [getattr(SETTINGS,"stage1_fraction",0.5), 1.0-getattr(SETTINGS,"stage1_fraction",0.5)] if getattr(SETTINGS,"two_stage_entry", False) else [1.0]
+                stage_fracs = [getattr(SETTINGS, "stage1_fraction", 0.5), 1.0 - getattr(SETTINGS, "stage1_fraction", 0.5)] if getattr(SETTINGS, "two_stage_entry", False) else [1.0]
 
                 for i, frac in enumerate(stage_fracs):
-                    oid = str(uuid.uuid4())+f"-s{i+1}"
+                    oid = str(uuid.uuid4()) + f"-s{i+1}"
 
                     # --- ENTRÉE LIMIT (post-only), avec retry levier si 100001
                     ok, res = _place_limit_with_lev_retry(
-                    trader, sym_api, side, px_maker, oid,
-                    post_only=getattr(SETTINGS, "post_only_entries", True),
-                    value_qty=20.0,
-                    leverage=10,
-                    logger=logger
-                )
-                    logger.info(f"ENTRY {side} px={px_maker} stg={i+1}/{len(stage_fracs)} ok={ok} res={res}", extra={"symbol": symbol})
+                        trader, sym_api, side, px_maker, oid,
+                        post_only=getattr(SETTINGS, "post_only_entries", True),
+                        logger=logger,
+                        value_qty=getattr(SETTINGS, "margin_per_trade", 20.0),
+                        leverage=DEFAULT_LEVERAGE,
+                    )
+                    logger.info(
+                        f"ENTRY {side} px={px_maker} stg={i+1}/{len(stage_fracs)} ok={ok} res={res}",
+                        extra={"symbol": symbol}
+                    )
                     if not ok:
                         break
 
@@ -478,13 +543,13 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: MacroCache, meta:
 
                     # --- Message Telegram (texte simple) ---
                     comp_txt = (
-                        f"sc={inst_merged.get('score',0):.2f} | "
-                        f"OI={inst_merged.get('oi_score',0):.2f} "
-                        f"Δ={inst_merged.get('delta_score',0):.2f} "
-                        f"F={inst_merged.get('funding_score',0):.2f} "
-                        f"Liq={inst_merged.get('liq_new_score', inst_merged.get('liq_score',0)):.2f}"
+                        f"sc={inst_merged.get('score', 0):.2f} | "
+                        f"OI={inst_merged.get('oi_score', 0):.2f} "
+                        f"Δ={inst_merged.get('delta_score', 0):.2f} "
+                        f"F={inst_merged.get('funding_score', 0):.2f} "
+                        f"Liq={inst_merged.get('liq_new_score', inst_merged.get('liq_score', 0)):.2f}"
                     )
-                    liq_src = inst_merged.get("liq_source","-")
+                    liq_src = inst_merged.get("liq_source", "-")
                     msg = (
                         f"🚀 {symbol} {dec.side} — stage {i+1}/{len(stage_fracs)} • post-only\n"
                         f"@ {px_maker} | SL {dec.sl:.5g} | TP1 {dec.tp1:.5g} | TP2 {dec.tp2:.5g}\n"
@@ -495,45 +560,55 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: MacroCache, meta:
                     last_trade_ts = time.time()
 
                     # attente fill / re-quotes
-                    t0=time.time(); rq=0
-                    while time.time()-t0 < getattr(SETTINGS,"entry_timeout_sec", 6):
+                    t0 = time.time()
+                    rq = 0
+                    while time.time() - t0 < getattr(SETTINGS, "entry_timeout_sec", 6):
                         await asyncio.sleep(0.2)
-                    while rq < getattr(SETTINGS,"max_requotes", 2):
+                    while rq < getattr(SETTINGS, "max_requotes", 2):
                         rq += 1
-                        px_maker = _tick_shift(symbol, px_maker, +1 if side=='buy' else -1, meta, getattr(SETTINGS,"default_tick_size", 0.001))
-                        px_maker = round_price(symbol, px_maker, meta, getattr(SETTINGS,"default_tick_size", 0.001))
+                        px_maker = _tick_shift(
+                            symbol,
+                            px_maker,
+                            +1 if side == 'buy' else -1,
+                            meta,
+                            getattr(SETTINGS, "default_tick_size", 0.001)
+                        )
+                        px_maker = round_price(symbol, px_maker, meta, getattr(SETTINGS, "default_tick_size", 0.001))
                         trader.cancel_by_client_oid(oid)
-                        oid = str(uuid.uuid4())+f"-rq{rq}"
-                        ok,_ = _place_limit_with_lev_retry(
+                        oid = str(uuid.uuid4()) + f"-rq{rq}"
+                        ok, _ = _place_limit_with_lev_retry(
                             trader, sym_api, side, px_maker, oid,
-                            post_only=getattr(SETTINGS,"post_only_entries", True),
-                            logger=logger
+                            post_only=getattr(SETTINGS, "post_only_entries", True),
+                            logger=logger,
+                            value_qty=getattr(SETTINGS, "margin_per_trade", 20.0),
+                            leverage=DEFAULT_LEVERAGE,
                         )
                         logger.info(f"REQUOTE {rq}/{getattr(SETTINGS,'max_requotes',2)} px={px_maker} ok={ok}", extra={"symbol": symbol})
-                        if not ok: break
+                        if not ok:
+                            break
                         om.add_pending(oid, symbol, side, px_maker)
-                        t0=time.time()
-                        while time.time()-t0 < getattr(SETTINGS,"entry_timeout_sec", 6):
+                        t0 = time.time()
+                        while time.time() - t0 < getattr(SETTINGS, "entry_timeout_sec", 6):
                             await asyncio.sleep(0.2)
 
                     # --- Fallback IOC agressif (traverse le spread) ---
-                    if getattr(SETTINGS,"use_ioc_fallback", True):
-                        tick = float(meta.get(symbol, {}).get("tickSize", getattr(SETTINGS,"default_tick_size", 0.001)))
+                    if getattr(SETTINGS, "use_ioc_fallback", True):
+                        tick = float(meta.get(symbol, {}).get("tickSize", getattr(SETTINGS, "default_tick_size", 0.001)))
                         aggr_ticks = 50  # agressivité; ajuste si besoin
                         if side == "buy":
                             ioc_px = round_price(symbol, entry_px + aggr_ticks * tick, meta, tick)
                         else:
                             ioc_px = round_price(symbol, entry_px - aggr_ticks * tick, meta, tick)
 
-                        ok,_ = _place_ioc_with_lev_retry(trader, sym_api, side, ioc_px, logger)
+                        ok, _ = _place_ioc_with_lev_retry(trader, sym_api, side, ioc_px, logger)
                         logger.info(f"IOC tried ok={ok} px={ioc_px}", extra={"symbol": symbol})
                         if ok:
                             send_msg(f"⚡ {symbol} — IOC fallback déclenché (@ {ioc_px})")
 
-                    if i==0 and len(stage_fracs)==2:
+                    if i == 0 and len(stage_fracs) == 2:
                         await asyncio.sleep(0.8)
-                        adv2 = should_cancel_or_requote("LONG" if dec.side=="LONG" else "SHORT", inst_merged, SETTINGS)
-                        if adv2!="OK" and getattr(SETTINGS, "cancel_on_adverse", True):
+                        adv2 = should_cancel_or_requote("LONG" if dec.side == "LONG" else "SHORT", inst_merged, SETTINGS)
+                        if adv2 != "OK" and getattr(SETTINGS, "cancel_on_adverse", True):
                             logger.info(f"ABORT stage2 adverse={adv2}", extra={"symbol": symbol})
                             break
         except Exception:
@@ -544,13 +619,13 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: MacroCache, meta:
 async def main():
     rootlog.info("Starting scanner...")
     if getattr(SETTINGS, "auto_symbols", False):
-        discovered = common_usdt_symbols(limit=0, exclude_csv=getattr(SETTINGS,"exclude_symbols",""))
+        discovered = common_usdt_symbols(limit=0, exclude_csv=getattr(SETTINGS, "exclude_symbols", ""))
         if discovered:
             SETTINGS.symbols = discovered
             rootlog.info(f"[SCAN] Auto-symbols activé — {len(discovered)} paires chargées.")
-    kws=KucoinPrivateWS()
+    kws = KucoinPrivateWS()
     meta = fetch_symbol_meta()
-    macro=MacroCache()
+    macro = MacroCache()
     asyncio.create_task(kws.run())
 
     tasks = []
@@ -559,5 +634,5 @@ async def main():
         await asyncio.sleep(0.05)
     await asyncio.gather(*tasks)
 
-if __name__=="__main__":
+if __name__ == "__main__":
     asyncio.run(main())
