@@ -15,22 +15,18 @@ from telegram_notifier import send_msg
 from institutional_data import get_macro_total_mcap, get_macro_total2, get_macro_btc_dominance
 from adverse_selection import should_cancel_or_requote
 from logger_utils import get_logger
-
-# --- APIs externes déjà utilisées ---
 from institutional_data import (
-    get_open_interest, get_funding_rate, get_recent_liquidations, map_symbol_to_binance,
-    get_liq_pack
+    get_open_interest, get_funding_rate, get_recent_liquidations, map_symbol_to_binance, get_liq_pack
 )
 
 rootlog = get_logger("scanner")
 
-# Debug périodique (mets à 0 pour off)
+# ---------------------------------------------------------------------
+# Config locaux & constantes
+# ---------------------------------------------------------------------
 INSTIT_DEBUG_EVERY_SEC = 0
-# Rafraîchissement du liq pack (HTTP throttle)
 LIQ_REFRESH_SEC = getattr(SETTINGS, "liq_refresh_sec", 30)
 
-# ---------------- Params par défaut (si absents dans SETTINGS) ----------------
-# Score global = SOMME pondérée ⇒ seuil ~2.0–2.2 si poids ~1.0
 REQ_SCORE_MIN        = float(getattr(SETTINGS, "req_score_min", 2.2))
 INST_COMPONENTS_MIN  = int(getattr(SETTINGS, "inst_components_min", 2))
 OI_MIN               = float(getattr(SETTINGS, "oi_req_min", 0.40))
@@ -40,36 +36,24 @@ LIQ_MIN              = float(getattr(SETTINGS, "liq_req_min", 0.50))
 BOOK_MIN             = float(getattr(SETTINGS, "book_req_min", 0.30))
 USE_BOOK             = bool(getattr(SETTINGS, "use_book_imbal", False))
 
-# Persistance: 2 sur 3 fenêtres
 PERSIST_WIN          = int(getattr(SETTINGS, "persist_win", 3))
 PERSIST_MIN_OK       = int(getattr(SETTINGS, "persist_min_ok", 2))
-
-# Cooldown par symbole (sec)
 SYMBOL_COOLDOWN_SEC  = int(getattr(SETTINGS, "symbol_cooldown_sec", 900))
+MIN_LIQ_NORM         = float(getattr(SETTINGS, "min_liq_norm", 0.0))
 
-# Filtre d’activité min (optionnel, via liq_pack si dispo)
-MIN_LIQ_NORM         = float(getattr(SETTINGS, "min_liq_norm", 0.0))  # 0 = désactivé
-
-# ----------- ENRICH OI/FUND depuis Binance (léger, sans historique local) -----------
 BINANCE_BASE = "https://fapi.binance.com"
 OI_FUND_REFRESH_SEC = int(getattr(SETTINGS, "oi_fund_refresh_sec", 45))
-FUND_REF = float(getattr(SETTINGS, "funding_ref", 0.00025))   # 0.025% ⇒ score 1.0
-OI_DELTA_REF = float(getattr(SETTINGS, "oi_delta_ref", 0.02)) # 2% ΔOI ⇒ score 1.0
+FUND_REF = float(getattr(SETTINGS, "funding_ref", 0.00025))
+OI_DELTA_REF = float(getattr(SETTINGS, "oi_delta_ref", 0.02))
 HTTP_TIMEOUT = float(getattr(SETTINGS, "http_timeout_sec", 6.0))
 
 def _norm01(x: float, ref: float) -> float:
     if ref <= 0: return 0.0
-    try:
-        return max(0.0, min(1.0, float(x) / float(ref)))
-    except Exception:
-        return 0.0
+    try: return max(0.0, min(1.0, float(x) / float(ref)))
+    except Exception: return 0.0
 
 def _fetch_oi_score_binance(symbol: str) -> float | None:
-    """
-    Score OI ∈ [0..1] via ΔOI% sur 5 minutes (API officielle):
-      GET /futures/data/openInterestHist?symbol=SYMBOL&period=5m&limit=2
-      score = min(1, |ΔOI%| / OI_DELTA_REF)
-    """
+    """Score OI ∈ [0..1] via ΔOI% (5m)."""
     bsym = map_symbol_to_binance(symbol)
     try:
         r = httpx.get(
@@ -78,34 +62,30 @@ def _fetch_oi_score_binance(symbol: str) -> float | None:
             timeout=HTTP_TIMEOUT,
             headers={"Accept": "application/json"}
         )
-        if r.status_code != 200:
-            return None
+        if r.status_code != 200: return None
         arr = r.json() or []
-        if len(arr) < 2:
-            return None
+        if len(arr) < 2: return None
         a, b2 = arr[-2], arr[-1]
         oi1 = float(a.get("sumOpenInterest", a.get("openInterest", 0.0)) or 0.0)
         oi2 = float(b2.get("sumOpenInterest", b2.get("openInterest", 0.0)) or 0.0)
-        if oi1 <= 0:
-            return None
+        if oi1 <= 0: return None
         delta_pct = abs((oi2 - oi1) / oi1)
         return _norm01(delta_pct, OI_DELTA_REF)
     except Exception:
         return None
 
 def _fetch_funding_score_binance(symbol: str) -> float | None:
-    """
-    Score Funding ∈ [0..1] via |lastFundingRate| / FUND_REF
-    (on exploite get_funding_rate déjà importé).
-    """
+    """Score Funding ∈ [0..1] via |lastFundingRate| / FUND_REF."""
     try:
         r = get_funding_rate(symbol)
-        if r is None:
-            return None
+        if r is None: return None
         return _norm01(abs(float(r)), FUND_REF)
     except Exception:
         return None
 
+# ---------------------------------------------------------------------
+# Macro cache
+# ---------------------------------------------------------------------
 class MacroCache:
     def __init__(self): self.last=0; self.data={}
     def refresh(self):
@@ -117,6 +97,9 @@ class MacroCache:
         self.data={"TOTAL":total,"TOTAL2":total2,"BTC_DOM":dom, "TOTAL_PCT":0.0, "TOTAL2_PCT":0.0}
         self.last=now; return self.data
 
+# ---------------------------------------------------------------------
+# OHLC local 1m
+# ---------------------------------------------------------------------
 class OHLCV1m:
     def __init__(self, meta: dict):
         self.df = {}
@@ -155,11 +138,14 @@ class OHLCV1m:
         if sym not in self.df: self.bootstrap(sym)
         return self.df[sym]
 
+# ---------------------------------------------------------------------
 def _tick_shift(symbol: str, px: float, ticks: int, meta, default_tick: float) -> float:
     tick = float(meta.get(symbol,{}).get("tickSize", default_tick))
     return px + ticks * tick
 
-# ------ Score global = SOMME pondérée ------
+# ---------------------------------------------------------------------
+# Score global = SOMME pondérée
+# ---------------------------------------------------------------------
 def _compute_global_score_sum(inst: dict) -> float:
     w_oi   = float(getattr(SETTINGS, "w_oi", 1.0))
     w_fund = float(getattr(SETTINGS, "w_funding", 1.0))
@@ -169,28 +155,19 @@ def _compute_global_score_sum(inst: dict) -> float:
     use_book = bool(getattr(SETTINGS, "use_book_imbal", USE_BOOK))
 
     total = 0.0
-
     def add(key: str, w: float):
         nonlocal total
         if w <= 0: return
         if key not in inst or inst[key] is None: return
-        try:
-            total += w * float(inst[key])
-        except Exception:
-            pass
+        try: total += w * float(inst[key])
+        except Exception: pass
 
     add("oi_score", w_oi)
     add("delta_score", w_delta)
     add("funding_score", w_fund)
-
-    if "liq_new_score" in inst:
-        add("liq_new_score", w_liq)
-    elif "liq_score" in inst:
-        add("liq_score", w_liq)
-
-    if use_book:
-        add("book_imbal_score", w_book)
-
+    if "liq_new_score" in inst: add("liq_new_score", w_liq)
+    elif "liq_score" in inst:   add("liq_score", w_liq)
+    if use_book: add("book_imbal_score", w_book)
     return float(total)
 
 def _components_ok(inst: dict) -> int:
@@ -204,6 +181,23 @@ def _components_ok(inst: dict) -> int:
         return int(oi_ok)+int(dlt_ok)+int(fund_ok)+int(liq_ok)+int(book_ok)
     return int(oi_ok)+int(dlt_ok)+int(fund_ok)+int(liq_ok)
 
+# --- seuil dynamique (débloque les signaux quand certains poids manquent) ---
+def _active_weight_sum(inst: dict, w_oi: float, w_fund: float, w_dlt: float, w_liq: float, w_book: float, use_book: bool) -> float:
+    s = 0.0
+    if inst.get("oi_score")      is not None: s += w_oi
+    if inst.get("funding_score") is not None: s += w_fund
+    if inst.get("delta_score")   is not None: s += w_dlt
+    if inst.get("liq_new_score") is not None or inst.get("liq_score") is not None: s += w_liq
+    if use_book and inst.get("book_imbal_score") is not None: s += w_book
+    return float(s)
+
+def _dyn_req_score(inst: dict, w_cfg: tuple, use_book: bool) -> float:
+    w_oi, w_fund, w_dlt, w_liq, w_book = w_cfg
+    active = _active_weight_sum(inst, w_oi, w_fund, w_dlt, w_liq, w_book, use_book)
+    base_req = float(getattr(SETTINGS, "req_score_min", 1.0))
+    return max(0.0, min(base_req, active * 0.80))
+
+# ---------------------------------------------------------------------
 async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: MacroCache, meta: dict):
     logger = get_logger("scanner.symbol", symbol)
     w_cfg=(SETTINGS.w_oi, SETTINGS.w_funding, SETTINGS.w_delta, SETTINGS.w_liq, SETTINGS.w_book_imbal)
@@ -218,11 +212,9 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: MacroCache, meta:
     liq_pack_cache = {}
     last_trade_ts = 0.0
 
-    # enrich cache pour oi/funding
     last_oi_fund_fetch = 0.0
-    oi_fund_cache = {}  # {"oi_score": x, "funding_score": y}
+    oi_fund_cache = {}
 
-    # Persistance 2/3 fenêtres
     persist_buf = deque(maxlen=PERSIST_WIN)
 
     def on_order(msg):
@@ -261,12 +253,12 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: MacroCache, meta:
     while True:
         try:
             await asyncio.sleep(1.1)
-            score_from_agg, inst = agg.get_meta_score()   # inst brut de l'aggregator
+            score_from_agg, inst = agg.get_meta_score()
             df = ohlc.frame(symbol)
             price=float(df["close"].iloc[-1])
             macro_data = macro.refresh()
 
-            # --- Refresh liq pack (externe) ---
+            # --- LIQ PACK (HTTP) ---
             if (time.time() - last_liq_fetch) > LIQ_REFRESH_SEC:
                 last_liq_fetch = time.time()
                 try:
@@ -283,16 +275,14 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: MacroCache, meta:
                 except Exception as e:
                     logger.exception(f"[LIQ PACK] fetch error: {e}", extra={"symbol": symbol})
 
-            # --- Refresh OI/Funding scores via Binance (léger, throttlé) ---
+            # --- OI/Funding (léger) ---
             if (time.time() - last_oi_fund_fetch) > OI_FUND_REFRESH_SEC:
                 last_oi_fund_fetch = time.time()
                 try:
                     oi_sc = _fetch_oi_score_binance(symbol)
-                    if oi_sc is not None:
-                        oi_fund_cache["oi_score"] = float(oi_sc)
+                    if oi_sc is not None: oi_fund_cache["oi_score"] = float(oi_sc)
                     fund_sc = _fetch_funding_score_binance(symbol)
-                    if fund_sc is not None:
-                        oi_fund_cache["funding_score"] = float(fund_sc)
+                    if fund_sc is not None: oi_fund_cache["funding_score"] = float(fund_sc)
                     if oi_fund_cache:
                         logger.info(
                             f"[OI/FUND] oi={oi_fund_cache.get('oi_score')} fund={oi_fund_cache.get('funding_score')}",
@@ -301,7 +291,7 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: MacroCache, meta:
                 except Exception as e:
                     logger.exception(f"[OI/FUND ENRICH] error: {e}", extra={"symbol": symbol})
 
-            # ---- merge inst avec liq pack + OI/Funding enrichis ----
+            # ---- merge inst + liq + oi/fund ----
             inst_merged = {**inst, **(liq_pack_cache or {}), **(oi_fund_cache or {})}
 
             # ---- Liquidity floor optionnel ----
@@ -317,13 +307,30 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: MacroCache, meta:
             score = _compute_global_score_sum(inst_merged)
             inst_merged["score"] = score
 
-            # heartbeat 30s — affiche VRAI score & sous-scores enrichis
+            # ---- Seuil dynamique + boost si composante très forte ----
+            use_book = bool(getattr(SETTINGS, "use_book_imbal", False))
+            dyn_req = _dyn_req_score(inst_merged, w_cfg, use_book)
+
+            comps_ok = _components_ok(inst_merged)
+            if comps_ok >= INST_COMPONENTS_MIN and score < dyn_req:
+                score = dyn_req
+
+            boost = 0.0
+            liq_val = float(inst_merged.get("liq_new_score", inst_merged.get("liq_score", 0.0)) or 0.0)
+            if liq_val >= max(0.75, LIQ_MIN): boost = max(boost, 0.25)
+            if float(inst_merged.get("delta_score", 0.0)) >= max(0.75, DELTA_MIN): boost = max(boost, 0.20)
+            if float(inst_merged.get("oi_score", 0.0))    >= max(0.75, OI_MIN):    boost = max(boost, 0.15)
+            if float(inst_merged.get("funding_score", 0.0))>= max(0.75, FUND_MIN): boost = max(boost, 0.10)
+            score += boost
+            inst_merged["score"] = score
+
+            # ---- Heartbeat 30s ----
             if time.time() - last_hb > 30:
                 last_hb = time.time()
                 logger.info(
                     f"hb p={price:.4f} s={score:.2f} oi={inst_merged.get('oi_score',0):.2f} "
                     f"dlt={inst_merged.get('delta_score',0):.2f} fund={inst_merged.get('funding_score',0):.2f} "
-                    f"liq={inst_merged.get('liq_new_score', inst_merged.get('liq_score',0)):.2f}",
+                    f"liq={liq_val:.2f}",
                     extra={"symbol": symbol}
                 )
 
@@ -331,14 +338,13 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: MacroCache, meta:
             if (time.time() - started_at) < getattr(SETTINGS, "warmup_seconds", 0):
                 continue
 
-            # ---- Gate “institutionnelle” + persistance 2/3 ----
-            comps_ok = _components_ok(inst_merged)
-            gate_now = (score >= REQ_SCORE_MIN) and (comps_ok >= INST_COMPONENTS_MIN)
+            # ---- Gate + persistance ----
+            gate_now = (score >= dyn_req) and (comps_ok >= INST_COMPONENTS_MIN)
             persist_buf.append(1 if gate_now else 0)
             if sum(persist_buf) < PERSIST_MIN_OK:
                 continue
 
-            # ---- Cooldown par symbole ----
+            # ---- Cooldown ----
             if (time.time() - last_trade_ts) < SYMBOL_COOLDOWN_SEC:
                 continue
 
@@ -374,7 +380,7 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: MacroCache, meta:
                         rem=pos.qty_value*(1.0-(getattr(SETTINGS,"tp1_part",0.5) if pos.tp1_done else 0.0))
                         ok,_=trader.close_reduce_market(symbol, ro_side, value_qty=rem)
                         if ok: om.close_all(symbol,"TP2"); send_msg(f"🎯 {symbol} TP2 — clôture")
-                continue  # pas d'entrées si déjà en position
+                continue
 
             # ---- Pas de position/pending -> décision & exécution ----
             if symbol not in om.pending_by_symbol:
@@ -440,6 +446,7 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: MacroCache, meta:
             logger.exception("run_symbol loop error", extra={"symbol": symbol})
             await asyncio.sleep(0.5)
 
+# ---------------------------------------------------------------------
 async def main():
     rootlog.info("Starting scanner...")
     if getattr(SETTINGS, "auto_symbols", False):
