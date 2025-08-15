@@ -610,16 +610,20 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: MacroCache, meta:
                     logger.info(f"rej s={score:.2f} ok={comps_ok}/{INST_COMPONENTS_MIN}", extra={"symbol": symbol})
                     continue
 
-                
-# Build a signal key to deduplicate (side+entry+sl+tp1+tp2)
+
+# --- Deduplicate identical signals within cooldown ---
 try:
-    _key = f"{dec.side}:{round_price(symbol, dec.entry, meta, getattr(SETTINGS, 'default_tick_size', 0.001))}:{round_price(symbol, dec.sl, meta, getattr(SETTINGS, 'default_tick_size', 0.001))}:{round_price(symbol, dec.tp1, meta, getattr(SETTINGS, 'default_tick_size', 0.001))}:{round_price(symbol, dec.tp2, meta, getattr(SETTINGS, 'default_tick_size', 0.001))}"
+    key_entry = round_price(symbol, dec.entry, meta, getattr(SETTINGS, "default_tick_size", 0.001))
+    key_sl    = round_price(symbol, dec.sl,    meta, getattr(SETTINGS, "default_tick_size", 0.001))
+    key_tp1   = round_price(symbol, dec.tp1,   meta, getattr(SETTINGS, "default_tick_size", 0.001))
+    key_tp2   = round_price(symbol, dec.tp2,   meta, getattr(SETTINGS, "default_tick_size", 0.001))
+    _key = f"{dec.side}:{key_entry}:{key_sl}:{key_tp1}:{key_tp2}"
 except Exception:
     _key = f"{dec.side}:{dec.entry}:{dec.sl}:{dec.tp1}:{dec.tp2}"
 if _is_duplicate_signal(symbol, _key, getattr(SETTINGS, "symbol_cooldown_sec", 45)):
     logger.info("Duplicate signal suppressed by cooldown", extra={"symbol": symbol})
     continue
-adv = should_cancel_or_requote("LONG" if dec.side == "LONG" else "SHORT", inst_merged, SETTINGS)
+                adv = should_cancel_or_requote("LONG" if dec.side == "LONG" else "SHORT", inst_merged, SETTINGS)
                 if adv != "OK" and getattr(SETTINGS, "cancel_on_adverse", True):
                     logger.info(f"block adverse={adv}", extra={"symbol": symbol})
                     continue
@@ -733,18 +737,18 @@ async def main():
     rootlog.info("Starting scanner...")
     
 if getattr(SETTINGS, "auto_symbols", False):
-    # Prefer full KuCoin USDT-M universe, then apply max cap and exclusions
+    # Discover full KuCoin USDT-M universe
     discovered = kucoin_active_usdt_symbols()
     # Apply exclusions
     excl = getattr(SETTINGS, "exclude_symbols", "")
     if excl:
         ex = {x.strip().upper() for x in excl.split(",") if x.strip()}
         discovered = [s for s in discovered if s not in ex]
-    # Respect symbols_max
+    # Respect symbols_max cap
     maxn = getattr(SETTINGS, "symbols_max", 0)
     if maxn and maxn > 0:
         discovered = discovered[:maxn]
-    # De-duplicate (preserve order)
+    # De-duplicate while preserving order
     seen = set()
     deduped = []
     for s in discovered:
@@ -752,7 +756,8 @@ if getattr(SETTINGS, "auto_symbols", False):
             seen.add(s)
             deduped.append(s)
     SETTINGS.symbols = deduped
-rootlog.info(f"[SCAN] Auto-symbols activé — {len(discovered)} paires chargées.")
+
+            rootlog.info(f"[SCAN] Auto-symbols activé — {len(discovered)} paires chargées.")
     kws = KucoinPrivateWS()
     meta = fetch_symbol_meta()
     macro = MacroCache()
