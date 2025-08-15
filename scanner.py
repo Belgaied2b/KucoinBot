@@ -10,7 +10,7 @@ from kucoin_trader import KucoinTrader
 from kucoin_ws import KucoinPrivateWS
 from order_manager import OrderManager
 from orderflow_features import compute_atr
-from kucoin_utils import fetch_klines, fetch_symbol_meta, round_price, common_usdt_symbols, kucoin_active_usdt_symbols
+from kucoin_utils import fetch_klines, fetch_symbol_meta, round_price, kucoin_active_usdt_symbols
 from telegram_notifier import send_msg
 from institutional_data import get_macro_total_mcap, get_macro_total2, get_macro_btc_dominance
 from adverse_selection import should_cancel_or_requote
@@ -488,6 +488,7 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: MacroCache, meta:
                 cvd_stats = cvd.update(bsym)
                 if cvd_stats:
                     inst_merged["delta_score"] = float(cvd_stats["delta_score"])
+                    inst_erged = inst_merged  # alias local si besoin
                     inst_merged["delta_cvd_usd"] = float(cvd_stats["cvd_notional"])
                     inst_merged["delta_buy_usd"] = float(cvd_stats["buy_notional"])
                     inst_merged["delta_sell_usd"] = float(cvd_stats["sell_notional"])
@@ -610,7 +611,6 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: MacroCache, meta:
                     logger.info(f"rej s={score:.2f} ok={comps_ok}/{INST_COMPONENTS_MIN}", extra={"symbol": symbol})
                     continue
 
-
                 # --- Deduplicate identical signals within cooldown ---
                 try:
                     key_entry = round_price(symbol, dec.entry, meta, getattr(SETTINGS, "default_tick_size", 0.001))
@@ -623,6 +623,7 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: MacroCache, meta:
                 if _is_duplicate_signal(symbol, _key, getattr(SETTINGS, "symbol_cooldown_sec", 45)):
                     logger.info("Duplicate signal suppressed by cooldown", extra={"symbol": symbol})
                     continue
+
                 adv = should_cancel_or_requote("LONG" if dec.side == "LONG" else "SHORT", inst_merged, SETTINGS)
                 if adv != "OK" and getattr(SETTINGS, "cancel_on_adverse", True):
                     logger.info(f"block adverse={adv}", extra={"symbol": symbol})
@@ -736,19 +737,19 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: MacroCache, meta:
 async def main():
     rootlog.info("Starting scanner...")
 
+    # Construire l'univers à scanner (~400 USDT-M actifs)
     if getattr(SETTINGS, "auto_symbols", False):
-        # Discover full KuCoin USDT-M universe
         discovered = kucoin_active_usdt_symbols()
-        # Apply exclusions
+        # Exclusions éventuelles
         excl = getattr(SETTINGS, "exclude_symbols", "")
         if excl:
             ex = {x.strip().upper() for x in excl.split(",") if x.strip()}
             discovered = [s for s in discovered if s not in ex]
-        # Respect symbols_max cap
+        # Limite max
         maxn = getattr(SETTINGS, "symbols_max", 0)
         if maxn and maxn > 0:
             discovered = discovered[:maxn]
-        # De-duplicate while preserving order
+        # Dédup (ordre conservé)
         seen = set()
         deduped = []
         for s in discovered:
@@ -756,18 +757,20 @@ async def main():
                 seen.add(s)
                 deduped.append(s)
         SETTINGS.symbols = deduped
+        rootlog.info(f"[SCAN] Auto-symbols activé — {len(SETTINGS.symbols)} paires chargées.")
 
-        rootlog.info(f"[SCAN] Auto-symbols activé — {len(discovered)} paires chargées.")
-        kws = KucoinPrivateWS()
-        meta = fetch_symbol_meta()
-        macro = MacroCache()
-        asyncio.create_task(kws.run())
+    # Métadonnées (tickSize, symbol_api, etc.)
+    meta = fetch_symbol_meta()
+    macro = MacroCache()
+    kws = KucoinPrivateWS()
+    asyncio.create_task(kws.run())
 
-        tasks = []
-        for i, sym in enumerate(SETTINGS.symbols):
-            tasks.append(asyncio.create_task(run_symbol(sym, kws, macro, meta)))
-            await asyncio.sleep(0.05)
-        await asyncio.gather(*tasks)
+    # Lancer une tâche par symbole
+    tasks = []
+    for i, sym in enumerate(SETTINGS.symbols):
+        tasks.append(asyncio.create_task(run_symbol(sym, kws, macro, meta)))
+        await asyncio.sleep(0.05)
+    await asyncio.gather(*tasks)
 
 if __name__ == "__main__":
     asyncio.run(main())
