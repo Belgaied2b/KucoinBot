@@ -24,6 +24,9 @@ class KucoinTrader:
         self.secret = SETTINGS.kucoin_secret
         self.passphrase = SETTINGS.kucoin_passphrase
         self.client = httpx.Client(timeout=10.0)
+        # tailles / levier (fallbacks si non définis dans Settings)
+        self.margin_per_trade = float(getattr(SETTINGS, "margin_per_trade", 20.0))
+        self.default_leverage = int(getattr(SETTINGS, "default_leverage", 10))
         _sync_server_time()
 
     def _headers(self, method: str, path: str, body: str = ""):
@@ -46,9 +49,10 @@ class KucoinTrader:
 
     def _post(self, path: str, body: dict):
         try:
+            body_json = json.dumps(body)
             r = self.client.post(
                 self.base + path,
-                headers=self._headers("POST", path, json.dumps(body)),
+                headers=self._headers("POST", path, body_json),
                 json=body
             )
             ok = r.status_code in (200, 201)
@@ -85,6 +89,11 @@ class KucoinTrader:
             log.exception(f"GET {path} exception: {e}")
             return False, {}
 
+    # -------- helpers taille --------
+    def _value_qty(self) -> float:
+        """valueQty envoyé à KuCoin Futures = marge * levier (ex: 20 * 10 = 200)."""
+        return float(self.margin_per_trade) * float(self.default_leverage)
+
     # ------------------ ORDERS ------------------
 
     def place_limit(
@@ -101,12 +110,13 @@ class KucoinTrader:
             "type": "limit",
             "side": side,
             "price": f"{price:.8f}",
-            "valueQty": f"{SETTINGS.margin_per_trade:.2f}",  # ex: 20.00 USDT
-            "leverage": "10",
+            "valueQty": f"{self._value_qty():.2f}",      # ex: 200.00 USDT si 20 * 10
+            "leverage": str(self.default_leverage),
             "timeInForce": "GTC",
             "reduceOnly": False,
             "postOnly": bool(post_only),
         }
+        log.info(f"[place_limit] {symbol} {side} px={price} valueQty={body['valueQty']} lev={self.default_leverage}")
         return self._post("/api/v1/orders", body)
 
     def place_limit_ioc(
@@ -121,12 +131,13 @@ class KucoinTrader:
             "type": "limit",
             "side": side,
             "price": f"{price:.8f}",
-            "valueQty": f"{SETTINGS.margin_per_trade:.2f}",
-            "leverage": "10",
+            "valueQty": f"{self._value_qty():.2f}",
+            "leverage": str(self.default_leverage),
             "timeInForce": "IOC",
             "reduceOnly": False,
             "postOnly": False,
         }
+        log.info(f"[place_limit_ioc] {symbol} {side} px={price} valueQty={body['valueQty']} lev={self.default_leverage}")
         return self._post("/api/v1/orders", body)
 
     def place_market(
@@ -140,9 +151,10 @@ class KucoinTrader:
             "type": "market",
             "side": side,
             "reduceOnly": False,
-            "valueQty": f"{SETTINGS.margin_per_trade:.2f}",
-            "leverage": "10",
+            "valueQty": f"{self._value_qty():.2f}",
+            "leverage": str(self.default_leverage),
         }
+        log.info(f"[place_market] {symbol} {side} valueQty={body['valueQty']} lev={self.default_leverage}")
         return self._post("/api/v1/orders", body)
 
     def close_reduce_market(
@@ -151,6 +163,7 @@ class KucoinTrader:
         side: Literal["buy", "sell"],
         value_qty: float
     ):
+        # On respecte la valeur transmise pour les sorties partielles/complètes
         body = {
             "clientOid": str(int(time.time() * 1000)),
             "symbol": symbol,
@@ -159,6 +172,7 @@ class KucoinTrader:
             "reduceOnly": True,
             "valueQty": f"{value_qty:.2f}",
         }
+        log.info(f"[close_reduce_market] {symbol} {side} valueQty={body['valueQty']} (reduceOnly)")
         return self._post("/api/v1/orders", body)
 
     # ------------------ CANCEL / QUERY ------------------
