@@ -70,21 +70,24 @@ class KucoinTrader:
             return False, {}
 
     def place_limit(self, symbol: str, side: Literal["buy","sell"], price: float, client_oid: str, post_only: bool=False):
-        body={"clientOid":client_oid,"symbol":symbol,"type":"limit","side":side,
-              "price":f"{price:.8f}","valueQty":f"{SETTINGS.margin_per_trade:.2f}",
-              "timeInForce":"GTC","reduceOnly":False,"postOnly":bool(post_only)}
-        return self._post("/api/v1/orders", body)
+    body={"clientOid":client_oid,"symbol":symbol,"type":"limit","side":side,
+          "price":f"{price:.8f}","valueQty":f"{SETTINGS.margin_per_trade:.2f}",
+          "leverage":"10",
+          "timeInForce":"GTC","reduceOnly":False,"postOnly":bool(post_only)}
+    return self._post("/api/v1/orders", body)
 
     def place_limit_ioc(self, symbol: str, side: Literal["buy","sell"], price: float):
-        body={"clientOid":str(int(time.time()*1000)),"symbol":symbol,"type":"limit","side":side,
-              "price":f"{price:.8f}","valueQty":f"{SETTINGS.margin_per_trade:.2f}",
-              "timeInForce":"IOC","reduceOnly":False,"postOnly":False}
-        return self._post("/api/v1/orders", body)
+    body={"clientOid":str(int(time.time()*1000)),"symbol":symbol,"type":"limit","side":side,
+          "price":f"{price:.8f}","valueQty":f"{SETTINGS.margin_per_trade:.2f}",
+          "leverage":"10",
+          "timeInForce":"IOC","reduceOnly":False,"postOnly":False}
+    return self._post("/api/v1/orders", body)
 
     def place_market(self, symbol: str, side: Literal["buy","sell"]):
-        body={"clientOid":str(int(time.time()*1000)),"symbol":symbol,"type":"market","side":side,
-              "reduceOnly":False,"valueQty":f"{SETTINGS.margin_per_trade:.2f}"}
-        return self._post("/api/v1/orders", body)
+    body={"clientOid":str(int(time.time()*1000)),"symbol":symbol,"type":"market","side":side,
+          "reduceOnly":False,"valueQty":f"{SETTINGS.margin_per_trade:.2f}",
+          "leverage":"10"}
+    return self._post("/api/v1/orders", body)
 
     def close_reduce_market(self, symbol: str, side: Literal["buy","sell"], value_qty: float):
         body={"clientOid":str(int(time.time()*1000)),"symbol":symbol,"type":"market","side":side,
