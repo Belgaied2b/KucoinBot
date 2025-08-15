@@ -206,6 +206,9 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: MacroCache, meta:
     ohlc=OHLCV1m(meta)
     om=OrderManager()
 
+    # --- symbole KuCoin API (ex: BONKUSDTM) pour les appels trader ---
+    sym_api = meta.get(symbol, {}).get("symbol_api", symbol)
+
     started_at = time.time()
     last_hb = 0.0
     last_liq_fetch = 0.0
@@ -356,7 +359,7 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: MacroCache, meta:
                 if not pos.tp1_done:
                     if (pos.side=="LONG" and price>=pos.tp1) or (pos.side=="SHORT" and price<=pos.tp1):
                         ro_side="sell" if pos.side=="LONG" else "buy"
-                        ok,_=trader.close_reduce_market(symbol, ro_side, value_qty=pos.qty_value*SETTINGS.tp1_part)
+                        ok,_=trader.close_reduce_market(sym_api, ro_side, value_qty=pos.qty_value*SETTINGS.tp1_part)
                         if ok:
                             om.close_half_at_tp1(symbol)
                             send_msg(f"✅ <b>{symbol}</b> TP1 atteint — passage BE", parse_mode="HTML")
@@ -366,14 +369,14 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: MacroCache, meta:
                     if pos.side=="LONG":
                         pos.sl=max(pos.sl, price-trail)
                         if price<=pos.sl:
-                            ok,_=trader.close_reduce_market(symbol,"sell", value_qty=pos.qty_value*(1.0-SETTINGS.tp1_part))
+                            ok,_=trader.close_reduce_market(sym_api,"sell", value_qty=pos.qty_value*(1.0-SETTINGS.tp1_part))
                             if ok:
                                 om.close_all(symbol,"TRAIL_LONG")
                                 send_msg(f"🛑 <b>{symbol}</b> Trailing stop LONG", parse_mode="HTML")
                     else:
                         pos.sl=min(pos.sl, price+trail)
                         if price>=pos.sl:
-                            ok,_=trader.close_reduce_market(symbol,"buy", value_qty=pos.qty_value*(1.0-SETTINGS.tp1_part))
+                            ok,_=trader.close_reduce_market(sym_api,"buy", value_qty=pos.qty_value*(1.0-SETTINGS.tp1_part))
                             if ok:
                                 om.close_all(symbol,"TRAIL_SHORT")
                                 send_msg(f"🛑 <b>{symbol}</b> Trailing stop SHORT", parse_mode="HTML")
@@ -383,7 +386,7 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: MacroCache, meta:
                     if (pos.side=="LONG" and price>=pos.tp2) or (pos.side=="SHORT" and price<=pos.tp2):
                         ro_side="sell" if pos.side=="LONG" else "buy"
                         rem=pos.qty_value*(1.0-(getattr(SETTINGS,"tp1_part",0.5) if pos.tp1_done else 0.0))
-                        ok,_=trader.close_reduce_market(symbol, ro_side, value_qty=rem)
+                        ok,_=trader.close_reduce_market(sym_api, ro_side, value_qty=rem)
                         if ok:
                             om.close_all(symbol,"TP2")
                             send_msg(f"🎯 <b>{symbol}</b> TP2 — position clôturée", parse_mode="HTML")
@@ -406,16 +409,18 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: MacroCache, meta:
                 px_maker = _tick_shift(symbol, entry_px, -1 if side=="buy" else +1, meta, getattr(SETTINGS,"default_tick_size", 0.001))
                 px_maker = round_price(symbol, px_maker, meta, getattr(SETTINGS,"default_tick_size", 0.001))
 
+                # taille des étapes (si 2-stages activé)
                 stage_fracs = [getattr(SETTINGS,"stage1_fraction",0.5), 1.0-getattr(SETTINGS,"stage1_fraction",0.5)] if getattr(SETTINGS,"two_stage_entry", False) else [1.0]
+
                 for i, frac in enumerate(stage_fracs):
                     oid = str(uuid.uuid4())+f"-s{i+1}"
-                    ok,res = trader.place_limit(symbol, side, px_maker, oid, post_only=getattr(SETTINGS,"post_only_entries", True))
-                    logger.info(f"ENTRY {side} px={px_maker} stg={i+1}/{len(stage_fracs)} ok={ok}", extra={"symbol": symbol})
+                    ok,res = trader.place_limit(sym_api, side, px_maker, oid, post_only=getattr(SETTINGS,"post_only_entries", True))
+                    logger.info(f"ENTRY {side} px={px_maker} stg={i+1}/{len(stage_fracs)} ok={ok} res={res}", extra={"symbol": symbol})
                     if not ok:
                         logger.error(f"ENTRY FAIL stage{i+1} resp={res}", extra={"symbol": symbol})
                         break
 
-                    om.add_pending(oid, symbol, side, px_maker)
+                    om.add_pending(oid, symbol, side, px_maker)  # suivi interne sur le display symbol
                     om.open_position(symbol, dec.side, dec.entry, dec.sl, dec.tp1, dec.tp2)
 
                     # --- Message Telegram enrichi (HTML) ---
@@ -446,7 +451,7 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: MacroCache, meta:
                         px_maker = round_price(symbol, px_maker, meta, getattr(SETTINGS,"default_tick_size", 0.001))
                         trader.cancel_by_client_oid(oid)
                         oid = str(uuid.uuid4())+f"-rq{rq}"
-                        ok,_ = trader.place_limit(symbol, side, px_maker, oid, post_only=getattr(SETTINGS,"post_only_entries", True))
+                        ok,_ = trader.place_limit(sym_api, side, px_maker, oid, post_only=getattr(SETTINGS,"post_only_entries", True))
                         logger.info(f"REQUOTE {rq}/{getattr(SETTINGS,'max_requotes',2)} px={px_maker} ok={ok}", extra={"symbol": symbol})
                         if not ok: break
                         om.add_pending(oid, symbol, side, px_maker)
@@ -454,12 +459,20 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: MacroCache, meta:
                         while time.time()-t0 < getattr(SETTINGS,"entry_timeout_sec", 6):
                             await asyncio.sleep(0.2)
 
+                    # --- Fallback IOC agressif (traverse le spread) ---
                     if getattr(SETTINGS,"use_ioc_fallback", True):
-                        ok,_ = trader.place_limit_ioc(symbol, side, entry_px)
-                        logger.info(f"IOC tried ok={ok} px={entry_px}", extra={"symbol": symbol})
+                        tick = float(meta.get(symbol, {}).get("tickSize", getattr(SETTINGS,"default_tick_size", 0.001)))
+                        aggr_ticks = 50  # agressivité; ajuste si besoin
+                        if side == "buy":
+                            ioc_px = round_price(symbol, entry_px + aggr_ticks * tick, meta, tick)
+                        else:
+                            ioc_px = round_price(symbol, entry_px - aggr_ticks * tick, meta, tick)
+
+                        ok,_ = trader.place_limit_ioc(sym_api, side, ioc_px)
+                        logger.info(f"IOC tried ok={ok} px={ioc_px}", extra={"symbol": symbol})
                         if ok:
                             send_msg(
-                                f"⚡ <b>{symbol}</b> — IOC fallback déclenché (@ {entry_px})",
+                                f"⚡ <b>{symbol}</b> — IOC fallback déclenché (@ {ioc_px})",
                                 parse_mode="HTML"
                             )
 
