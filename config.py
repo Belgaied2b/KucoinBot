@@ -2,10 +2,9 @@
 import os
 from typing import List
 from pydantic import BaseModel, Field
-from dotenv import load_dotenv
 
-# Charge .env et autorise l'écrasement (si présent)
-load_dotenv(override=True)
+# ❗️On n’utilise plus .env ici. Si des variables d’environnement existent,
+# elles peuvent encore écraser les valeurs par défaut, mais ce n’est pas requis.
 
 def _get_bool(name: str, default: bool) -> bool:
     v = os.getenv(name)
@@ -31,48 +30,50 @@ def _get_list(name: str, default: List[str]) -> List[str]:
         return default
     return [s.strip().upper() for s in raw.split(",") if s.strip()]
 
-# Aliases Railway (si tu utilises TOKEN / CHAT_ID)
-os.environ.setdefault("TELEGRAM_BOT_TOKEN", os.getenv("TOKEN", ""))
-os.environ.setdefault("TELEGRAM_CHAT_ID",   os.getenv("CHAT_ID", ""))
-
 class Settings(BaseModel):
     # --- KUCOIN EXECUTION ---
-    kucoin_base_url: str     = Field(default_factory=lambda: os.getenv("KUCOIN_BASE_URL", "https://api-futures.kucoin.com"))
-    kucoin_ws_url: str       = Field(default_factory=lambda: os.getenv("KUCOIN_WS_URL", "wss://ws-api-futures.kucoin.com/endpoint"))
-    kucoin_key: str          = Field(default_factory=lambda: os.getenv("KUCOIN_API_KEY", "6890cfb4dffe710001e6edb0"))
-    kucoin_secret: str       = Field(default_factory=lambda: os.getenv("KUCOIN_API_SECRET", "889e4492-c2ff-4c9d-9136-64afe6d5e780"))
-    kucoin_passphrase: str   = Field(default_factory=lambda: os.getenv("KUCOIN_API_PASSPHRASE", "Nad1703-_"))
+    kucoin_base_url: str   = Field(default_factory=lambda: os.getenv("KUCOIN_BASE_URL", "https://api-futures.kucoin.com"))
+    kucoin_ws_url: str     = Field(default_factory=lambda: os.getenv("KUCOIN_WS_URL", "wss://ws-api-futures.kucoin.com/endpoint"))
+
+    # ⚠️ Identifiants par défaut intégrés (plus de .env nécessaire)
+    kucoin_key: str        = Field(default_factory=lambda: os.getenv("KUCOIN_API_KEY", "6890cfb4dffe710001e6edb0"))
+    kucoin_secret: str     = Field(default_factory=lambda: os.getenv("KUCOIN_API_SECRET", "889e4492-c2ff-4c9d-9136-64afe6d5e780"))
+    kucoin_passphrase: str = Field(default_factory=lambda: os.getenv("KUCOIN_API_PASSPHRASE", "Nad1703-_"))
 
     # --- SYMBOLS ---
-    auto_symbols: bool       = Field(default_factory=lambda: _get_bool("AUTO_SYMBOLS", False))  # 0 -> False
-    symbols: List[str]       = Field(default_factory=lambda: _get_list("SYMBOLS", ["BTCUSDT", "ETHUSDT", "SOLUSDT"]))
-    symbols_max: int         = Field(default_factory=lambda: _get_int("SYMBOLS_MAX", 40))
-    exclude_symbols: str     = Field(default_factory=lambda: os.getenv("EXCLUDE_SYMBOLS", ""))
+    auto_symbols: bool     = Field(default_factory=lambda: _get_bool("AUTO_SYMBOLS", False))
+    symbols: List[str]     = Field(default_factory=lambda: _get_list("SYMBOLS", ["BTCUSDT", "ETHUSDT", "SOLUSDT"]))
+    symbols_max: int       = Field(default_factory=lambda: _get_int("SYMBOLS_MAX", 40))
+    exclude_symbols: str   = Field(default_factory=lambda: os.getenv("EXCLUDE_SYMBOLS", ""))
 
     # --- WARMUP ---
-    warmup_seconds: int      = Field(default_factory=lambda: _get_int("WARMUP_SECONDS", 5))
+    warmup_seconds: int    = Field(default_factory=lambda: _get_int("WARMUP_SECONDS", 5))
 
     # --- RISK & ORDERS ---
+    # Marge souhaitée par trade (USD), pas le notionnel
     margin_per_trade: float  = Field(default_factory=lambda: _get_float("MARGIN_PER_TRADE_USDT", 20.0))
+    # Levier par défaut (utilisé pour calculer valueQty = marge * levier)
+    default_leverage: int    = Field(default_factory=lambda: _get_int("DEFAULT_LEVERAGE", 10))
+
     max_positions: int       = Field(default_factory=lambda: _get_int("MAX_CONCURRENT_POSITIONS", 10))
     sl_atr_mult: float       = Field(default_factory=lambda: _get_float("STOP_BUFFER_ATR_MULT", 1.0))
     tp1_rr: float            = Field(default_factory=lambda: _get_float("TAKE_PROFIT_1_RR", 1.0))
     tp2_rr: float            = Field(default_factory=lambda: _get_float("TAKE_PROFIT_2_RR", 1.5))
     tp1_part: float          = Field(default_factory=lambda: _get_float("TP1_PART", 0.5))
     trail_mult_atr: float    = Field(default_factory=lambda: _get_float("TRAIL_AFTER_TP1_MULT_ATR", 0.5))
-    breakeven_after_tp1: bool = Field(default_factory=lambda: _get_bool("MOVE_TO_BE_AFTER_TP1", False))  # 0 -> False
+    breakeven_after_tp1: bool = Field(default_factory=lambda: _get_bool("MOVE_TO_BE_AFTER_TP1", False))
 
     # --- SCORING (Institution++) ---
-    req_score_min: float     = Field(default_factory=lambda: _get_float("REQ_SCORE_MIN", 1.0))  # permissif
-    req_rr_min: float        = Field(default_factory=lambda: _get_float("REQ_RR_MIN", 1.0))
-    allow_tol_rr: bool       = Field(default_factory=lambda: _get_bool("ALLOW_TOLERANCE_RR", True))
+    req_score_min: float   = Field(default_factory=lambda: _get_float("REQ_SCORE_MIN", 1.0))
+    req_rr_min: float      = Field(default_factory=lambda: _get_float("REQ_RR_MIN", 1.0))
+    allow_tol_rr: bool     = Field(default_factory=lambda: _get_bool("ALLOW_TOLERANCE_RR", True))
 
-    # Pondérations (permissif & adapté à tes valeurs)
-    w_oi: float              = Field(default_factory=lambda: _get_float("W_OI", 0.5))
-    w_funding: float         = Field(default_factory=lambda: _get_float("W_FUNDING", 0.2))
-    w_delta: float           = Field(default_factory=lambda: _get_float("W_DELTA", 0.0))
-    w_liq: float             = Field(default_factory=lambda: _get_float("W_LIQ", 0.3))
-    w_book_imbal: float      = Field(default_factory=lambda: _get_float("W_BOOK_IMBAL", 0.0))
+    # Pondérations (permissif & adapté)
+    w_oi: float            = Field(default_factory=lambda: _get_float("W_OI", 0.5))
+    w_funding: float       = Field(default_factory=lambda: _get_float("W_FUNDING", 0.2))
+    w_delta: float         = Field(default_factory=lambda: _get_float("W_DELTA", 0.0))
+    w_liq: float           = Field(default_factory=lambda: _get_float("W_LIQ", 0.3))
+    w_book_imbal: float    = Field(default_factory=lambda: _get_float("W_BOOK_IMBAL", 0.0))
 
     # Seuils très permissifs
     inst_components_min: int = Field(default_factory=lambda: _get_int("INST_COMPONENTS_MIN", 1))
@@ -83,9 +84,9 @@ class Settings(BaseModel):
     book_req_min: float      = Field(default_factory=lambda: _get_float("BOOK_REQ_MIN", 0.10))
     use_book_imbal: bool     = Field(default_factory=lambda: _get_bool("USE_BOOK_IMBAL", False))
 
-    # Normalisation élargie (Binance enrichissements)
-    funding_ref: float       = Field(default_factory=lambda: _get_float("FUNDING_REF", 0.00010))  # 0.01% -> score 1.0
-    oi_delta_ref: float      = Field(default_factory=lambda: _get_float("OI_DELTA_REF", 0.005))   # 0.5% ΔOI (5m) -> 1.0
+    # Normalisation des enrichissements Binance
+    funding_ref: float       = Field(default_factory=lambda: _get_float("FUNDING_REF", 0.00010))
+    oi_delta_ref: float      = Field(default_factory=lambda: _get_float("OI_DELTA_REF", 0.005))
     oi_fund_refresh_sec: int = Field(default_factory=lambda: _get_int("OI_FUND_REFRESH_SEC", 30))
 
     # --- LIQ PACK ---
@@ -119,6 +120,9 @@ class Settings(BaseModel):
     # --- EXECUTION (V1.1-bis) ---
     use_ioc_fallback: bool    = Field(default_factory=lambda: _get_bool("USE_IOC_FALLBACK", True))
     default_tick_size: float  = Field(default_factory=lambda: _get_float("DEFAULT_TICK_SIZE", 0.1))
+
+    # --- DIVERS / HTTP ---
+    http_timeout_sec: float   = Field(default_factory=lambda: _get_float("HTTP_TIMEOUT_SEC", 6.0))
 
     # --- ENV / LOGS ---
     env: str                  = Field(default_factory=lambda: os.getenv("ENV", "prod"))
