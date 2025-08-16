@@ -298,8 +298,8 @@ def _active_weight_sum(inst: dict, w_oi: float, w_fund: float, w_dlt: float, w_l
     if inst.get("oi_score")      is not None: s += w_oi
     if inst.get("funding_score") is not None: s += w_fund
     if inst.get("delta_score")   is not None: s += w_dlt
-    if inst.get("liq_new_score") is not None or inst.get("liq_score") is not None: s += w_liq
-    if use_book and inst.get("book_imbal_score") is not None: s += w_book
+    if (inst.get("liq_new_score") is not None) or (inst.get("liq_score") is not None): s += w_liq
+    if use_book and (inst.get("book_imbal_score") is not None): s += w_book
     return float(s)
 
 def _dyn_req_score(inst: dict, w_cfg: tuple, use_book: bool) -> float:
@@ -488,7 +488,6 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: MacroCache, meta:
                 cvd_stats = cvd.update(bsym)
                 if cvd_stats:
                     inst_merged["delta_score"] = float(cvd_stats["delta_score"])
-                    inst_erged = inst_merged  # alias local si besoin
                     inst_merged["delta_cvd_usd"] = float(cvd_stats["cvd_notional"])
                     inst_merged["delta_buy_usd"] = float(cvd_stats["buy_notional"])
                     inst_merged["delta_sell_usd"] = float(cvd_stats["sell_notional"])
@@ -737,30 +736,47 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: MacroCache, meta:
 async def main():
     rootlog.info("Starting scanner...")
 
-    # Construire l'univers à scanner (~400 USDT-M actifs)
-    if getattr(SETTINGS, "auto_symbols", False):
-        discovered = kucoin_active_usdt_symbols()
-        # Exclusions éventuelles
-        excl = getattr(SETTINGS, "exclude_symbols", "")
-        if excl:
-            ex = {x.strip().upper() for x in excl.split(",") if x.strip()}
-            discovered = [s for s in discovered if s not in ex]
-        # Limite max
-        maxn = getattr(SETTINGS, "symbols_max", 0)
-        if maxn and maxn > 0:
-            discovered = discovered[:maxn]
-        # Dédup (ordre conservé)
-        seen = set()
-        deduped = []
-        for s in discovered:
-            if s not in seen:
-                seen.add(s)
-                deduped.append(s)
-        SETTINGS.symbols = deduped
-        rootlog.info(f"[SCAN] Auto-symbols activé — {len(SETTINGS.symbols)} paires chargées.")
-
-    # Métadonnées (tickSize, symbol_api, etc.)
+    # 1) Univers depuis les métadonnées (plus robuste)
     meta = fetch_symbol_meta()
+    discovered = list(meta.keys())
+
+    # Fallback si l'endpoint meta ne répond pas
+    if not discovered:
+        rootlog.warning("[SCAN] fetch_symbol_meta vide → fallback kucoin_active_usdt_symbols()")
+        discovered = kucoin_active_usdt_symbols()
+
+    # Exclusions éventuelles
+    excl = getattr(SETTINGS, "exclude_symbols", "")
+    if excl:
+        ex = {x.strip().upper() for x in excl.split(",") if x.strip()}
+        discovered = [s for s in discovered if s not in ex]
+
+    # Limite max
+    maxn = getattr(SETTINGS, "symbols_max", 0)
+    if maxn and maxn > 0:
+        discovered = discovered[:maxn]
+
+    # Dédup (ordre conservé)
+    seen = set()
+    deduped = []
+    for s in discovered:
+        if s not in seen:
+            seen.add(s)
+            deduped.append(s)
+    SETTINGS.symbols = deduped
+
+    # Logs détaillés + CSV
+    rootlog.info(f"[SCAN] {len(SETTINGS.symbols)} paires prêtes à scanner (après exclusion/dédoublonnage).")
+    try:
+        with open("./runtime_symbols.csv", "w", encoding="utf-8") as f:
+            for s in SETTINGS.symbols:
+                f.write(s + "\n")
+    except Exception as e:
+        rootlog.warning(f"[SCAN] Écriture runtime_symbols.csv échouée: {e}")
+
+    for s in SETTINGS.symbols:
+        rootlog.info(f"[SCAN] will run: {s}")
+
     macro = MacroCache()
     kws = KucoinPrivateWS()
     asyncio.create_task(kws.run())
