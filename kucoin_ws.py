@@ -1,28 +1,51 @@
-import time, hmac, base64, hashlib, httpx, ujson as json, asyncio, websockets, random
-from typing import Callable, Dict, Any, Optional
+# kucoin_ws.py — privé Futures WS (bullet-private) prêt à coller
+import time
+import hmac
+import base64
+import hashlib
+import httpx
+import ujson as json
+import asyncio
+import websockets
+import random
+from typing import Callable, Dict, Any, Optional, List
 from websockets.exceptions import ConnectionClosed, ConnectionClosedError, ConnectionClosedOK
 
 from config import SETTINGS
 from logger_utils import get_logger
 
-TOKEN_URL = "/api/v1/bullet-private"
+TOKEN_PATH = "/api/v1/bullet-private"
+TIME_PATH  = "/api/v1/timestamp"
+
 log = get_logger("kucoin.ws")
 
+# Décalage local -> serveur (en secondes)
 _SERVER_OFFSET = 0.0
-def _sync_server_time():
+
+def _sync_server_time() -> None:
+    """Synchronise l'heure locale sur l'heure serveur KuCoin Futures (ms)."""
     global _SERVER_OFFSET
     try:
-        r = httpx.get(SETTINGS.kucoin_base_url + "/api/v1/timestamp", timeout=5.0)
-        if r.status_code == 200:
-            server_ms = int(r.json().get("data", 0))
-            _SERVER_OFFSET = (server_ms / 1000.0) - time.time()
-            log.info(f"time sync offset={_SERVER_OFFSET:.3f}s")
+        url = SETTINGS.kucoin_base_url.rstrip("/") + TIME_PATH
+        r = httpx.get(url, timeout=5.0)
+        r.raise_for_status()
+        server_ms = int(r.json().get("data", 0))
+        _SERVER_OFFSET = (server_ms / 1000.0) - time.time()
+        log.info(f"time sync offset={_SERVER_OFFSET:.3f}s")
     except Exception as e:
         log.warning(f"time sync failed: {e}")
 
+def _ts_ms() -> int:
+    return int((time.time() + _SERVER_OFFSET) * 1000)
+
+def _b64_hmac_sha256(secret: str, payload: str) -> str:
+    return base64.b64encode(
+        hmac.new(secret.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).digest()
+    ).decode("utf-8")
+
 class KucoinPrivateWS:
     def __init__(self):
-        self.base = SETTINGS.kucoin_base_url
+        self.base = SETTINGS.kucoin_base_url.rstrip("/")
         self.key = SETTINGS.kucoin_key
         self.secret = SETTINGS.kucoin_secret
         self.passphrase = SETTINGS.kucoin_passphrase
@@ -30,11 +53,11 @@ class KucoinPrivateWS:
         self.token: Optional[str] = None
         self.endpoint: Optional[str] = None
 
-        self.listeners: Dict[str, list[Callable[[Dict[str, Any]], None]]] = {
+        self.listeners: Dict[str, List[Callable[[Dict[str, Any]], None]]] = {
             "fill": [], "position": [], "order": []
         }
 
-        # ping/pong params fournis par bullet-private
+        # paramètres ping/pong fournis par bullet-private
         self.ping_interval_ms: int = 15000
         self.ping_timeout_ms: int = 10000
         self._pong_deadline: float = float("inf")
@@ -45,52 +68,75 @@ class KucoinPrivateWS:
         self._ping_task: Optional[asyncio.Task] = None
         self._recv_task: Optional[asyncio.Task] = None
 
-        _sync_server_time()
+    # ---------------------- Auth HTTP (v2) ----------------------
+    def _headers(self, method: str, path: str, body_str: str = "") -> Dict[str, str]:
+        """
+        Construit les en-têtes signés v2 :
+        KC-API-SIGN = base64(HMAC_SHA256(secret, timestamp + method + path + body))
+        KC-API-PASSPHRASE = base64(HMAC_SHA256(secret, passphrase))
+        timestamp = ms (string)
+        """
+        ts = str(_ts_ms())
+        str_to_sign = ts + method.upper() + path + (body_str or "")
+        sig = _b64_hmac_sha256(self.secret, str_to_sign)
+        psp = _b64_hmac_sha256(self.secret, self.passphrase)
 
-    # ---------------------- Utils auth HTTP ----------------------
-    def _headers(self, method: str, path: str, body: str = ""):
-        ts = int((time.time() + _SERVER_OFFSET) * 1000)
-        now = str(ts)
-        sig = base64.b64encode(
-            hmac.new(self.secret.encode(), (now + method + path + body).encode(), hashlib.sha256).digest()
-        ).decode()
-        psp = base64.b64encode(
-            hmac.new(self.secret.encode(), self.passphrase.encode(), hashlib.sha256).digest()
-        ).decode()
         return {
             "KC-API-KEY": self.key,
             "KC-API-SIGN": sig,
-            "KC-API-TIMESTAMP": now,
+            "KC-API-TIMESTAMP": ts,
             "KC-API-PASSPHRASE": psp,
             "KC-API-KEY-VERSION": "2",
+            "Accept": "application/json",
             "Content-Type": "application/json",
         }
 
-    def _post(self, path: str, body: dict | None = None):
+    def _post_signed(self, path: str, body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """
+        POST signé en envoyant exactement la même chaîne que celle utilisée dans la signature.
+        ⚠️ N'utilise PAS le paramètre httpx `json=` pour éviter toute re-sérialisation.
+        """
+        url = self.base + path
+        # sérialisation compacte et stable (ordre non garanti côté dict -> ok car on signe EXACTEMENT ce qu'on envoie)
+        body_str = "" if body is None else json.dumps(body, separators=(",", ":"), ensure_ascii=False)
+        headers = self._headers("POST", path, body_str)
+
         with httpx.Client(timeout=10.0) as c:
-            r = c.post(self.base + path, headers=self._headers("POST", path, json.dumps(body) if body else ""), json=body)
+            r = c.post(url, headers=headers, content=(body_str.encode("utf-8") if body_str else None))
             if r.status_code >= 400:
-                log.error(f"HTTP {path} {r.status_code}: {r.text[:200]}")
+                # messages d'aide si 401 signature invalide
+                if r.status_code == 401:
+                    log.error(
+                        f"HTTP {path} 401: {r.text[:200]} — "
+                        f"Vérifiez: (1) clés **Futures** actives, (2) passphrase exacte, "
+                        f"(3) permission Trade, (4) horloge (offset={_SERVER_OFFSET:.3f}s)"
+                    )
+                else:
+                    log.error(f"HTTP {path} {r.status_code}: {r.text[:200]}")
                 r.raise_for_status()
-            return r.json()
+            return r.json() if r.content else {}
 
     # ---------------------- Events ----------------------
-    def on(self, event: str, cb: Callable[[Dict[str, Any]], None]):
+    def on(self, event: str, cb: Callable[[Dict[str, Any]], None]) -> None:
         self.listeners.setdefault(event, []).append(cb)
 
-    def _emit(self, event: str, payload: Dict[str, Any]):
+    def _emit(self, event: str, payload: Dict[str, Any]) -> None:
         for cb in self.listeners.get(event, []):
             try:
                 cb(payload)
             except Exception as e:
                 log.warning(f"listener error on '{event}': {e}")
 
-    # ---------------------- Bullet token ----------------------
-    async def _ensure_token(self):
-        # Toujours rafraîchir pour éviter expiration silencieuse
-        data = self._post(TOKEN_URL, {})
+    # ---------------------- Token bullet-private ----------------------
+    async def _ensure_token(self) -> None:
+        # resync avant demande (drift max 5s côté KuCoin)
+        _sync_server_time()
+
+        # Body vide recommandé par la doc (pas nécessaire d'envoyer "{}")
+        data = self._post_signed(TOKEN_PATH, None)
         d = data.get("data", {}) if isinstance(data, dict) else {}
-        inst = (d.get("instanceServers") or [None])[0] or {}
+        inst_list = d.get("instanceServers") or []
+        inst = inst_list[0] if inst_list else {}
 
         self.token = d.get("token")
         self.endpoint = inst.get("endpoint")
@@ -103,27 +149,39 @@ class KucoinPrivateWS:
         log.info(f"bullet-private ok pingInterval={self.ping_interval_ms}ms pingTimeout={self.ping_timeout_ms}ms")
 
     # ---------------------- Subscribe ----------------------
-    async def _subscribe(self):
+    async def _subscribe(self) -> None:
         assert self.ws is not None
+        # Private topics Futures (orders & position)
         subs = [
-            {"id": str(int(time.time()*1000)), "type": "subscribe", "topic": "/contractMarket/tradeOrders", "privateChannel": True, "response": True},
-            {"id": str(int(time.time()*1000))+":pos", "type": "subscribe", "topic": "/contract/position", "privateChannel": True, "response": True},
+            {
+                "id": str(_ts_ms()),
+                "type": "subscribe",
+                "topic": "/contractMarket/tradeOrders",
+                "privateChannel": True,
+                "response": True,
+            },
+            {
+                "id": str(_ts_ms()) + ":pos",
+                "type": "subscribe",
+                "topic": "/contract/position",
+                "privateChannel": True,
+                "response": True,
+            },
         ]
         for s in subs:
             await self.ws.send(json.dumps(s))
         log.info("subscriptions sent")
 
     # ---------------------- Ping / Recv ----------------------
-    async def _ping_loop(self):
+    async def _ping_loop(self) -> None:
         try:
             while self._running and self.ws:
-                pid = str(int(time.time() * 1000))
-                msg = {"id": pid, "type": "ping"}
-                await self.ws.send(json.dumps(msg))
-                # deadline: ping_timeout après envoi
+                pid = str(_ts_ms())
+                await self.ws.send(json.dumps({"id": pid, "type": "ping"}))
+                # deadline: timeout après l’envoi du ping
                 self._pong_deadline = time.time() + (self.ping_timeout_ms / 1000.0)
 
-                # dormir ~90% de l'intervalle pour ping avant expiration
+                # ping un peu avant l’intervalle serveur
                 sleep_s = max(1.0, (self.ping_interval_ms / 1000.0) * 0.9)
                 await asyncio.sleep(sleep_s)
 
@@ -134,7 +192,7 @@ class KucoinPrivateWS:
                 log.warning(f"ping loop error: {e}")
             await self._safe_close()
 
-    async def _recv_loop(self):
+    async def _recv_loop(self) -> None:
         try:
             while self._running and self.ws:
                 raw = await self.ws.recv()
@@ -171,7 +229,7 @@ class KucoinPrivateWS:
                 log.warning(f"ws loop error: {e}")
         await self._safe_close()
 
-    async def _safe_close(self):
+    async def _safe_close(self) -> None:
         try:
             if self.ws:
                 await self.ws.close()
@@ -187,17 +245,19 @@ class KucoinPrivateWS:
         self._pong_deadline = float("inf")
 
     # ---------------------- Lifecycle ----------------------
-    async def run(self):
+    async def run(self) -> None:
         self._running = True
         backoff = 1.0
         while self._running:
             try:
                 await self._ensure_token()
-                connect_id = str(int(time.time() * 1000))
-                # ping natif désactivé: on gère le ping applicatif KuCoin
+                connect_id = str(_ts_ms())
+                # ping/pong applicatif KuCoin -> désactiver le ping WebSocket natif
                 ws_url = f"{self.endpoint}?token={self.token}&connectId={connect_id}&acceptUserMessage=true"
                 log.info("connecting private WS...")
-                async with websockets.connect(ws_url, ping_interval=None, ping_timeout=None, max_size=2**22) as ws:
+                async with websockets.connect(
+                    ws_url, ping_interval=None, ping_timeout=None, max_size=2**22
+                ) as ws:
                     self.ws = ws
                     log.info("WS connected (private)")
                     backoff = 1.0
@@ -226,6 +286,6 @@ class KucoinPrivateWS:
             await asyncio.sleep(sleep_s)
             backoff = min(60.0, backoff * 2.0)
 
-    async def stop(self):
+    async def stop(self) -> None:
         self._running = False
         await self._safe_close()
