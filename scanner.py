@@ -1,6 +1,5 @@
-# scanner.py — scan complet, tri alpha (XBT→Z), logs filtrés
-import os
-import asyncio, time, uuid
+# scanner.py — scan cyclique, ordre alpha (XBT→Z), logs filtrés
+import asyncio, time, uuid, os
 from collections import deque
 import logging
 import pandas as pd
@@ -39,8 +38,7 @@ def _is_duplicate_signal(symbol: str, key: str, cooldown_sec: int) -> bool:
     return False
 
 # ====== Config locaux & constantes ======
-INSTIT_DEBUG_EVERY_SEC = 0
-LIQ_REFRESH_SEC = getattr(SETTINGS, "liq_refresh_sec", 30)
+LIQ_REFRESH_SEC      = getattr(SETTINGS, "liq_refresh_sec", 30)
 
 REQ_SCORE_MIN        = float(getattr(SETTINGS, "req_score_min", 1.2))
 INST_COMPONENTS_MIN  = int(getattr(SETTINGS, "inst_components_min", 2))
@@ -56,14 +54,18 @@ PERSIST_MIN_OK       = int(getattr(SETTINGS, "persist_min_ok", 1))
 SYMBOL_COOLDOWN_SEC  = int(getattr(SETTINGS, "symbol_cooldown_sec", 45))
 MIN_LIQ_NORM         = float(getattr(SETTINGS, "min_liq_norm", 0.0))
 
-BINANCE_BASE = "https://fapi.binance.com"
-OI_FUND_REFRESH_SEC = int(getattr(SETTINGS, "oi_fund_refresh_sec", 30))
-FUND_REF       = float(getattr(SETTINGS, "funding_ref", 0.00008))
-OI_DELTA_REF   = float(getattr(SETTINGS, "oi_delta_ref", 0.004))
-HTTP_TIMEOUT   = float(getattr(SETTINGS, "http_timeout_sec", 6.0))
-DEFAULT_LEVERAGE = int(getattr(SETTINGS, "default_leverage", 10))
+BINANCE_BASE         = "https://fapi.binance.com"
+FUND_REF             = float(getattr(SETTINGS, "funding_ref", 0.00008))
+OI_DELTA_REF         = float(getattr(SETTINGS, "oi_delta_ref", 0.004))
+HTTP_TIMEOUT         = float(getattr(SETTINGS, "http_timeout_sec", 6.0))
+DEFAULT_LEVERAGE     = int(getattr(SETTINGS, "default_leverage", 10))
 
-BINANCE_FUTURES_API = "https://fapi.binance.com"
+# Mode scan cyclique (nouveau)
+SEQUENTIAL_SCAN      = bool(getattr(SETTINGS, "sequential_scan", True))
+SCAN_WORKERS         = int(getattr(SETTINGS, "scan_workers", 8))
+SCAN_TIME_PER_SYMBOL = float(getattr(SETTINGS, "scan_time_per_symbol_sec", 3.0))
+
+BINANCE_FUTURES_API  = "https://fapi.binance.com"
 
 # ====== CVD Binance (delta tick-by-tick) ======
 class BinanceCVD:
@@ -234,7 +236,7 @@ def _tick_shift(symbol: str, px: float, ticks: int, meta, default_tick: float) -
 def _compute_global_score_sum(inst: dict) -> float:
     w_oi   = float(getattr(SETTINGS, "w_oi", 0.6))
     w_fund = float(getattr(SETTINGS, "w_funding", 0.2))
-    w_delta= float(getattr(SETTINGS, "W_DELTA", getattr(SETTINGS, "w_delta", 0.2)))
+    w_delta= float(getattr(SETTINGS, "w_delta", 0.2))
     w_liq  = float(getattr(SETTINGS, "w_liq", 0.5))
     w_book = float(getattr(SETTINGS, "w_book_imbal", 0.0))
     use_book = bool(getattr(SETTINGS, "use_book_imbal", USE_BOOK))
@@ -322,8 +324,8 @@ def _place_ioc_with_lev_retry(trader: KucoinTrader, sym_api: str, side: str, px:
         return trader.place_limit_ioc(sym_api, side, px)
     return ok, res
 
-# ====== Symbol loop ======
-async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: MacroCache, meta: dict):
+# ====== Symbol loop (scanné pendant un créneau, puis on rend la main) ======
+async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: 'MacroCache', meta: dict, time_budget_sec: float | None = None):
     logger = get_logger("scanner.symbol", symbol)
     w_cfg  = (SETTINGS.w_oi, SETTINGS.w_funding, SETTINGS.w_delta, SETTINGS.w_liq, SETTINGS.w_book_imbal)
     agg    = InstitutionalAggregator(symbol, w_cfg)
@@ -339,6 +341,7 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: MacroCache, meta:
         ref_notional=float(getattr(SETTINGS, "delta_notional_ref", 150_000.0)),
     )
 
+    loop_started = time.time()
     started_at = time.time()
     last_hb = 0.0
     last_liq_fetch = 0.0
@@ -382,12 +385,19 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: MacroCache, meta:
                 logger.exception("feed_ohlc loop error", extra={"symbol": symbol})
                 await asyncio.sleep(0.5)
 
+    # Démarre l’agrégateur & le feeder OHLC
     asyncio.create_task(agg.run())
     asyncio.create_task(feed_ohlc())
     logger.info("symbol task started", extra={"symbol": symbol})
     await asyncio.sleep(2.0)
 
     while True:
+        # ======= Fenêtre de scan (mode cyclique) =======
+        if time_budget_sec is not None and (time.time() - loop_started) > time_budget_sec:
+            # On clôt proprement cette passe pour passer au symbole suivant
+            logger.info("scan window done", extra={"symbol": symbol})
+            return
+
         try:
             await asyncio.sleep(1.1)
             _, inst = agg.get_meta_score()
@@ -412,8 +422,8 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: MacroCache, meta:
                 except Exception as e:
                     logger.exception(f"[LIQ PACK] fetch error: {e}", extra={"symbol": symbol})
 
-            # OI/Funding
-            if (time.time() - last_oi_fund_fetch) > OI_FUND_REFRESH_SEC:
+            # OI/Funding (rafraîchi sans spam)
+            if (time.time() - last_oi_fund_fetch) > getattr(SETTINGS, "oi_fund_refresh_sec", 30):
                 last_oi_fund_fetch = time.time()
                 try:
                     oi_sc = _fetch_oi_score_binance(symbol)
@@ -432,15 +442,15 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: MacroCache, meta:
 
             inst_merged = {**inst, **(liq_pack_cache or {}), **(oi_fund_cache or {})}
 
-            # Δ tick-by-tick
+            # Δ tick-by-tick via Binance
             try:
                 bsym = map_symbol_to_binance(symbol)
                 cvd_stats = cvd.update(bsym)
                 if cvd_stats:
-                    inst_merged["delta_score"] = float(cvd_stats["delta_score"])
-                    inst_merged["delta_cvd_usd"]  = float(cvd_stats["cvd_notional"])
-                    inst_merged["delta_buy_usd"]  = float(cvd_stats["buy_notional"])
-                    inst_merged["delta_sell_usd"] = float(cvd_stats["sell_notional"])
+                    inst_merged["delta_score"]   = float(cvd_stats["delta_score"])
+                    inst_merged["delta_cvd_usd"] = float(cvd_stats["cvd_notional"])
+                    inst_merged["delta_buy_usd"] = float(cvd_stats["buy_notional"])
+                    inst_merged["delta_sell_usd"]= float(cvd_stats["sell_notional"])
             except Exception:
                 logger.exception("CVD update failed", extra={"symbol": symbol})
 
@@ -472,7 +482,7 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: MacroCache, meta:
             score += boost
             inst_merged["score"] = score
 
-            # Heartbeat 30s
+            # Heartbeat 30s (uniquement pour le symbole en cours)
             if time.time() - last_hb > 30:
                 last_hb = time.time()
                 logger.info(
@@ -482,7 +492,7 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: MacroCache, meta:
                     extra={"symbol": symbol}
                 )
 
-            # warmup
+            # warmup local de la passe
             if (time.time() - started_at) < getattr(SETTINGS, "warmup_seconds", 5):
                 continue
 
@@ -492,7 +502,7 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: MacroCache, meta:
             if sum(persist_buf) < PERSIST_MIN_OK:
                 continue
 
-            # Cooldown
+            # Cooldown par symbole
             if (time.time() - last_trade_ts) < SYMBOL_COOLDOWN_SEC:
                 continue
 
@@ -611,12 +621,16 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: MacroCache, meta:
                     send_msg(msg)
                     last_trade_ts = time.time()
 
-                    # Attente fill / re-quotes
+                    # Attente fill / re-quotes pendant la fenêtre restante
                     t0 = time.time()
                     rq = 0
                     while time.time() - t0 < getattr(SETTINGS, "entry_timeout_sec", 2.2):
                         await asyncio.sleep(0.2)
                     while rq < getattr(SETTINGS, "max_requotes", 1):
+                        # si la fenêtre se termine, on sort
+                        if time_budget_sec is not None and (time.time() - loop_started) > time_budget_sec:
+                            logger.info("scan window done", extra={"symbol": symbol})
+                            return
                         rq += 1
                         px_maker = _tick_shift(symbol, px_maker, +1 if side == 'buy' else -1, meta, getattr(SETTINGS, "default_tick_size", 0.001))
                         px_maker = round_price(symbol, px_maker, meta, getattr(SETTINGS, "default_tick_size", 0.001))
@@ -637,7 +651,7 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: MacroCache, meta:
                         while time.time() - t0 < getattr(SETTINGS, "entry_timeout_sec", 2.2):
                             await asyncio.sleep(0.2)
 
-                    # Fallback IOC
+                    # Fallback IOC en fin de fenêtre si demandé
                     if getattr(SETTINGS, "use_ioc_fallback", True):
                         tick = float(meta.get(symbol, {}).get("tickSize", getattr(SETTINGS, "default_tick_size", 0.001)))
                         aggr_ticks = 50
@@ -653,21 +667,23 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: MacroCache, meta:
 
 # ====== Build universe (tri alpha, XBT d'abord), logs filtrés ======
 def _quiet_noise_loggers():
+    # On garde les logs utiles: seulement le symbole scanné affiche ses messages.
     logging.getLogger("kucoin.trader").setLevel(logging.WARNING)
     logging.getLogger("kucoin.ws").setLevel(logging.WARNING)
     logging.getLogger("institutional_data").setLevel(logging.WARNING)
 
 def _build_symbols() -> list[str]:
-    # Intersection KuCoin × Binance pour éviter symboles invalides côté funding/liquidity
-    excl = getattr(SETTINGS, "exclude_symbols", "")
+    # Intersection KuCoin × Binance → évite les funding/liquidity invalides
+    excl  = getattr(SETTINGS, "exclude_symbols", "")
     limit = int(getattr(SETTINGS, "symbols_max", 450) or 0)
-    common = common_usdt_symbols(limit=0, exclude_csv=excl)  # pas de limite ici
+
+    common = common_usdt_symbols(limit=0, exclude_csv=excl)
 
     # Dédup + tri alpha
     seen = set()
     common = [s for s in sorted(common) if not (s in seen or seen.add(s))]
 
-    # Prioriser XBTUSDT (fallback BTCUSDT)
+    # Prioriser XBTUSDT puis BTCUSDT
     ordered = []
     if "XBTUSDT" in common:
         ordered.append("XBTUSDT")
@@ -678,13 +694,18 @@ def _build_symbols() -> list[str]:
         if s not in ordered:
             ordered.append(s)
 
-    # Appliquer la limite finale si demandée
     if limit and limit > 0:
         ordered = ordered[:limit]
-
     return ordered
 
-# ====== Main ======
+# ====== Workers séquentiels ======
+async def _worker_cyclic(worker_id: int, symbols: list[str], kws: KucoinPrivateWS, macro: 'MacroCache', meta: dict):
+    # Chaque worker parcourt la liste entière dans l'ordre, puis recommence.
+    # Avec plusieurs workers, on couvre plus vite l’alphabet.
+    while True:
+        for sym in symbols:
+            await run_symbol(sym, kws, macro, meta, time_budget_sec=SCAN_TIME_PER_SYMBOL)
+
 async def main():
     _quiet_noise_loggers()
     rootlog.info("Starting scanner...")
@@ -692,7 +713,7 @@ async def main():
     # Univers de scan
     if getattr(SETTINGS, "auto_symbols", True):
         symbols = _build_symbols()
-        # Si l'utilisateur force SYMBOLS via env (SETTINGS.symbols rempli ET var env SYMBOLS présente)
+        # si l'utilisateur a passé SYMBOLS via env, on respecte
         if getattr(SETTINGS, "symbols", None) and len(SETTINGS.symbols) > 0 and os.getenv("SYMBOLS", ""):
             user_list = [s.strip().upper() for s in SETTINGS.symbols if s.strip()]
             user_list = sorted(set(user_list))
@@ -707,20 +728,29 @@ async def main():
     # Résumé clair des paires scannées
     n = len(SETTINGS.symbols)
     preview = ", ".join(SETTINGS.symbols[:25]) + (" ..." if n > 25 else "")
-    rootlog.info(f"[SCAN] {n} paires prêtes (alpha, XBT first): {preview}")
+    rootlog.info(f"[SCAN] {n} paires prêtes (alpha, XBT/BTC first): {preview}")
 
     # Métadonnées / WS / Macro
-    meta = fetch_symbol_meta()
+    meta  = fetch_symbol_meta()
     macro = MacroCache()
-    kws = KucoinPrivateWS()
+    kws   = KucoinPrivateWS()
     asyncio.create_task(kws.run())
 
-    # Lancer une tâche par symbole
-    tasks = []
-    for i, sym in enumerate(SETTINGS.symbols):
-        tasks.append(asyncio.create_task(run_symbol(sym, kws, macro, meta)))
-        await asyncio.sleep(0.05)
-    await asyncio.gather(*tasks)
+    if SEQUENTIAL_SCAN:
+        # Lancement de W workers séquentiels qui parcourent l'alphabet en boucle
+        workers = max(1, int(SCAN_WORKERS))
+        tasks = []
+        for i in range(workers):
+            tasks.append(asyncio.create_task(_worker_cyclic(i+1, SETTINGS.symbols, kws, macro, meta)))
+            await asyncio.sleep(0.05)
+        await asyncio.gather(*tasks)
+    else:
+        # Mode ancien: une tâche par symbole (verbeux, non séquentiel)
+        tasks = []
+        for i, sym in enumerate(SETTINGS.symbols):
+            tasks.append(asyncio.create_task(run_symbol(sym, kws, macro, meta, time_budget_sec=None)))
+            await asyncio.sleep(0.05)
+        await asyncio.gather(*tasks)
 
 if __name__ == "__main__":
     asyncio.run(main())
