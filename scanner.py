@@ -1,6 +1,9 @@
-# scanner.py — scan cyclique, ordre alpha (XBT→Z), logs filtrés
-import asyncio, time, uuid, os, logging, pandas as pd, httpx, random
+# scanner.py — scan séquentiel qui défile, 400 perp USDT, ordre alpha (XBT→Z), logs filtrés
+import asyncio, time, uuid, os
 from collections import deque
+import logging
+import pandas as pd
+import httpx
 from typing import Optional, List, Dict
 
 from config import SETTINGS
@@ -10,7 +13,10 @@ from kucoin_trader import KucoinTrader
 from kucoin_ws import KucoinPrivateWS
 from order_manager import OrderManager
 from orderflow_features import compute_atr
-from kucoin_utils import fetch_klines, fetch_symbol_meta, round_price, common_usdt_symbols
+from kucoin_utils import (
+    fetch_klines, fetch_symbol_meta, round_price,
+    common_usdt_symbols
+)
 from telegram_notifier import send_msg
 from institutional_data import get_macro_total_mcap, get_macro_total2, get_macro_btc_dominance
 from adverse_selection import should_cancel_or_requote
@@ -33,7 +39,7 @@ def _is_duplicate_signal(symbol: str, key: str, cooldown_sec: int) -> bool:
     return False
 
 # ====== Config locaux & constantes ======
-LIQ_REFRESH_SEC      = getattr(SETTINGS, "liq_refresh_sec", 30)
+LIQ_REFRESH_SEC      = float(getattr(SETTINGS, "liq_refresh_sec", 30))
 REQ_SCORE_MIN        = float(getattr(SETTINGS, "req_score_min", 1.2))
 INST_COMPONENTS_MIN  = int(getattr(SETTINGS, "inst_components_min", 2))
 OI_MIN               = float(getattr(SETTINGS, "oi_req_min", 0.25))
@@ -54,10 +60,11 @@ OI_DELTA_REF         = float(getattr(SETTINGS, "oi_delta_ref", 0.004))
 HTTP_TIMEOUT         = float(getattr(SETTINGS, "http_timeout_sec", 6.0))
 DEFAULT_LEVERAGE     = int(getattr(SETTINGS, "default_leverage", 10))
 
-# ====== Mode scan cyclique (scalable 400+) ======
-SEQUENTIAL_SCAN      = bool(getattr(SETTINGS, "sequential_scan", True))
-SCAN_WORKERS         = int(getattr(SETTINGS, "scan_workers", 16))  # FIX: défaut + élevé
-SCAN_TIME_PER_SYMBOL = float(getattr(SETTINGS, "scan_time_per_symbol_sec", 0.8))  # FIX: plus court pour 400
+# ====== Mode scan séquentiel (défilement) ======
+# On force le mode "défilement" : un ou plusieurs workers, mais jamais une tâche par symbole.
+SCAN_WORKERS         = int(getattr(SETTINGS, "scan_workers", 1))  # 1 = défilement pur
+SCAN_TIME_PER_SYMBOL = float(getattr(SETTINGS, "scan_time_per_symbol_sec", 1.0))
+
 BINANCE_FUTURES_API  = "https://fapi.binance.com"
 
 # ====== CVD Binance (delta tick-by-tick) ======
@@ -172,7 +179,7 @@ class MacroCache:
         self.data = {}
     def refresh(self):
         now = time.time()
-        if now - self.last < getattr(SETTINGS, "macro_refresh_minutes", 5) * 60:
+        if now - self.last < float(getattr(SETTINGS, "macro_refresh_minutes", 5)) * 60.0:
             return self.data
         total  = get_macro_total_mcap()
         total2 = get_macro_total2() if getattr(SETTINGS, "use_total2", False) else 0.0
@@ -185,7 +192,7 @@ class MacroCache:
 class OHLCV1m:
     def __init__(self, meta: dict):
         self.df: Dict[str, pd.DataFrame] = {}
-        self.meta = meta
+        self.meta = meta  # display_symbol -> {symbol_api, tickSize, pricePrecision, ...}
 
     def bootstrap(self, sym: str):
         logger = get_logger("scanner.bootstrap", sym)
@@ -291,7 +298,7 @@ def _ensure_leverage_if_needed(trader: KucoinTrader, sym_api: str, logger, want_
             logger.warning(f"LEV ensure failed: {e}")
 
 def _place_limit_with_lev_retry(trader: KucoinTrader, sym_api: str, side: str, px: float, client_oid: str, post_only: bool, logger, value_qty: Optional[float] = None, leverage: Optional[int] = None):
-    ok, res = trader.place_limit(sym_api, side, px, client_oid, post_only=post_only, value_qty=value_qty)  # FIX: value_qty
+    ok, res = trader.place_limit(sym_api, side, px, client_oid, post_only=post_only, value_qty=value_qty)
     if ok:
         return ok, res
     try:
@@ -301,12 +308,12 @@ def _place_limit_with_lev_retry(trader: KucoinTrader, sym_api: str, side: str, p
         code, msg = None, str(res)
     if (code == "100001") or ("Leverage parameter invalid" in (msg or "")):
         _ensure_leverage_if_needed(trader, sym_api, logger, want_lev=(leverage or DEFAULT_LEVERAGE))
-        ok2, res2 = trader.place_limit(sym_api, side, px, client_oid, post_only=post_only, value_qty=value_qty)  # FIX: value_qty
+        ok2, res2 = trader.place_limit(sym_api, side, px, client_oid, post_only=post_only, value_qty=value_qty)
         return ok2, res2
     return ok, res
 
 def _place_ioc_with_lev_retry(trader: KucoinTrader, sym_api: str, side: str, px: float, logger, value_qty: Optional[float] = None, leverage: Optional[int] = None):
-    ok, res = trader.place_limit_ioc(sym_api, side, px, value_qty=value_qty)  # FIX: value_qty
+    ok, res = trader.place_limit_ioc(sym_api, side, px, value_qty=value_qty)
     if ok:
         return ok, res
     try:
@@ -316,10 +323,10 @@ def _place_ioc_with_lev_retry(trader: KucoinTrader, sym_api: str, side: str, px:
         code, msg = None, str(res)
     if (code == "100001") or ("Leverage parameter invalid" in (msg or "")):
         _ensure_leverage_if_needed(trader, sym_api, logger, want_lev=(leverage or DEFAULT_LEVERAGE))
-        return trader.place_limit_ioc(sym_api, side, px, value_qty=value_qty)  # FIX: value_qty
+        return trader.place_limit_ioc(sym_api, side, px, value_qty=value_qty)
     return ok, res
 
-# ====== Symbol loop ======
+# ====== Symbol loop (une passe courte par symbole, puis on défile) ======
 async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: 'MacroCache', meta: dict, time_budget_sec: Optional[float] = None):
     logger = get_logger("scanner.symbol", symbol)
     w_cfg  = (
@@ -335,7 +342,7 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: 'MacroCache', met
     om     = OrderManager()
 
     sym_api = meta.get(symbol, {}).get("symbol_api", symbol)
-    cvd = BinanceCVD(
+    cvd     = BinanceCVD(
         window_sec=int(getattr(SETTINGS, "delta_window_sec", 300)),
         http_timeout=float(getattr(SETTINGS, "http_timeout_sec", 6.0)),
         ref_notional=float(getattr(SETTINGS, "delta_notional_ref", 150_000.0)),
@@ -384,13 +391,12 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: 'MacroCache', met
     asyncio.create_task(agg.run())
     asyncio.create_task(feed_ohlc())
     logger.info("symbol task started", extra={"symbol": symbol})
-    await asyncio.sleep(2.0 + random.random()*0.5)  # FIX: jitter de départ
+    await asyncio.sleep(1.5)
 
     while True:
         if time_budget_sec is not None and (time.time() - loop_started) > time_budget_sec:
             logger.info("scan window done", extra={"symbol": symbol})
             return
-
         try:
             await asyncio.sleep(1.0)
             _, inst = agg.get_meta_score()
@@ -398,12 +404,8 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: 'MacroCache', met
             price = float(df["close"].iloc[-1])
             macro_data = macro.refresh()
 
-            # Throttling léger par symbole (évite le burst sur 400)
-            liq_due   = (time.time() - last_liq_fetch) > LIQ_REFRESH_SEC + random.uniform(-2, 2)
-            oi_due    = (time.time() - last_oi_fund_fetch) > getattr(SETTINGS, "oi_fund_refresh_sec", 30) + random.uniform(-3, 3)
-
-            # LIQ PACK
-            if liq_due:
+            # LIQ PACK (throttle)
+            if (time.time() - last_liq_fetch) > LIQ_REFRESH_SEC:
                 last_liq_fetch = time.time()
                 try:
                     liq_pack_cache = get_liq_pack(symbol)
@@ -419,8 +421,8 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: 'MacroCache', met
                 except Exception as e:
                     logger.exception(f"[LIQ PACK] fetch error: {e}", extra={"symbol": symbol})
 
-            # OI/Funding
-            if oi_due:
+            # OI/Funding (throttle)
+            if (time.time() - last_oi_fund_fetch) > float(getattr(SETTINGS, "oi_fund_refresh_sec", 30.0)):
                 last_oi_fund_fetch = time.time()
                 try:
                     oi_sc = _fetch_oi_score_binance(symbol)
@@ -440,17 +442,7 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: 'MacroCache', met
             try:
                 bsym = map_symbol_to_binance(symbol)
                 if bsym:
-                    cvd_stats = self_cvd = getattr(run_symbol, "_cvd_cache", None)
-                    if self_cvd is None:
-                        run_symbol._cvd_cache = {}
-                        self_cvd = run_symbol._cvd_cache
-                    if bsym not in self_cvd:
-                        self_cvd[bsym] = BinanceCVD(
-                            window_sec=int(getattr(SETTINGS, "delta_window_sec", 300)),
-                            http_timeout=float(getattr(SETTINGS, "http_timeout_sec", 6.0)),
-                            ref_notional=float(getattr(SETTINGS, "delta_notional_ref", 150_000.0)),
-                        )
-                    cvd_stats = self_cvd[bsym].update(bsym)
+                    cvd_stats = cvd.update(bsym)
                     if cvd_stats:
                         inst_merged["delta_score"]   = float(cvd_stats["delta_score"])
                         inst_merged["delta_cvd_usd"] = float(cvd_stats["cvd_notional"])
@@ -505,7 +497,7 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: 'MacroCache', met
                 )
 
             # Warmup
-            if (time.time() - started_at) < getattr(SETTINGS, "warmup_seconds", 5):
+            if (time.time() - started_at) < float(getattr(SETTINGS, "warmup_seconds", 5.0)):
                 continue
 
             # Gate + persistance
@@ -527,19 +519,19 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: 'MacroCache', met
                 if not pos.tp1_done:
                     if (pos.side == "LONG" and price >= pos.tp1) or (pos.side == "SHORT" and price <= pos.tp1):
                         ro_side = "sell" if pos.side == "LONG" else "buy"
-                        part_val = pos.qty_value * getattr(SETTINGS, "tp1_part", 0.5)
+                        part_val = pos.qty_value * float(getattr(SETTINGS, "tp1_part", 0.5))
                         ok, _ = trader.close_reduce_market(sym_api, ro_side, value_qty=part_val)
                         if ok:
                             om.close_half_at_tp1(symbol)
                             send_msg(f"✅ {symbol} TP1 atteint — passage BE")
                             logger.info("TP1 hit → BE", extra={"symbol": symbol})
                 else:
-                    trail = getattr(SETTINGS, "trail_mult_atr", 0.5) * float(atr)
+                    trail = float(getattr(SETTINGS, "trail_mult_atr", 0.5)) * float(atr)
                     if pos.side == "LONG":
                         pos.sl = max(pos.sl, price - trail)
                         if price <= pos.sl:
                             ro_side = "sell"
-                            rem_val = pos.qty_value * (1.0 - getattr(SETTINGS, "tp1_part", 0.5))
+                            rem_val = pos.qty_value * (1.0 - float(getattr(SETTINGS, "tp1_part", 0.5)))
                             ok, _ = trader.close_reduce_market(sym_api, ro_side, value_qty=rem_val)
                             if ok:
                                 om.close_all(symbol, "TRAIL_LONG"); send_msg(f"🛑 {symbol} Trailing stop LONG")
@@ -547,7 +539,7 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: 'MacroCache', met
                         pos.sl = min(pos.sl, price + trail)
                         if price >= pos.sl:
                             ro_side = "buy"
-                            rem_val = pos.qty_value * (1.0 - getattr(SETTINGS, "tp1_part", 0.5))
+                            rem_val = pos.qty_value * (1.0 - float(getattr(SETTINGS, "tp1_part", 0.5)))
                             ok, _ = trader.close_reduce_market(sym_api, ro_side, value_qty=rem_val)
                             if ok:
                                 om.close_all(symbol, "TRAIL_SHORT"); send_msg(f"🛑 {symbol} Trailing stop SHORT")
@@ -556,7 +548,7 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: 'MacroCache', met
                     pos = om.pos[symbol]
                     if (pos.side == "LONG" and price >= pos.tp2) or (pos.side == "SHORT" and price <= pos.tp2):
                         ro_side = "sell" if pos.side == "LONG" else "buy"
-                        rem_val = pos.qty_value * (1.0 - getattr(SETTINGS, "tp1_part", 0.5)) if pos.tp1_done else pos.qty_value
+                        rem_val = pos.qty_value * (1.0 - float(getattr(SETTINGS, "tp1_part", 0.5))) if pos.tp1_done else pos.qty_value
                         ok, _ = trader.close_reduce_market(sym_api, ro_side, value_qty=rem_val)
                         if ok:
                             om.close_all(symbol, "TP2"); send_msg(f"🎯 {symbol} TP2 — position clôturée")
@@ -569,38 +561,38 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: 'MacroCache', met
                     logger.info(f"rej s={score:.2f} ok={comps_ok}/{INST_COMPONENTS_MIN}", extra={"symbol": symbol})
                     continue
 
-                # De-dup
+                # Dedup
                 try:
-                    key_entry = round_price(symbol, dec.entry, meta, getattr(SETTINGS, "default_tick_size", 0.001))
-                    key_sl    = round_price(symbol, dec.sl,    meta, getattr(SETTINGS, "default_tick_size", 0.001))
-                    key_tp1   = round_price(symbol, dec.tp1,   meta, getattr(SETTINGS, "default_tick_size", 0.001))
-                    key_tp2   = round_price(symbol, dec.tp2,   meta, getattr(SETTINGS, "default_tick_size", 0.001))
+                    key_entry = round_price(symbol, dec.entry, meta, float(getattr(SETTINGS, "default_tick_size", 0.001)))
+                    key_sl    = round_price(symbol, dec.sl,    meta, float(getattr(SETTINGS, "default_tick_size", 0.001)))
+                    key_tp1   = round_price(symbol, dec.tp1,   meta, float(getattr(SETTINGS, "default_tick_size", 0.001)))
+                    key_tp2   = round_price(symbol, dec.tp2,   meta, float(getattr(SETTINGS, "default_tick_size", 0.001)))
                     _key = f"{dec.side}:{key_entry}:{key_sl}:{key_tp1}:{key_tp2}"
                 except Exception:
                     _key = f"{dec.side}:{dec.entry}:{dec.sl}:{dec.tp1}:{dec.tp2}"
-                if _is_duplicate_signal(symbol, _key, getattr(SETTINGS, "symbol_cooldown_sec", 45)):
+                if _is_duplicate_signal(symbol, _key, int(getattr(SETTINGS, "symbol_cooldown_sec", 45))):
                     logger.info("Duplicate signal suppressed by cooldown", extra={"symbol": symbol})
                     continue
 
                 adv = should_cancel_or_requote("LONG" if dec.side == "LONG" else "SHORT", inst_merged, SETTINGS)
-                if adv != "OK" and getattr(SETTINGS, "cancel_on_adverse", False):
+                if adv != "OK" and bool(getattr(SETTINGS, "cancel_on_adverse", False)):
                     logger.info(f"block adverse={adv}", extra={"symbol": symbol})
                     continue
 
                 side = "buy" if dec.side == "LONG" else "sell"
-                entry_px = round_price(symbol, dec.entry, meta, getattr(SETTINGS, "default_tick_size", 0.001))
-                px_maker = _tick_shift(symbol, entry_px, -1 if side == "buy" else +1, meta, getattr(SETTINGS, "default_tick_size", 0.001))
-                px_maker = round_price(symbol, px_maker, meta, getattr(SETTINGS, "default_tick_size", 0.001))
+                entry_px = round_price(symbol, dec.entry, meta, float(getattr(SETTINGS, "default_tick_size", 0.001)))
+                px_maker = _tick_shift(symbol, entry_px, -1 if side == "buy" else +1, meta, float(getattr(SETTINGS, "default_tick_size", 0.001)))
+                px_maker = round_price(symbol, px_maker, meta, float(getattr(SETTINGS, "default_tick_size", 0.001)))
 
-                stage_fracs = [getattr(SETTINGS, "stage1_fraction", 0.35), 1.0 - getattr(SETTINGS, "stage1_fraction", 0.35)] if getattr(SETTINGS, "two_stage_entry", False) else [1.0]
+                stage_fracs = [float(getattr(SETTINGS, "stage1_fraction", 0.35)), 1.0 - float(getattr(SETTINGS, "stage1_fraction", 0.35))] if bool(getattr(SETTINGS, "two_stage_entry", False)) else [1.0]
 
                 for i, frac in enumerate(stage_fracs):
                     oid = str(uuid.uuid4()) + f"-s{i+1}"
                     ok, res = _place_limit_with_lev_retry(
                         trader, sym_api, side, px_maker, oid,
-                        post_only=getattr(SETTINGS, "post_only_entries", True),
+                        post_only=bool(getattr(SETTINGS, "post_only_entries", True)),
                         logger=logger,
-                        value_qty=getattr(SETTINGS, "margin_per_trade", 20.0),
+                        value_qty=float(getattr(SETTINGS, "margin_per_trade", 20.0)),
                         leverage=DEFAULT_LEVERAGE,
                     )
                     logger.info(f"ENTRY {side} px={px_maker} stg={i+1}/{len(stage_fracs)} ok={ok} res={res}", extra={"symbol": symbol})
@@ -622,47 +614,47 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: 'MacroCache', met
                     msg = (
                         f"🚀 {symbol} {dec.side} — stage {i+1}/{len(stage_fracs)} • post-only\n"
                         f"@ {px_maker} | SL {dec.sl:.5g} | TP1 {dec.tp1:.5g} | TP2 {dec.tp2:.5g}\n"
-                        f"R:R min {getattr(SETTINGS,'req_rr_min',1.2):.2f} • score {inst_merged.get('score',0):.2f}\n"
+                        f"R:R min {float(getattr(SETTINGS,'req_rr_min',1.2)):.2f} • score {inst_merged.get('score',0):.2f}\n"
                         f"{comp_txt} • liq={liq_src}"
                     )
                     send_msg(msg)
                     last_trade_ts = time.time()
 
-                    # Fenêtre de fill
+                    # Fenêtre de fill + re-quotes (courte, on reste dans le budget de la passe)
                     t0 = time.time()
                     rq = 0
-                    while time.time() - t0 < getattr(SETTINGS, "entry_timeout_sec", 2.0):
+                    while time.time() - t0 < float(getattr(SETTINGS, "entry_timeout_sec", 2.0)):
                         await asyncio.sleep(0.2)
-                    while rq < getattr(SETTINGS, "max_requotes", 1):
+                    while rq < int(getattr(SETTINGS, "max_requotes", 1)):
                         if time_budget_sec is not None and (time.time() - loop_started) > time_budget_sec:
                             logger.info("scan window done", extra={"symbol": symbol})
                             return
                         rq += 1
-                        px_maker = _tick_shift(symbol, px_maker, +1 if side == 'buy' else -1, meta, getattr(SETTINGS, "default_tick_size", 0.001))
-                        px_maker = round_price(symbol, px_maker, meta, getattr(SETTINGS, "default_tick_size", 0.001))
+                        px_maker = _tick_shift(symbol, px_maker, +1 if side == 'buy' else -1, meta, float(getattr(SETTINGS, "default_tick_size", 0.001)))
+                        px_maker = round_price(symbol, px_maker, meta, float(getattr(SETTINGS, "default_tick_size", 0.001)))
                         trader.cancel_by_client_oid(oid)
                         oid = str(uuid.uuid4()) + f"-rq{rq}"
                         ok, _ = _place_limit_with_lev_retry(
                             trader, sym_api, side, px_maker, oid,
-                            post_only=getattr(SETTINGS, "post_only_entries", True),
+                            post_only=bool(getattr(SETTINGS, "post_only_entries", True)),
                             logger=logger,
-                            value_qty=getattr(SETTINGS, "margin_per_trade", 20.0),
+                            value_qty=float(getattr(SETTINGS, "margin_per_trade", 20.0)),
                             leverage=DEFAULT_LEVERAGE,
                         )
-                        logger.info(f"REQUOTE {rq}/{getattr(SETTINGS,'max_requotes',1)} px={px_maker} ok={ok}", extra={"symbol": symbol})
+                        logger.info(f"REQUOTE {rq}/{int(getattr(SETTINGS,'max_requotes',1))} px={px_maker} ok={ok}", extra={"symbol": symbol})
                         if not ok:
                             break
                         om.add_pending(oid, symbol, side, px_maker)
                         t0 = time.time()
-                        while time.time() - t0 < getattr(SETTINGS, "entry_timeout_sec", 2.0):
+                        while time.time() - t0 < float(getattr(SETTINGS, "entry_timeout_sec", 2.0)):
                             await asyncio.sleep(0.2)
 
-                    # Fallback IOC
-                    if getattr(SETTINGS, "use_ioc_fallback", True):
-                        tick = float(meta.get(symbol, {}).get("tickSize", getattr(SETTINGS, "default_tick_size", 0.001)))
+                    # Fallback IOC en fin de fenêtre si demandé
+                    if bool(getattr(SETTINGS, "use_ioc_fallback", True)):
+                        tick = float(meta.get(symbol, {}).get("tickSize", float(getattr(SETTINGS, "default_tick_size", 0.001))))
                         aggr_ticks = 50
                         ioc_px = round_price(symbol, entry_px + aggr_ticks * tick if side == "buy" else entry_px - aggr_ticks * tick, meta, tick)
-                        ok, _ = _place_ioc_with_lev_retry(trader, sym_api, side, ioc_px, logger, value_qty=getattr(SETTINGS, "margin_per_trade", 20.0))
+                        ok, _ = _place_ioc_with_lev_retry(trader, sym_api, side, ioc_px, logger, value_qty=float(getattr(SETTINGS, "margin_per_trade", 20.0)))
                         logger.info(f"IOC tried ok={ok} px={ioc_px}", extra={"symbol": symbol})
                         if ok:
                             send_msg(f"⚡ {symbol} — IOC fallback déclenché (@ {ioc_px})")
@@ -671,72 +663,85 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: 'MacroCache', met
             logger.exception("run_symbol loop error", extra={"symbol": symbol})
             await asyncio.sleep(0.5)
 
-# ====== Build universe (tri alpha, XBT d'abord), logs filtrés ======
+# ====== Build universe (400 perp USDT), logs filtrés ======
 def _quiet_noise_loggers():
     logging.getLogger("kucoin.trader").setLevel(logging.WARNING)
     logging.getLogger("kucoin.ws").setLevel(logging.WARNING)
     logging.getLogger("institutional_data").setLevel(logging.WARNING)
 
-def _build_symbols() -> List[str]:
-    # Intersection KuCoin × Binance → évite les funding/liquidity invalides
-    excl  = getattr(SETTINGS, "exclude_symbols", "")
-    # FIX: par défaut 400, et on respecte un éventuel env SYMBOLS_MAX
-    limit_cfg = int(getattr(SETTINGS, "symbols_max", int(os.getenv("SYMBOLS_MAX", "400"))))
-    common = common_usdt_symbols(limit=0, exclude_csv=excl)
+def _prioritize_xbt_btc(symbols: List[str]) -> List[str]:
+    ordered = []
+    if "XBTUSDT" in symbols:
+        ordered.append("XBTUSDT")
+    elif "BTCUSDT" in symbols:
+        ordered.append("BTCUSDT")
+    for s in symbols:
+        if s not in ordered:
+            ordered.append(s)
+    return ordered
 
+def _fallback_symbols_from_meta(target_max: int) -> List[str]:
+    # Fallback robuste : on repart des métadonnées KuCoin Futures
+    meta = fetch_symbol_meta()  # {display_symbol: {..., symbol_api, tickSize, ...}}
+    syms = sorted([s for s in meta.keys() if s.endswith("USDT")])  # perp USDT
+    # Intersection avec Binance (pour funding/liq)
+    syms = [s for s in syms if map_symbol_to_binance(s)]
+    syms = _prioritize_xbt_btc(syms)
+    return syms[:target_max] if target_max > 0 else syms
+
+def _build_symbols() -> List[str]:
+    # Objectif : ~400 perp USDT
+    # Si l’utilisateur fournit SYMBOLS (liste), on respecte et on ne touche pas.
+    user_forced = os.getenv("SYMBOLS", "").strip() != ""
+    target_max_env = int(os.getenv("SYMBOLS_MAX", "400"))
+    target_max_cfg = int(getattr(SETTINGS, "symbols_max", target_max_env))
+    target_max = max(400, target_max_cfg) if not user_forced else target_max_cfg  # vise 400 si pas de liste utilisateur
+
+    excl = getattr(SETTINGS, "exclude_symbols", "")
+    try:
+        # 1) Essai via helper (intersection prête)
+        common = common_usdt_symbols(limit=10_000, exclude_csv=excl)  # FIX: pas de 40 implicite
+    except Exception:
+        common = []
     # Dédup + tri alpha
     seen = set()
     common = [s for s in sorted(common) if not (s in seen or seen.add(s))]
+    # Intersection Binance (sécurité pour funding/liq)
+    common = [s for s in common if map_symbol_to_binance(s)]
 
-    # Prioriser XBTUSDT puis BTCUSDT
-    ordered = []
-    if "XBTUSDT" in common:
-        ordered.append("XBTUSDT")
-    elif "BTCUSDT" in common:
-        ordered.append("BTCUSDT")
-    for s in common:
-        if s not in ordered:
-            ordered.append(s)
+    # Si ça renvoie trop peu (< 200), fallback méta
+    if len(common) < 200:
+        rootlog.info(f"[SYMS] helper renvoie {len(common)} syms → fallback via meta()")
+        common = _fallback_symbols_from_meta(target_max*2)
 
-    if limit_cfg and limit_cfg > 0:
-        ordered = ordered[:limit_cfg]  # FIX: impose le plafond effectif (400)
-    return ordered
+    common = _prioritize_xbt_btc(common)
+    return common[:target_max] if target_max > 0 else common
 
-# ====== Workers (sharding) ======
-async def _worker_cyclic(worker_id: int, shard: List[str], kws: KucoinPrivateWS, macro: 'MacroCache', meta: dict):
-    # FIX: chaque worker ne parcourt QUE sa part (shard) → pas de double-scan
+# ====== Worker séquentiel (défilement) ======
+async def _worker_cyclic(worker_id: int, symbols: List[str], kws: KucoinPrivateWS, macro: 'MacroCache', meta: dict):
+    total = len(symbols)
     while True:
-        for sym in shard:
+        for idx, sym in enumerate(symbols, start=1):
+            rootlog.info(f"[{worker_id}] → ({idx}/{total}) {sym}")
             await run_symbol(sym, kws, macro, meta, time_budget_sec=SCAN_TIME_PER_SYMBOL)
-
-def _make_shards(symbols: List[str], workers: int) -> List[List[str]]:
-    # FIX: répartition round-robin stable pour couvrir toute la liste
-    shards = [[] for _ in range(workers)]
-    for i, s in enumerate(symbols):
-        shards[i % workers].append(s)
-    return shards
 
 async def main():
     _quiet_noise_loggers()
     rootlog.info("Starting scanner...")
 
-    # Univers de scan
+    # Univers de scan (400 par défaut, XBT/BTC first, alpha ensuite)
     if getattr(SETTINGS, "auto_symbols", True):
         symbols = _build_symbols()
         if getattr(SETTINGS, "symbols", None) and len(SETTINGS.symbols) > 0 and os.getenv("SYMBOLS", ""):
+            # L'utilisateur a explicitement fourni une liste → on respecte.
             user_list = [s.strip().upper() for s in SETTINGS.symbols if s.strip()]
             user_list = sorted(set(user_list))
-            if "XBTUSDT" in user_list:
-                user_list = ["XBTUSDT"] + [s for s in user_list if s != "XBTUSDT"]
-            elif "BTCUSDT" in user_list:
-                user_list = ["BTCUSDT"] + [s for s in user_list if s != "BTCUSDT"]
-            SETTINGS.symbols = user_list
+            SETTINGS.symbols = _prioritize_xbt_btc(user_list)
         else:
             SETTINGS.symbols = symbols
 
-    # Résumé clair des paires scannées
     n = len(SETTINGS.symbols)
-    preview = ", ".join(SETTINGS.symbols[:25]) + (" ..." if n > 25 else "")
+    preview = ", ".join(SETTINGS.symbols[:40]) + (" ..." if n > 40 else "")
     rootlog.info(f"[SCAN] {n} paires prêtes (alpha, XBT/BTC first): {preview}")
 
     # Métadonnées / WS / Macro
@@ -745,22 +750,18 @@ async def main():
     kws   = KucoinPrivateWS()
     asyncio.create_task(kws.run())
 
-    if SEQUENTIAL_SCAN:
-        workers = max(1, int(SCAN_WORKERS))
-        shards = _make_shards(SETTINGS.symbols, workers)  # FIX: sharding réel
-        tasks = []
-        for i in range(workers):
-            # petit jitter de démarrage pour lisser la charge
-            await asyncio.sleep(0.05)
-            tasks.append(asyncio.create_task(_worker_cyclic(i+1, shards[i], kws, macro, meta)))
-        await asyncio.gather(*tasks)
-    else:
-        # Mode ancien: une tâche par symbole (pas recommandé pour 400)
-        tasks = []
-        for sym in SETTINGS.symbols:
-            tasks.append(asyncio.create_task(run_symbol(sym, kws, macro, meta, time_budget_sec=None)))
-            await asyncio.sleep(0.01)
-        await asyncio.gather(*tasks)
+    # Toujours en mode séquentiel (défilement), jamais une tâche par symbole
+    workers = max(1, int(SCAN_WORKERS))
+    # sharding simple round-robin si workers > 1 (sinon défilement pur à 1 worker)
+    shards = [[] for _ in range(workers)]
+    for i, s in enumerate(SETTINGS.symbols):
+        shards[i % workers].append(s)
+
+    tasks = []
+    for i in range(workers):
+        tasks.append(asyncio.create_task(_worker_cyclic(i+1, shards[i], kws, macro, meta)))
+        await asyncio.sleep(0.05)
+    await asyncio.gather(*tasks)
 
 if __name__ == "__main__":
     asyncio.run(main())
