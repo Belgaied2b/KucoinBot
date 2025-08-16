@@ -1,4 +1,5 @@
 # scanner.py — scan complet, tri alpha (XBT→Z), logs filtrés
+import os
 import asyncio, time, uuid
 from collections import deque
 import logging
@@ -14,7 +15,7 @@ from order_manager import OrderManager
 from orderflow_features import compute_atr
 from kucoin_utils import (
     fetch_klines, fetch_symbol_meta, round_price,
-    kucoin_active_usdt_symbols, binance_usdt_perp_symbols, common_usdt_symbols
+    common_usdt_symbols
 )
 from telegram_notifier import send_msg
 from institutional_data import get_macro_total_mcap, get_macro_total2, get_macro_btc_dominance
@@ -657,12 +658,11 @@ def _quiet_noise_loggers():
     logging.getLogger("institutional_data").setLevel(logging.WARNING)
 
 def _build_symbols() -> list[str]:
-    # Intersection KuCoin × Binance pour éviter les symboles funding/liquidity invalides
-    # Respecte SYMBOLS_MAX / EXCLUDE_SYMBOLS
+    # Intersection KuCoin × Binance pour éviter symboles invalides côté funding/liquidity
     excl = getattr(SETTINGS, "exclude_symbols", "")
     limit = int(getattr(SETTINGS, "symbols_max", 450) or 0)
-    # limit=0 => pas de limite dans helper ; on coupe après
-    common = common_usdt_symbols(limit=0, exclude_csv=excl)
+    common = common_usdt_symbols(limit=0, exclude_csv=excl)  # pas de limite ici
+
     # Dédup + tri alpha
     seen = set()
     common = [s for s in sorted(common) if not (s in seen or seen.add(s))]
@@ -692,11 +692,9 @@ async def main():
     # Univers de scan
     if getattr(SETTINGS, "auto_symbols", True):
         symbols = _build_symbols()
-        # si l'utilisateur a passé SYMBOLS via env, on respecte (pydantic l’a mis dans SETTINGS.symbols)
+        # Si l'utilisateur force SYMBOLS via env (SETTINGS.symbols rempli ET var env SYMBOLS présente)
         if getattr(SETTINGS, "symbols", None) and len(SETTINGS.symbols) > 0 and os.getenv("SYMBOLS", ""):
-            # L'utilisateur force la liste → normaliser/tri selon la règle
             user_list = [s.strip().upper() for s in SETTINGS.symbols if s.strip()]
-            # Tri alpha avec priorité XBT/BTC
             user_list = sorted(set(user_list))
             if "XBTUSDT" in user_list:
                 user_list = ["XBTUSDT"] + [s for s in user_list if s != "XBTUSDT"]
