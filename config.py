@@ -3,11 +3,13 @@ import os
 from typing import List
 from pydantic import BaseModel, Field
 
+
 def _get_bool(name: str, default: bool) -> bool:
     v = os.getenv(name)
     if v is None:
         return default
     return v.strip().lower() in ("1", "true", "t", "yes", "y", "on")
+
 
 def _get_float(name: str, default: float) -> float:
     try:
@@ -15,11 +17,13 @@ def _get_float(name: str, default: float) -> float:
     except Exception:
         return default
 
+
 def _get_int(name: str, default: int) -> int:
     try:
         return int(os.getenv(name, str(default)))
     except Exception:
         return default
+
 
 def _get_list(name: str, default: List[str]) -> List[str]:
     raw = os.getenv(name, "")
@@ -27,12 +31,13 @@ def _get_list(name: str, default: List[str]) -> List[str]:
         return default
     return [s.strip().upper() for s in raw.split(",") if s.strip()]
 
+
 class Settings(BaseModel):
     # --- KUCOIN EXECUTION ---
     kucoin_base_url: str   = Field(default_factory=lambda: os.getenv("KUCOIN_BASE_URL", "https://api-futures.kucoin.com"))
     kucoin_ws_url: str     = Field(default_factory=lambda: os.getenv("KUCOIN_WS_URL", "wss://ws-api-futures.kucoin.com/endpoint"))
 
-    # Identifiants par défaut intégrés
+    # Identifiants (⚠️ remplace par tes vraies clés Futures)
     kucoin_key: str        = Field(default_factory=lambda: os.getenv("KUCOIN_API_KEY", "6890cfb4dffe710001e6edb0"))
     kucoin_secret: str     = Field(default_factory=lambda: os.getenv("KUCOIN_API_SECRET", "889e4492-c2ff-4c9d-9136-64afe6d5e780"))
     kucoin_passphrase: str = Field(default_factory=lambda: os.getenv("KUCOIN_API_PASSPHRASE", "Nad1703-_"))
@@ -59,36 +64,42 @@ class Settings(BaseModel):
     breakeven_after_tp1: bool = Field(default_factory=lambda: _get_bool("MOVE_TO_BE_AFTER_TP1", False))
 
     # --- SCORING (Institution 2/4) ---
-    # Seuil global relativement bas pour laisser passer des configs 2/4
+    # Seuil global
     req_score_min: float   = Field(default_factory=lambda: _get_float("REQ_SCORE_MIN", 1.2))
     req_rr_min: float      = Field(default_factory=lambda: _get_float("REQ_RR_MIN", 1.2))
     allow_tol_rr: bool     = Field(default_factory=lambda: _get_bool("ALLOW_TOLERANCE_RR", True))
 
-    # Pondérations (donne du poids à OI/Liq, Δ modéré, funding léger)
+    # Pondérations
     w_oi: float            = Field(default_factory=lambda: _get_float("W_OI", 0.6))
     w_funding: float       = Field(default_factory=lambda: _get_float("W_FUNDING", 0.2))
     w_delta: float         = Field(default_factory=lambda: _get_float("W_DELTA", 0.2))
     w_liq: float           = Field(default_factory=lambda: _get_float("W_LIQ", 0.5))
     w_book_imbal: float    = Field(default_factory=lambda: _get_float("W_BOOK_IMBAL", 0.0))
     use_book_imbal: bool   = Field(default_factory=lambda: _get_bool("USE_BOOK_IMBAL", False))
+    book_req_min: float    = Field(default_factory=lambda: _get_float("BOOK_REQ_MIN", 0.30))  # utilisé par scanner
 
     # Exige 2 composantes OK (sur OI/Δ/Funding/Liq)
     inst_components_min: int = Field(default_factory=lambda: _get_int("INST_COMPONENTS_MIN", 2))
-    # Minima “institutionnels” (corrigés)
-    oi_req_min: float        = Field(default_factory=lambda: _get_float("OI_REQ_MIN", 0.25))  # au lieu de 0.08
-    delta_req_min: float     = Field(default_factory=lambda: _get_float("DELTA_REQ_MIN", 0.30))  # au lieu de 0.08
-    funding_req_min: float   = Field(default_factory=lambda: _get_float("FUNDING_REQ_MIN", 0.05))  # au lieu de 0.03
-    liq_req_min: float       = Field(default_factory=lambda: _get_float("LIQ_REQ_MIN", 0.20))  # au lieu de 0.08
 
-    # Normalisation pour éviter les scores ≈ 0
-    funding_ref: float       = Field(default_factory=lambda: _get_float("FUNDING_REF", 0.00008))  # 0.008%
-    oi_delta_ref: float      = Field(default_factory=lambda: _get_float("OI_DELTA_REF", 0.004))   # 0.4% ΔOI (5m)
+    # Minima “institutionnels” (corrigés)
+    oi_req_min: float        = Field(default_factory=lambda: _get_float("OI_REQ_MIN", 0.25))   # au lieu de 0.08
+    delta_req_min: float     = Field(default_factory=lambda: _get_float("DELTA_REQ_MIN", 0.30))# au lieu de 0.08
+    funding_req_min: float   = Field(default_factory=lambda: _get_float("FUNDING_REQ_MIN", 0.05))
+    liq_req_min: float       = Field(default_factory=lambda: _get_float("LIQ_REQ_MIN", 0.20))
+
+    # Normalisation (éviter scores ≈ 0)
+    funding_ref: float       = Field(default_factory=lambda: _get_float("FUNDING_REF", 0.00008))   # 0.008%
+    oi_delta_ref: float      = Field(default_factory=lambda: _get_float("OI_DELTA_REF", 0.004))    # 0.4% ΔOI (5m)
     oi_fund_refresh_sec: int = Field(default_factory=lambda: _get_int("OI_FUND_REFRESH_SEC", 30))
+
+    # --- DELTA (CVD Binance) utilisés par scanner ---
+    delta_window_sec: int    = Field(default_factory=lambda: _get_int("DELTA_WINDOW_SEC", 300))
+    delta_notional_ref: float= Field(default_factory=lambda: _get_float("DELTA_NOTIONAL_REF", 150_000.0))
 
     # --- LIQ PACK ---
     use_legacy_binance_liq: bool = Field(default_factory=lambda: _get_bool("USE_LEGACY_BINANCE_LIQ", False))
     liq_refresh_sec: int       = Field(default_factory=lambda: _get_int("LIQ_REFRESH_SEC", 20))
-    liq_notional_norm: float   = Field(default_factory=lambda: _get_float("LIQ_NOTIONAL_NORM", 30000.0))  # abaissement
+    liq_notional_norm: float   = Field(default_factory=lambda: _get_float("LIQ_NOTIONAL_NORM", 30000.0))
     liq_imbal_weight: float    = Field(default_factory=lambda: _get_float("LIQ_IMBAL_WEIGHT", 0.35))
     liq_notional_overrides: str = Field(default_factory=lambda: os.getenv("LIQ_NOTIONAL_OVERRIDES", "{}"))
 
@@ -115,7 +126,7 @@ class Settings(BaseModel):
 
     # --- EXECUTION (V1.1-bis) ---
     use_ioc_fallback: bool    = Field(default_factory=lambda: _get_bool("USE_IOC_FALLBACK", True))
-    default_tick_size: float  = Field(default_factory=lambda: _get_float("DEFAULT_TICK_SIZE", 0.1))
+    default_tick_size: float  = Field(default_factory=lambda: _get_float("DEFAULT_TICK_SIZE", 0.001))
 
     # --- DIVERS / HTTP ---
     http_timeout_sec: float   = Field(default_factory=lambda: _get_float("HTTP_TIMEOUT_SEC", 6.0))
@@ -128,5 +139,6 @@ class Settings(BaseModel):
     # --- TELEGRAM ---
     tg_token: str             = Field(default_factory=lambda: os.getenv("TELEGRAM_BOT_TOKEN", "7605602027:AAFTBVopeZQYBh8ZtoudgU5oykuWbZtDz2o"))
     tg_chat: str              = Field(default_factory=lambda: os.getenv("TELEGRAM_CHAT_ID", "5485398553"))
+
 
 SETTINGS = Settings()
