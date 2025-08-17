@@ -26,8 +26,8 @@ from institutional_data import map_symbol_to_binance, get_liq_pack, get_funding_
 rootlog = get_logger("scanner")
 
 # ====== Anti-duplicate signals (cooldown) ======
-_LAST_SIGNAL_KEY: Dict[str,str] = {}
-_LAST_SIGNAL_TS: Dict[str,float] = {}
+_LAST_SIGNAL_KEY: Dict[str, str] = {}
+_LAST_SIGNAL_TS: Dict[str, float] = {}
 def _is_duplicate_signal(symbol: str, key: str, cooldown_sec: int) -> bool:
     now = time.time()
     last_key = _LAST_SIGNAL_KEY.get(symbol)
@@ -65,9 +65,8 @@ SCAN_WORKERS         = int(getattr(SETTINGS, "scan_workers", 1))  # 1 = défilem
 SCAN_TIME_PER_SYMBOL = float(getattr(SETTINGS, "scan_time_per_symbol_sec", 1.0))
 
 # ====== Cadence fine (patch) ======
-INNER_SLEEP_SEC      = float(getattr(SETTINGS, "inner_sleep_sec", 0.15))  # 3–6 ticks/passe
-WARMUP_SECONDS       = float(getattr(SETTINGS, "warmup_seconds", 0.30))   # warmup bref
-WARMUP_FRAC          = float(getattr(SETTINGS, "warmup_frac", 0.30))      # % de la fenêtre, bornage dynamique
+INNER_SLEEP_SEC      = float(getattr(SETTINGS, "inner_sleep_sec", 0.15))  # était 1.0s → plus de ticks/passe
+WARMUP_SECONDS       = float(getattr(SETTINGS, "warmup_seconds", 0.30))   # warmup bref pour fenêtres courtes
 
 BINANCE_FUTURES_API  = "https://fapi.binance.com"
 
@@ -106,8 +105,7 @@ def _gate_fail_reasons(inst: dict, dyn_req: float, score: float, comps_ok: int, 
     return reasons or ["unknown"]
 
 def _log_gate(symbol: str, price: float, inst: dict, score: float, dyn_req: float, comps_ok: int,
-              persist_sum: int, persist_need: int, persist_next: int,
-              cooldown_left: float, warmup_left: float,
+              persist_sum: int, persist_need: int, cooldown_left: float, warmup_left: float,
               liq_norm: float, gate_now: bool, use_book: bool, extra_reasons: list[str] | None = None):
     oi   = float(inst.get("oi_score", 0.0) or 0.0)
     dlt  = float(inst.get("delta_score", 0.0) or 0.0)
@@ -123,9 +121,7 @@ def _log_gate(symbol: str, price: float, inst: dict, score: float, dyn_req: floa
     )
     if use_book:
         base_msg += f" Book={_fmt(book)}/{_fmt(BOOK_MIN)}"
-    base_msg += f" liq_norm={int(liq_norm)} cvd={int(cvd)} persist={persist_sum}/{persist_need}(next={persist_next})"
-    if cooldown_left > 0 or warmup_left > 0:
-        base_msg += f" cooldn={int(cooldown_left)}s warmup={_fmt(warmup_left,1)}s"
+    base_msg += f" liq_norm={int(liq_norm)} cvd={int(cvd)} persist={persist_sum}/{persist_need}"
     reasons = extra_reasons or []
     logger = get_logger("scanner.symbol", symbol)
     logger.info(base_msg + (f" reasons={','.join(reasons)}" if reasons else ""))
@@ -196,7 +192,7 @@ class BinanceCVD:
 
         self._trim(st["deq"])
         total = 0.0; buy_n = 0.0; sell_n = 0.0
-        for _, val in st["deq"]]:
+        for _, val in st["deq"]:
             total += val
             if val >= 0: buy_n += val
             else: sell_n += (-val)
@@ -473,11 +469,6 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: 'MacroCache', met
     loop_started = time.time()  # la fenêtre démarre ici
     started_at   = loop_started
 
-    # Warmup effectif borné par la fenêtre (si définie)
-    warmup_eff = WARMUP_SECONDS
-    if time_budget_sec is not None and time_budget_sec > 0:
-        warmup_eff = min(WARMUP_SECONDS, max(0.0, time_budget_sec * WARMUP_FRAC))
-
     try:
         while True:
             if time_budget_sec is not None and (time.time() - loop_started) > time_budget_sec:
@@ -551,7 +542,7 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: 'MacroCache', met
                         if INST_DEBUG:
                             use_book = bool(getattr(SETTINGS, "use_book_imbal", False))
                             persist_sum = sum(persist_buf)
-                            warmup_left = max(0.0, warmup_eff - (time.time() - started_at))
+                            warmup_left = max(0.0, WARMUP_SECONDS - (time.time() - started_at))
                             cooldown_left = max(0.0, float(SYMBOL_COOLDOWN_SEC) - (time.time() - last_trade_ts)) if last_trade_ts > 0 else 0.0
                             score_tmp = _compute_global_score_sum(inst_merged)
                             dyn_req_tmp = _dyn_req_score(inst_merged, (
@@ -562,12 +553,9 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: 'MacroCache', met
                                 float(getattr(SETTINGS, "w_book_imbal", 0.0)),
                             ), use_book)
                             comps_ok_tmp = _components_ok(inst_merged)
-                            gate_now_tmp = (score_tmp >= dyn_req_tmp) and (comps_ok_tmp >= INST_COMPONENTS_MIN)
-                            persist_next_tmp = persist_sum + (1 if gate_now_tmp else 0)
                             reasons = _gate_fail_reasons(inst_merged, dyn_req_tmp, score_tmp, comps_ok_tmp, persist_sum, PERSIST_MIN_OK,
                                                          cooldown_left, warmup_left, MIN_LIQ_NORM, liq_norm, use_book)
-                            _log_gate(symbol, price, inst_merged, score_tmp, dyn_req_tmp, comps_ok_tmp,
-                                      persist_sum, PERSIST_MIN_OK, persist_next_tmp,
+                            _log_gate(symbol, price, inst_merged, score_tmp, dyn_req_tmp, comps_ok_tmp, persist_sum, PERSIST_MIN_OK,
                                       cooldown_left, warmup_left, liq_norm, False, use_book, reasons)
                             _bump_gate_stats(reasons); _maybe_log_gate_stats()
                         continue
@@ -608,26 +596,24 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: 'MacroCache', met
                         extra={"symbol": symbol}
                     )
 
-                # DEBUG INSTITUTIONNEL : état de passage/échec + raisons (préview avant warmup/persist)
+                # DEBUG INSTITUTIONNEL : état de passage/échec + raisons
                 if INST_DEBUG:
                     persist_sum = sum(persist_buf)
-                    gate_now_preview = (score >= dyn_req) and (comps_ok >= INST_COMPONENTS_MIN)
-                    persist_next = persist_sum + (1 if gate_now_preview else 0)
-                    warmup_left = max(0.0, warmup_eff - (time.time() - started_at))
+                    warmup_left = max(0.0, WARMUP_SECONDS - (time.time() - started_at))
                     cooldown_left = max(0.0, float(SYMBOL_COOLDOWN_SEC) - (time.time() - last_trade_ts)) if last_trade_ts > 0 else 0.0
                     liq_norm = float(inst_merged.get("liq_norm", 0.0) or 0.0)
+                    gate_now_preview = (score >= dyn_req) and (comps_ok >= INST_COMPONENTS_MIN)
                     reasons = []
                     if not gate_now_preview:
                         reasons = _gate_fail_reasons(inst_merged, dyn_req, score, comps_ok, persist_sum, PERSIST_MIN_OK,
                                                      cooldown_left, warmup_left, MIN_LIQ_NORM, liq_norm, use_book)
-                    _log_gate(symbol, price, inst_merged, score, dyn_req, comps_ok,
-                              persist_sum, PERSIST_MIN_OK, persist_next,
+                    _log_gate(symbol, price, inst_merged, score, dyn_req, comps_ok, persist_sum, PERSIST_MIN_OK,
                               cooldown_left, warmup_left, liq_norm, gate_now_preview, use_book, reasons)
                     if not gate_now_preview:
                         _bump_gate_stats(reasons); _maybe_log_gate_stats()
 
-                # Warmup (bref, dynamique)
-                if (time.time() - started_at) < warmup_eff:
+                # Warmup (bref)
+                if (time.time() - started_at) < WARMUP_SECONDS:
                     continue
 
                 # Gate + persistance (valide sur le tick courant)
@@ -726,9 +712,11 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: 'MacroCache', met
                             value_qty=float(getattr(SETTINGS, "margin_per_trade", 20.0)),
                             leverage=DEFAULT_LEVERAGE,
                         )
-                        logger.info(f"[EXEC] side={dec.side} px={px_maker} stg={i+1}/{len(stage_fracs)} ok={ok} res={res} "
-                                    f"score={_fmt(score)} dyn_req={_fmt(dyn_req)} comps={comps_ok}/{INST_COMPONENTS_MIN}",
-                                    extra={"symbol": symbol})
+                        logger.info(
+                            f"[EXEC] side={dec.side} px={px_maker} stg={i+1}/{len(stage_fracs)} ok={ok} res={res} "
+                            f"score={_fmt(score)} dyn_req={_fmt(dyn_req)} comps={comps_ok}/{INST_COMPONENTS_MIN}",
+                            extra={"symbol": symbol}
+                        )
                         if not ok:
                             break
 
