@@ -61,9 +61,12 @@ HTTP_TIMEOUT         = float(getattr(SETTINGS, "http_timeout_sec", 6.0))
 DEFAULT_LEVERAGE     = int(getattr(SETTINGS, "default_leverage", 10))
 
 # ====== Mode scan séquentiel (défilement) ======
-# On force le mode "défilement" : un ou plusieurs workers, mais jamais une tâche par symbole.
 SCAN_WORKERS         = int(getattr(SETTINGS, "scan_workers", 1))  # 1 = défilement pur
 SCAN_TIME_PER_SYMBOL = float(getattr(SETTINGS, "scan_time_per_symbol_sec", 1.0))
+
+# ====== Cadence fine (patch) ======
+INNER_SLEEP_SEC      = float(getattr(SETTINGS, "inner_sleep_sec", 0.15))  # était 1.0s → donne 3–6 ticks/passe
+WARMUP_SECONDS       = float(getattr(SETTINGS, "warmup_seconds", 0.30))   # warmup bref pour fenêtres courtes
 
 BINANCE_FUTURES_API  = "https://fapi.binance.com"
 
@@ -473,7 +476,9 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: 'MacroCache', met
                 break
 
             try:
-                await asyncio.sleep(1.0)
+                # ---- cadence plus fine
+                await asyncio.sleep(INNER_SLEEP_SEC)
+
                 _, inst = agg.get_meta_score()
                 df = ohlc.frame(symbol)
                 price = float(df["close"].iloc[-1])
@@ -533,24 +538,24 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: 'MacroCache', met
                         if time.time() - last_hb > 30:
                             last_hb = time.time()
                             logger.info(f"hb illiq p={price:.4f} norm={liq_norm:.0f}", extra={"symbol": symbol})
-                        # On loggue aussi le blocage par liq_norm dans les raisons
+                        # log de gate pour explication
                         if INST_DEBUG:
                             use_book = bool(getattr(SETTINGS, "use_book_imbal", False))
                             persist_sum = sum(persist_buf)
-                            warmup_left = max(0.0, float(getattr(SETTINGS, "warmup_seconds", 5.0)) - (time.time() - started_at))
+                            warmup_left = max(0.0, WARMUP_SECONDS - (time.time() - started_at))
                             cooldown_left = max(0.0, float(SYMBOL_COOLDOWN_SEC) - (time.time() - last_trade_ts)) if last_trade_ts > 0 else 0.0
-                            score = _compute_global_score_sum(inst_merged)
-                            dyn_req = _dyn_req_score(inst_merged, (
+                            score_tmp = _compute_global_score_sum(inst_merged)
+                            dyn_req_tmp = _dyn_req_score(inst_merged, (
                                 float(getattr(SETTINGS, "w_oi", 0.6)),
                                 float(getattr(SETTINGS, "w_funding", 0.2)),
                                 float(getattr(SETTINGS, "w_delta", 0.2)),
                                 float(getattr(SETTINGS, "w_liq", 0.5)),
                                 float(getattr(SETTINGS, "w_book_imbal", 0.0)),
                             ), use_book)
-                            comps_ok = _components_ok(inst_merged)
-                            reasons = _gate_fail_reasons(inst_merged, dyn_req, score, comps_ok, persist_sum, PERSIST_MIN_OK,
+                            comps_ok_tmp = _components_ok(inst_merged)
+                            reasons = _gate_fail_reasons(inst_merged, dyn_req_tmp, score_tmp, comps_ok_tmp, persist_sum, PERSIST_MIN_OK,
                                                          cooldown_left, warmup_left, MIN_LIQ_NORM, liq_norm, use_book)
-                            _log_gate(symbol, price, inst_merged, score, dyn_req, comps_ok, persist_sum, PERSIST_MIN_OK,
+                            _log_gate(symbol, price, inst_merged, score_tmp, dyn_req_tmp, comps_ok_tmp, persist_sum, PERSIST_MIN_OK,
                                       cooldown_left, warmup_left, liq_norm, False, use_book, reasons)
                             _bump_gate_stats(reasons); _maybe_log_gate_stats()
                         continue
@@ -594,7 +599,7 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: 'MacroCache', met
                 # DEBUG INSTITUTIONNEL : état de passage/échec + raisons
                 if INST_DEBUG:
                     persist_sum = sum(persist_buf)
-                    warmup_left = max(0.0, float(getattr(SETTINGS, "warmup_seconds", 5.0)) - (time.time() - started_at))
+                    warmup_left = max(0.0, WARMUP_SECONDS - (time.time() - started_at))
                     cooldown_left = max(0.0, float(SYMBOL_COOLDOWN_SEC) - (time.time() - last_trade_ts)) if last_trade_ts > 0 else 0.0
                     liq_norm = float(inst_merged.get("liq_norm", 0.0) or 0.0)
                     gate_now_preview = (score >= dyn_req) and (comps_ok >= INST_COMPONENTS_MIN)
@@ -607,15 +612,17 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: 'MacroCache', met
                     if not gate_now_preview:
                         _bump_gate_stats(reasons); _maybe_log_gate_stats()
 
-                # Warmup
-                if (time.time() - started_at) < float(getattr(SETTINGS, "warmup_seconds", 5.0)):
+                # Warmup (bref)
+                if (time.time() - started_at) < WARMUP_SECONDS:
                     continue
 
-                # Gate + persistance
+                # Gate + persistance (valide sur le tick courant)
                 gate_now = (score >= dyn_req) and (comps_ok >= INST_COMPONENTS_MIN)
-                persist_buf.append(1 if gate_now else 0)
-                if sum(persist_buf) < PERSIST_MIN_OK:
+                persist_next = sum(persist_buf) + (1 if gate_now else 0)
+                if persist_next < PERSIST_MIN_OK:
+                    persist_buf.append(1 if gate_now else 0)
                     continue
+                persist_buf.append(1 if gate_now else 0)  # validé sur CE tick
 
                 # Cooldown symbole
                 if (time.time() - last_trade_ts) < SYMBOL_COOLDOWN_SEC:
@@ -669,7 +676,6 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: 'MacroCache', met
                 if symbol not in om.pending_by_symbol:
                     dec: Decision = analyze_signal(price, df, {"score": score, **inst_merged}, macro=macro_data)
                     if dec.side == "NONE":
-                        # le log [GATE] couvre déjà la raison du rejet
                         continue
 
                     # Dedup
