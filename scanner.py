@@ -1,6 +1,6 @@
 # scanner.py — scan séquentiel qui défile, 400 perp USDT, ordre alpha (XBT→Z), logs filtrés
 import asyncio, time, uuid, os
-from collections import deque
+from collections import deque, Counter
 import logging
 import pandas as pd
 import httpx
@@ -66,6 +66,77 @@ SCAN_WORKERS         = int(getattr(SETTINGS, "scan_workers", 1))  # 1 = défilem
 SCAN_TIME_PER_SYMBOL = float(getattr(SETTINGS, "scan_time_per_symbol_sec", 1.0))
 
 BINANCE_FUTURES_API  = "https://fapi.binance.com"
+
+# ====== Debug institutionnel (logs de gate) ======
+INST_DEBUG = bool(int(os.getenv("INST_DEBUG", "1"))) if not hasattr(SETTINGS, "inst_debug") else bool(getattr(SETTINGS, "inst_debug"))
+GATE_STATS_PERIOD_SEC = int(getattr(SETTINGS, "gate_stats_period_sec", int(os.getenv("GATE_STATS_PERIOD_SEC", "60"))))
+_GATE_STATS = {"cnt": Counter(), "last_log": 0.0}
+
+def _fmt(v, d=2):
+    try:
+        return f"{float(v):.{d}f}"
+    except Exception:
+        return str(v)
+
+def _gate_fail_reasons(inst: dict, dyn_req: float, score: float, comps_ok: int, persist_sum: int,
+                       persist_need: int, cooldown_left: float, warmup_left: float,
+                       min_liq_norm: float, liq_norm: float, use_book: bool) -> list[str]:
+    reasons = []
+    if score < dyn_req:
+        reasons.append(f"below_score:{_fmt(score)}/{_fmt(dyn_req)}")
+    if float(inst.get("oi_score", 0.0))        < OI_MIN:    reasons.append(f"oi<{_fmt(OI_MIN)}")
+    if float(inst.get("delta_score", 0.0))     < DELTA_MIN: reasons.append(f"delta<{_fmt(DELTA_MIN)}")
+    if float(inst.get("funding_score", 0.0))   < FUND_MIN:  reasons.append(f"fund<{_fmt(FUND_MIN)}")
+    if float(inst.get("liq_new_score", inst.get("liq_score", 0.0))) < LIQ_MIN:
+        reasons.append(f"liq<{_fmt(LIQ_MIN)}")
+    if use_book and float(inst.get("book_imbal_score", 0.0)) < BOOK_MIN:
+        reasons.append(f"book<{_fmt(BOOK_MIN)}")
+    if persist_sum < persist_need:
+        reasons.append(f"persist:{persist_sum}/{persist_need}")
+    if MIN_LIQ_NORM > 0 and liq_norm and liq_norm < min_liq_norm:
+        reasons.append(f"liq_norm<{int(min_liq_norm)}({int(liq_norm)})")
+    if cooldown_left > 0:
+        reasons.append(f"cooldown:{int(cooldown_left)}s")
+    if warmup_left > 0:
+        reasons.append(f"warmup:{_fmt(warmup_left,1)}s")
+    return reasons or ["unknown"]
+
+def _log_gate(symbol: str, price: float, inst: dict, score: float, dyn_req: float, comps_ok: int,
+              persist_sum: int, persist_need: int, cooldown_left: float, warmup_left: float,
+              liq_norm: float, gate_now: bool, use_book: bool, extra_reasons: list[str] | None = None):
+    oi   = float(inst.get("oi_score", 0.0) or 0.0)
+    dlt  = float(inst.get("delta_score", 0.0) or 0.0)
+    fund = float(inst.get("funding_score", 0.0) or 0.0)
+    liq  = float(inst.get("liq_new_score", inst.get("liq_score", 0.0)) or 0.0)
+    book = float(inst.get("book_imbal_score", 0.0) or 0.0)
+    cvd  = float(inst.get("delta_cvd_usd", 0.0) or 0.0)
+    base_msg = (
+        f"[GATE] pass={gate_now} price={_fmt(price,4)} "
+        f"s={_fmt(score)}/{_fmt(dyn_req)} comps={comps_ok}/{INST_COMPONENTS_MIN} "
+        f"OI={_fmt(oi)}/{_fmt(OI_MIN)} Δ={_fmt(dlt)}/{_fmt(DELTA_MIN)} F={_fmt(fund)}/{_fmt(FUND_MIN)} "
+        f"Liq={_fmt(liq)}/{_fmt(LIQ_MIN)}"
+    )
+    if use_book:
+        base_msg += f" Book={_fmt(book)}/{_fmt(BOOK_MIN)}"
+    base_msg += f" liq_norm={int(liq_norm)} cvd={int(cvd)} persist={persist_sum}/{persist_need}"
+    reasons = extra_reasons or []
+    logger = get_logger("scanner.symbol", symbol)
+    logger.info(base_msg + (f" reasons={','.join(reasons)}" if reasons else ""))
+
+def _bump_gate_stats(reasons: list[str]):
+    if reasons:
+        _GATE_STATS["cnt"].update(reasons)
+
+def _maybe_log_gate_stats():
+    now = time.time()
+    if now - _GATE_STATS["last_log"] < GATE_STATS_PERIOD_SEC:
+        return
+    _GATE_STATS["last_log"] = now
+    if not _GATE_STATS["cnt"]:
+        return
+    top = ", ".join([f"{k}:{v}" for k, v in _GATE_STATS["cnt"].most_common(6)])
+    rootlog.info(f"[GATE-STATS] top blockers (≈{GATE_STATS_PERIOD_SEC}s) → {top}")
+    _GATE_STATS["cnt"].clear()
 
 # ====== CVD Binance (delta tick-by-tick) ======
 class BinanceCVD:
@@ -348,8 +419,6 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: 'MacroCache', met
         ref_notional=float(getattr(SETTINGS, "delta_notional_ref", 150_000.0)),
     )
 
-    loop_started = time.time()
-    started_at   = time.time()
     last_hb = 0.0
     last_liq_fetch = 0.0
     liq_pack_cache = {}
@@ -388,280 +457,340 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: 'MacroCache', met
                 logger.exception("feed_ohlc loop error", extra={"symbol": symbol})
                 await asyncio.sleep(0.5)
 
-    asyncio.create_task(agg.run())
-    asyncio.create_task(feed_ohlc())
+    # Démarrage des tâches + petit délai (fenêtre démarre après)
+    task_agg  = asyncio.create_task(agg.run())
+    task_feed = asyncio.create_task(feed_ohlc())
     logger.info("symbol task started", extra={"symbol": symbol})
     await asyncio.sleep(1.5)
 
-    while True:
-        if time_budget_sec is not None and (time.time() - loop_started) > time_budget_sec:
-            logger.info("scan window done", extra={"symbol": symbol})
-            return
-        try:
-            await asyncio.sleep(1.0)
-            _, inst = agg.get_meta_score()
-            df = ohlc.frame(symbol)
-            price = float(df["close"].iloc[-1])
-            macro_data = macro.refresh()
+    loop_started = time.time()  # la fenêtre démarre ici
+    started_at   = loop_started
 
-            # LIQ PACK (throttle)
-            if (time.time() - last_liq_fetch) > LIQ_REFRESH_SEC:
-                last_liq_fetch = time.time()
-                try:
-                    liq_pack_cache = get_liq_pack(symbol)
-                    if liq_pack_cache.get("liq_source") != "none":
-                        logger.info(
-                            f"[LIQ] src={liq_pack_cache.get('liq_source')} "
-                            f"sc={liq_pack_cache.get('liq_new_score', 0.0):.3f} "
-                            f"N5m={liq_pack_cache.get('liq_notional_5m', 0.0):.0f} "
-                            f"imb={liq_pack_cache.get('liq_imbalance_5m', 0.0):.3f} "
-                            f"norm={liq_pack_cache.get('liq_norm', 0.0):.0f}",
-                            extra={"symbol": symbol}
-                        )
-                except Exception as e:
-                    logger.exception(f"[LIQ PACK] fetch error: {e}", extra={"symbol": symbol})
+    try:
+        while True:
+            if time_budget_sec is not None and (time.time() - loop_started) > time_budget_sec:
+                logger.info("scan window done", extra={"symbol": symbol})
+                break
 
-            # OI/Funding (throttle)
-            if (time.time() - last_oi_fund_fetch) > float(getattr(SETTINGS, "oi_fund_refresh_sec", 30.0)):
-                last_oi_fund_fetch = time.time()
-                try:
-                    oi_sc = _fetch_oi_score_binance(symbol)
-                    if oi_sc is not None:
-                        oi_fund_cache["oi_score"] = float(oi_sc)
-                    fund_sc = _fetch_funding_score_binance(symbol)
-                    if fund_sc is not None:
-                        oi_fund_cache["funding_score"] = float(fund_sc)
-                    if oi_fund_cache:
-                        logger.info(f"[OI/FUND] oi={oi_fund_cache.get('oi_score')} fund={oi_fund_cache.get('funding_score')}", extra={"symbol": symbol})
-                except Exception as e:
-                    logger.exception(f"[OI/FUND ENRICH] error: {e}", extra={"symbol": symbol})
-
-            inst_merged = {**inst, **(liq_pack_cache or {}), **(oi_fund_cache or {})}
-
-            # Δ tick-by-tick via Binance
             try:
-                bsym = map_symbol_to_binance(symbol)
-                if bsym:
-                    cvd_stats = cvd.update(bsym)
-                    if cvd_stats:
-                        inst_merged["delta_score"]   = float(cvd_stats["delta_score"])
-                        inst_merged["delta_cvd_usd"] = float(cvd_stats["cvd_notional"])
-                        inst_merged["delta_buy_usd"] = float(cvd_stats["buy_notional"])
-                        inst_merged["delta_sell_usd"]= float(cvd_stats["sell_notional"])
-            except Exception:
-                logger.exception("CVD update failed", extra={"symbol": symbol})
+                await asyncio.sleep(1.0)
+                _, inst = agg.get_meta_score()
+                df = ohlc.frame(symbol)
+                price = float(df["close"].iloc[-1])
+                macro_data = macro.refresh()
 
-            # Liquidity floor optionnel
-            if MIN_LIQ_NORM > 0:
-                liq_norm = float(inst_merged.get("liq_norm", 0.0) or 0.0)
-                if liq_norm and liq_norm < MIN_LIQ_NORM:
-                    if time.time() - last_hb > 30:
-                        last_hb = time.time()
-                        logger.info(f"hb illiq p={price:.4f} norm={liq_norm:.0f}", extra={"symbol": symbol})
-                    continue
+                # LIQ PACK (throttle)
+                if (time.time() - last_liq_fetch) > LIQ_REFRESH_SEC:
+                    last_liq_fetch = time.time()
+                    try:
+                        liq_pack_cache = get_liq_pack(symbol)
+                        if liq_pack_cache.get("liq_source") != "none":
+                            logger.info(
+                                f"[LIQ] src={liq_pack_cache.get('liq_source')} "
+                                f"sc={liq_pack_cache.get('liq_new_score', 0.0):.3f} "
+                                f"N5m={liq_pack_cache.get('liq_notional_5m', 0.0):.0f} "
+                                f"imb={liq_pack_cache.get('liq_imbalance_5m', 0.0):.3f} "
+                                f"norm={liq_pack_cache.get('liq_norm', 0.0):.0f}",
+                                extra={"symbol": symbol}
+                            )
+                    except Exception as e:
+                        logger.exception(f"[LIQ PACK] fetch error: {e}", extra={"symbol": symbol})
 
-            # Score
-            score = _compute_global_score_sum(inst_merged)
-            inst_merged["score"] = score
+                # OI/Funding (throttle)
+                if (time.time() - last_oi_fund_fetch) > float(getattr(SETTINGS, "oi_fund_refresh_sec", 30.0)):
+                    last_oi_fund_fetch = time.time()
+                    try:
+                        oi_sc = _fetch_oi_score_binance(symbol)
+                        if oi_sc is not None:
+                            oi_fund_cache["oi_score"] = float(oi_sc)
+                        fund_sc = _fetch_funding_score_binance(symbol)
+                        if fund_sc is not None:
+                            oi_fund_cache["funding_score"] = float(fund_sc)
+                        if oi_fund_cache:
+                            logger.info(f"[OI/FUND] oi={oi_fund_cache.get('oi_score')} fund={oi_fund_cache.get('funding_score')}", extra={"symbol": symbol})
+                    except Exception as e:
+                        logger.exception(f"[OI/FUND ENRICH] error: {e}", extra={"symbol": symbol})
 
-            use_book = bool(getattr(SETTINGS, "use_book_imbal", False))
-            dyn_req  = _dyn_req_score(inst_merged, (
-                float(getattr(SETTINGS, "w_oi", 0.6)),
-                float(getattr(SETTINGS, "w_funding", 0.2)),
-                float(getattr(SETTINGS, "w_delta", 0.2)),
-                float(getattr(SETTINGS, "w_liq", 0.5)),
-                float(getattr(SETTINGS, "w_book_imbal", 0.0)),
-            ), use_book)
+                inst_merged = {**inst, **(liq_pack_cache or {}), **(oi_fund_cache or {})}
 
-            comps_ok = _components_ok(inst_merged)
-            if comps_ok >= INST_COMPONENTS_MIN and score < dyn_req:
-                score = dyn_req
-
-            liq_val = float(inst_merged.get("liq_new_score", inst_merged.get("liq_score", 0.0)) or 0.0)
-            boost = 0.0
-            if liq_val >= max(0.75, LIQ_MIN): boost = max(boost, 0.25)
-            if float(inst_merged.get("delta_score", 0.0)) >= max(0.75, DELTA_MIN): boost = max(boost, 0.20)
-            if float(inst_merged.get("oi_score", 0.0))    >= max(0.75, OI_MIN):    boost = max(boost, 0.15)
-            if float(inst_merged.get("funding_score", 0.0))>= max(0.75, FUND_MIN): boost = max(boost, 0.10)
-            score += boost
-            inst_merged["score"] = score
-
-            # Heartbeat allégé
-            if time.time() - last_hb > 30:
-                last_hb = time.time()
-                logger.info(
-                    f"hb p={price:.4f} s={score:.2f} oi={inst_merged.get('oi_score',0):.2f} "
-                    f"dlt={inst_merged.get('delta_score',0):.2f} fund={inst_merged.get('funding_score',0):.2f} "
-                    f"liq={liq_val:.2f} cvd={inst_merged.get('delta_cvd_usd',0):.0f}",
-                    extra={"symbol": symbol}
-                )
-
-            # Warmup
-            if (time.time() - started_at) < float(getattr(SETTINGS, "warmup_seconds", 5.0)):
-                continue
-
-            # Gate + persistance
-            gate_now = (score >= dyn_req) and (comps_ok >= INST_COMPONENTS_MIN)
-            persist_buf.append(1 if gate_now else 0)
-            if sum(persist_buf) < PERSIST_MIN_OK:
-                continue
-
-            # Cooldown symbole
-            if (time.time() - last_trade_ts) < SYMBOL_COOLDOWN_SEC:
-                continue
-
-            # Gestion position existante
-            pos = om.pos.get(symbol)
-            if pos:
-                try: atr = float(compute_atr(df).iloc[-1])
-                except Exception: atr = 0.0
-
-                if not pos.tp1_done:
-                    if (pos.side == "LONG" and price >= pos.tp1) or (pos.side == "SHORT" and price <= pos.tp1):
-                        ro_side = "sell" if pos.side == "LONG" else "buy"
-                        part_val = pos.qty_value * float(getattr(SETTINGS, "tp1_part", 0.5))
-                        ok, _ = trader.close_reduce_market(sym_api, ro_side, value_qty=part_val)
-                        if ok:
-                            om.close_half_at_tp1(symbol)
-                            send_msg(f"✅ {symbol} TP1 atteint — passage BE")
-                            logger.info("TP1 hit → BE", extra={"symbol": symbol})
-                else:
-                    trail = float(getattr(SETTINGS, "trail_mult_atr", 0.5)) * float(atr)
-                    if pos.side == "LONG":
-                        pos.sl = max(pos.sl, price - trail)
-                        if price <= pos.sl:
-                            ro_side = "sell"
-                            rem_val = pos.qty_value * (1.0 - float(getattr(SETTINGS, "tp1_part", 0.5)))
-                            ok, _ = trader.close_reduce_market(sym_api, ro_side, value_qty=rem_val)
-                            if ok:
-                                om.close_all(symbol, "TRAIL_LONG"); send_msg(f"🛑 {symbol} Trailing stop LONG")
-                    else:
-                        pos.sl = min(pos.sl, price + trail)
-                        if price >= pos.sl:
-                            ro_side = "buy"
-                            rem_val = pos.qty_value * (1.0 - float(getattr(SETTINGS, "tp1_part", 0.5)))
-                            ok, _ = trader.close_reduce_market(sym_api, ro_side, value_qty=rem_val)
-                            if ok:
-                                om.close_all(symbol, "TRAIL_SHORT"); send_msg(f"🛑 {symbol} Trailing stop SHORT")
-
-                if symbol in om.pos:
-                    pos = om.pos[symbol]
-                    if (pos.side == "LONG" and price >= pos.tp2) or (pos.side == "SHORT" and price <= pos.tp2):
-                        ro_side = "sell" if pos.side == "LONG" else "buy"
-                        rem_val = pos.qty_value * (1.0 - float(getattr(SETTINGS, "tp1_part", 0.5))) if pos.tp1_done else pos.qty_value
-                        ok, _ = trader.close_reduce_market(sym_api, ro_side, value_qty=rem_val)
-                        if ok:
-                            om.close_all(symbol, "TP2"); send_msg(f"🎯 {symbol} TP2 — position clôturée")
-                continue
-
-            # Pas de position -> décision & exécution
-            if symbol not in om.pending_by_symbol:
-                dec: Decision = analyze_signal(price, df, {"score": score, **inst_merged}, macro=macro_data)
-                if dec.side == "NONE":
-                    logger.info(f"rej s={score:.2f} ok={comps_ok}/{INST_COMPONENTS_MIN}", extra={"symbol": symbol})
-                    continue
-
-                # Dedup
+                # Δ tick-by-tick via Binance
                 try:
-                    key_entry = round_price(symbol, dec.entry, meta, float(getattr(SETTINGS, "default_tick_size", 0.001)))
-                    key_sl    = round_price(symbol, dec.sl,    meta, float(getattr(SETTINGS, "default_tick_size", 0.001)))
-                    key_tp1   = round_price(symbol, dec.tp1,   meta, float(getattr(SETTINGS, "default_tick_size", 0.001)))
-                    key_tp2   = round_price(symbol, dec.tp2,   meta, float(getattr(SETTINGS, "default_tick_size", 0.001)))
-                    _key = f"{dec.side}:{key_entry}:{key_sl}:{key_tp1}:{key_tp2}"
+                    bsym = map_symbol_to_binance(symbol)
+                    if bsym:
+                        cvd_stats = cvd.update(bsym)
+                        if cvd_stats:
+                            inst_merged["delta_score"]   = float(cvd_stats["delta_score"])
+                            inst_merged["delta_cvd_usd"] = float(cvd_stats["cvd_notional"])
+                            inst_merged["delta_buy_usd"] = float(cvd_stats["buy_notional"])
+                            inst_merged["delta_sell_usd"]= float(cvd_stats["sell_notional"])
                 except Exception:
-                    _key = f"{dec.side}:{dec.entry}:{dec.sl}:{dec.tp1}:{dec.tp2}"
-                if _is_duplicate_signal(symbol, _key, int(getattr(SETTINGS, "symbol_cooldown_sec", 45))):
-                    logger.info("Duplicate signal suppressed by cooldown", extra={"symbol": symbol})
+                    logger.exception("CVD update failed", extra={"symbol": symbol})
+
+                # Liquidity floor optionnel
+                if MIN_LIQ_NORM > 0:
+                    liq_norm = float(inst_merged.get("liq_norm", 0.0) or 0.0)
+                    if liq_norm and liq_norm < MIN_LIQ_NORM:
+                        if time.time() - last_hb > 30:
+                            last_hb = time.time()
+                            logger.info(f"hb illiq p={price:.4f} norm={liq_norm:.0f}", extra={"symbol": symbol})
+                        # On loggue aussi le blocage par liq_norm dans les raisons
+                        if INST_DEBUG:
+                            use_book = bool(getattr(SETTINGS, "use_book_imbal", False))
+                            persist_sum = sum(persist_buf)
+                            warmup_left = max(0.0, float(getattr(SETTINGS, "warmup_seconds", 5.0)) - (time.time() - started_at))
+                            cooldown_left = max(0.0, float(SYMBOL_COOLDOWN_SEC) - (time.time() - last_trade_ts)) if last_trade_ts > 0 else 0.0
+                            score = _compute_global_score_sum(inst_merged)
+                            dyn_req = _dyn_req_score(inst_merged, (
+                                float(getattr(SETTINGS, "w_oi", 0.6)),
+                                float(getattr(SETTINGS, "w_funding", 0.2)),
+                                float(getattr(SETTINGS, "w_delta", 0.2)),
+                                float(getattr(SETTINGS, "w_liq", 0.5)),
+                                float(getattr(SETTINGS, "w_book_imbal", 0.0)),
+                            ), use_book)
+                            comps_ok = _components_ok(inst_merged)
+                            reasons = _gate_fail_reasons(inst_merged, dyn_req, score, comps_ok, persist_sum, PERSIST_MIN_OK,
+                                                         cooldown_left, warmup_left, MIN_LIQ_NORM, liq_norm, use_book)
+                            _log_gate(symbol, price, inst_merged, score, dyn_req, comps_ok, persist_sum, PERSIST_MIN_OK,
+                                      cooldown_left, warmup_left, liq_norm, False, use_book, reasons)
+                            _bump_gate_stats(reasons); _maybe_log_gate_stats()
+                        continue
+
+                # Score
+                score = _compute_global_score_sum(inst_merged)
+                inst_merged["score"] = score
+
+                use_book = bool(getattr(SETTINGS, "use_book_imbal", False))
+                dyn_req  = _dyn_req_score(inst_merged, (
+                    float(getattr(SETTINGS, "w_oi", 0.6)),
+                    float(getattr(SETTINGS, "w_funding", 0.2)),
+                    float(getattr(SETTINGS, "w_delta", 0.2)),
+                    float(getattr(SETTINGS, "w_liq", 0.5)),
+                    float(getattr(SETTINGS, "w_book_imbal", 0.0)),
+                ), use_book)
+
+                comps_ok = _components_ok(inst_merged)
+                if comps_ok >= INST_COMPONENTS_MIN and score < dyn_req:
+                    score = dyn_req
+
+                liq_val = float(inst_merged.get("liq_new_score", inst_merged.get("liq_score", 0.0)) or 0.0)
+                boost = 0.0
+                if liq_val >= max(0.75, LIQ_MIN): boost = max(boost, 0.25)
+                if float(inst_merged.get("delta_score", 0.0)) >= max(0.75, DELTA_MIN): boost = max(boost, 0.20)
+                if float(inst_merged.get("oi_score", 0.0))    >= max(0.75, OI_MIN):    boost = max(boost, 0.15)
+                if float(inst_merged.get("funding_score", 0.0))>= max(0.75, FUND_MIN): boost = max(boost, 0.10)
+                score += boost
+                inst_merged["score"] = score
+
+                # Heartbeat allégé
+                if time.time() - last_hb > 30:
+                    last_hb = time.time()
+                    logger.info(
+                        f"hb p={price:.4f} s={score:.2f} oi={inst_merged.get('oi_score',0):.2f} "
+                        f"dlt={inst_merged.get('delta_score',0):.2f} fund={inst_merged.get('funding_score',0):.2f} "
+                        f"liq={liq_val:.2f} cvd={inst_merged.get('delta_cvd_usd',0):.0f}",
+                        extra={"symbol": symbol}
+                    )
+
+                # DEBUG INSTITUTIONNEL : état de passage/échec + raisons
+                if INST_DEBUG:
+                    persist_sum = sum(persist_buf)
+                    warmup_left = max(0.0, float(getattr(SETTINGS, "warmup_seconds", 5.0)) - (time.time() - started_at))
+                    cooldown_left = max(0.0, float(SYMBOL_COOLDOWN_SEC) - (time.time() - last_trade_ts)) if last_trade_ts > 0 else 0.0
+                    liq_norm = float(inst_merged.get("liq_norm", 0.0) or 0.0)
+                    gate_now_preview = (score >= dyn_req) and (comps_ok >= INST_COMPONENTS_MIN)
+                    reasons = []
+                    if not gate_now_preview:
+                        reasons = _gate_fail_reasons(inst_merged, dyn_req, score, comps_ok, persist_sum, PERSIST_MIN_OK,
+                                                     cooldown_left, warmup_left, MIN_LIQ_NORM, liq_norm, use_book)
+                    _log_gate(symbol, price, inst_merged, score, dyn_req, comps_ok, persist_sum, PERSIST_MIN_OK,
+                              cooldown_left, warmup_left, liq_norm, gate_now_preview, use_book, reasons)
+                    if not gate_now_preview:
+                        _bump_gate_stats(reasons); _maybe_log_gate_stats()
+
+                # Warmup
+                if (time.time() - started_at) < float(getattr(SETTINGS, "warmup_seconds", 5.0)):
                     continue
 
-                adv = should_cancel_or_requote("LONG" if dec.side == "LONG" else "SHORT", inst_merged, SETTINGS)
-                if adv != "OK" and bool(getattr(SETTINGS, "cancel_on_adverse", False)):
-                    logger.info(f"block adverse={adv}", extra={"symbol": symbol})
+                # Gate + persistance
+                gate_now = (score >= dyn_req) and (comps_ok >= INST_COMPONENTS_MIN)
+                persist_buf.append(1 if gate_now else 0)
+                if sum(persist_buf) < PERSIST_MIN_OK:
                     continue
 
-                side = "buy" if dec.side == "LONG" else "sell"
-                entry_px = round_price(symbol, dec.entry, meta, float(getattr(SETTINGS, "default_tick_size", 0.001)))
-                px_maker = _tick_shift(symbol, entry_px, -1 if side == "buy" else +1, meta, float(getattr(SETTINGS, "default_tick_size", 0.001)))
-                px_maker = round_price(symbol, px_maker, meta, float(getattr(SETTINGS, "default_tick_size", 0.001)))
+                # Cooldown symbole
+                if (time.time() - last_trade_ts) < SYMBOL_COOLDOWN_SEC:
+                    continue
 
-                stage_fracs = [float(getattr(SETTINGS, "stage1_fraction", 0.35)), 1.0 - float(getattr(SETTINGS, "stage1_fraction", 0.35))] if bool(getattr(SETTINGS, "two_stage_entry", False)) else [1.0]
+                # Gestion position existante
+                pos = om.pos.get(symbol)
+                if pos:
+                    try: atr = float(compute_atr(df).iloc[-1])
+                    except Exception: atr = 0.0
 
-                for i, frac in enumerate(stage_fracs):
-                    oid = str(uuid.uuid4()) + f"-s{i+1}"
-                    ok, res = _place_limit_with_lev_retry(
-                        trader, sym_api, side, px_maker, oid,
-                        post_only=bool(getattr(SETTINGS, "post_only_entries", True)),
-                        logger=logger,
-                        value_qty=float(getattr(SETTINGS, "margin_per_trade", 20.0)),
-                        leverage=DEFAULT_LEVERAGE,
-                    )
-                    logger.info(f"ENTRY {side} px={px_maker} stg={i+1}/{len(stage_fracs)} ok={ok} res={res}", extra={"symbol": symbol})
-                    if not ok:
-                        break
+                    if not pos.tp1_done:
+                        if (pos.side == "LONG" and price >= pos.tp1) or (pos.side == "SHORT" and price <= pos.tp1):
+                            ro_side = "sell" if pos.side == "LONG" else "buy"
+                            part_val = pos.qty_value * float(getattr(SETTINGS, "tp1_part", 0.5))
+                            ok, _ = trader.close_reduce_market(sym_api, ro_side, value_qty=part_val)
+                            if ok:
+                                om.close_half_at_tp1(symbol)
+                                send_msg(f"✅ {symbol} TP1 atteint — passage BE")
+                                logger.info("TP1 hit → BE", extra={"symbol": symbol})
+                    else:
+                        trail = float(getattr(SETTINGS, "trail_mult_atr", 0.5)) * float(atr)
+                        if pos.side == "LONG":
+                            pos.sl = max(pos.sl, price - trail)
+                            if price <= pos.sl:
+                                ro_side = "sell"
+                                rem_val = pos.qty_value * (1.0 - float(getattr(SETTINGS, "tp1_part", 0.5)))
+                                ok, _ = trader.close_reduce_market(sym_api, ro_side, value_qty=rem_val)
+                                if ok:
+                                    om.close_all(symbol, "TRAIL_LONG"); send_msg(f"🛑 {symbol} Trailing stop LONG")
+                        else:
+                            pos.sl = min(pos.sl, price + trail)
+                            if price >= pos.sl:
+                                ro_side = "buy"
+                                rem_val = pos.qty_value * (1.0 - float(getattr(SETTINGS, "tp1_part", 0.5)))
+                                ok, _ = trader.close_reduce_market(sym_api, ro_side, value_qty=rem_val)
+                                if ok:
+                                    om.close_all(symbol, "TRAIL_SHORT"); send_msg(f"🛑 {symbol} Trailing stop SHORT")
 
-                    om.add_pending(oid, symbol, side, px_maker)
-                    om.open_position(symbol, dec.side, dec.entry, dec.sl, dec.tp1, dec.tp2)
+                    if symbol in om.pos:
+                        pos = om.pos[symbol]
+                        if (pos.side == "LONG" and price >= pos.tp2) or (pos.side == "SHORT" and price <= pos.tp2):
+                            ro_side = "sell" if pos.side == "LONG" else "buy"
+                            rem_val = pos.qty_value * (1.0 - float(getattr(SETTINGS, "tp1_part", 0.5))) if pos.tp1_done else pos.qty_value
+                            ok, _ = trader.close_reduce_market(sym_api, ro_side, value_qty=rem_val)
+                            if ok:
+                                om.close_all(symbol, "TP2"); send_msg(f"🎯 {symbol} TP2 — position clôturée")
+                    continue
 
-                    comp_txt = (
-                        f"sc={inst_merged.get('score', 0):.2f} | "
-                        f"OI={inst_merged.get('oi_score', 0):.2f} "
-                        f"Δ={inst_merged.get('delta_score', 0):.2f} "
-                        f"CVD={int(inst_merged.get('delta_cvd_usd',0))} "
-                        f"F={inst_merged.get('funding_score', 0):.2f} "
-                        f"Liq={inst_merged.get('liq_new_score', inst_merged.get('liq_score', 0)):.2f}"
-                    )
-                    liq_src = inst_merged.get("liq_source", "-")
-                    msg = (
-                        f"🚀 {symbol} {dec.side} — stage {i+1}/{len(stage_fracs)} • post-only\n"
-                        f"@ {px_maker} | SL {dec.sl:.5g} | TP1 {dec.tp1:.5g} | TP2 {dec.tp2:.5g}\n"
-                        f"R:R min {float(getattr(SETTINGS,'req_rr_min',1.2)):.2f} • score {inst_merged.get('score',0):.2f}\n"
-                        f"{comp_txt} • liq={liq_src}"
-                    )
-                    send_msg(msg)
-                    last_trade_ts = time.time()
+                # Pas de position -> décision & exécution
+                if symbol not in om.pending_by_symbol:
+                    dec: Decision = analyze_signal(price, df, {"score": score, **inst_merged}, macro=macro_data)
+                    if dec.side == "NONE":
+                        # le log [GATE] couvre déjà la raison du rejet
+                        continue
 
-                    # Fenêtre de fill + re-quotes (courte, on reste dans le budget de la passe)
-                    t0 = time.time()
-                    rq = 0
-                    while time.time() - t0 < float(getattr(SETTINGS, "entry_timeout_sec", 2.0)):
-                        await asyncio.sleep(0.2)
-                    while rq < int(getattr(SETTINGS, "max_requotes", 1)):
-                        if time_budget_sec is not None and (time.time() - loop_started) > time_budget_sec:
-                            logger.info("scan window done", extra={"symbol": symbol})
-                            return
-                        rq += 1
-                        px_maker = _tick_shift(symbol, px_maker, +1 if side == 'buy' else -1, meta, float(getattr(SETTINGS, "default_tick_size", 0.001)))
-                        px_maker = round_price(symbol, px_maker, meta, float(getattr(SETTINGS, "default_tick_size", 0.001)))
-                        trader.cancel_by_client_oid(oid)
-                        oid = str(uuid.uuid4()) + f"-rq{rq}"
-                        ok, _ = _place_limit_with_lev_retry(
+                    # Dedup
+                    try:
+                        key_entry = round_price(symbol, dec.entry, meta, float(getattr(SETTINGS, "default_tick_size", 0.001)))
+                        key_sl    = round_price(symbol, dec.sl,    meta, float(getattr(SETTINGS, "default_tick_size", 0.001)))
+                        key_tp1   = round_price(symbol, dec.tp1,   meta, float(getattr(SETTINGS, "default_tick_size", 0.001)))
+                        key_tp2   = round_price(symbol, dec.tp2,   meta, float(getattr(SETTINGS, "default_tick_size", 0.001)))
+                        _key = f"{dec.side}:{key_entry}:{key_sl}:{key_tp1}:{key_tp2}"
+                    except Exception:
+                        _key = f"{dec.side}:{dec.entry}:{dec.sl}:{dec.tp1}:{dec.tp2}"
+                    if _is_duplicate_signal(symbol, _key, int(getattr(SETTINGS, "symbol_cooldown_sec", 45))):
+                        logger.info("Duplicate signal suppressed by cooldown", extra={"symbol": symbol})
+                        continue
+
+                    adv = should_cancel_or_requote("LONG" if dec.side == "LONG" else "SHORT", inst_merged, SETTINGS)
+                    if adv != "OK" and bool(getattr(SETTINGS, "cancel_on_adverse", False)):
+                        logger.info(f"block adverse={adv}", extra={"symbol": symbol})
+                        continue
+
+                    side = "buy" if dec.side == "LONG" else "sell"
+                    entry_px = round_price(symbol, dec.entry, meta, float(getattr(SETTINGS, "default_tick_size", 0.001)))
+                    px_maker = _tick_shift(symbol, entry_px, -1 if side == "buy" else +1, meta, float(getattr(SETTINGS, "default_tick_size", 0.001)))
+                    px_maker = round_price(symbol, px_maker, meta, float(getattr(SETTINGS, "default_tick_size", 0.001)))
+
+                    stage_fracs = [float(getattr(SETTINGS, "stage1_fraction", 0.35)), 1.0 - float(getattr(SETTINGS, "stage1_fraction", 0.35))] if bool(getattr(SETTINGS, "two_stage_entry", False)) else [1.0]
+
+                    for i, frac in enumerate(stage_fracs):
+                        oid = str(uuid.uuid4()) + f"-s{i+1}"
+                        ok, res = _place_limit_with_lev_retry(
                             trader, sym_api, side, px_maker, oid,
                             post_only=bool(getattr(SETTINGS, "post_only_entries", True)),
                             logger=logger,
                             value_qty=float(getattr(SETTINGS, "margin_per_trade", 20.0)),
                             leverage=DEFAULT_LEVERAGE,
                         )
-                        logger.info(f"REQUOTE {rq}/{int(getattr(SETTINGS,'max_requotes',1))} px={px_maker} ok={ok}", extra={"symbol": symbol})
+                        logger.info(f"[EXEC] side={dec.side} px={px_maker} stg={i+1}/{len(stage_fracs)} ok={ok} res={res} "
+                                    f"score={_fmt(score)} dyn_req={_fmt(dyn_req)} comps={comps_ok}/{INST_COMPONENTS_MIN}",
+                                    extra={"symbol": symbol})
                         if not ok:
                             break
+
                         om.add_pending(oid, symbol, side, px_maker)
+                        om.open_position(symbol, dec.side, dec.entry, dec.sl, dec.tp1, dec.tp2)
+
+                        comp_txt = (
+                            f"sc={inst_merged.get('score', 0):.2f} | "
+                            f"OI={inst_merged.get('oi_score', 0):.2f} "
+                            f"Δ={inst_merged.get('delta_score', 0):.2f} "
+                            f"CVD={int(inst_merged.get('delta_cvd_usd',0))} "
+                            f"F={inst_merged.get('funding_score', 0):.2f} "
+                            f"Liq={inst_merged.get('liq_new_score', inst_merged.get('liq_score', 0)):.2f}"
+                        )
+                        liq_src = inst_merged.get("liq_source", "-")
+                        msg = (
+                            f"🚀 {symbol} {dec.side} — stage {i+1}/{len(stage_fracs)} • post-only\n"
+                            f"@ {px_maker} | SL {dec.sl:.5g} | TP1 {dec.tp1:.5g} | TP2 {dec.tp2:.5g}\n"
+                            f"R:R min {float(getattr(SETTINGS,'req_rr_min',1.2)):.2f} • score {inst_merged.get('score',0):.2f}\n"
+                            f"{comp_txt} • liq={liq_src}"
+                        )
+                        send_msg(msg)
+                        last_trade_ts = time.time()
+
+                        # Fenêtre de fill + re-quotes (courte, on reste dans le budget de la passe)
                         t0 = time.time()
+                        rq = 0
                         while time.time() - t0 < float(getattr(SETTINGS, "entry_timeout_sec", 2.0)):
                             await asyncio.sleep(0.2)
+                        while rq < int(getattr(SETTINGS, "max_requotes", 1)):
+                            if time_budget_sec is not None and (time.time() - loop_started) > time_budget_sec:
+                                logger.info("scan window done", extra={"symbol": symbol})
+                                break
+                            rq += 1
+                            px_maker = _tick_shift(symbol, px_maker, +1 if side == 'buy' else -1, meta, float(getattr(SETTINGS, "default_tick_size", 0.001)))
+                            px_maker = round_price(symbol, px_maker, meta, float(getattr(SETTINGS, "default_tick_size", 0.001)))
+                            trader.cancel_by_client_oid(oid)
+                            oid = str(uuid.uuid4()) + f"-rq{rq}"
+                            ok, _ = _place_limit_with_lev_retry(
+                                trader, sym_api, side, px_maker, oid,
+                                post_only=bool(getattr(SETTINGS, "post_only_entries", True)),
+                                logger=logger,
+                                value_qty=float(getattr(SETTINGS, "margin_per_trade", 20.0)),
+                                leverage=DEFAULT_LEVERAGE,
+                            )
+                            logger.info(f"REQUOTE {rq}/{int(getattr(SETTINGS,'max_requotes',1))} px={px_maker} ok={ok}", extra={"symbol": symbol})
+                            if not ok:
+                                break
+                            om.add_pending(oid, symbol, side, px_maker)
+                            t0 = time.time()
+                            while time.time() - t0 < float(getattr(SETTINGS, "entry_timeout_sec", 2.0)):
+                                await asyncio.sleep(0.2)
 
-                    # Fallback IOC en fin de fenêtre si demandé
-                    if bool(getattr(SETTINGS, "use_ioc_fallback", True)):
-                        tick = float(meta.get(symbol, {}).get("tickSize", float(getattr(SETTINGS, "default_tick_size", 0.001))))
-                        aggr_ticks = 50
-                        ioc_px = round_price(symbol, entry_px + aggr_ticks * tick if side == "buy" else entry_px - aggr_ticks * tick, meta, tick)
-                        ok, _ = _place_ioc_with_lev_retry(trader, sym_api, side, ioc_px, logger, value_qty=float(getattr(SETTINGS, "margin_per_trade", 20.0)))
-                        logger.info(f"IOC tried ok={ok} px={ioc_px}", extra={"symbol": symbol})
-                        if ok:
-                            send_msg(f"⚡ {symbol} — IOC fallback déclenché (@ {ioc_px})")
+                        # Fallback IOC en fin de fenêtre si demandé
+                        if bool(getattr(SETTINGS, "use_ioc_fallback", True)):
+                            tick = float(meta.get(symbol, {}).get("tickSize", float(getattr(SETTINGS, "default_tick_size", 0.001))))
+                            aggr_ticks = 50
+                            ioc_px = round_price(symbol, entry_px + aggr_ticks * tick if side == "buy" else entry_px - aggr_ticks * tick, meta, tick)
+                            ok, _ = _place_ioc_with_lev_retry(trader, sym_api, side, ioc_px, logger, value_qty=float(getattr(SETTINGS, "margin_per_trade", 20.0)))
+                            logger.info(f"IOC tried ok={ok} px={ioc_px}", extra={"symbol": symbol})
+                            if ok:
+                                send_msg(f"⚡ {symbol} — IOC fallback déclenché (@ {ioc_px})")
 
+            except Exception:
+                logger.exception("run_symbol loop error", extra={"symbol": symbol})
+                await asyncio.sleep(0.5)
+    finally:
+        # Nettoyage systématique des tâches et du callback WS
+        for t in (task_agg, task_feed):
+            try:
+                t.cancel()
+            except Exception:
+                pass
+        try:
+            await asyncio.gather(task_agg, task_feed, return_exceptions=True)
         except Exception:
-            logger.exception("run_symbol loop error", extra={"symbol": symbol})
-            await asyncio.sleep(0.5)
+            pass
+        if hasattr(kws, "off"):
+            try:
+                kws.off("order", on_order)
+            except Exception:
+                pass
 
 # ====== Build universe (400 perp USDT), logs filtrés ======
 def _quiet_noise_loggers():
