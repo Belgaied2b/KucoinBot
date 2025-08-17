@@ -26,8 +26,8 @@ from institutional_data import map_symbol_to_binance, get_liq_pack, get_funding_
 rootlog = get_logger("scanner")
 
 # ====== Anti-duplicate signals (cooldown) ======
-_LAST_SIGNAL_KEY: Dict[str, str] = {}
-_LAST_SIGNAL_TS: Dict[str, float] = {}
+_LAST_SIGNAL_KEY: Dict[str,str] = {}
+_LAST_SIGNAL_TS: Dict[str,float] = {}
 def _is_duplicate_signal(symbol: str, key: str, cooldown_sec: int) -> bool:
     now = time.time()
     last_key = _LAST_SIGNAL_KEY.get(symbol)
@@ -64,13 +64,23 @@ DEFAULT_LEVERAGE     = int(getattr(SETTINGS, "default_leverage", 10))
 SCAN_WORKERS         = int(getattr(SETTINGS, "scan_workers", 1))  # 1 = défilement pur
 SCAN_TIME_PER_SYMBOL = float(getattr(SETTINGS, "scan_time_per_symbol_sec", 1.0))
 
-# ====== Cadence fine (patch) ======
-INNER_SLEEP_SEC      = float(getattr(SETTINGS, "inner_sleep_sec", 0.15))  # était 1.0s → plus de ticks/passe
-WARMUP_SECONDS       = float(getattr(SETTINGS, "warmup_seconds", 0.30))   # warmup bref pour fenêtres courtes
+# ====== Cadence fine ======
+INNER_SLEEP_SEC      = float(getattr(SETTINGS, "inner_sleep_sec", 0.15))
+WARMUP_SECONDS       = float(getattr(SETTINGS, "warmup_seconds", 0.30))
+WARMUP_CAP_FRAC      = float(getattr(SETTINGS, "warmup_cap_frac", 0.40))  # ≤40% de la fenêtre
+
+# ====== Comparaisons tolérantes (éviter effets de flottants) ======
+EPS = float(getattr(SETTINGS, "cmp_eps", 1e-6))
+def _ge(x, y):  # x >= y avec tolérance
+    try: return float(x) + EPS >= float(y)
+    except Exception: return False
+def _lt(x, y):  # x < y avec tolérance
+    try: return float(x) + EPS < float(y)
+    except Exception: return True
 
 BINANCE_FUTURES_API  = "https://fapi.binance.com"
 
-# ====== Debug institutionnel (logs de gate) ======
+# ====== Debug institutionnel ======
 INST_DEBUG = bool(int(os.getenv("INST_DEBUG", "1"))) if not hasattr(SETTINGS, "inst_debug") else bool(getattr(SETTINGS, "inst_debug"))
 GATE_STATS_PERIOD_SEC = int(getattr(SETTINGS, "gate_stats_period_sec", int(os.getenv("GATE_STATS_PERIOD_SEC", "60"))))
 _GATE_STATS = {"cnt": Counter(), "last_log": 0.0}
@@ -85,14 +95,14 @@ def _gate_fail_reasons(inst: dict, dyn_req: float, score: float, comps_ok: int, 
                        persist_need: int, cooldown_left: float, warmup_left: float,
                        min_liq_norm: float, liq_norm: float, use_book: bool) -> list[str]:
     reasons = []
-    if score < dyn_req:
+    if _lt(score, dyn_req):
         reasons.append(f"below_score:{_fmt(score)}/{_fmt(dyn_req)}")
-    if float(inst.get("oi_score", 0.0))        < OI_MIN:    reasons.append(f"oi<{_fmt(OI_MIN)}")
-    if float(inst.get("delta_score", 0.0))     < DELTA_MIN: reasons.append(f"delta<{_fmt(DELTA_MIN)}")
-    if float(inst.get("funding_score", 0.0))   < FUND_MIN:  reasons.append(f"fund<{_fmt(FUND_MIN)}")
-    if float(inst.get("liq_new_score", inst.get("liq_score", 0.0))) < LIQ_MIN:
-        reasons.append(f"liq<{_fmt(LIQ_MIN)}")
-    if use_book and float(inst.get("book_imbal_score", 0.0)) < BOOK_MIN:
+    if _lt(inst.get("oi_score", 0.0), OI_MIN):    reasons.append(f"oi<{_fmt(OI_MIN)}")
+    if _lt(inst.get("delta_score", 0.0), DELTA_MIN): reasons.append(f"delta<{_fmt(DELTA_MIN)}")
+    if _lt(inst.get("funding_score", 0.0), FUND_MIN): reasons.append(f"fund<{_fmt(FUND_MIN)}")
+    liq_val = float(inst.get("liq_new_score", inst.get("liq_score", 0.0)) or 0.0)
+    if _lt(liq_val, LIQ_MIN): reasons.append(f"liq<{_fmt(LIQ_MIN)}")
+    if use_book and _lt(inst.get("book_imbal_score", 0.0), BOOK_MIN):
         reasons.append(f"book<{_fmt(BOOK_MIN)}")
     if persist_sum < persist_need:
         reasons.append(f"persist:{persist_sum}/{persist_need}")
@@ -337,12 +347,12 @@ def _compute_global_score_sum(inst: dict) -> float:
     return float(total)
 
 def _components_ok(inst: dict) -> int:
-    oi_ok   = float(inst.get("oi_score", 0.0))        >= OI_MIN
-    dlt_ok  = float(inst.get("delta_score", 0.0))     >= DELTA_MIN
-    fund_ok = float(inst.get("funding_score", 0.0))   >= FUND_MIN
-    liq_ok  = float(inst.get("liq_new_score", inst.get("liq_score", 0.0))) >= LIQ_MIN
+    oi_ok   = _ge(inst.get("oi_score", 0.0), OI_MIN)
+    dlt_ok  = _ge(inst.get("delta_score", 0.0), DELTA_MIN)
+    fund_ok = _ge(inst.get("funding_score", 0.0), FUND_MIN)
+    liq_ok  = _ge(inst.get("liq_new_score", inst.get("liq_score", 0.0)), LIQ_MIN)
     if USE_BOOK:
-        book_ok = float(inst.get("book_imbal_score", 0.0)) >= BOOK_MIN
+        book_ok = _ge(inst.get("book_imbal_score", 0.0), BOOK_MIN)
         return int(oi_ok)+int(dlt_ok)+int(fund_ok)+int(liq_ok)+int(book_ok)
     return int(oi_ok)+int(dlt_ok)+int(fund_ok)+int(liq_ok)
 
@@ -400,7 +410,7 @@ def _place_ioc_with_lev_retry(trader: KucoinTrader, sym_api: str, side: str, px:
         return trader.place_limit_ioc(sym_api, side, px, value_qty=value_qty)
     return ok, res
 
-# ====== Symbol loop (une passe courte par symbole, puis on défile) ======
+# ====== Symbol loop ======
 async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: 'MacroCache', meta: dict, time_budget_sec: Optional[float] = None):
     logger = get_logger("scanner.symbol", symbol)
     w_cfg  = (
@@ -460,14 +470,19 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: 'MacroCache', met
                 logger.exception("feed_ohlc loop error", extra={"symbol": symbol})
                 await asyncio.sleep(0.5)
 
-    # Démarrage des tâches + petit délai (fenêtre démarre après)
+    # Démarrage des tâches + petit délai
     task_agg  = asyncio.create_task(agg.run())
     task_feed = asyncio.create_task(feed_ohlc())
     logger.info("symbol task started", extra={"symbol": symbol})
     await asyncio.sleep(1.5)
 
-    loop_started = time.time()  # la fenêtre démarre ici
+    loop_started = time.time()
     started_at   = loop_started
+
+    # Warmup effectif borné par la fenêtre
+    eff_warmup = WARMUP_SECONDS
+    if time_budget_sec is not None and time_budget_sec > 0:
+        eff_warmup = min(WARMUP_SECONDS, max(0.0, WARMUP_CAP_FRAC * time_budget_sec))
 
     try:
         while True:
@@ -476,7 +491,6 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: 'MacroCache', met
                 break
 
             try:
-                # ---- cadence plus fine
                 await asyncio.sleep(INNER_SLEEP_SEC)
 
                 _, inst = agg.get_meta_score()
@@ -484,7 +498,7 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: 'MacroCache', met
                 price = float(df["close"].iloc[-1])
                 macro_data = macro.refresh()
 
-                # LIQ PACK (throttle)
+                # LIQ PACK
                 if (time.time() - last_liq_fetch) > LIQ_REFRESH_SEC:
                     last_liq_fetch = time.time()
                     try:
@@ -501,7 +515,7 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: 'MacroCache', met
                     except Exception as e:
                         logger.exception(f"[LIQ PACK] fetch error: {e}", extra={"symbol": symbol})
 
-                # OI/Funding (throttle)
+                # OI/Funding
                 if (time.time() - last_oi_fund_fetch) > float(getattr(SETTINGS, "oi_fund_refresh_sec", 30.0)):
                     last_oi_fund_fetch = time.time()
                     try:
@@ -538,11 +552,11 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: 'MacroCache', met
                         if time.time() - last_hb > 30:
                             last_hb = time.time()
                             logger.info(f"hb illiq p={price:.4f} norm={liq_norm:.0f}", extra={"symbol": symbol})
-                        # log de gate pour explication
+                        # log explicatif
                         if INST_DEBUG:
                             use_book = bool(getattr(SETTINGS, "use_book_imbal", False))
                             persist_sum = sum(persist_buf)
-                            warmup_left = max(0.0, WARMUP_SECONDS - (time.time() - started_at))
+                            warmup_left = max(0.0, eff_warmup - (time.time() - started_at))
                             cooldown_left = max(0.0, float(SYMBOL_COOLDOWN_SEC) - (time.time() - last_trade_ts)) if last_trade_ts > 0 else 0.0
                             score_tmp = _compute_global_score_sum(inst_merged)
                             dyn_req_tmp = _dyn_req_score(inst_merged, (
@@ -574,15 +588,15 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: 'MacroCache', met
                 ), use_book)
 
                 comps_ok = _components_ok(inst_merged)
-                if comps_ok >= INST_COMPONENTS_MIN and score < dyn_req:
+                if comps_ok >= INST_COMPONENTS_MIN and _lt(score, dyn_req):
                     score = dyn_req
 
                 liq_val = float(inst_merged.get("liq_new_score", inst_merged.get("liq_score", 0.0)) or 0.0)
                 boost = 0.0
-                if liq_val >= max(0.75, LIQ_MIN): boost = max(boost, 0.25)
-                if float(inst_merged.get("delta_score", 0.0)) >= max(0.75, DELTA_MIN): boost = max(boost, 0.20)
-                if float(inst_merged.get("oi_score", 0.0))    >= max(0.75, OI_MIN):    boost = max(boost, 0.15)
-                if float(inst_merged.get("funding_score", 0.0))>= max(0.75, FUND_MIN): boost = max(boost, 0.10)
+                if _ge(liq_val, max(0.75, LIQ_MIN)): boost = max(boost, 0.25)
+                if _ge(inst_merged.get("delta_score", 0.0), max(0.75, DELTA_MIN)): boost = max(boost, 0.20)
+                if _ge(inst_merged.get("oi_score", 0.0),    max(0.75, OI_MIN)):    boost = max(boost, 0.15)
+                if _ge(inst_merged.get("funding_score", 0.0), max(0.75, FUND_MIN)): boost = max(boost, 0.10)
                 score += boost
                 inst_merged["score"] = score
 
@@ -596,13 +610,13 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: 'MacroCache', met
                         extra={"symbol": symbol}
                     )
 
-                # DEBUG INSTITUTIONNEL : état de passage/échec + raisons
+                # DEBUG INSTITUTIONNEL
                 if INST_DEBUG:
                     persist_sum = sum(persist_buf)
-                    warmup_left = max(0.0, WARMUP_SECONDS - (time.time() - started_at))
+                    warmup_left = max(0.0, eff_warmup - (time.time() - started_at))
                     cooldown_left = max(0.0, float(SYMBOL_COOLDOWN_SEC) - (time.time() - last_trade_ts)) if last_trade_ts > 0 else 0.0
                     liq_norm = float(inst_merged.get("liq_norm", 0.0) or 0.0)
-                    gate_now_preview = (score >= dyn_req) and (comps_ok >= INST_COMPONENTS_MIN)
+                    gate_now_preview = (_ge(score, dyn_req) and comps_ok >= INST_COMPONENTS_MIN)
                     reasons = []
                     if not gate_now_preview:
                         reasons = _gate_fail_reasons(inst_merged, dyn_req, score, comps_ok, persist_sum, PERSIST_MIN_OK,
@@ -612,19 +626,19 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: 'MacroCache', met
                     if not gate_now_preview:
                         _bump_gate_stats(reasons); _maybe_log_gate_stats()
 
-                # Warmup (bref)
-                if (time.time() - started_at) < WARMUP_SECONDS:
+                # Warmup effectif
+                if (time.time() - started_at) < eff_warmup:
                     continue
 
-                # Gate + persistance (valide sur le tick courant)
-                gate_now = (score >= dyn_req) and (comps_ok >= INST_COMPONENTS_MIN)
+                # Gate + persistance
+                gate_now = (_ge(score, dyn_req) and comps_ok >= INST_COMPONENTS_MIN)
                 persist_next = sum(persist_buf) + (1 if gate_now else 0)
                 if persist_next < PERSIST_MIN_OK:
                     persist_buf.append(1 if gate_now else 0)
                     continue
-                persist_buf.append(1 if gate_now else 0)  # validé sur CE tick
+                persist_buf.append(1 if gate_now else 0)
 
-                # Cooldown symbole
+                # Cooldown
                 if (time.time() - last_trade_ts) < SYMBOL_COOLDOWN_SEC:
                     continue
 
@@ -712,11 +726,9 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: 'MacroCache', met
                             value_qty=float(getattr(SETTINGS, "margin_per_trade", 20.0)),
                             leverage=DEFAULT_LEVERAGE,
                         )
-                        logger.info(
-                            f"[EXEC] side={dec.side} px={px_maker} stg={i+1}/{len(stage_fracs)} ok={ok} res={res} "
-                            f"score={_fmt(score)} dyn_req={_fmt(dyn_req)} comps={comps_ok}/{INST_COMPONENTS_MIN}",
-                            extra={"symbol": symbol}
-                        )
+                        logger.info(f"[EXEC] side={dec.side} px={px_maker} stg={i+1}/{len(stage_fracs)} ok={ok} res={res} "
+                                    f"score={_fmt(score)} dyn_req={_fmt(dyn_req)} comps={comps_ok}/{INST_COMPONENTS_MIN}",
+                                    extra={"symbol": symbol})
                         if not ok:
                             break
 
@@ -741,7 +753,7 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: 'MacroCache', met
                         send_msg(msg)
                         last_trade_ts = time.time()
 
-                        # Fenêtre de fill + re-quotes (courte, on reste dans le budget de la passe)
+                        # Fenêtre de fill + re-quotes
                         t0 = time.time()
                         rq = 0
                         while time.time() - t0 < float(getattr(SETTINGS, "entry_timeout_sec", 2.0)):
@@ -770,7 +782,7 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: 'MacroCache', met
                             while time.time() - t0 < float(getattr(SETTINGS, "entry_timeout_sec", 2.0)):
                                 await asyncio.sleep(0.2)
 
-                        # Fallback IOC en fin de fenêtre si demandé
+                        # Fallback IOC
                         if bool(getattr(SETTINGS, "use_ioc_fallback", True)):
                             tick = float(meta.get(symbol, {}).get("tickSize", float(getattr(SETTINGS, "default_tick_size", 0.001))))
                             aggr_ticks = 50
@@ -784,23 +796,19 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: 'MacroCache', met
                 logger.exception("run_symbol loop error", extra={"symbol": symbol})
                 await asyncio.sleep(0.5)
     finally:
-        # Nettoyage systématique des tâches et du callback WS
+        # Nettoyage
         for t in (task_agg, task_feed):
-            try:
-                t.cancel()
-            except Exception:
-                pass
+            try: t.cancel()
+            except Exception: pass
         try:
             await asyncio.gather(task_agg, task_feed, return_exceptions=True)
         except Exception:
             pass
         if hasattr(kws, "off"):
-            try:
-                kws.off("order", on_order)
-            except Exception:
-                pass
+            try: kws.off("order", on_order)
+            except Exception: pass
 
-# ====== Build universe (400 perp USDT), logs filtrés ======
+# ====== Build universe (400 perp USDT) ======
 def _quiet_noise_loggers():
     logging.getLogger("kucoin.trader").setLevel(logging.WARNING)
     logging.getLogger("kucoin.ws").setLevel(logging.WARNING)
@@ -818,35 +826,27 @@ def _prioritize_xbt_btc(symbols: List[str]) -> List[str]:
     return ordered
 
 def _fallback_symbols_from_meta(target_max: int) -> List[str]:
-    # Fallback robuste : on repart des métadonnées KuCoin Futures
-    meta = fetch_symbol_meta()  # {display_symbol: {..., symbol_api, tickSize, ...}}
-    syms = sorted([s for s in meta.keys() if s.endswith("USDT")])  # perp USDT
-    # Intersection avec Binance (pour funding/liq)
+    meta = fetch_symbol_meta()
+    syms = sorted([s for s in meta.keys() if s.endswith("USDT")])
     syms = [s for s in syms if map_symbol_to_binance(s)]
     syms = _prioritize_xbt_btc(syms)
     return syms[:target_max] if target_max > 0 else syms
 
 def _build_symbols() -> List[str]:
-    # Objectif : ~400 perp USDT
-    # Si l’utilisateur fournit SYMBOLS (liste), on respecte et on ne touche pas.
     user_forced = os.getenv("SYMBOLS", "").strip() != ""
     target_max_env = int(os.getenv("SYMBOLS_MAX", "400"))
     target_max_cfg = int(getattr(SETTINGS, "symbols_max", target_max_env))
-    target_max = max(400, target_max_cfg) if not user_forced else target_max_cfg  # vise 400 si pas de liste utilisateur
+    target_max = max(400, target_max_cfg) if not user_forced else target_max_cfg
 
     excl = getattr(SETTINGS, "exclude_symbols", "")
     try:
-        # 1) Essai via helper (intersection prête)
-        common = common_usdt_symbols(limit=10_000, exclude_csv=excl)  # FIX: pas de 40 implicite
+        common = common_usdt_symbols(limit=10_000, exclude_csv=excl)
     except Exception:
         common = []
-    # Dédup + tri alpha
     seen = set()
     common = [s for s in sorted(common) if not (s in seen or seen.add(s))]
-    # Intersection Binance (sécurité pour funding/liq)
     common = [s for s in common if map_symbol_to_binance(s)]
 
-    # Si ça renvoie trop peu (< 200), fallback méta
     if len(common) < 200:
         rootlog.info(f"[SYMS] helper renvoie {len(common)} syms → fallback via meta()")
         common = _fallback_symbols_from_meta(target_max*2)
@@ -866,11 +866,10 @@ async def main():
     _quiet_noise_loggers()
     rootlog.info("Starting scanner...")
 
-    # Univers de scan (400 par défaut, XBT/BTC first, alpha ensuite)
+    # Univers de scan
     if getattr(SETTINGS, "auto_symbols", True):
         symbols = _build_symbols()
         if getattr(SETTINGS, "symbols", None) and len(SETTINGS.symbols) > 0 and os.getenv("SYMBOLS", ""):
-            # L'utilisateur a explicitement fourni une liste → on respecte.
             user_list = [s.strip().upper() for s in SETTINGS.symbols if s.strip()]
             user_list = sorted(set(user_list))
             SETTINGS.symbols = _prioritize_xbt_btc(user_list)
@@ -887,9 +886,8 @@ async def main():
     kws   = KucoinPrivateWS()
     asyncio.create_task(kws.run())
 
-    # Toujours en mode séquentiel (défilement), jamais une tâche par symbole
+    # Séquentiel (multi-shards optionnels)
     workers = max(1, int(SCAN_WORKERS))
-    # sharding simple round-robin si workers > 1 (sinon défilement pur à 1 worker)
     shards = [[] for _ in range(workers)]
     for i, s in enumerate(SETTINGS.symbols):
         shards[i % workers].append(s)
