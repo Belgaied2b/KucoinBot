@@ -605,8 +605,8 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: 'MacroCache', met
                     last_hb = time.time()
                     logger.info(
                         f"hb p={price:.4f} s={score:.2f} oi={inst_merged.get('oi_score',0):.2f} "
-                        f"dlt={inst_merged.get('delta_score',0):.2f} fund={inst_merged.get('funding_score',0):.2f} "
-                        f"liq={liq_val:.2f} cvd={inst_merged.get('delta_cvd_usd',0):.0f}",
+                        f"dlt={inst_erged.get('delta_score',0):.2f} fund={inst_erged.get('funding_score',0):.2f} "
+                        f"liq={liq_val:.2f} cvd={inst_erged.get('delta_cvd_usd',0):.0f}",
                         extra={"symbol": symbol}
                     )
 
@@ -626,7 +626,7 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: 'MacroCache', met
                     if not gate_now_preview:
                         _bump_gate_stats(reasons); _maybe_log_gate_stats()
 
-                # Warmup (bref)
+                # Warmup (bref) — on nourrit la persistance mais on ne déclenche pas
                 if (time.time() - started_at) < WARMUP_SECONDS:
                     persist_buf.append(0)
                     continue
@@ -724,7 +724,7 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: 'MacroCache', met
                             trader, sym_api, side, px_maker, oid,
                             post_only=bool(getattr(SETTINGS, "post_only_entries", True)),
                             logger=logger,
-                            value_qty=float(getattr(SETTINGS, "margin_per_trade", 20.0)),
+                            value_qty=float(getattr(SETTINGS, "margin_per_trade", 20.0)) * float(frac),
                             leverage=DEFAULT_LEVERAGE,
                         )
                         logger.info(f"[EXEC] side={dec.side} px={px_maker} stg={i+1}/{len(stage_fracs)} ok={ok} res={res} "
@@ -776,7 +776,7 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: 'MacroCache', met
                                 trader, sym_api, side, px_maker, oid,
                                 post_only=bool(getattr(SETTINGS, "post_only_entries", True)),
                                 logger=logger,
-                                value_qty=float(getattr(SETTINGS, "margin_per_trade", 20.0)),
+                                value_qty=float(getattr(SETTINGS, "margin_per_trade", 20.0)) * float(frac),
                                 leverage=DEFAULT_LEVERAGE,
                             )
                             logger.info(f"REQUOTE {rq}/{int(getattr(SETTINGS,'max_requotes',1))} px={px_maker} ok={ok}", extra={"symbol": symbol})
