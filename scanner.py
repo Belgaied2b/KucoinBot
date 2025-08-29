@@ -605,8 +605,8 @@ async def run_symbol(symbol: str, kws: KucoinPrivateWS, macro: 'MacroCache', met
                     last_hb = time.time()
                     logger.info(
                         f"hb p={price:.4f} s={score:.2f} oi={inst_merged.get('oi_score',0):.2f} "
-                        f"dlt={inst_erged.get('delta_score',0):.2f} fund={inst_erged.get('funding_score',0):.2f} "
-                        f"liq={liq_val:.2f} cvd={inst_erged.get('delta_cvd_usd',0):.0f}",
+                        f"dlt={inst_merged.get('delta_score',0):.2f} fund={inst_merged.get('funding_score',0):.2f} "
+                        f"liq={liq_val:.2f} cvd={inst_merged.get('delta_cvd_usd',0):.0f}",
                         extra={"symbol": symbol}
                     )
 
