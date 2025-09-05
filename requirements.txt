@@ -6,3 +6,4 @@ numpy==1.26.4
 pydantic==2.7.4
 ujson==5.10.0
 tenacity==8.3.0
+requests==2.32.3
