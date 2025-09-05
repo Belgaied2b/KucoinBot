@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-main_event.py — Boucle event-driven (recommandée)
+main.py — Boucle event-driven (recommandée)
 Relie: ws_router.EventBus + PollingSource → analyze_signal → risk_guard → execution_sfi
 """
 
@@ -11,7 +11,7 @@ from execution_sfi import SFIEngine
 from risk_guard import RiskGuard
 from meta_policy import MetaPolicy
 from perf_metrics import register_signal_perf, update_perf_for_symbol
-from kucoin_utils import fetch_all_symbols
+from kucoin_utils import fetch_all_symbols, fetch_klines  # <-- ajout de fetch_klines
 
 # Utilise le bridge si dispo
 try:
@@ -42,12 +42,23 @@ async def handle_symbol_event(ev: Dict[str, Any], rg: RiskGuard, policy: MetaPol
     symbol = ev.get("symbol")
     if ev.get("type") not in ("top", "bar"):
         return
+
+    # --- Prépare H1/H4 (corrige le manque de df_h1/df_h4)
     try:
-        res = analyze_signal.analyze_signal(symbol=symbol)
-    except TypeError:
-        res = analyze_signal.analyze_signal(None, None)
+        h1_lim = int(os.getenv("H1_LIMIT", "500"))
+        h4_lim = int(os.getenv("H4_LIMIT", "400"))
+        df_h1 = fetch_klines(symbol, interval="1h", limit=h1_lim)
+        df_h4 = fetch_klines(symbol, interval="4h", limit=h4_lim)
     except Exception as e:
-        logging.warning("[%s] analyze_signal KO: %s", symbol, e); return
+        logging.warning("[%s] fetch_klines KO: %s", symbol, e)
+        return
+
+    # --- Analyse avec DF fournis
+    try:
+        res = analyze_signal.analyze_signal(symbol=symbol, df_h1=df_h1, df_h4=df_h4)
+    except Exception as e:
+        logging.warning("[%s] analyze_signal KO: %s", symbol, e)
+        return
 
     if not isinstance(res, dict) or not res.get("valid", False):
         update_perf_for_symbol(symbol)
@@ -84,6 +95,7 @@ async def handle_symbol_event(ev: Dict[str, Any], rg: RiskGuard, policy: MetaPol
 async def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
     try:
+        # fetch_all_symbols retourne des contrats USDT-M (…USDTM)
         symbols = [s for s in fetch_all_symbols() if s.endswith("USDTM")]
     except Exception:
         symbols = []
