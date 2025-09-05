@@ -99,8 +99,18 @@ async def handle_symbol_event(ev: Dict[str, Any], rg: RiskGuard, policy: MetaPol
         log.warning("analyze_signal KO: %s", e, extra={"symbol": symbol})
         return
 
+    # ---- Logs d'analyse détaillés
+    side = str(res.get("side", "none")).lower()
+    rr   = float(res.get("rr", 0) or 0)
+    score= float(res.get("inst_score", 0) or 0)
+    comments_list = res.get("comments", []) or []
+    comments = ", ".join([str(c) for c in comments_list]) if comments_list else ""
+    log.info("analysis: side=%s rr=%.2f score=%.2f comment=%s",
+             side, rr, score, comments or "—", extra={"symbol": symbol})
+
     if not isinstance(res, dict) or not res.get("valid", False):
-        log.info("no-trade (invalid signal)", extra={"symbol": symbol})
+        log.info("no-trade (invalid signal) — rr=%.2f score=%.2f reason=%s",
+                 rr, score, (comments or "no reason"), extra={"symbol": symbol})
         try: update_perf_for_symbol(symbol, df_h1=df_h1)
         except Exception: pass
         return
@@ -111,13 +121,12 @@ async def handle_symbol_event(ev: Dict[str, Any], rg: RiskGuard, policy: MetaPol
         return
 
     arm, weight, label = policy.choose({"atr_pct": res.get("atr_pct", 0), "adx_proxy": res.get("adx_proxy", 0)})
-    if weight < 0.25 and res.get("rr", 0) < 1.5:
-        log.info("policy reject (arm=%s, w=%.2f, rr=%.2f)", arm, weight, res.get("rr",0.0), extra={"symbol": symbol})
+    if weight < 0.25 and rr < 1.5:
+        log.info("policy reject — arm=%s w=%.2f rr=%.2f", arm, weight, rr, extra={"symbol": symbol})
         try: update_perf_for_symbol(symbol, df_h1=df_h1)
         except Exception: pass
         return
 
-    side = res.get("side", "long").lower()
     entry = res.get("entry"); sl, tp1, tp2 = res.get("sl"), res.get("tp1"), res.get("tp2")
     value_usdt = float(os.environ.get("ORDER_VALUE_USDT", "20"))
 
