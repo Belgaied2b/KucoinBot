@@ -1,49 +1,78 @@
 # -*- coding: utf-8 -*-
 """
 main.py — Boucle event-driven optimisée + logs détaillés
+- Build des symboles via fetch_symbol_meta() (contrats USDTM)
+- Institutionnel + autotune si présents (soft import)
+- Logs clairs à chaque étape
 """
 
 import os, asyncio, logging, math, time
-from typing import Dict, Any, Tuple
+from typing import Dict, Any, Tuple, List
+
 from ws_router import EventBus, PollingSource
 from execution_sfi import SFIEngine
 from risk_guard import RiskGuard
 from meta_policy import MetaPolicy
 from perf_metrics import register_signal_perf, update_perf_for_symbol
-from kucoin_utils import fetch_all_symbols, fetch_klines
-from log_setup import init_logging, enable_httpx   # <-- NEW
+from kucoin_utils import fetch_klines, fetch_symbol_meta
+from log_setup import init_logging, enable_httpx
 
+# ---- Soft imports pour l'institutionnel / autotune (optionnels)
+HAS_INST = True
 try:
-    import analyze_bridge as analyze_signal
+    from inst_enrich import get_institutional_snapshot  # type: ignore
 except Exception:
-    import analyze_signal  # fallback
+    HAS_INST = False
+
+HAS_TUNER = True
+try:
+    from inst_autotune import InstAutoTune, components_ok  # type: ignore
+except Exception:
+    HAS_TUNER = False
+
+# ---- Analyse: bridge prioritaire, sinon fallback
+try:
+    import analyze_bridge as analyze_signal  # type: ignore
+except Exception:
+    import analyze_signal  # type: ignore
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID")
 
-H1_LIMIT = int(os.getenv("H1_LIMIT", "500"))
-H4_LIMIT = int(os.getenv("H4_LIMIT", "400"))
-H1_REFRESH_SEC = int(os.getenv("H1_REFRESH_SEC", "60"))
-H4_REFRESH_SEC = int(os.getenv("H4_REFRESH_SEC", "300"))
-ANALYSIS_MIN_INTERVAL_SEC = int(os.getenv("ANALYSIS_MIN_INTERVAL_SEC", "15"))
+H1_LIMIT                 = int(os.getenv("H1_LIMIT", "500"))
+H4_LIMIT                 = int(os.getenv("H4_LIMIT", "400"))
+H1_REFRESH_SEC           = int(os.getenv("H1_REFRESH_SEC", "60"))
+H4_REFRESH_SEC           = int(os.getenv("H4_REFRESH_SEC", "300"))
+ANALYSIS_MIN_INTERVAL_SEC= int(os.getenv("ANALYSIS_MIN_INTERVAL_SEC", "15"))
+WS_POLL_SEC              = int(os.getenv("WS_POLL_SEC", "5"))
 
 _KLINE_CACHE: Dict[str, Dict[str, Any]] = {}
 _LAST_ANALYSIS_TS: Dict[str, float] = {}
-log = logging.getLogger("runner")
 
+log = logging.getLogger("runner")
+TUNER = InstAutoTune() if HAS_TUNER else None  # type: ignore
+
+
+# ------------------------
+# Utils
+# ------------------------
 def fmt_price(x):
     if x is None: return "—"
     if x == 0: return "0"
-    d = 2 if x >= 1 else min(8, int(abs(math.log10(1.0/x))) + 2)
-    return f"{x:.{d}f}"
+    try:
+        d = 2 if x >= 1 else min(8, int(abs(math.log10(1.0/float(x)))) + 2)
+        return f"{float(x):.{d}f}"
+    except Exception:
+        return str(x)
 
 def send_telegram(text: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         log.info("[TG OFF] %s", text); return
     import requests
-    url=f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     try:
-        requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode":"Markdown", "disable_web_page_preview": True}, timeout=10)
+        requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text,
+                                 "parse_mode":"Markdown", "disable_web_page_preview": True}, timeout=10)
     except Exception as e:
         log.error("Telegram KO: %s", e)
 
@@ -70,19 +99,43 @@ def _get_klines_cached(symbol: str) -> Tuple[Any, Any]:
     _KLINE_CACHE[symbol] = ent
     return ent.get("h1"), ent.get("h4")
 
+def _build_symbols() -> List[str]:
+    """
+    Construit la liste des contrats USDTM (ex: BTCUSDTM) à partir de fetch_symbol_meta().
+    - Respecte l'env SYMBOLS="BTCUSDTM,ETHUSDTM" si fourni.
+    """
+    env_syms = os.getenv("SYMBOLS", "").strip()
+    if env_syms:
+        # on fait confiance à l'utilisateur pour donner des contrats valides
+        lst = [s.strip().upper() for s in env_syms.split(",") if s.strip()]
+        return sorted(set(lst))
+    meta = fetch_symbol_meta()  # clés = "BTCUSDT", valeurs -> {"symbol_api":"BTCUSDTM", ...}
+    syms = []
+    for v in meta.values():
+        sym_api = str(v.get("symbol_api", "")).strip().upper()
+        if sym_api.endswith("USDTM"):
+            syms.append(sym_api)
+    return sorted(set(syms))
+
+
+# ------------------------
+# Event handler
+# ------------------------
 async def handle_symbol_event(ev: Dict[str, Any], rg: RiskGuard, policy: MetaPolicy):
     symbol = ev.get("symbol")
-    etype = ev.get("type")
+    etype  = ev.get("type")
     if etype != "bar":
         return
     log.info("event: %s", etype, extra={"symbol": symbol})
 
+    # anti-spam analyse
     last = _LAST_ANALYSIS_TS.get(symbol, 0.0)
     if time.time() - last < ANALYSIS_MIN_INTERVAL_SEC:
         log.debug("skip: analysis throttle", extra={"symbol": symbol})
         return
     _LAST_ANALYSIS_TS[symbol] = time.time()
 
+    # klines cache
     try:
         df_h1, df_h4 = _get_klines_cached(symbol)
     except Exception as e:
@@ -92,34 +145,79 @@ async def handle_symbol_event(ev: Dict[str, Any], rg: RiskGuard, policy: MetaPol
         log.warning("klines vides", extra={"symbol": symbol})
         return
 
+    # --- Institutionnel + autotune (si dispo)
+    inst = {}
+    if HAS_INST:
+        try:
+            inst = get_institutional_snapshot(symbol)
+            log.info("inst: s=%.2f oi=%.2f d=%.2f f=%.2f liq=%.2f cvd=%d liq5m=%d",
+                     float(inst.get("score",0)), float(inst.get("oi_score",0)),
+                     float(inst.get("delta_score",0)), float(inst.get("funding_score",0)),
+                     float(inst.get("liq_score",0)), int(inst.get("delta_cvd_usd",0)),
+                     int(inst.get("liq_notional_5m",0)), extra={"symbol": symbol})
+        except Exception as e:
+            log.warning("inst snapshot KO: %s", e, extra={"symbol": symbol})
+            inst = {}
+
+    if HAS_INST and HAS_TUNER and TUNER is not None:
+        try:
+            thr = TUNER.update_and_get(symbol, df_h1, inst)  # seuils adaptatifs
+            comps_cnt, comps_detail = components_ok(inst, thr)
+            inst_ok = (float(inst.get("score",0)) >= thr["req_score"]) and (comps_cnt >= thr["components_min"])
+            log.info("inst-gate: pass=%s score=%.2f req=%.2f comps=%d/%d q=%.2f atr%%=%.2f",
+                     inst_ok, float(inst.get("score",0)), thr["req_score"], comps_cnt, thr["components_min"],
+                     float(thr.get("q_used", 0.0)), float(thr.get("atr_pct", 0.0)), extra={"symbol": symbol})
+            if not inst_ok:
+                log.info("inst-reject details: %s", comps_detail, extra={"symbol": symbol})
+                try: update_perf_for_symbol(symbol, df_h1=df_h1)
+                except Exception: pass
+                return
+        except Exception as e:
+            log.warning("autotune failed: %s", e, extra={"symbol": symbol})
+            # on continue sans gating si l'autotune a un souci
+
+    # --- Analyse (avec institutional si supporté)
     try:
         log.debug("analyze...", extra={"symbol": symbol})
-        res = analyze_signal.analyze_signal(symbol=symbol, df_h1=df_h1, df_h4=df_h4)
+        try:
+            res = analyze_signal.analyze_signal(symbol=symbol, df_h1=df_h1, df_h4=df_h4, institutional=inst)
+        except TypeError:
+            # signature plus simple
+            res = analyze_signal.analyze_signal(symbol=symbol, df_h1=df_h1, df_h4=df_h4)
     except Exception as e:
         log.warning("analyze_signal KO: %s", e, extra={"symbol": symbol})
         return
 
     # ---- Logs d'analyse détaillés
+    if not isinstance(res, dict):
+        log.info("no-trade (bad result type)", extra={"symbol": symbol})
+        try: update_perf_for_symbol(symbol, df_h1=df_h1)
+        except Exception: pass
+        return
+
     side = str(res.get("side", "none")).lower()
     rr   = float(res.get("rr", 0) or 0)
-    score= float(res.get("inst_score", 0) or 0)
+    # si l'analyse ne renvoie pas 'inst_score', on reprend celui du snapshot
+    score= float(res.get("inst_score", inst.get("score", 0) if isinstance(inst, dict) else 0) or 0)
     comments_list = res.get("comments", []) or []
     comments = ", ".join([str(c) for c in comments_list]) if comments_list else ""
     log.info("analysis: side=%s rr=%.2f score=%.2f comment=%s",
              side, rr, score, comments or "—", extra={"symbol": symbol})
 
-    if not isinstance(res, dict) or not res.get("valid", False):
+    if not res.get("valid", False):
         log.info("no-trade (invalid signal) — rr=%.2f score=%.2f reason=%s",
                  rr, score, (comments or "no reason"), extra={"symbol": symbol})
         try: update_perf_for_symbol(symbol, df_h1=df_h1)
         except Exception: pass
         return
 
+    # --- Risk guard
     ok, reason = rg.can_enter(symbol, ws_latency_ms=50, last_data_age_s=5)
     if not ok:
         log.info("blocked by risk_guard: %s", reason, extra={"symbol": symbol})
         return
 
+    # --- Policy
     arm, weight, label = policy.choose({"atr_pct": res.get("atr_pct", 0), "adx_proxy": res.get("adx_proxy", 0)})
     if weight < 0.25 and rr < 1.5:
         log.info("policy reject — arm=%s w=%.2f rr=%.2f", arm, weight, rr, extra={"symbol": symbol})
@@ -127,6 +225,7 @@ async def handle_symbol_event(ev: Dict[str, Any], rg: RiskGuard, policy: MetaPol
         except Exception: pass
         return
 
+    # --- Exécution
     entry = res.get("entry"); sl, tp1, tp2 = res.get("sl"), res.get("tp1"), res.get("tp2")
     value_usdt = float(os.environ.get("ORDER_VALUE_USDT", "20"))
 
@@ -149,22 +248,30 @@ async def handle_symbol_event(ev: Dict[str, Any], rg: RiskGuard, policy: MetaPol
     try: update_perf_for_symbol(symbol, df_h1=df_h1)
     except Exception: pass
 
+
+# ------------------------
+# Main
+# ------------------------
 async def main():
-    init_logging()  # <-- NEW
+    init_logging()
     if os.getenv("LOG_HTTP", "0") == "1":
-        enable_httpx(True)  # <-- NEW
+        enable_httpx(True)
 
     logging.getLogger("runner").info("start")
+
+    # Build des symboles contrats via meta (ou via env SYMBOLS)
     try:
-        symbols = [s for s in fetch_all_symbols() if s.endswith("USDTM")]
-    except Exception:
+        symbols = _build_symbols()
+    except Exception as e:
+        logging.getLogger("runner").error("Build symbols KO: %s", e)
         symbols = []
+
     if not symbols:
         logging.getLogger("runner").warning("Aucun symbole.")
         return
 
     bus = EventBus()
-    src = PollingSource(symbols, interval_sec=int(os.getenv("WS_POLL_SEC", "5")))
+    src = PollingSource(symbols, interval_sec=WS_POLL_SEC)
     bus.add_source(src.__aiter__())
     await bus.start()
 
