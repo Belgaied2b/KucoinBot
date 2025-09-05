@@ -1,11 +1,18 @@
 # -*- coding: utf-8 -*-
 """
 perf_metrics.py — MFE/MAE tracking + export CSV
+Optimisé: accepte df_h1 fourni pour éviter des /kline supplémentaires.
 """
 
 from __future__ import annotations
 import os, json, time, csv, logging
 from typing import Dict, Any, Optional
+
+try:
+    import pandas as pd  # type: ignore
+except Exception:
+    pd = None
+
 from kucoin_utils import fetch_klines
 
 PERF_PATH = os.environ.get("PERF_PATH", "performance.json")
@@ -31,31 +38,42 @@ def register_signal_perf(key: str, symbol: str, side: str, entry: Optional[float
                   "mfe": 0.0, "mae": 0.0, "last_update": 0.0}
     save_perf_store(store)
 
-def update_perf_for_symbol(symbol: str) -> None:
+def update_perf_for_symbol(symbol: str, df_h1: Optional["pd.DataFrame"]=None) -> None:
+    """
+    Met à jour MFE/MAE pour `symbol`.
+    Si df_h1 est fourni, il est utilisé tel quel (évite refetch); sinon on fetch.
+    """
     store = load_perf_store()
     items = [(k, v) for k, v in store.items() if v.get("symbol") == symbol]
     if not items: return
-    try:
-        df = fetch_klines(symbol, interval="1h", limit=H1_LIMIT)
-    except Exception as e:
-        logging.warning("[%s] update_perf: fetch_klines KO: %s", symbol, e); return
-    if df is None or getattr(df, "empty", False): return
+
+    if df_h1 is None:
+        try:
+            df_h1 = fetch_klines(symbol, interval="1h", limit=H1_LIMIT)
+        except Exception as e:
+            logging.warning("[%s] update_perf: fetch_klines KO: %s", symbol, e); return
+
+    if df_h1 is None or getattr(df_h1, "empty", False): return
+
     for k, v in items:
         entry = float(v.get("entry", 0))
         if entry <= 0: continue
         start_ts = float(v.get("ts", 0)) * 1000.0
-        sub = df[df["time"] >= start_ts]
+        sub = df_h1[df_h1["time"] >= start_ts]
         if getattr(sub, "empty", False): continue
-        if v.get("side", "long").lower() == "long":
+
+        if str(v.get("side","long")).lower() == "long":
             max_high = float(sub["high"].max()); min_low = float(sub["low"].min())
             mfe = max(0.0, (max_high - entry) / entry); mae = max(0.0, (entry - min_low) / entry)
         else:
             min_low = float(sub["low"].min()); max_high = float(sub["high"].max())
             mfe = max(0.0, (entry - min_low) / entry); mae = max(0.0, (max_high - entry) / entry)
+
         v["mfe"] = max(float(v.get("mfe", 0.0)), float(mfe))
         v["mae"] = max(float(v.get("mae", 0.0)), float(mae))
         v["last_update"] = time.time()
         store[k] = v
+
     save_perf_store(store)
 
 def export_csv(path: str = "performance_export.csv") -> str:
