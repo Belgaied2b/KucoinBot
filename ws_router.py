@@ -1,18 +1,21 @@
 # -*- coding: utf-8 -*-
 """
 ws_router.py — Event bus + source de polling optimisée
-- N'émet un 'bar' que si la dernière bougie 1h change (réduction d'events)
+- N'émet un 'bar' que si une **nouvelle bougie 1h** est détectée
+- Et on ne vérifie cela que près du **top-of-hour** pour réduire les appels
 """
 
 from __future__ import annotations
 import asyncio, time, logging
-from typing import Dict, Any, List, AsyncGenerator, Optional
+from typing import Dict, Any, List, AsyncGenerator
 from kucoin_utils import fetch_klines
 
 try:
     import kucoin_adapter as kt  # si dispo
 except Exception:
     kt = None
+
+WS_BAR_CHECK_WINDOW_SEC = int(__import__("os").getenv("WS_BAR_CHECK_WINDOW_SEC", "30"))
 
 class EventBus:
     def __init__(self):
@@ -46,6 +49,8 @@ class PollingSource:
     async def __aiter__(self):
         while True:
             t0 = time.time()
+            spoh = int(t0) % 3600  # seconds past of hour
+
             for sym in self.symbols:
                 # 1) Event 'top' (si backend dispo)
                 if kt and hasattr(kt, "get_orderbook_top"):
@@ -56,14 +61,19 @@ class PollingSource:
                     except Exception:
                         pass
 
-                # 2) Event 'bar' UNIQUEMENT si nouvelle bougie 1h détectée
+                # 2) 'bar' UNIQUEMENT si on est proche du top-of-hour
+                #    (ou si on n'a jamais vu ce symbole -> initialisation)
+                last_seen = self._last_bar_ts.get(sym, 0)
+                near_to_hour = (spoh <= WS_BAR_CHECK_WINDOW_SEC) or (spoh >= 3600 - WS_BAR_CHECK_WINDOW_SEC)
+                if not near_to_hour and last_seen != 0:
+                    continue  # saute la vérif 'bar' hors fenêtre
+
                 try:
                     df = fetch_klines(sym, interval="1h", limit=2)
                     if df is not None and len(df) >= 1:
                         last = df.iloc[-1].to_dict()
                         last_ts = int(last.get("time", 0))
-                        prev = self._last_bar_ts.get(sym, 0)
-                        if last_ts > prev:
+                        if last_ts > last_seen:
                             self._last_bar_ts[sym] = last_ts
                             yield {"type": "bar", "symbol": sym, "bar": last, "ts": time.time()}
                 except Exception:
