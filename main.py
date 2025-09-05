@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 """
 main.py — Boucle event-driven optimisée
-EventBus + PollingSource -> analyze_signal (sur nouveaux bars) -> risk_guard -> SFI
 """
 
 import os, asyncio, logging, math, time
@@ -13,7 +12,6 @@ from meta_policy import MetaPolicy
 from perf_metrics import register_signal_perf, update_perf_for_symbol
 from kucoin_utils import fetch_all_symbols, fetch_klines
 
-# Utilise le bridge si dispo
 try:
     import analyze_bridge as analyze_signal
 except Exception:
@@ -22,15 +20,13 @@ except Exception:
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-# --------- Tunables (overridables via ENV) ----------
 H1_LIMIT = int(os.getenv("H1_LIMIT", "500"))
 H4_LIMIT = int(os.getenv("H4_LIMIT", "400"))
-H1_REFRESH_SEC = int(os.getenv("H1_REFRESH_SEC", "60"))     # TTL cache H1
-H4_REFRESH_SEC = int(os.getenv("H4_REFRESH_SEC", "300"))    # TTL cache H4
+H1_REFRESH_SEC = int(os.getenv("H1_REFRESH_SEC", "60"))
+H4_REFRESH_SEC = int(os.getenv("H4_REFRESH_SEC", "300"))
 ANALYSIS_MIN_INTERVAL_SEC = int(os.getenv("ANALYSIS_MIN_INTERVAL_SEC", "15"))
 
-# --------- Caches ----------
-_KLINE_CACHE: Dict[str, Dict[str, Any]] = {}       # {symbol: {"h1": df, "h4": df, "ts_h1": t, "ts_h4": t}}
+_KLINE_CACHE: Dict[str, Dict[str, Any]] = {}
 _LAST_ANALYSIS_TS: Dict[str, float] = {}
 
 def fmt_price(x):
@@ -50,7 +46,6 @@ def send_telegram(text: str):
         logging.error("Telegram KO: %s", e)
 
 def _get_klines_cached(symbol: str) -> Tuple[Any, Any]:
-    """Retourne (df_h1, df_h4) depuis cache TTL, sinon recharge intelligemment."""
     now = time.time()
     ent = _KLINE_CACHE.get(symbol, {})
     need_h1 = ("h1" not in ent) or (now - ent.get("ts_h1", 0) > H1_REFRESH_SEC)
@@ -71,16 +66,14 @@ def _get_klines_cached(symbol: str) -> Tuple[Any, Any]:
 async def handle_symbol_event(ev: Dict[str, Any], rg: RiskGuard, policy: MetaPolicy):
     symbol = ev.get("symbol")
     etype = ev.get("type")
-    if etype not in ("bar",):   # ← on ignore les 'top' pour éviter les re-fetchs inutiles
+    if etype not in ("bar",):
         return
 
-    # anti-spam analyse
     last = _LAST_ANALYSIS_TS.get(symbol, 0.0)
     if time.time() - last < ANALYSIS_MIN_INTERVAL_SEC:
         return
     _LAST_ANALYSIS_TS[symbol] = time.time()
 
-    # --- Klines via cache TTL (réduit >90% des appels lourds)
     try:
         df_h1, df_h4 = _get_klines_cached(symbol)
     except Exception as e:
@@ -90,7 +83,6 @@ async def handle_symbol_event(ev: Dict[str, Any], rg: RiskGuard, policy: MetaPol
         logging.warning("[%s] klines vides", symbol)
         return
 
-    # --- Analyse avec DF fournis
     try:
         res = analyze_signal.analyze_signal(symbol=symbol, df_h1=df_h1, df_h4=df_h4)
     except Exception as e:
@@ -98,7 +90,9 @@ async def handle_symbol_event(ev: Dict[str, Any], rg: RiskGuard, policy: MetaPol
         return
 
     if not isinstance(res, dict) or not res.get("valid", False):
-        update_perf_for_symbol(symbol)
+        # ⬇️ utilise le DF déjà en cache (évite un fetch H1)
+        try: update_perf_for_symbol(symbol, df_h1=df_h1)
+        except Exception: pass
         return
 
     ok, reason = rg.can_enter(symbol, ws_latency_ms=50, last_data_age_s=5)
@@ -108,7 +102,8 @@ async def handle_symbol_event(ev: Dict[str, Any], rg: RiskGuard, policy: MetaPol
 
     arm, weight, label = policy.choose({"atr_pct": res.get("atr_pct", 0), "adx_proxy": res.get("adx_proxy", 0)})
     if weight < 0.25 and res.get("rr", 0) < 1.5:
-        update_perf_for_symbol(symbol)
+        try: update_perf_for_symbol(symbol, df_h1=df_h1)  # ⬅️ idem, pas de refetch
+        except Exception: pass
         return
 
     side = res.get("side", "long").lower()
@@ -127,10 +122,14 @@ async def handle_symbol_event(ev: Dict[str, Any], rg: RiskGuard, policy: MetaPol
 
     key = f"{symbol}:{side}:{fmt_price(entry)}:{round(res.get('rr',0),2)}"
     register_signal_perf(key, symbol, side, entry)
-    update_perf_for_symbol(symbol)
+    try: update_perf_for_symbol(symbol, df_h1=df_h1)  # ⬅️ encore sans refetch
+    except Exception: pass
 
 async def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+    # ↓↓ coupe le bruit httpx (les lignes "HTTP Request: GET ...")
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+
     try:
         symbols = [s for s in fetch_all_symbols() if s.endswith("USDTM")]
     except Exception:
