@@ -1,17 +1,17 @@
 # -*- coding: utf-8 -*-
 """
-main.py — Boucle event-driven (recommandée)
-Relie: ws_router.EventBus + PollingSource → analyze_signal → risk_guard → execution_sfi
+main.py — Boucle event-driven optimisée
+EventBus + PollingSource -> analyze_signal (sur nouveaux bars) -> risk_guard -> SFI
 """
 
-import os, asyncio, logging, math
-from typing import Dict, Any
+import os, asyncio, logging, math, time
+from typing import Dict, Any, Tuple
 from ws_router import EventBus, PollingSource
 from execution_sfi import SFIEngine
 from risk_guard import RiskGuard
 from meta_policy import MetaPolicy
 from perf_metrics import register_signal_perf, update_perf_for_symbol
-from kucoin_utils import fetch_all_symbols, fetch_klines  # <-- ajout de fetch_klines
+from kucoin_utils import fetch_all_symbols, fetch_klines
 
 # Utilise le bridge si dispo
 try:
@@ -21,6 +21,17 @@ except Exception:
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+
+# --------- Tunables (overridables via ENV) ----------
+H1_LIMIT = int(os.getenv("H1_LIMIT", "500"))
+H4_LIMIT = int(os.getenv("H4_LIMIT", "400"))
+H1_REFRESH_SEC = int(os.getenv("H1_REFRESH_SEC", "60"))     # TTL cache H1
+H4_REFRESH_SEC = int(os.getenv("H4_REFRESH_SEC", "300"))    # TTL cache H4
+ANALYSIS_MIN_INTERVAL_SEC = int(os.getenv("ANALYSIS_MIN_INTERVAL_SEC", "15"))
+
+# --------- Caches ----------
+_KLINE_CACHE: Dict[str, Dict[str, Any]] = {}       # {symbol: {"h1": df, "h4": df, "ts_h1": t, "ts_h4": t}}
+_LAST_ANALYSIS_TS: Dict[str, float] = {}
 
 def fmt_price(x):
     if x is None: return "—"
@@ -38,19 +49,45 @@ def send_telegram(text: str):
     except Exception as e:
         logging.error("Telegram KO: %s", e)
 
+def _get_klines_cached(symbol: str) -> Tuple[Any, Any]:
+    """Retourne (df_h1, df_h4) depuis cache TTL, sinon recharge intelligemment."""
+    now = time.time()
+    ent = _KLINE_CACHE.get(symbol, {})
+    need_h1 = ("h1" not in ent) or (now - ent.get("ts_h1", 0) > H1_REFRESH_SEC)
+    need_h4 = ("h4" not in ent) or (now - ent.get("ts_h4", 0) > H4_REFRESH_SEC)
+
+    if need_h1:
+        df_h1 = fetch_klines(symbol, interval="1h", limit=H1_LIMIT)
+        ent["h1"] = df_h1
+        ent["ts_h1"] = now
+    if need_h4:
+        df_h4 = fetch_klines(symbol, interval="4h", limit=H4_LIMIT)
+        ent["h4"] = df_h4
+        ent["ts_h4"] = now
+
+    _KLINE_CACHE[symbol] = ent
+    return ent.get("h1"), ent.get("h4")
+
 async def handle_symbol_event(ev: Dict[str, Any], rg: RiskGuard, policy: MetaPolicy):
     symbol = ev.get("symbol")
-    if ev.get("type") not in ("top", "bar"):
+    etype = ev.get("type")
+    if etype not in ("bar",):   # ← on ignore les 'top' pour éviter les re-fetchs inutiles
         return
 
-    # --- Prépare H1/H4 (corrige le manque de df_h1/df_h4)
+    # anti-spam analyse
+    last = _LAST_ANALYSIS_TS.get(symbol, 0.0)
+    if time.time() - last < ANALYSIS_MIN_INTERVAL_SEC:
+        return
+    _LAST_ANALYSIS_TS[symbol] = time.time()
+
+    # --- Klines via cache TTL (réduit >90% des appels lourds)
     try:
-        h1_lim = int(os.getenv("H1_LIMIT", "500"))
-        h4_lim = int(os.getenv("H4_LIMIT", "400"))
-        df_h1 = fetch_klines(symbol, interval="1h", limit=h1_lim)
-        df_h4 = fetch_klines(symbol, interval="4h", limit=h4_lim)
+        df_h1, df_h4 = _get_klines_cached(symbol)
     except Exception as e:
         logging.warning("[%s] fetch_klines KO: %s", symbol, e)
+        return
+    if df_h1 is None and df_h4 is None:
+        logging.warning("[%s] klines vides", symbol)
         return
 
     # --- Analyse avec DF fournis
@@ -95,7 +132,6 @@ async def handle_symbol_event(ev: Dict[str, Any], rg: RiskGuard, policy: MetaPol
 async def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
     try:
-        # fetch_all_symbols retourne des contrats USDT-M (…USDTM)
         symbols = [s for s in fetch_all_symbols() if s.endswith("USDTM")]
     except Exception:
         symbols = []
@@ -104,7 +140,7 @@ async def main():
         return
 
     bus = EventBus()
-    src = PollingSource(symbols, interval_sec=5)
+    src = PollingSource(symbols, interval_sec=int(os.getenv("WS_POLL_SEC", "5")))
     bus.add_source(src.__aiter__())
     await bus.start()
 
