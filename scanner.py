@@ -14,7 +14,6 @@ import httpx
 
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"),
                     format="%(asctime)s [%(levelname)s] %(message)s")
-# Couper le bruit réseau verbeux
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("urllib3").setLevel(logging.WARNING)
 
@@ -101,7 +100,7 @@ INST_WINDOW = _env_int("INST_WINDOW", 200)
 INST_STATS_PATH = os.environ.get("INST_STATS_PATH", "inst_stats.json")
 
 AUTO_SYMBOLS = os.environ.get("AUTO_SYMBOLS", "1") == "1"
-# ⚠️ Sur KuCoin Futures le BTC perp est XBTUSDTM (on mappe BTCUSDTM -> XBTUSDTM).
+# ⚠️ Sur KuCoin Futures le perp BTC est XBTUSDTM, on mappe automatiquement.
 SYMBOLS = [s.strip() for s in os.environ.get("SYMBOLS", "BTCUSDTM,ETHUSDTM,SOLUSDTM").split(",") if s.strip()]
 SYMBOLS_MAX = _env_int("SYMBOLS_MAX", 450)
 
@@ -143,17 +142,16 @@ def signal_key(symbol: str, side: str, entry: Optional[float], rr: Optional[floa
     br = None if rr is None else round(float(rr), 2)
     return f"{symbol}:{side}:{be}:{br}"
 
-# ---- KuCoin Futures Klines (from/to en millisecondes)
+# ---- KuCoin Futures Klines (granularity en MINUTES, from/to en MILLISECONDES)
 KU_FUT_BASE = "https://api-futures.kucoin.com"
 
 _GRAN_MIN = {
     "1m": 1, "3m": 3, "5m": 5, "15m": 15, "30m": 30,
     "1h": 60, "2h": 120, "4h": 240, "8h": 480, "12h": 720,
-    "1d": 1440, "1w": 10080, "1mo": 43200
+    "1d": 1440, "1w": 10080
 }
 
-# Aliases symboles (BTC futures = XBT… sur KuCoin)
-_ALIAS = {
+_ALIAS = {  # BTC -> XBT
     "BTCUSDT": "XBTUSDTM",
     "BTCUSDTM": "XBTUSDTM",
     "XBTUSDT": "XBTUSDTM"
@@ -165,14 +163,12 @@ def _canon_symbol(sym: str) -> str:
         if s != _ALIAS[s]:
             LOG.info("alias symbole: %s -> %s", s, _ALIAS[s])
         return _ALIAS[s]
-    # Ajouter M si ça finit en USDT sans M
     if s.endswith("USDT") and not s.endswith("USDTM"):
         s = s + "M"
     return s
 
 def _parse_kline_row(row) -> Optional[tuple]:
-    """Retourne (t_ms, o, h, l, c, v) ou None si non parsable.
-       6 ou 7 colonnes acceptées."""
+    """Retourne (t_ms, o, h, l, c, v) — accepte 6 ou 7 colonnes."""
     if not isinstance(row, (list, tuple)) or len(row) < 6:
         return None
     try:
@@ -180,44 +176,39 @@ def _parse_kline_row(row) -> Optional[tuple]:
         if t < 10**12:  # secondes -> ms
             t *= 1000
         o = float(row[1])
-
         if len(row) >= 7:
-            # Doc futures: [time, open, close, high, low, volume, turnover]
             c = float(row[2]); h = float(row[3]); l = float(row[4]); v = float(row[5])
         else:
-            # 6 colonnes: a2/a3/a4 = {close, high, low} ordre inconnu
             a2 = float(row[2]); a3 = float(row[3]); a4 = float(row[4]); v = float(row[5])
-            hi = max(a2, a3, a4)
-            lo = min(a2, a3, a4)
+            hi = max(a2, a3, a4); lo = min(a2, a3, a4)
             if a2 != hi and a2 != lo: c = a2
             elif a3 != hi and a3 != lo: c = a3
             else: c = a4
             h, l = hi, lo
-
-        if l > h:
-            h, l = l, h
+        if l > h: h, l = l, h
         if c < l: c = l
         if c > h: c = h
         return (t, o, h, l, c, v)
     except Exception:
         return None
 
-def _fetch_klines_once(sym: str, gran: int, req_pts: int, shrink: float) -> pd.DataFrame:
-    now_ms = int(time.time() * 1000)
-    span_ms = int(gran * req_pts * 60_000 * shrink)  # minutes -> ms
-    params = {
-        "symbol": sym,
-        "granularity": gran,
-        "from": now_ms - span_ms,
-        "to": now_ms
-    }
+def _fetch_klines(sym: str, gran_min: int, limit: int,
+                  use_window: bool, shrink: float) -> pd.DataFrame:
+    """Appel unique: avec fenêtre from/to (use_window=True) ou SANS (False)."""
+    params = {"symbol": sym, "granularity": gran_min}
+    if use_window:
+        now_ms = int(time.time() * 1000)
+        span_ms = int(gran_min * min(limit, 500) * 60_000 * shrink)
+        params["from"] = now_ms - span_ms
+        params["to"]   = now_ms
     try:
         r = httpx.get(f"{KU_FUT_BASE}/api/v1/kline/query", params=params, timeout=15)
         r.raise_for_status()
         data = (r.json() or {}).get("data") or []
     except httpx.HTTPStatusError as e:
         if e.response is not None and e.response.status_code == 400:
-            LOG.warning("[%s] kline 400 → shrink=%.3f params=%s", sym, shrink, params)
+            LOG.warning("[%s] kline 400 (use_window=%s, shrink=%.3f) params=%s",
+                        sym, use_window, shrink, params)
             return pd.DataFrame()
         LOG.warning("[%s] kline KO: %s", sym, e)
         return pd.DataFrame()
@@ -226,7 +217,7 @@ def _fetch_klines_once(sym: str, gran: int, req_pts: int, shrink: float) -> pd.D
         return pd.DataFrame()
 
     if not data:
-        LOG.warning("[%s] kline vide (shrink=%.3f)", sym, shrink)
+        LOG.warning("[%s] kline vide (use_window=%s, shrink=%.3f)", sym, use_window, shrink)
         return pd.DataFrame()
 
     rows = []
@@ -235,43 +226,41 @@ def _fetch_klines_once(sym: str, gran: int, req_pts: int, shrink: float) -> pd.D
         if parsed is not None:
             rows.append(parsed)
     if not rows:
-        LOG.warning("[%s] aucune ligne parsée (shape inattendue) — shrink=%.3f", sym, shrink)
+        LOG.warning("[%s] aucune ligne parsée (shape inattendue) — use_window=%s, shrink=%.3f",
+                    sym, use_window, shrink)
         return pd.DataFrame()
 
     df = pd.DataFrame(rows, columns=["time_ms", "open", "high", "low", "close", "volume"])
     df.sort_values("time_ms", inplace=True)
     df["time"] = (df["time_ms"] // 1000).astype(int)
     df = df[["time", "open", "high", "low", "close", "volume"]].reset_index(drop=True)
+    if len(df) > limit:
+        df = df.iloc[-limit:].reset_index(drop=True)
     return df
 
 def _ku_get_klines(symbol: str, interval: str, limit: int) -> pd.DataFrame:
-    """KuCoin Futures /api/v1/kline/query (granularity en minutes, from/to en millisecondes).
-       Parser tolérant + alias BTC→XBT + retry shrink."""
+    """Granularity en minutes, from/to en ms. Fallback sans fenêtre + alias BTC/XBT."""
     gran = _GRAN_MIN.get(interval)
     if not gran:
         raise ValueError(f"interval inconnu: {interval}")
-
     sym = _canon_symbol(symbol)
-    max_pts = 1500
-    req_pts = min(int(limit), max_pts)
 
-    def _attempt(sym_try: str) -> pd.DataFrame:
-        for shrink in (1.0, 0.5, 0.25, 0.125):
-            df = _fetch_klines_once(sym_try, gran, req_pts, shrink)
+    def attempt(sym_try: str) -> pd.DataFrame:
+        # 1) avec fenêtre (3 tailles)
+        for shrink in (1.0, 0.5, 0.25):
+            df = _fetch_klines(sym_try, gran, min(limit, 500), True, shrink)
             if not df.empty:
-                # coupe à 'limit' dernières
-                if len(df) > limit:
-                    df = df.iloc[-limit:].reset_index(drop=True)
                 return df
             time.sleep(0.2)
-        return pd.DataFrame()
+        # 2) sans fenêtre → 500 dernières bougies (recommandé par KuCoin)
+        df = _fetch_klines(sym_try, gran, min(limit, 500), False, 1.0)
+        return df
 
-    # 1) essai symbole canoniqué
-    df = _attempt(sym)
+    df = attempt(sym)
     if not df.empty:
         return df
 
-    # 2) fallback alias BTC<->XBT si toujours vide
+    # Fallback alias BTC <-> XBT
     alt = None
     if sym.startswith("BTC"):
         alt = "XBT" + sym[3:]
@@ -279,7 +268,7 @@ def _ku_get_klines(symbol: str, interval: str, limit: int) -> pd.DataFrame:
         alt = "BTC" + sym[3:]
     if alt:
         LOG.warning("[%s] vide — tentative alias %s", sym, alt)
-        df_alt = _attempt(alt)
+        df_alt = attempt(alt)
         if not df_alt.empty:
             return df_alt
 
@@ -293,8 +282,7 @@ class MacroCache:
     def snapshot(self) -> Dict[str, Any]:
         if self._snap and (time.time()-self._ts)<self.ttl:
             return self._snap
-        # TODO: brancher ta vraie macro (TOTAL/TOTAL2/DOM, etc.)
-        self._snap = {}
+        self._snap = {}  # TODO: brancher TOTAL/TOTAL2/DOM
         self._ts = time.time()
         return self._snap
 
@@ -399,13 +387,11 @@ def _load_symbols() -> List[str]:
 
 # ---- Analyse d'un symbole
 def analyze_one(symbol: str, macro: MacroCache, gate: InstThreshold) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-    # Bougies KuCoin Futures (from/to en ms)
     df_h1 = _ku_get_klines(symbol, "1h", H1_LIMIT)
     df_h4 = _ku_get_klines(symbol, "4h", H4_LIMIT)
     if df_h1.empty or df_h4.empty:
         return None, "bars vides (fetch KO)"
 
-    # Call analyzer (supporte bridge et direct)
     try:
         res_raw = analyze_mod.analyze_signal(symbol=_canon_symbol(symbol), df_h1=df_h1, df_h4=df_h4, macro=macro.snapshot())
     except TypeError:
@@ -415,17 +401,14 @@ def analyze_one(symbol: str, macro: MacroCache, gate: InstThreshold) -> Tuple[Op
     if not isinstance(res, dict):
         return None, "analyze_signal renvoie non-dict"
 
-    # diagnostics pour logs
     diag = res.get("diagnostics") or (res.get("manage", {}) or {}).get("diagnostics") or {}
     inst_diag = diag.get("inst") or {}
     tech_diag = diag.get("tech") or {}
     macro_diag = diag.get("macro") or {}
 
-    # champs insti unifiés
     inst_score = float(res.get("inst_score", inst_diag.get("score", res.get("score", 0.0)) or 0.0))
     inst_ok_count = int(res.get("inst_ok_count", inst_diag.get("components_ok_count", 0)) or 0)
 
-    # Logs détaillés
     if LOG_DETAIL:
         comps_req = (inst_diag.get("thresholds") or {}).get("components_min", 2)
         details = (inst_diag.get("components_ok") or {})
@@ -437,7 +420,6 @@ def analyze_one(symbol: str, macro: MacroCache, gate: InstThreshold) -> Tuple[Op
         log_macro(symbol, macro_diag if macro_diag else macro.snapshot())
         log_tech(symbol, tech_diag, tolerated=res.get("tolerated"))
 
-    # Validation principale (si non fournie par l'analyse)
     valid = bool(res.get("valid", False))
     rr = res.get("rr")
     dyn_thr = gate.threshold()
@@ -452,9 +434,7 @@ def analyze_one(symbol: str, macro: MacroCache, gate: InstThreshold) -> Tuple[Op
                 f"Validation institutionnelle (seuil adaptatif {dyn_thr:.2f}): ≥2 indicateurs OK et RR ≥ 1.2"
             )
 
-    # Màj stats quantile
     gate.add(inst_score)
-    # Ajout pour logs décision
     res.setdefault("inst_score", inst_score)
     res.setdefault("inst_ok_count", inst_ok_count)
     return res, None
@@ -483,7 +463,6 @@ def scan_and_send_signals(symbols: Optional[List[str]] = None) -> Dict[str, Any]
         if not res:
             update_perf_for_symbol(sym); continue
 
-        # Décision + logs finaux
         side = str(res.get("side", "none")).lower()
         entry = float(res.get("entry") or 0.0)
         sl = float(res.get("sl") or 0.0)
@@ -492,7 +471,6 @@ def scan_and_send_signals(symbols: Optional[List[str]] = None) -> Dict[str, Any]
         rr = res.get("rr")
         score = float(res.get("inst_score", res.get("score", 0.0)) or 0.0)
 
-        # RR brut/net (si possible)
         rr_g, rr_n = 0.0, 0.0
         try:
             if entry and sl and tp1 and float(entry) != float(sl):
@@ -513,26 +491,22 @@ def scan_and_send_signals(symbols: Optional[List[str]] = None) -> Dict[str, Any]
             update_perf_for_symbol(sym)
             continue
 
-        # Anti-doublon
         key = signal_key(sym, side, entry, rr)
         if key in store:
             LOG.info("[%s] doublon ignoré", sym)
             update_perf_for_symbol(sym)
             continue
 
-        # Telegram
         try:
             send_telegram(build_msg(sym, res))
         except Exception as e:
             LOG.warning("[%s] Telegram msg KO: %s", sym, e)
 
-        # Metrics “signal”
         try:
             log_signal(sym, side, float(score), float(rr_g), float(rr_n), "maker", note="accept")
         except Exception:
             pass
 
-        # Exécution SFI
         try:
             value_usdt = _value_usdt_for_order(entry, sl)
             engine = SFIEngine(sym, side, float(value_usdt), sl, tp1, tp2)
@@ -543,7 +517,6 @@ def scan_and_send_signals(symbols: Optional[List[str]] = None) -> Dict[str, Any]
         except Exception as e:
             LOG.error("[%s] SFI KO: %s", sym, e)
 
-        # Persistance doublon + perf
         store[key] = {"symbol": sym, "side": side, "rr": rr, "entry": entry, "ts": time.time()}
         save_json(SENT_SIGNALS_PATH, store)
 
