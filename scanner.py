@@ -101,7 +101,7 @@ INST_WINDOW = _env_int("INST_WINDOW", 200)
 INST_STATS_PATH = os.environ.get("INST_STATS_PATH", "inst_stats.json")
 
 AUTO_SYMBOLS = os.environ.get("AUTO_SYMBOLS", "1") == "1"
-# ⚠️ KuCoin Futures accepte bien BTCUSDTM/ETHUSDTM/SOLUSDTM
+# ⚠️ Sur KuCoin Futures le BTC perp est XBTUSDTM (on mappe BTCUSDTM -> XBTUSDTM).
 SYMBOLS = [s.strip() for s in os.environ.get("SYMBOLS", "BTCUSDTM,ETHUSDTM,SOLUSDTM").split(",") if s.strip()]
 SYMBOLS_MAX = _env_int("SYMBOLS_MAX", 450)
 
@@ -152,107 +152,136 @@ _GRAN_MIN = {
     "1d": 1440, "1w": 10080, "1mo": 43200
 }
 
+# Aliases symboles (BTC futures = XBT… sur KuCoin)
+_ALIAS = {
+    "BTCUSDT": "XBTUSDTM",
+    "BTCUSDTM": "XBTUSDTM",
+    "XBTUSDT": "XBTUSDTM"
+}
+
 def _canon_symbol(sym: str) -> str:
     s = sym.upper()
+    if s in _ALIAS:
+        if s != _ALIAS[s]:
+            LOG.info("alias symbole: %s -> %s", s, _ALIAS[s])
+        return _ALIAS[s]
     # Ajouter M si ça finit en USDT sans M
     if s.endswith("USDT") and not s.endswith("USDTM"):
         s = s + "M"
     return s
 
+def _parse_kline_row(row) -> Optional[tuple]:
+    """Retourne (t_ms, o, h, l, c, v) ou None si non parsable.
+       6 ou 7 colonnes acceptées."""
+    if not isinstance(row, (list, tuple)) or len(row) < 6:
+        return None
+    try:
+        t = int(float(row[0]))
+        if t < 10**12:  # secondes -> ms
+            t *= 1000
+        o = float(row[1])
+
+        if len(row) >= 7:
+            # Doc futures: [time, open, close, high, low, volume, turnover]
+            c = float(row[2]); h = float(row[3]); l = float(row[4]); v = float(row[5])
+        else:
+            # 6 colonnes: a2/a3/a4 = {close, high, low} ordre inconnu
+            a2 = float(row[2]); a3 = float(row[3]); a4 = float(row[4]); v = float(row[5])
+            hi = max(a2, a3, a4)
+            lo = min(a2, a3, a4)
+            if a2 != hi and a2 != lo: c = a2
+            elif a3 != hi and a3 != lo: c = a3
+            else: c = a4
+            h, l = hi, lo
+
+        if l > h:
+            h, l = l, h
+        if c < l: c = l
+        if c > h: c = h
+        return (t, o, h, l, c, v)
+    except Exception:
+        return None
+
+def _fetch_klines_once(sym: str, gran: int, req_pts: int, shrink: float) -> pd.DataFrame:
+    now_ms = int(time.time() * 1000)
+    span_ms = int(gran * req_pts * 60_000 * shrink)  # minutes -> ms
+    params = {
+        "symbol": sym,
+        "granularity": gran,
+        "from": now_ms - span_ms,
+        "to": now_ms
+    }
+    try:
+        r = httpx.get(f"{KU_FUT_BASE}/api/v1/kline/query", params=params, timeout=15)
+        r.raise_for_status()
+        data = (r.json() or {}).get("data") or []
+    except httpx.HTTPStatusError as e:
+        if e.response is not None and e.response.status_code == 400:
+            LOG.warning("[%s] kline 400 → shrink=%.3f params=%s", sym, shrink, params)
+            return pd.DataFrame()
+        LOG.warning("[%s] kline KO: %s", sym, e)
+        return pd.DataFrame()
+    except Exception as e:
+        LOG.warning("[%s] kline KO: %s", sym, e)
+        return pd.DataFrame()
+
+    if not data:
+        LOG.warning("[%s] kline vide (shrink=%.3f)", sym, shrink)
+        return pd.DataFrame()
+
+    rows = []
+    for row in data:
+        parsed = _parse_kline_row(row)
+        if parsed is not None:
+            rows.append(parsed)
+    if not rows:
+        LOG.warning("[%s] aucune ligne parsée (shape inattendue) — shrink=%.3f", sym, shrink)
+        return pd.DataFrame()
+
+    df = pd.DataFrame(rows, columns=["time_ms", "open", "high", "low", "close", "volume"])
+    df.sort_values("time_ms", inplace=True)
+    df["time"] = (df["time_ms"] // 1000).astype(int)
+    df = df[["time", "open", "high", "low", "close", "volume"]].reset_index(drop=True)
+    return df
+
 def _ku_get_klines(symbol: str, interval: str, limit: int) -> pd.DataFrame:
     """KuCoin Futures /api/v1/kline/query (granularity en minutes, from/to en millisecondes).
-       Parser tolérant: accepte lignes à 6 ou 7 colonnes, et ordres [o,c,h,l,v] / [o,h,l,c,v]."""
+       Parser tolérant + alias BTC→XBT + retry shrink."""
     gran = _GRAN_MIN.get(interval)
     if not gran:
         raise ValueError(f"interval inconnu: {interval}")
 
     sym = _canon_symbol(symbol)
-    now_ms = int(time.time() * 1000)
-
     max_pts = 1500
     req_pts = min(int(limit), max_pts)
 
-    def _parse_row(row):
-        """Retourne (t_ms, o, h, l, c, v) ou None si non parsable."""
-        if not isinstance(row, (list, tuple)) or len(row) < 6:
-            return None
-        try:
-            t = int(float(row[0]))
-            if t < 10**12:  # secondes -> ms
-                t *= 1000
-            o = float(row[1])
-
-            if len(row) >= 7:
-                # Doc futures: [time, open, close, high, low, volume, turnover]
-                c = float(row[2]); h = float(row[3]); l = float(row[4]); v = float(row[5])
-            else:
-                # 6 colonnes: heuristique sur a2/a3/a4 = {close, high, low} (ordre inconnu)
-                a2 = float(row[2]); a3 = float(row[3]); a4 = float(row[4]); v = float(row[5])
-                hi = max(a2, a3, a4)
-                lo = min(a2, a3, a4)
-                # close = celle qui n'est ni hi ni lo
-                if a2 != hi and a2 != lo: c = a2
-                elif a3 != hi and a3 != lo: c = a3
-                else: c = a4
-                h, l = hi, lo
-
-            # garde-fous
-            if l > h:
-                h, l = l, h
-            if c < l: c = l
-            if c > h: c = h
-
-            return (t, o, h, l, c, v)
-        except Exception:
-            return None
-
-    for shrink in (1.0, 0.5, 0.25, 0.125):
-        span_ms = int(gran * req_pts * 60_000 * shrink)  # minutes -> ms
-        params = {
-            "symbol": sym,
-            "granularity": gran,      # minutes
-            "from": now_ms - span_ms, # ms
-            "to": now_ms              # ms
-        }
-        try:
-            r = httpx.get(f"{KU_FUT_BASE}/api/v1/kline/query", params=params, timeout=15)
-            r.raise_for_status()
-            js = r.json()
-            data = js.get("data") or []
-        except httpx.HTTPStatusError as e:
-            if e.response is not None and e.response.status_code == 400:
-                LOG.warning("[%s] kline query 400 → shrink=%.3f params=%s", sym, shrink, params)
-                time.sleep(0.3)
-                continue
-            LOG.warning("[%s] kline query KO: %s", sym, e)
-            return pd.DataFrame()
-        except Exception as e:
-            LOG.warning("[%s] kline query KO: %s", sym, e)
-            return pd.DataFrame()
-
-        if not data:
-            LOG.warning("[%s] kline vide (shrink=%.3f) → on réduit encore", sym, shrink)
+    def _attempt(sym_try: str) -> pd.DataFrame:
+        for shrink in (1.0, 0.5, 0.25, 0.125):
+            df = _fetch_klines_once(sym_try, gran, req_pts, shrink)
+            if not df.empty:
+                # coupe à 'limit' dernières
+                if len(df) > limit:
+                    df = df.iloc[-limit:].reset_index(drop=True)
+                return df
             time.sleep(0.2)
-            continue
+        return pd.DataFrame()
 
-        rows = []
-        for row in data:
-            parsed = _parse_row(row)
-            if parsed is not None:
-                rows.append(parsed)
-
-        if not rows:
-            LOG.warning("[%s] aucune ligne parsée (shape inattendue) — shrink=%.3f", sym, shrink)
-            continue
-
-        df = pd.DataFrame(rows, columns=["time_ms", "open", "high", "low", "close", "volume"])
-        df.sort_values("time_ms", inplace=True)
-        df["time"] = (df["time_ms"] // 1000).astype(int)
-        df = df[["time", "open", "high", "low", "close", "volume"]].reset_index(drop=True)
-
-        if len(df) > limit:
-            df = df.iloc[-limit:].reset_index(drop=True)
+    # 1) essai symbole canoniqué
+    df = _attempt(sym)
+    if not df.empty:
         return df
+
+    # 2) fallback alias BTC<->XBT si toujours vide
+    alt = None
+    if sym.startswith("BTC"):
+        alt = "XBT" + sym[3:]
+    elif sym.startswith("XBT"):
+        alt = "BTC" + sym[3:]
+    if alt:
+        LOG.warning("[%s] vide — tentative alias %s", sym, alt)
+        df_alt = _attempt(alt)
+        if not df_alt.empty:
+            return df_alt
 
     LOG.warning("[%s] kline query épuisée (interval=%s, limit=%s)", sym, interval, limit)
     return pd.DataFrame()
