@@ -121,7 +121,7 @@ def get_funding_score(symbol: str, history: Optional[List[float]] = None) -> flo
     return 0.0
 
 # --------------------------------------------------------------------------------------
-# Liquidations (WebSocket exact + normalisation volume 5m réel)
+# Liquidations (WebSocket exact + normalisation)
 # --------------------------------------------------------------------------------------
 try:
     from binance_ws import get_liquidations_notional_5m
@@ -131,14 +131,14 @@ except Exception:
     _log_warn("[Liq] binance_ws non disponible, aucune liquidation comptée")
 
 def _get_avg_vol_5m(symbol: str) -> float:
-    """Calcule le volume moyen 5m à partir du quoteVolume 24h Binance."""
+    """Calcule le volume moyen 5m (quoteVolume 24h / 288)."""
     b_symbol = map_symbol_to_binance(symbol)
     try:
         r = _get(f"{BASE}/fapi/v1/ticker/24hr", {"symbol": b_symbol}, timeout=6.0)
         if r.status_code == 200:
             data = r.json() or {}
             vol_24h = float(data.get("quoteVolume", 0.0) or 0.0)
-            return max(1.0, vol_24h / 288.0)  # 288 * 5m = 24h
+            return max(1.0, vol_24h / 288.0)
     except Exception as e:
         _log_exc(f"[AvgVol5m] {b_symbol}", e)
     return 1e6  # fallback
@@ -149,13 +149,13 @@ def get_liq_pack(symbol: str) -> Dict[str, Any]:
 
     if USE_WS:
         try:
-            notional = get_liquidations_notional_5m(b_symbol)  # somme brute USDT
-            score = _clamp(notional / avg_vol_5m)
+            notional = get_liquidations_notional_5m(b_symbol)  # somme brute 5m
+            score = _clamp(notional / avg_vol_5m)  # normalisation
             return {
                 "liq_new_score": score,
                 "liq_score": score,
-                "liq_notional_5m": notional,
-                "liq_imbalance_5m": notional / avg_vol_5m,  # ratio direct
+                "liq_notional_5m": notional,  # exact
+                "liq_imbalance_5m": 0.0,
                 "liq_source": "ws_forceOrder"
             }
         except Exception as e:
@@ -209,4 +209,41 @@ def get_macro_btc_dominance() -> float:
             data = r.json()
             dom_pct = float(data.get("data", {}).get("market_cap_percentage", {}).get("btc", 0.0) or 0.0)
             return dom_pct / 100.0
-    except
+    except Exception as e:
+        _log_exc("[Macro] DOM", e)
+    return 0.0
+
+def get_macro_total2() -> float:
+    tot = get_macro_total_mcap()
+    dom = get_macro_btc_dominance()
+    return max(0.0, tot * (1 - dom))
+
+# --------------------------------------------------------------------------------------
+# Snapshot
+# --------------------------------------------------------------------------------------
+def build_institutional_snapshot(symbol: str, price_series: Optional[List[float]] = None,
+                                 funding_hist: Optional[List[float]] = None) -> Dict[str, Any]:
+    oi_s  = get_oi_score(symbol, price_series)
+    fund_s = get_funding_score(symbol, funding_hist)
+    liq_p  = get_liq_pack(symbol)
+    cvd_s  = get_cvd_score(symbol)
+
+    score = (
+        0.4 * oi_s +
+        0.3 * cvd_s +
+        0.2 * fund_s +
+        0.1 * liq_p["liq_new_score"]
+    )
+
+    return {
+        "oi_score": oi_s,
+        "funding_score": fund_s,
+        "liq_new_score": liq_p["liq_new_score"],
+        "liq_notional_5m": liq_p["liq_notional_5m"],  # exact liquidations
+        "cvd_score": cvd_s,
+        "score": score,
+        "meta": {
+            "liq_imbalance_5m": liq_p["liq_imbalance_5m"],
+            "liq_source": liq_p["liq_source"],
+        }
+    }
