@@ -165,7 +165,7 @@ def _institutional_gate(inst: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
     """Porte institutionnelle stricte: seuil score global + min composantes OK."""
     score = float(inst.get("score", 0.0) or 0.0)
     oi_s = float(inst.get("oi_score", 0.0) or 0.0)
-    dlt_s = float(inst.get("delta_score", 0.0) or 0.0)
+    dlt_s = float(inst.get("cvd_score", 0.0) or 0.0)  # corrigé
     fund_s = float(inst.get("funding_score", 0.0) or 0.0)
     liq_new = inst.get("liq_new_score", None)
     liq_s = float(liq_new if liq_new is not None else (inst.get("liq_score", 0.0) or 0.0))
@@ -195,11 +195,11 @@ def _institutional_gate(inst: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
     return gate_ok, {
         "score": score,
         "req_score_min": req_score_min,
-        "oi_score": oi_s, "delta_score": dlt_s, "funding_score": fund_s,
+        "oi_score": oi_s, "cvd_score": dlt_s, "funding_score": fund_s,
         "liq_score": liq_s, "book_score": book_s,
         "liq_source": "liq_new_score" if liq_new is not None else "liq_score",
         "thresholds": {
-            "oi_min": oi_min, "delta_min": delta_min, "funding_min": funding_min,
+            "oi_min": oi_min, "cvd_min": delta_min, "funding_min": funding_min,
             "liq_min": liq_min, "book_min": book_min,
             "components_min": inst_components_min, "use_book": use_book,
         },
