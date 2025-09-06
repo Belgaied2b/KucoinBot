@@ -71,9 +71,6 @@ def get_open_interest_hist(symbol: str, period: str = "5m", limit: int = 20) -> 
     return []
 
 def get_oi_score(symbol: str, price_series: Optional[List[float]] = None) -> float:
-    """
-    Score OI basé sur variation relative et alignement avec prix.
-    """
     hist = get_open_interest_hist(symbol, limit=5)
     if len(hist) < 2: return 0.0
     try:
@@ -87,9 +84,9 @@ def get_oi_score(symbol: str, price_series: Optional[List[float]] = None) -> flo
             pr_delta = price_series[-1] - price_series[-2]
             if delta_pct * pr_delta < 0:  # OI ↑ mais prix ↓ => piégeur
                 align = 0.3
-        score = _clamp(base * align)
-        return score
-    except Exception: return 0.0
+        return _clamp(base * align)
+    except Exception:
+        return 0.0
 
 # --------------------------------------------------------------------------------------
 # Funding
@@ -115,27 +112,49 @@ def get_funding_score(symbol: str, history: Optional[List[float]] = None) -> flo
     return 0.0
 
 # --------------------------------------------------------------------------------------
-# Liquidations
+# Liquidations (WS + fallback proxy)
 # --------------------------------------------------------------------------------------
+try:
+    from binance_ws import get_liquidations_notional_5m
+    USE_WS = True
+except Exception:
+    USE_WS = False
+    _log_warn("[Liq] binance_ws non disponible, fallback REST proxy")
+
 def get_liq_pack(symbol: str, avg_vol_5m: float = 1e6) -> Dict[str, Any]:
-    """
-    Liquidations via takerLongShortRatio proxy.
-    Score = notional / avg_vol_5m (borné 0..1).
-    """
     b_symbol = map_symbol_to_binance(symbol)
+
+    # 1) Essai WebSocket (si dispo)
+    if USE_WS:
+        try:
+            notional = get_liquidations_notional_5m(b_symbol)
+            score = _clamp(notional / max(1.0, avg_vol_5m))
+            return {
+                "liq_new_score": score,
+                "liq_score": score,
+                "liq_notional_5m": notional,
+                "liq_imbalance_5m": 0.0,
+                "liq_source": "ws_forceOrder"
+            }
+        except Exception as e:
+            _log_exc(f"[Liq-WS] {b_symbol}", e)
+
+    # 2) Fallback REST proxy
     try:
         rr = _get(f"{BASE}/futures/data/takerlongshortRatio",
                   {"symbol": b_symbol, "period": "5m", "limit": 1}, timeout=6.0)
         if rr.status_code == 200:
             recs = rr.json() or []
             if not recs:
-                return {"liq_new_score":0.0,"liq_notional_5m":0.0,"liq_source":"none"}
+                return {"liq_new_score":0.0,"liq_score":0.0,"liq_notional_5m":0.0,
+                        "liq_imbalance_5m":0.0,"liq_source":"none"}
             rec = recs[-1]
             buy = float(rec.get("buyVol",0.0)); sell = float(rec.get("sellVol",0.0))
             imb = abs(buy-sell); denom = max(1.0,buy+sell)
             imb_ratio = imb/denom
             try:
-                mark = float(_get(f"{BASE}/fapi/v1/premiumIndex",{"symbol":b_symbol}).json().get("markPrice",0.0))
+                mark = float(_get(f"{BASE}/fapi/v1/premiumIndex",
+                                  {"symbol":b_symbol}).json().get("markPrice",0.0))
             except: mark = 1.0
             notionnel = imb * mark
             score = _clamp(notionnel / max(1.0, avg_vol_5m))
@@ -147,16 +166,15 @@ def get_liq_pack(symbol: str, avg_vol_5m: float = 1e6) -> Dict[str, Any]:
                 "liq_source": "proxy"
             }
     except Exception as e:
-        _log_exc(f"[Liq] {b_symbol}", e)
-    return {"liq_new_score":0.0,"liq_score":0.0,"liq_notional_5m":0.0,"liq_imbalance_5m":0.0,"liq_source":"none"}
+        _log_exc(f"[Liq-Proxy] {b_symbol}", e)
+
+    return {"liq_new_score":0.0,"liq_score":0.0,"liq_notional_5m":0.0,
+            "liq_imbalance_5m":0.0,"liq_source":"none"}
 
 # --------------------------------------------------------------------------------------
 # CVD (Delta volume via aggTrades)
 # --------------------------------------------------------------------------------------
 def get_cvd_score(symbol: str, limit: int = 500) -> float:
-    """
-    Retourne un score [0..1] basé sur l’imbalance du volume (CVD).
-    """
     b_symbol = map_symbol_to_binance(symbol)
     try:
         r = _get(f"{BASE}/fapi/v1/aggTrades", {"symbol": b_symbol, "limit": limit}, timeout=6.0)
