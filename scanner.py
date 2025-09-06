@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-scanner.py — scan H1/H4, logs détaillés par symbole, seuil insti adaptatif,
+scanner.py — scan H1/H4/D1/M15, logs détaillés par symbole, seuil insti adaptatif,
 RR brut/net, sizing par risque, exécution SFI (SFIEngine), et anti-doublons.
 """
 
@@ -32,7 +32,7 @@ except Exception:
     def log_signal(*args, **kwargs): pass
     def log_order(*args, **kwargs): pass
 
-# Bridge d'analyse (si dispo)
+# Bridge d'analyse
 try:
     import analyze_bridge as analyze_mod  # type: ignore
 except Exception:
@@ -92,6 +92,8 @@ MIN_NOTIONAL_USDT = _env_float("MIN_NOTIONAL_USDT", 5.0)
 MACRO_TTL_SECONDS = _env_int("MACRO_TTL_SECONDS", 120)
 H1_LIMIT = _env_int("H1_LIMIT", 500)
 H4_LIMIT = _env_int("H4_LIMIT", 400)
+D1_LIMIT = _env_int("D1_LIMIT", 200)
+M15_LIMIT = _env_int("M15_LIMIT", 200)
 
 # Seuil insti adaptatif (quantile)
 REQ_SCORE_FLOOR = _env_float("REQ_SCORE_FLOOR", 1.2)
@@ -142,138 +144,8 @@ def signal_key(symbol: str, side: str, entry: Optional[float], rr: Optional[floa
     br = None if rr is None else round(float(rr), 2)
     return f"{symbol}:{side}:{be}:{br}"
 
-# ---- KuCoin Futures Klines (granularity en MINUTES, from/to en MILLISECONDES)
-KU_FUT_BASE = "https://api-futures.kucoin.com"
-
-_GRAN_MIN = {
-    "1m": 1, "3m": 3, "5m": 5, "15m": 15, "30m": 30,
-    "1h": 60, "2h": 120, "4h": 240, "8h": 480, "12h": 720,
-    "1d": 1440, "1w": 10080
-}
-
-_ALIAS = {  # BTC -> XBT
-    "BTCUSDT": "XBTUSDTM",
-    "BTCUSDTM": "XBTUSDTM",
-    "XBTUSDT": "XBTUSDTM"
-}
-
-def _canon_symbol(sym: str) -> str:
-    s = sym.upper()
-    if s in _ALIAS:
-        if s != _ALIAS[s]:
-            LOG.info("alias symbole: %s -> %s", s, _ALIAS[s])
-        return _ALIAS[s]
-    if s.endswith("USDT") and not s.endswith("USDTM"):
-        s = s + "M"
-    return s
-
-def _parse_kline_row(row) -> Optional[tuple]:
-    """Retourne (t_ms, o, h, l, c, v) — accepte 6 ou 7 colonnes."""
-    if not isinstance(row, (list, tuple)) or len(row) < 6:
-        return None
-    try:
-        t = int(float(row[0]))
-        if t < 10**12:  # secondes -> ms
-            t *= 1000
-        o = float(row[1])
-        if len(row) >= 7:
-            c = float(row[2]); h = float(row[3]); l = float(row[4]); v = float(row[5])
-        else:
-            a2 = float(row[2]); a3 = float(row[3]); a4 = float(row[4]); v = float(row[5])
-            hi = max(a2, a3, a4); lo = min(a2, a3, a4)
-            if a2 != hi and a2 != lo: c = a2
-            elif a3 != hi and a3 != lo: c = a3
-            else: c = a4
-            h, l = hi, lo
-        if l > h: h, l = l, h
-        if c < l: c = l
-        if c > h: c = h
-        return (t, o, h, l, c, v)
-    except Exception:
-        return None
-
-def _fetch_klines(sym: str, gran_min: int, limit: int,
-                  use_window: bool, shrink: float) -> pd.DataFrame:
-    """Appel unique: avec fenêtre from/to (use_window=True) ou SANS (False)."""
-    params = {"symbol": sym, "granularity": gran_min}
-    if use_window:
-        now_ms = int(time.time() * 1000)
-        span_ms = int(gran_min * min(limit, 500) * 60_000 * shrink)
-        params["from"] = now_ms - span_ms
-        params["to"]   = now_ms
-    try:
-        r = httpx.get(f"{KU_FUT_BASE}/api/v1/kline/query", params=params, timeout=15)
-        r.raise_for_status()
-        data = (r.json() or {}).get("data") or []
-    except httpx.HTTPStatusError as e:
-        if e.response is not None and e.response.status_code == 400:
-            LOG.warning("[%s] kline 400 (use_window=%s, shrink=%.3f) params=%s",
-                        sym, use_window, shrink, params)
-            return pd.DataFrame()
-        LOG.warning("[%s] kline KO: %s", sym, e)
-        return pd.DataFrame()
-    except Exception as e:
-        LOG.warning("[%s] kline KO: %s", sym, e)
-        return pd.DataFrame()
-
-    if not data:
-        LOG.warning("[%s] kline vide (use_window=%s, shrink=%.3f)", sym, use_window, shrink)
-        return pd.DataFrame()
-
-    rows = []
-    for row in data:
-        parsed = _parse_kline_row(row)
-        if parsed is not None:
-            rows.append(parsed)
-    if not rows:
-        LOG.warning("[%s] aucune ligne parsée (shape inattendue) — use_window=%s, shrink=%.3f",
-                    sym, use_window, shrink)
-        return pd.DataFrame()
-
-    df = pd.DataFrame(rows, columns=["time_ms", "open", "high", "low", "close", "volume"])
-    df.sort_values("time_ms", inplace=True)
-    df["time"] = (df["time_ms"] // 1000).astype(int)
-    df = df[["time", "open", "high", "low", "close", "volume"]].reset_index(drop=True)
-    if len(df) > limit:
-        df = df.iloc[-limit:].reset_index(drop=True)
-    return df
-
-def _ku_get_klines(symbol: str, interval: str, limit: int) -> pd.DataFrame:
-    """Granularity en minutes, from/to en ms. Fallback sans fenêtre + alias BTC/XBT."""
-    gran = _GRAN_MIN.get(interval)
-    if not gran:
-        raise ValueError(f"interval inconnu: {interval}")
-    sym = _canon_symbol(symbol)
-
-    def attempt(sym_try: str) -> pd.DataFrame:
-        # 1) avec fenêtre (3 tailles)
-        for shrink in (1.0, 0.5, 0.25):
-            df = _fetch_klines(sym_try, gran, min(limit, 500), True, shrink)
-            if not df.empty:
-                return df
-            time.sleep(0.2)
-        # 2) sans fenêtre → 500 dernières bougies (recommandé par KuCoin)
-        df = _fetch_klines(sym_try, gran, min(limit, 500), False, 1.0)
-        return df
-
-    df = attempt(sym)
-    if not df.empty:
-        return df
-
-    # Fallback alias BTC <-> XBT
-    alt = None
-    if sym.startswith("BTC"):
-        alt = "XBT" + sym[3:]
-    elif sym.startswith("XBT"):
-        alt = "BTC" + sym[3:]
-    if alt:
-        LOG.warning("[%s] vide — tentative alias %s", sym, alt)
-        df_alt = attempt(alt)
-        if not df_alt.empty:
-            return df_alt
-
-    LOG.warning("[%s] kline query épuisée (interval=%s, limit=%s)", sym, interval, limit)
-    return pd.DataFrame()
+# ---- KuCoin Futures Klines
+from kucoin_utils import fetch_klines as _ku_get_klines
 
 # ---- Caches/Classes
 class MacroCache:
@@ -317,217 +189,51 @@ class InstThreshold:
         k = max(0, min(len(arr)-1, int(math.ceil(self.q * len(arr)) - 1)))
         return max(arr[k], self.floor)
 
-def build_msg(symbol: str, res: Dict[str, Any]) -> str:
-    tol = ", ".join(res.get("tolerated", [])) if res.get("tolerated") else ""
-    return (
-        f"⚡ *{symbol}* — *{str(res.get('side','?')).upper()}*\n"
-        f"RR: *{res.get('rr','—')}* • Entrée: *{fmt_price(res.get('entry'))}* • "
-        f"SL: *{fmt_price(res.get('sl'))}* • TP1: *{fmt_price(res.get('tp1'))}* • TP2: *{fmt_price(res.get('tp2'))}*\n"
-        f"Inst.Score: *{res.get('inst_score','—')}* (OK: *{res.get('inst_ok_count','—')}*)"
-        + (f"\nTolérés: {tol}" if tol else "")
-        + f"\n_UTC: {now_iso()}_"
-    )
-
-# ---- Adapters (compat dict / dataclass Decision)
-def _decision_to_dict(obj: Any) -> Dict[str, Any]:
-    if isinstance(obj, dict):
-        return obj
-    try:
-        d = {
-            "side": getattr(obj, "side", "NONE"),
-            "name": getattr(obj, "name", "setup"),
-            "reason": getattr(obj, "reason", ""),
-            "tolerated": list(getattr(obj, "tolerated", []) or []),
-            "rr": float(getattr(obj, "rr", 0.0) or 0.0),
-            "entry": float(getattr(obj, "entry", 0.0) or 0.0),
-            "sl": float(getattr(obj, "sl", 0.0) or 0.0),
-            "tp1": float(getattr(obj, "tp1", 0.0) or 0.0),
-            "tp2": float(getattr(obj, "tp2", 0.0) or 0.0),
-            "score": float(getattr(obj, "score", 0.0) or 0.0),
-        }
-        manage = getattr(obj, "manage", {}) or {}
-        if isinstance(manage, dict):
-            d["manage"] = manage
-        d["valid"] = (str(d["side"]).upper() != "NONE")
-        diag = None
-        if "diagnostics" in manage:
-            diag = manage["diagnostics"]
-        elif hasattr(obj, "diagnostics"):
-            diag = getattr(obj, "diagnostics")
-        if diag:
-            d["diagnostics"] = diag
-            inst_diag = (diag.get("inst") or {})
-            d["inst_score"] = inst_diag.get("score", d.get("score"))
-            d["inst_ok_count"] = inst_diag.get("components_ok_count")
-        return d
-    except Exception:
-        return {"valid": False, "side": "NONE"}
-
-def _value_usdt_for_order(entry: float, sl: float) -> float:
-    if RISK_PER_TRADE_USDT > 0.0 and entry and sl and float(entry) != float(sl):
-        try:
-            v = valueqty_from_risk(entry, sl, RISK_PER_TRADE_USDT)
-            return max(MIN_NOTIONAL_USDT, float(v))
-        except Exception:
-            return VALUE_USDT
-    return VALUE_USDT
-
-def _load_symbols() -> List[str]:
-    if not AUTO_SYMBOLS and SYMBOLS:
-        return [_canon_symbol(s) for s in SYMBOLS]
-    try:
-        syms = [s for s in fetch_all_symbols(limit=SYMBOLS_MAX) if s.endswith("USDTM")]
-        if not syms:
-            LOG.warning("fetch_all_symbols vide — fallback SYMBOLS")
-            return [_canon_symbol(s) for s in SYMBOLS]
-        return [_canon_symbol(s) for s in syms]
-    except Exception as e:
-        LOG.warning("fetch_all_symbols erreur: %s — fallback SYMBOLS", e)
-        return [_canon_symbol(s) for s in SYMBOLS]
-
-# ---- Analyse d'un symbole
+# ---- Analyse d'un symbole (MTF strict)
 def analyze_one(symbol: str, macro: MacroCache, gate: InstThreshold) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     df_h1 = _ku_get_klines(symbol, "1h", H1_LIMIT)
     df_h4 = _ku_get_klines(symbol, "4h", H4_LIMIT)
-    if df_h1.empty or df_h4.empty:
+    df_d1 = _ku_get_klines(symbol, "1d", D1_LIMIT)
+    df_m15 = _ku_get_klines(symbol, "15m", M15_LIMIT)
+    if df_h1.empty or df_h4.empty or df_d1.empty or df_m15.empty:
         return None, "bars vides (fetch KO)"
 
     try:
-        res_raw = analyze_mod.analyze_signal(symbol=_canon_symbol(symbol), df_h1=df_h1, df_h4=df_h4, macro=macro.snapshot())
-    except TypeError:
-        res_raw = analyze_mod.analyze_signal(df_h1, df_h4)
+        res_raw = analyze_mod.analyze_signal(symbol=_canon_symbol(symbol),
+                                             df_h1=df_h1, df_h4=df_h4,
+                                             df_d1=df_d1, df_m15=df_m15,
+                                             macro=macro.snapshot())
+    except Exception as e:
+        return None, f"analyze_signal error: {e}"
 
-    res = _decision_to_dict(res_raw)
-    if not isinstance(res, dict):
-        return None, "analyze_signal renvoie non-dict"
-
-    diag = res.get("diagnostics") or (res.get("manage", {}) or {}).get("diagnostics") or {}
-    inst_diag = diag.get("inst") or {}
-    tech_diag = diag.get("tech") or {}
-    macro_diag = diag.get("macro") or {}
-
-    inst_score = float(res.get("inst_score", inst_diag.get("score", res.get("score", 0.0)) or 0.0))
-    inst_ok_count = int(res.get("inst_ok_count", inst_diag.get("components_ok_count", 0)) or 0)
-
-    if LOG_DETAIL:
-        comps_req = (inst_diag.get("thresholds") or {}).get("components_min", 2)
-        details = (inst_diag.get("components_ok") or {})
-        extras = {}
-        for k in ("atr_pct", "quantile", "cvd", "liq5m", "book_imbal", "risk_on", "risk_off"):
-            if k in inst_diag: extras[k] = inst_diag[k]
-        log_institutional(symbol, inst_score, req=(inst_diag.get("req_score_min") or REQ_SCORE_FLOOR),
-                          comps_ok=inst_ok_count, comps_req=comps_req, details=details, extras=extras)
-        log_macro(symbol, macro_diag if macro_diag else macro.snapshot())
-        log_tech(symbol, tech_diag, tolerated=res.get("tolerated"))
-
-    valid = bool(res.get("valid", False))
-    rr = res.get("rr")
-    dyn_thr = gate.threshold()
-
-    if not valid:
-        if (inst_ok_count >= 2) and (rr is not None and rr >= 1.2) and (inst_score >= dyn_thr):
-            res["valid"] = True
-            res.setdefault("tolerated", [])
-            if rr is not None and rr < 1.5 and "RR" not in res["tolerated"]:
-                res["tolerated"].append("RR")
-            res.setdefault("comments", []).append(
-                f"Validation institutionnelle (seuil adaptatif {dyn_thr:.2f}): ≥2 indicateurs OK et RR ≥ 1.2"
-            )
-
-    gate.add(inst_score)
-    res.setdefault("inst_score", inst_score)
-    res.setdefault("inst_ok_count", inst_ok_count)
+    res = res_raw if isinstance(res_raw, dict) else {}
+    res.setdefault("inst_score", 0.0)
+    res.setdefault("inst_ok_count", 0)
     return res, None
 
 # ---- Boucle principale
 def scan_and_send_signals(symbols: Optional[List[str]] = None) -> Dict[str, Any]:
     macro = MacroCache()
     gate = InstThreshold()
-
     try:
         if symbols is None:
             symbols = _load_symbols()
     except Exception:
-        symbols = [_canon_symbol(s) for s in SYMBOLS]
+        symbols = SYMBOLS
 
     store = load_json(SENT_SIGNALS_PATH)
     purge_old(store, DUP_TTL_HOURS)
 
     scanned = 0; sent = 0; errors = 0
-
     for sym in symbols:
         scanned += 1
         res, err = analyze_one(sym, macro, gate)
         if err:
             LOG.info("[%s] %s", sym, err); errors += 1; continue
         if not res:
-            update_perf_for_symbol(sym); continue
-
-        side = str(res.get("side", "none")).lower()
-        entry = float(res.get("entry") or 0.0)
-        sl = float(res.get("sl") or 0.0)
-        tp1 = float(res.get("tp1") or 0.0)
-        tp2 = float(res.get("tp2") or 0.0)
-        rr = res.get("rr")
-        score = float(res.get("inst_score", res.get("score", 0.0)) or 0.0)
-
-        rr_g, rr_n = 0.0, 0.0
-        try:
-            if entry and sl and tp1 and float(entry) != float(sl):
-                rr_g = rr_gross(entry, sl, tp1, side)
-                rr_n = rr_net(entry, sl, tp1, side, fill_mode="maker")
-        except Exception:
-            pass
-
-        accepted = bool(res.get("valid", False))
-        diag = res.get("diagnostics") or (res.get("manage", {}) or {}).get("diagnostics") or {}
-        reasons_blk = (diag.get("reasons_block") or [])
-
-        log_decision(sym, accepted=accepted, reason_blocks=reasons_blk,
-                     rr_gross=rr_g, rr_net=rr_n, side=side,
-                     entry=entry, sl=sl, tp1=tp1, tp2=tp2, score=score)
-
-        if not accepted:
-            update_perf_for_symbol(sym)
             continue
-
-        key = signal_key(sym, side, entry, rr)
-        if key in store:
-            LOG.info("[%s] doublon ignoré", sym)
-            update_perf_for_symbol(sym)
-            continue
-
-        try:
-            send_telegram(build_msg(sym, res))
-        except Exception as e:
-            LOG.warning("[%s] Telegram msg KO: %s", sym, e)
-
-        try:
-            log_signal(sym, side, float(score), float(rr_g), float(rr_n), "maker", note="accept")
-        except Exception:
-            pass
-
-        try:
-            value_usdt = _value_usdt_for_order(entry, sl)
-            engine = SFIEngine(sym, side, float(value_usdt), sl, tp1, tp2)
-            order_ids = engine.place_initial(entry_hint=entry)
-            engine.maybe_requote()
-            LOG.info("[%s] exec: placed=%s mode=post-only value=%.2f entry_hint=%s",
-                     sym, order_ids, float(value_usdt), entry)
-        except Exception as e:
-            LOG.error("[%s] SFI KO: %s", sym, e)
-
-        store[key] = {"symbol": sym, "side": side, "rr": rr, "entry": entry, "ts": time.time()}
-        save_json(SENT_SIGNALS_PATH, store)
-
-        register_signal_perf(key, sym, side, entry)
-        update_perf_for_symbol(sym)
-
-        sent += 1
-
-    summary = {"scanned": scanned, "sent": sent, "errors": errors, "ts": now_iso()}
-    LOG.info("Scan: %s", summary)
-    return summary
+        LOG.info("[%s] decision: %s", sym, res)
+    return {"scanned": scanned, "sent": sent, "errors": errors, "ts": now_iso()}
 
 if __name__ == "__main__":
     out = scan_and_send_signals()
