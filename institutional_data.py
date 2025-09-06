@@ -15,28 +15,28 @@ except Exception:
 
 def _log_info(msg: str):
     if _logger:
-        try: 
-            _logger.info(msg); 
+        try:
+            _logger.info(msg)
             return
-        except Exception: 
+        except Exception:
             pass
     print(msg, flush=True)
 
 def _log_warn(msg: str):
     if _logger:
-        try: 
-            _logger.warning(msg); 
+        try:
+            _logger.warning(msg)
             return
-        except Exception: 
+        except Exception:
             pass
     print(msg, flush=True)
 
 def _log_exc(prefix: str, e: Exception):
     if _logger:
-        try: 
-            _logger.exception(f"{prefix} error: {e}"); 
+        try:
+            _logger.exception(f"{prefix} error: {e}")
             return
-        except Exception: 
+        except Exception:
             pass
     print(f"{prefix} error: {e}", flush=True)
 
@@ -54,9 +54,9 @@ def _get(url: str, params: Optional[dict] = None, timeout: float = 6.0) -> httpx
 # --------------------------------------------------------------------------------------
 def map_symbol_to_binance(sym: str) -> str:
     s = (sym or "").upper()
-    if s.endswith("USDTM"): 
+    if s.endswith("USDTM"):
         s = s.replace("USDTM", "USDT")
-    if s.endswith(".P"): 
+    if s.endswith(".P"):
         s = s.replace(".P", "")
     return s
 
@@ -80,20 +80,19 @@ def get_open_interest_hist(symbol: str, period: str = "5m", limit: int = 20) -> 
 
 def get_oi_score(symbol: str, price_series: Optional[List[float]] = None) -> float:
     hist = get_open_interest_hist(symbol, limit=5)
-    if len(hist) < 2: 
+    if len(hist) < 2:
         return 0.0
     try:
         prev = float(hist[-2].get("sumOpenInterest", hist[-2].get("openInterest", 0.0)) or 0.0)
         last = float(hist[-1].get("sumOpenInterest", hist[-1].get("openInterest", 0.0)) or 0.0)
-        if prev <= 0: 
+        if prev <= 0:
             return 0.0
         delta_pct = (last - prev) / prev
-        # Institutionnel : 0.5% OI move = score 1
-        base = _clamp(abs(delta_pct) / 0.005)
+        base = _clamp(abs(delta_pct) / 0.005)  # Institutionnel : 0.5% OI move = score 1
         align = 1.0
         if price_series and len(price_series) >= 2:
             pr_delta = price_series[-1] - price_series[-2]
-            if delta_pct * pr_delta < 0:  
+            if delta_pct * pr_delta < 0:
                 align = 0.3
         return _clamp(base * align)
     except Exception:
@@ -115,15 +114,14 @@ def get_funding_score(symbol: str, history: Optional[List[float]] = None) -> flo
                 z = abs((fr - mean) / stdev)
                 score = _clamp(z / 3.0)
             else:
-                # Institutionnel : 0.01% = score 1
-                score = _clamp(abs(fr) / 0.0001)
+                score = _clamp(abs(fr) / 0.0001)  # Institutionnel : 0.01% = score 1
             return score
     except Exception as e:
         _log_exc(f"[FundingScore] {b_symbol}", e)
     return 0.0
 
 # --------------------------------------------------------------------------------------
-# Liquidations (WebSocket uniquement)
+# Liquidations (WebSocket avec normalisation par volume réel)
 # --------------------------------------------------------------------------------------
 try:
     from binance_ws import get_liquidations_notional_5m
@@ -132,12 +130,27 @@ except Exception:
     USE_WS = False
     _log_warn("[Liq] binance_ws non disponible, aucune liquidation comptée")
 
-def get_liq_pack(symbol: str, avg_vol_5m: float = 1e6) -> Dict[str, Any]:
+def _get_avg_vol_5m(symbol: str) -> float:
+    """Calcule le volume moyen 5m à partir du quoteVolume 24h Binance."""
     b_symbol = map_symbol_to_binance(symbol)
+    try:
+        r = _get(f"{BASE}/fapi/v1/ticker/24hr", {"symbol": b_symbol}, timeout=6.0)
+        if r.status_code == 200:
+            data = r.json() or {}
+            vol_24h = float(data.get("quoteVolume", 0.0) or 0.0)
+            return max(1.0, vol_24h / 288.0)  # 288 * 5m = 24h
+    except Exception as e:
+        _log_exc(f"[AvgVol5m] {b_symbol}", e)
+    return 1e6  # fallback
+
+def get_liq_pack(symbol: str) -> Dict[str, Any]:
+    b_symbol = map_symbol_to_binance(symbol)
+    avg_vol_5m = _get_avg_vol_5m(b_symbol)
+
     if USE_WS:
         try:
             notional = get_liquidations_notional_5m(b_symbol)
-            score = _clamp(notional / max(1.0, avg_vol_5m))
+            score = _clamp(notional / avg_vol_5m)
             return {
                 "liq_new_score": score,
                 "liq_score": score,
@@ -147,6 +160,7 @@ def get_liq_pack(symbol: str, avg_vol_5m: float = 1e6) -> Dict[str, Any]:
             }
         except Exception as e:
             _log_exc(f"[Liq-WS] {b_symbol}", e)
+
     return {
         "liq_new_score": 0.0,
         "liq_score": 0.0,
@@ -167,7 +181,7 @@ def get_cvd_score(symbol: str, limit: int = 500) -> float:
             buy_vol = sum(float(t["q"]) for t in trades if t.get("m") == False)
             sell_vol = sum(float(t["q"]) for t in trades if t.get("m") == True)
             tot = buy_vol + sell_vol
-            if tot <= 0: 
+            if tot <= 0:
                 return 0.0
             delta = (buy_vol - sell_vol) / tot
             return _clamp(abs(delta))
@@ -184,7 +198,7 @@ def get_macro_total_mcap() -> float:
         if r.status_code == 200:
             data = r.json()
             return float(data.get("data", {}).get("total_market_cap", {}).get("usd", 0.0) or 0.0)
-    except Exception as e: 
+    except Exception as e:
         _log_exc("[Macro] TOTAL", e)
     return 0.0
 
@@ -195,7 +209,7 @@ def get_macro_btc_dominance() -> float:
             data = r.json()
             dom_pct = float(data.get("data", {}).get("market_cap_percentage", {}).get("btc", 0.0) or 0.0)
             return dom_pct / 100.0
-    except Exception as e: 
+    except Exception as e:
         _log_exc("[Macro] DOM", e)
     return 0.0
 
@@ -208,14 +222,12 @@ def get_macro_total2() -> float:
 # Snapshot
 # --------------------------------------------------------------------------------------
 def build_institutional_snapshot(symbol: str, price_series: Optional[List[float]] = None,
-                                 funding_hist: Optional[List[float]] = None,
-                                 avg_vol_5m: float = 1e6) -> Dict[str, Any]:
+                                 funding_hist: Optional[List[float]] = None) -> Dict[str, Any]:
     oi_s  = get_oi_score(symbol, price_series)
     fund_s = get_funding_score(symbol, funding_hist)
-    liq_p  = get_liq_pack(symbol, avg_vol_5m)
+    liq_p  = get_liq_pack(symbol)
     cvd_s  = get_cvd_score(symbol)
 
-    # Pondération institutionnelle
     score = (
         0.4 * oi_s +
         0.3 * cvd_s +
