@@ -20,6 +20,10 @@ from datetime import datetime
 
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"),
                     format="%(asctime)s [%(levelname)s] %(message)s")
+# Couper le bruit réseau verbeux
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("urllib3").setLevel(logging.WARNING)
+
 LOG = logging.getLogger("runner")
 
 # ---- Imports projet
