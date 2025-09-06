@@ -2,21 +2,15 @@
 """
 scanner.py — scan H1/H4, logs détaillés par symbole, seuil insti adaptatif,
 RR brut/net, sizing par risque, exécution SFI (SFIEngine), et anti-doublons.
-
-Dépendances internes attendues:
-- kucoin_utils.fetch_all_symbols, fetch_klines
-- analyze_bridge.analyze_signal (ou analyze_signal.analyze_signal)
-- decision_logger.log_institutional/log_tech/log_macro/log_decision (optionnel)
-- rr_costs.rr_gross/rr_net
-- risk_sizing.valueqty_from_risk
-- execution_sfi.SFIEngine
-- perf_metrics.register_signal_perf/update_perf_for_symbol (optionnel)
 """
 
 from __future__ import annotations
 import os, json, time, math, logging
 from typing import Dict, Any, List, Optional, Tuple
-from datetime import datetime
+from datetime import datetime, timezone
+
+import pandas as pd
+import httpx
 
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"),
                     format="%(asctime)s [%(levelname)s] %(message)s")
@@ -27,10 +21,10 @@ logging.getLogger("urllib3").setLevel(logging.WARNING)
 LOG = logging.getLogger("runner")
 LOG.info("runner: start")
 
-# ---- Imports projet
-from kucoin_utils import fetch_all_symbols, fetch_klines
-from risk_sizing import valueqty_from_risk
-from rr_costs import rr_gross, rr_net
+# ---- Imports projet (on n'utilise plus fetch_klines interne)
+from kucoin_utils import fetch_all_symbols  # type: ignore
+from risk_sizing import valueqty_from_risk  # type: ignore
+from rr_costs import rr_gross, rr_net       # type: ignore
 
 # Metrics CSV (optionnel)
 try:
@@ -69,10 +63,9 @@ def send_telegram(text: str, parse_mode: str = "Markdown"):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         LOG.info("[TG OFF] %s", text); return
     try:
-        import requests
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-        requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": parse_mode,
-                                 "disable_web_page_preview": True}, timeout=10)
+        httpx.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": parse_mode,
+                              "disable_web_page_preview": True}, timeout=10)
     except Exception as e:
         LOG.error("Telegram KO: %s", e)
 
@@ -110,13 +103,15 @@ INST_WINDOW = _env_int("INST_WINDOW", 200)
 INST_STATS_PATH = os.environ.get("INST_STATS_PATH", "inst_stats.json")
 
 AUTO_SYMBOLS = os.environ.get("AUTO_SYMBOLS", "1") == "1"
-SYMBOLS = [s.strip() for s in os.environ.get("SYMBOLS", "BTCUSDT,ETHUSDT,SOLUSDT").split(",") if s.strip()]
+# ⚠️ Par défaut on met XBTUSDTM (KuCoin Futures = XBT, pas BTC)
+SYMBOLS = [s.strip() for s in os.environ.get("SYMBOLS", "XBTUSDTM,ETHUSDTM,SOLUSDTM").split(",") if s.strip()]
 SYMBOLS_MAX = _env_int("SYMBOLS_MAX", 450)
 
 LOG_DETAIL = os.environ.get("LOG_DETAIL", "1") == "1"
 
-# ---- Utils
-def now_iso() -> str: return datetime.utcnow().isoformat(timespec="seconds") + "Z"
+# ---- Utils généraux
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 def fmt_price(x: Optional[float]) -> str:
     if x is None: return "—"
@@ -150,34 +145,69 @@ def signal_key(symbol: str, side: str, entry: Optional[float], rr: Optional[floa
     br = None if rr is None else round(float(rr), 2)
     return f"{symbol}:{side}:{be}:{br}"
 
-# --- FETCH ROBUSTE DES BARRES (retries + fallback USDT/USDTM) ---
-def _alt_symbols(sym: str) -> List[str]:
-    alts = [sym]
-    if sym.endswith("USDT") and not sym.endswith("USDTM"):
-        alts.append(sym + "M")          # BTCUSDT  -> BTCUSDTM
-    if sym.endswith("USDTM"):
-        alts.append(sym[:-1])           # BTCUSDTM -> BTCUSDT
-    return list(dict.fromkeys(alts))
+# ---- KuCoin Futures Klines (seconds, mapping BTC->XBT)
+KU_FUT_BASE = "https://api-futures.kucoin.com"
 
-def _fetch_bars_safe(symbol: str, interval: str, limit: int, min_needed: int = 50):
-    tries = []
-    for sym in _alt_symbols(symbol):
-        for attempt in range(3):
-            try:
-                df = fetch_klines(sym, interval, limit)
-            except Exception as e:
-                df = None
-                tries.append((sym, f"exc:{type(e).__name__}"))
-            else:
-                n = (0 if df is None else len(df))
-                if n >= min_needed:
-                    if sym != symbol:
-                        LOG.info("[%s] fetch fallback via %s -> ok (%d bars)", symbol, sym, n)
-                    return df
-                tries.append((sym, f"len={n}"))
-            time.sleep(0.5 * (attempt + 1))
-    LOG.warning("[%s] fetch_bars_safe KO (%s %s) tries=%s", symbol, interval, limit, tries)
-    return None
+_GRAN_MIN = {
+    "1m": 1, "3m": 3, "5m": 5, "15m": 15, "30m": 30,
+    "1h": 60, "2h": 120, "4h": 240, "8h": 480, "12h": 720,
+    "1d": 1440, "1w": 10080, "1mo": 43200
+}
+
+def _canon_symbol(sym: str) -> str:
+    s = sym.upper()
+    # Futures KuCoin: BTC = XBT
+    if s.startswith("BTC"):
+        s = "XBT" + s[3:]
+    # Ajouter M si manque
+    if s.endswith("USDT") and not s.endswith("USDTM"):
+        s = s + "M"
+    return s
+
+def _ku_get_klines(symbol: str, interval: str, limit: int) -> pd.DataFrame:
+    """Appel direct KuCoin Futures /api/v1/kline/query avec from/to en SECONDES."""
+    gran = _GRAN_MIN.get(interval)
+    if not gran:
+        raise ValueError(f"interval inconnu: {interval}")
+
+    sym = _canon_symbol(symbol)
+    now_s = int(time.time())
+    span_min = gran * max(1, int(limit))
+    frm = now_s - span_min * 60
+
+    params = {
+        "symbol": sym,
+        "granularity": gran,   # en minutes (KuCoin Futures)
+        "from": frm,           # SECONDES (pas millisecondes)
+        "to": now_s
+    }
+    try:
+        r = httpx.get(f"{KU_FUT_BASE}/api/v1/kline/query", params=params, timeout=15)
+        r.raise_for_status()
+        js = r.json()
+        data = js.get("data") or []
+    except Exception as e:
+        LOG.warning("[%s] kline query KO: %s", sym, e)
+        return pd.DataFrame()
+
+    if not data:
+        return pd.DataFrame()
+
+    # Réponse KuCoin futures: [time, open, close, high, low, volume, turnover]
+    # time est normalement en secondes, mais on tolère ms.
+    rows = []
+    for row in data:
+        # certains clients renvoient des strings
+        t, o, c, h, l, v, _ = row
+        t = int(float(t))
+        if t > 10**12:  # ms -> sec
+            t //= 1000
+        rows.append((t, float(o), float(h), float(l), float(c), float(v)))
+
+    df = pd.DataFrame(rows, columns=["time", "open", "high", "low", "close", "volume"])
+    df.sort_values("time", inplace=True)
+    df.reset_index(drop=True, inplace=True)
+    return df
 
 # ---- Caches/Classes
 class MacroCache:
@@ -186,7 +216,7 @@ class MacroCache:
     def snapshot(self) -> Dict[str, Any]:
         if self._snap and (time.time()-self._ts)<self.ttl:
             return self._snap
-        # TODO: Brancher ici ta vraie macro (TOTAL/TOTAL2/DOM, etc.)
+        # TODO: brancher ta vraie macro (TOTAL/TOTAL2/DOM, etc.)
         self._snap = {}
         self._ts = time.time()
         return self._snap
@@ -237,7 +267,6 @@ def build_msg(symbol: str, res: Dict[str, Any]) -> str:
 
 # ---- Adapters (compat dict / dataclass Decision)
 def _decision_to_dict(obj: Any) -> Dict[str, Any]:
-    """Accepte un dict ou un dataclass Decision -> dict unifié pour scanner."""
     if isinstance(obj, dict):
         return obj
     try:
@@ -272,7 +301,6 @@ def _decision_to_dict(obj: Any) -> Dict[str, Any]:
         return {"valid": False, "side": "NONE"}
 
 def _value_usdt_for_order(entry: float, sl: float) -> float:
-    """Sizing par risque si configuré, sinon valeur fixe."""
     if RISK_PER_TRADE_USDT > 0.0 and entry and sl and float(entry) != float(sl):
         try:
             v = valueqty_from_risk(entry, sl, RISK_PER_TRADE_USDT)
@@ -282,34 +310,32 @@ def _value_usdt_for_order(entry: float, sl: float) -> float:
     return VALUE_USDT
 
 def _load_symbols() -> List[str]:
+    # On normalise toujours (BTC->XBT, + 'M')
     if not AUTO_SYMBOLS and SYMBOLS:
-        return SYMBOLS
+        return [_canon_symbol(s) for s in SYMBOLS]
     try:
         syms = [s for s in fetch_all_symbols(limit=SYMBOLS_MAX) if s.endswith("USDTM")]
         if not syms:
             LOG.warning("fetch_all_symbols vide — fallback SYMBOLS")
-            return SYMBOLS
-        return syms
+            return [_canon_symbol(s) for s in SYMBOLS]
+        return [_canon_symbol(s) for s in syms]
     except Exception as e:
         LOG.warning("fetch_all_symbols erreur: %s — fallback SYMBOLS", e)
-        return SYMBOLS
+        return [_canon_symbol(s) for s in SYMBOLS]
 
 # ---- Analyse d'un symbole
 def analyze_one(symbol: str, macro: MacroCache, gate: InstThreshold) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-    # Bars robustes
-    df_h1 = _fetch_bars_safe(symbol, "1h", H1_LIMIT, min_needed=min(100, max(20, H1_LIMIT//2)))
-    df_h4 = _fetch_bars_safe(symbol, "4h", H4_LIMIT, min_needed=min(100, max(20, H4_LIMIT//2)))
-    if df_h1 is None or df_h4 is None:
+    # Bougies KuCoin Futures (seconds)
+    df_h1 = _ku_get_klines(symbol, "1h", H1_LIMIT)
+    df_h4 = _ku_get_klines(symbol, "4h", H4_LIMIT)
+    if df_h1.empty or df_h4.empty:
         return None, "bars vides (fetch KO)"
 
     # Call analyzer (supporte bridge et direct)
     try:
-        res_raw = analyze_mod.analyze_signal(symbol=symbol, df_h1=df_h1, df_h4=df_h4, macro=macro.snapshot())
+        res_raw = analyze_mod.analyze_signal(symbol=_canon_symbol(symbol), df_h1=df_h1, df_h4=df_h4, macro=macro.snapshot())
     except TypeError:
         res_raw = analyze_mod.analyze_signal(df_h1, df_h4)
-    except ValueError as e:
-        LOG.info("[%s] analyze skipped: %s", symbol, e)
-        return None, str(e)
 
     res = _decision_to_dict(res_raw)
     if not isinstance(res, dict):
@@ -343,7 +369,7 @@ def analyze_one(symbol: str, macro: MacroCache, gate: InstThreshold) -> Tuple[Op
     dyn_thr = gate.threshold()
 
     if not valid:
-        # Règle “secours”: ≥2 composants insti OK, RR≥1.2, score≥seuil adaptatif
+        # Règle secours: ≥2 composants insti OK, RR≥1.2, score≥seuil adaptatif
         if (inst_ok_count >= 2) and (rr is not None and rr >= 1.2) and (inst_score >= dyn_thr):
             res["valid"] = True
             res.setdefault("tolerated", [])
@@ -369,7 +395,7 @@ def scan_and_send_signals(symbols: Optional[List[str]] = None) -> Dict[str, Any]
         if symbols is None:
             symbols = _load_symbols()
     except Exception:
-        symbols = SYMBOLS
+        symbols = [_canon_symbol(s) for s in SYMBOLS]
 
     store = load_json(SENT_SIGNALS_PATH)
     purge_old(store, DUP_TTL_HOURS)
