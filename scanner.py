@@ -154,6 +154,11 @@ def signal_key(symbol: str, side: str, entry: Optional[float], rr: Optional[floa
 def _canon_symbol(sym: str) -> str:
     return sym.upper().replace("/", "").replace("-", "")
 
+def _load_symbols() -> List[str]:
+    if AUTO_SYMBOLS:
+        return fetch_all_symbols(limit=SYMBOLS_MAX)
+    return SYMBOLS
+
 # ---- Caches/Classes
 class MacroCache:
     def __init__(self, ttl: int = MACRO_TTL_SECONDS):
@@ -211,6 +216,7 @@ def analyze_one(symbol: str, macro: MacroCache, gate: InstThreshold) -> Tuple[Op
 
     try:
         inst_snap = inst_data.build_institutional_snapshot(symbol)
+        LOG.info("[%s] inst_snap: %s", symbol, inst_snap)
         res_raw = analyze_mod.analyze_signal(symbol=_canon_symbol(symbol),
                                              df_h1=df_h1, df_h4=df_h4,
                                              df_d1=df_d1, df_m15=df_m15,
@@ -220,7 +226,7 @@ def analyze_one(symbol: str, macro: MacroCache, gate: InstThreshold) -> Tuple[Op
         return None, f"analyze_signal error: {e}"
 
     res = res_raw if isinstance(res_raw, dict) else {}
-    res.setdefault("inst_score", 0.0)
+    res.setdefault("inst_score", inst_snap.get("score", 0.0))
     res.setdefault("inst_ok_count", 0)
     return res, None
 
@@ -247,11 +253,6 @@ def scan_and_send_signals(symbols: Optional[List[str]] = None) -> Dict[str, Any]
             continue
         LOG.info("[%s] decision: %s", sym, res)
     return {"scanned": scanned, "sent": sent, "errors": errors, "ts": now_iso()}
-
-def _load_symbols() -> List[str]:
-    if AUTO_SYMBOLS:
-        return fetch_all_symbols(limit=SYMBOLS_MAX)
-    return SYMBOLS
 
 if __name__ == "__main__":
     out = scan_and_send_signals()
