@@ -1,5 +1,4 @@
 # -*- coding: utf-8 -*-
-import time
 import httpx
 import statistics
 from typing import Optional, Dict, Any, List
@@ -124,7 +123,7 @@ except Exception:
 def get_liq_pack(symbol: str, avg_vol_5m: float = 1e6) -> Dict[str, Any]:
     b_symbol = map_symbol_to_binance(symbol)
 
-    # 1) Essai WebSocket (si dispo)
+    # 1) Essai WebSocket (forceOrder, notionnel réel)
     if USE_WS:
         try:
             notional = get_liquidations_notional_5m(b_symbol)
@@ -139,7 +138,7 @@ def get_liq_pack(symbol: str, avg_vol_5m: float = 1e6) -> Dict[str, Any]:
         except Exception as e:
             _log_exc(f"[Liq-WS] {b_symbol}", e)
 
-    # 2) Fallback REST proxy
+    # 2) Fallback REST proxy (takerLongShortRatio)
     try:
         rr = _get(f"{BASE}/futures/data/takerlongshortRatio",
                   {"symbol": b_symbol, "period": "5m", "limit": 1}, timeout=6.0)
