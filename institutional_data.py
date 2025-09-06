@@ -85,7 +85,7 @@ def get_oi_score(symbol: str, price_series: Optional[List[float]] = None) -> flo
         align = 1.0
         if price_series and len(price_series) >= 2:
             pr_delta = price_series[-1] - price_series[-2]
-            if delta_pct * pr_delta < 0:  # OI monte mais prix baisse -> piégeur
+            if delta_pct * pr_delta < 0:  # OI ↑ mais prix ↓ => piégeur
                 align = 0.3
         score = _clamp(base * align)
         return score
@@ -128,7 +128,8 @@ def get_liq_pack(symbol: str, avg_vol_5m: float = 1e6) -> Dict[str, Any]:
                   {"symbol": b_symbol, "period": "5m", "limit": 1}, timeout=6.0)
         if rr.status_code == 200:
             recs = rr.json() or []
-            if not recs: return {"liq_new_score":0.0,"liq_notional_5m":0.0,"liq_source":"none"}
+            if not recs:
+                return {"liq_new_score":0.0,"liq_notional_5m":0.0,"liq_source":"none"}
             rec = recs[-1]
             buy = float(rec.get("buyVol",0.0)); sell = float(rec.get("sellVol",0.0))
             imb = abs(buy-sell); denom = max(1.0,buy+sell)
@@ -153,6 +154,9 @@ def get_liq_pack(symbol: str, avg_vol_5m: float = 1e6) -> Dict[str, Any]:
 # CVD (Delta volume via aggTrades)
 # --------------------------------------------------------------------------------------
 def get_cvd_score(symbol: str, limit: int = 500) -> float:
+    """
+    Retourne un score [0..1] basé sur l’imbalance du volume (CVD).
+    """
     b_symbol = map_symbol_to_binance(symbol)
     try:
         r = _get(f"{BASE}/fapi/v1/aggTrades", {"symbol": b_symbol, "limit": limit}, timeout=6.0)
