@@ -160,7 +160,8 @@ def _canon_symbol(sym: str) -> str:
     return s
 
 def _ku_get_klines(symbol: str, interval: str, limit: int) -> pd.DataFrame:
-    """KuCoin Futures /api/v1/kline/query (granularity en minutes, from/to en millisecondes)."""
+    """KuCoin Futures /api/v1/kline/query (granularity en minutes, from/to en millisecondes).
+       Parser tolérant: accepte lignes à 6 ou 7 colonnes, et ordres [o,c,h,l,v] / [o,h,l,c,v]."""
     gran = _GRAN_MIN.get(interval)
     if not gran:
         raise ValueError(f"interval inconnu: {interval}")
@@ -168,10 +169,42 @@ def _ku_get_klines(symbol: str, interval: str, limit: int) -> pd.DataFrame:
     sym = _canon_symbol(symbol)
     now_ms = int(time.time() * 1000)
 
-    # Certaines configs 400 si la fenêtre est trop large → on réessaie en réduisant la fenêtre.
-    # On limite aussi le nb max de points à 1500 par sécurité.
     max_pts = 1500
     req_pts = min(int(limit), max_pts)
+
+    def _parse_row(row):
+        """Retourne (t_ms, o, h, l, c, v) ou None si non parsable."""
+        if not isinstance(row, (list, tuple)) or len(row) < 6:
+            return None
+        try:
+            t = int(float(row[0]))
+            if t < 10**12:  # secondes -> ms
+                t *= 1000
+            o = float(row[1])
+
+            if len(row) >= 7:
+                # Doc futures: [time, open, close, high, low, volume, turnover]
+                c = float(row[2]); h = float(row[3]); l = float(row[4]); v = float(row[5])
+            else:
+                # 6 colonnes: heuristique sur a2/a3/a4 = {close, high, low} (ordre inconnu)
+                a2 = float(row[2]); a3 = float(row[3]); a4 = float(row[4]); v = float(row[5])
+                hi = max(a2, a3, a4)
+                lo = min(a2, a3, a4)
+                # close = celle qui n'est ni hi ni lo
+                if a2 != hi and a2 != lo: c = a2
+                elif a3 != hi and a3 != lo: c = a3
+                else: c = a4
+                h, l = hi, lo
+
+            # garde-fous
+            if l > h:
+                h, l = l, h
+            if c < l: c = l
+            if c > h: c = h
+
+            return (t, o, h, l, c, v)
+        except Exception:
+            return None
 
     for shrink in (1.0, 0.5, 0.25, 0.125):
         span_ms = int(gran * req_pts * 60_000 * shrink)  # minutes -> ms
@@ -198,32 +231,29 @@ def _ku_get_klines(symbol: str, interval: str, limit: int) -> pd.DataFrame:
             return pd.DataFrame()
 
         if not data:
-            # Essaye rétrécir encore
             LOG.warning("[%s] kline vide (shrink=%.3f) → on réduit encore", sym, shrink)
             time.sleep(0.2)
             continue
 
-        # data: [time, open, close, high, low, volume, turnover] ; time en ms normalement
         rows = []
         for row in data:
-            t, o, c, h, l, v, _ = row
-            t = int(float(t))
-            # au cas où ce serait en secondes (rare), on convertit en ms pour DatetimeIndex, puis on redivise
-            if t < 10**12:  # secondes -> ms
-                t *= 1000
-            rows.append((t, float(o), float(h), float(l), float(c), float(v)))
+            parsed = _parse_row(row)
+            if parsed is not None:
+                rows.append(parsed)
+
+        if not rows:
+            LOG.warning("[%s] aucune ligne parsée (shape inattendue) — shrink=%.3f", sym, shrink)
+            continue
 
         df = pd.DataFrame(rows, columns=["time_ms", "open", "high", "low", "close", "volume"])
         df.sort_values("time_ms", inplace=True)
         df["time"] = (df["time_ms"] // 1000).astype(int)
         df = df[["time", "open", "high", "low", "close", "volume"]].reset_index(drop=True)
 
-        # On coupe à 'limit' bougies les plus récentes si besoin
         if len(df) > limit:
             df = df.iloc[-limit:].reset_index(drop=True)
         return df
 
-    # tous les essais vides/400
     LOG.warning("[%s] kline query épuisée (interval=%s, limit=%s)", sym, interval, limit)
     return pd.DataFrame()
 
@@ -384,7 +414,6 @@ def analyze_one(symbol: str, macro: MacroCache, gate: InstThreshold) -> Tuple[Op
     dyn_thr = gate.threshold()
 
     if not valid:
-        # Règle secours: ≥2 composants insti OK, RR≥1.2, score≥seuil adaptatif
         if (inst_ok_count >= 2) and (rr is not None and rr >= 1.2) and (inst_score >= dyn_thr):
             res["valid"] = True
             res.setdefault("tolerated", [])
