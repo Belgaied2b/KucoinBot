@@ -21,7 +21,7 @@ logging.getLogger("urllib3").setLevel(logging.WARNING)
 LOG = logging.getLogger("runner")
 LOG.info("runner: start")
 
-# ---- Imports projet (on n'utilise plus fetch_klines interne)
+# ---- Imports projet
 from kucoin_utils import fetch_all_symbols  # type: ignore
 from risk_sizing import valueqty_from_risk  # type: ignore
 from rr_costs import rr_gross, rr_net       # type: ignore
@@ -72,15 +72,13 @@ def send_telegram(text: str, parse_mode: str = "Markdown"):
 # ---- Helpers ENV robustes
 def _env_float(name: str, default: float) -> float:
     v = os.environ.get(name)
-    if v in (None, "", "null", "None"):
-        return float(default)
+    if v in (None, "", "null", "None"): return float(default)
     try: return float(v)
     except Exception: return float(default)
 
 def _env_int(name: str, default: int) -> int:
     v = os.environ.get(name)
-    if v in (None, "", "null", "None"):
-        return int(default)
+    if v in (None, "", "null", "None"): return int(default)
     try: return int(v)
     except Exception: return int(default)
 
@@ -103,8 +101,8 @@ INST_WINDOW = _env_int("INST_WINDOW", 200)
 INST_STATS_PATH = os.environ.get("INST_STATS_PATH", "inst_stats.json")
 
 AUTO_SYMBOLS = os.environ.get("AUTO_SYMBOLS", "1") == "1"
-# ⚠️ Par défaut on met XBTUSDTM (KuCoin Futures = XBT, pas BTC)
-SYMBOLS = [s.strip() for s in os.environ.get("SYMBOLS", "XBTUSDTM,ETHUSDTM,SOLUSDTM").split(",") if s.strip()]
+# ⚠️ KuCoin Futures accepte bien BTCUSDTM/ETHUSDTM/SOLUSDTM
+SYMBOLS = [s.strip() for s in os.environ.get("SYMBOLS", "BTCUSDTM,ETHUSDTM,SOLUSDTM").split(",") if s.strip()]
 SYMBOLS_MAX = _env_int("SYMBOLS_MAX", 450)
 
 LOG_DETAIL = os.environ.get("LOG_DETAIL", "1") == "1"
@@ -145,7 +143,7 @@ def signal_key(symbol: str, side: str, entry: Optional[float], rr: Optional[floa
     br = None if rr is None else round(float(rr), 2)
     return f"{symbol}:{side}:{be}:{br}"
 
-# ---- KuCoin Futures Klines (seconds, mapping BTC->XBT)
+# ---- KuCoin Futures Klines (from/to en millisecondes)
 KU_FUT_BASE = "https://api-futures.kucoin.com"
 
 _GRAN_MIN = {
@@ -156,58 +154,78 @@ _GRAN_MIN = {
 
 def _canon_symbol(sym: str) -> str:
     s = sym.upper()
-    # Futures KuCoin: BTC = XBT
-    if s.startswith("BTC"):
-        s = "XBT" + s[3:]
-    # Ajouter M si manque
+    # Ajouter M si ça finit en USDT sans M
     if s.endswith("USDT") and not s.endswith("USDTM"):
         s = s + "M"
     return s
 
 def _ku_get_klines(symbol: str, interval: str, limit: int) -> pd.DataFrame:
-    """Appel direct KuCoin Futures /api/v1/kline/query avec from/to en SECONDES."""
+    """KuCoin Futures /api/v1/kline/query (granularity en minutes, from/to en millisecondes)."""
     gran = _GRAN_MIN.get(interval)
     if not gran:
         raise ValueError(f"interval inconnu: {interval}")
 
     sym = _canon_symbol(symbol)
-    now_s = int(time.time())
-    span_min = gran * max(1, int(limit))
-    frm = now_s - span_min * 60
+    now_ms = int(time.time() * 1000)
 
-    params = {
-        "symbol": sym,
-        "granularity": gran,   # en minutes (KuCoin Futures)
-        "from": frm,           # SECONDES (pas millisecondes)
-        "to": now_s
-    }
-    try:
-        r = httpx.get(f"{KU_FUT_BASE}/api/v1/kline/query", params=params, timeout=15)
-        r.raise_for_status()
-        js = r.json()
-        data = js.get("data") or []
-    except Exception as e:
-        LOG.warning("[%s] kline query KO: %s", sym, e)
-        return pd.DataFrame()
+    # Certaines configs 400 si la fenêtre est trop large → on réessaie en réduisant la fenêtre.
+    # On limite aussi le nb max de points à 1500 par sécurité.
+    max_pts = 1500
+    req_pts = min(int(limit), max_pts)
 
-    if not data:
-        return pd.DataFrame()
+    for shrink in (1.0, 0.5, 0.25, 0.125):
+        span_ms = int(gran * req_pts * 60_000 * shrink)  # minutes -> ms
+        params = {
+            "symbol": sym,
+            "granularity": gran,      # minutes
+            "from": now_ms - span_ms, # ms
+            "to": now_ms              # ms
+        }
+        try:
+            r = httpx.get(f"{KU_FUT_BASE}/api/v1/kline/query", params=params, timeout=15)
+            r.raise_for_status()
+            js = r.json()
+            data = js.get("data") or []
+        except httpx.HTTPStatusError as e:
+            if e.response is not None and e.response.status_code == 400:
+                LOG.warning("[%s] kline query 400 → shrink=%.3f params=%s", sym, shrink, params)
+                time.sleep(0.3)
+                continue
+            LOG.warning("[%s] kline query KO: %s", sym, e)
+            return pd.DataFrame()
+        except Exception as e:
+            LOG.warning("[%s] kline query KO: %s", sym, e)
+            return pd.DataFrame()
 
-    # Réponse KuCoin futures: [time, open, close, high, low, volume, turnover]
-    # time est normalement en secondes, mais on tolère ms.
-    rows = []
-    for row in data:
-        # certains clients renvoient des strings
-        t, o, c, h, l, v, _ = row
-        t = int(float(t))
-        if t > 10**12:  # ms -> sec
-            t //= 1000
-        rows.append((t, float(o), float(h), float(l), float(c), float(v)))
+        if not data:
+            # Essaye rétrécir encore
+            LOG.warning("[%s] kline vide (shrink=%.3f) → on réduit encore", sym, shrink)
+            time.sleep(0.2)
+            continue
 
-    df = pd.DataFrame(rows, columns=["time", "open", "high", "low", "close", "volume"])
-    df.sort_values("time", inplace=True)
-    df.reset_index(drop=True, inplace=True)
-    return df
+        # data: [time, open, close, high, low, volume, turnover] ; time en ms normalement
+        rows = []
+        for row in data:
+            t, o, c, h, l, v, _ = row
+            t = int(float(t))
+            # au cas où ce serait en secondes (rare), on convertit en ms pour DatetimeIndex, puis on redivise
+            if t < 10**12:  # secondes -> ms
+                t *= 1000
+            rows.append((t, float(o), float(h), float(l), float(c), float(v)))
+
+        df = pd.DataFrame(rows, columns=["time_ms", "open", "high", "low", "close", "volume"])
+        df.sort_values("time_ms", inplace=True)
+        df["time"] = (df["time_ms"] // 1000).astype(int)
+        df = df[["time", "open", "high", "low", "close", "volume"]].reset_index(drop=True)
+
+        # On coupe à 'limit' bougies les plus récentes si besoin
+        if len(df) > limit:
+            df = df.iloc[-limit:].reset_index(drop=True)
+        return df
+
+    # tous les essais vides/400
+    LOG.warning("[%s] kline query épuisée (interval=%s, limit=%s)", sym, interval, limit)
+    return pd.DataFrame()
 
 # ---- Caches/Classes
 class MacroCache:
@@ -240,10 +258,8 @@ class InstThreshold:
             LOG.error("InstThreshold save KO: %s", e)
     def add(self, score: Optional[float]):
         if score is None: return
-        try:
-            s = float(score)
-        except Exception:
-            return
+        try: s = float(score)
+        except Exception: return
         self.scores.append(s)
         if len(self.scores) > self.window:
             self.scores = self.scores[-self.window:]
@@ -310,7 +326,6 @@ def _value_usdt_for_order(entry: float, sl: float) -> float:
     return VALUE_USDT
 
 def _load_symbols() -> List[str]:
-    # On normalise toujours (BTC->XBT, + 'M')
     if not AUTO_SYMBOLS and SYMBOLS:
         return [_canon_symbol(s) for s in SYMBOLS]
     try:
@@ -325,7 +340,7 @@ def _load_symbols() -> List[str]:
 
 # ---- Analyse d'un symbole
 def analyze_one(symbol: str, macro: MacroCache, gate: InstThreshold) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-    # Bougies KuCoin Futures (seconds)
+    # Bougies KuCoin Futures (from/to en ms)
     df_h1 = _ku_get_klines(symbol, "1h", H1_LIMIT)
     df_h4 = _ku_get_klines(symbol, "4h", H4_LIMIT)
     if df_h1.empty or df_h4.empty:
