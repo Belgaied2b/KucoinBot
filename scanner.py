@@ -21,9 +21,18 @@ LOG = logging.getLogger("runner")
 LOG.info("runner: start")
 
 # ---- Imports projet
-from kucoin_utils import fetch_all_symbols  # type: ignore
+from kucoin_utils import fetch_all_symbols, fetch_klines as _ku_get_klines  # type: ignore
 from risk_sizing import valueqty_from_risk  # type: ignore
 from rr_costs import rr_gross, rr_net       # type: ignore
+import institutional_data as inst_data
+
+# WebSocket Binance (liquidations temps réel)
+try:
+    import binance_ws
+    binance_ws.start_ws_background()
+    LOG.info("Binance WS démarré")
+except Exception as e:
+    LOG.warning("Binance WS KO: %s", e)
 
 # Metrics CSV (optionnel)
 try:
@@ -95,14 +104,12 @@ H4_LIMIT = _env_int("H4_LIMIT", 400)
 D1_LIMIT = _env_int("D1_LIMIT", 200)
 M15_LIMIT = _env_int("M15_LIMIT", 200)
 
-# Seuil insti adaptatif (quantile)
 REQ_SCORE_FLOOR = _env_float("REQ_SCORE_FLOOR", 1.2)
 INST_Q = _env_float("INST_Q", 0.70)
 INST_WINDOW = _env_int("INST_WINDOW", 200)
 INST_STATS_PATH = os.environ.get("INST_STATS_PATH", "inst_stats.json")
 
 AUTO_SYMBOLS = os.environ.get("AUTO_SYMBOLS", "1") == "1"
-# ⚠️ Sur KuCoin Futures le perp BTC est XBTUSDTM, on mappe automatiquement.
 SYMBOLS = [s.strip() for s in os.environ.get("SYMBOLS", "BTCUSDTM,ETHUSDTM,SOLUSDTM").split(",") if s.strip()]
 SYMBOLS_MAX = _env_int("SYMBOLS_MAX", 450)
 
@@ -144,8 +151,8 @@ def signal_key(symbol: str, side: str, entry: Optional[float], rr: Optional[floa
     br = None if rr is None else round(float(rr), 2)
     return f"{symbol}:{side}:{be}:{br}"
 
-# ---- KuCoin Futures Klines
-from kucoin_utils import fetch_klines as _ku_get_klines
+def _canon_symbol(sym: str) -> str:
+    return sym.upper().replace("/", "").replace("-", "")
 
 # ---- Caches/Classes
 class MacroCache:
@@ -154,7 +161,11 @@ class MacroCache:
     def snapshot(self) -> Dict[str, Any]:
         if self._snap and (time.time()-self._ts)<self.ttl:
             return self._snap
-        self._snap = {}  # TODO: brancher TOTAL/TOTAL2/DOM
+        self._snap = {
+            "TOTAL": inst_data.get_macro_total_mcap(),
+            "TOTAL2": inst_data.get_macro_total2(),
+            "BTC_DOM": inst_data.get_macro_btc_dominance(),
+        }
         self._ts = time.time()
         return self._snap
 
@@ -199,9 +210,11 @@ def analyze_one(symbol: str, macro: MacroCache, gate: InstThreshold) -> Tuple[Op
         return None, "bars vides (fetch KO)"
 
     try:
+        inst_snap = inst_data.build_institutional_snapshot(symbol)
         res_raw = analyze_mod.analyze_signal(symbol=_canon_symbol(symbol),
                                              df_h1=df_h1, df_h4=df_h4,
                                              df_d1=df_d1, df_m15=df_m15,
+                                             inst=inst_snap,
                                              macro=macro.snapshot())
     except Exception as e:
         return None, f"analyze_signal error: {e}"
@@ -234,6 +247,11 @@ def scan_and_send_signals(symbols: Optional[List[str]] = None) -> Dict[str, Any]
             continue
         LOG.info("[%s] decision: %s", sym, res)
     return {"scanned": scanned, "sent": sent, "errors": errors, "ts": now_iso()}
+
+def _load_symbols() -> List[str]:
+    if AUTO_SYMBOLS:
+        return fetch_all_symbols(limit=SYMBOLS_MAX)
+    return SYMBOLS
 
 if __name__ == "__main__":
     out = scan_and_send_signals()
