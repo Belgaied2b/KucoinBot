@@ -92,7 +92,7 @@ def get_oi_score(symbol: str, price_series: Optional[List[float]] = None) -> flo
         align = 1.0
         if price_series and len(price_series) >= 2:
             pr_delta = price_series[-1] - price_series[-2]
-            if delta_pct * pr_delta < 0:
+            if delta_pct * pr_delta < 0:  # OI ↑ mais prix ↓ => piégeur
                 align = 0.3
         return _clamp(base * align)
     except Exception:
@@ -121,7 +121,7 @@ def get_funding_score(symbol: str, history: Optional[List[float]] = None) -> flo
     return 0.0
 
 # --------------------------------------------------------------------------------------
-# Liquidations (WebSocket exact + normalisation)
+# Liquidations (WebSocket exact + normalisation altcoins)
 # --------------------------------------------------------------------------------------
 try:
     from binance_ws import get_liquidations_notional_5m
@@ -228,18 +228,18 @@ def build_institutional_snapshot(symbol: str, price_series: Optional[List[float]
     liq_p  = get_liq_pack(symbol)
     cvd_s  = get_cvd_score(symbol)
 
-    score = (
-        0.4 * oi_s +
-        0.3 * cvd_s +
-        0.2 * fund_s +
-        0.1 * liq_p["liq_new_score"]
-    )
+    # Pondération institutionnelle : BTC/ETH > OI + Delta, Alts > Delta + Funding + Liq
+    sym = map_symbol_to_binance(symbol)
+    if sym in ("BTCUSDT", "ETHUSDT"):
+        score = (0.45 * oi_s) + (0.35 * cvd_s) + (0.15 * fund_s) + (0.05 * liq_p["liq_new_score"])
+    else:
+        score = (0.25 * oi_s) + (0.35 * cvd_s) + (0.25 * fund_s) + (0.15 * liq_p["liq_new_score"])
 
     return {
         "oi_score": oi_s,
         "funding_score": fund_s,
         "liq_new_score": liq_p["liq_new_score"],
-        "liq_notional_5m": liq_p["liq_notional_5m"],  # exact liquidations
+        "liq_notional_5m": liq_p["liq_notional_5m"],
         "cvd_score": cvd_s,
         "score": score,
         "meta": {
