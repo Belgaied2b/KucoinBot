@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*- 
+# -*- coding: utf-8 -*-
 """
 main.py — Boucle event-driven + fallback institutionnel structuré (OTE, liquidité, swings)
 - Direction H4, exécution H1 via OTE 62–79% et pools de liquidité
@@ -16,6 +16,7 @@ from meta_policy import MetaPolicy
 from perf_metrics import register_signal_perf, update_perf_for_symbol
 from kucoin_utils import fetch_klines, fetch_symbol_meta
 from log_setup import init_logging, enable_httpx
+from kucoin_adapter import place_limit_order, get_symbol_meta  # fallback direct KuCoin
 
 # ---- Soft imports institutionnel / autotune
 HAS_INST = True
@@ -125,26 +126,80 @@ def _build_symbols() -> List[str]:
             syms.append(sym_api)
     return sorted(set(syms))
 
+def _round_to_tick(px: float, tick: float) -> float:
+    if not tick or tick <= 0:
+        return float(px)
+    # floor vers le tick inférieur (évite rejet prix)
+    return math.floor(float(px) / float(tick)) * float(tick)
+
+def _has_real_order_id(orders: List[Dict[str, Any]]) -> bool:
+    for o in orders or []:
+        if isinstance(o, dict):
+            if o.get("orderId") or o.get("clientOid"):
+                return True
+            raw = o.get("raw")
+            if isinstance(raw, str) and raw.strip():
+                return True
+    return False
+
 # ------------------------
 # Exécution robuste SFI
 # ------------------------
-def _normalize_orders(orders: Union[None, dict, list, tuple]) -> List[Dict[str, Any]]:
+def _normalize_orders(orders: Union[None, dict, list, tuple, str]) -> List[Dict[str, Any]]:
+    """
+    Uniformise la sortie en liste de dicts.
+    Extrait orderId/clientOid si possible même depuis 'raw' str.
+    """
+    def _from_str(s: str) -> Dict[str, Any]:
+        s = str(s).strip()
+        if not s:
+            return {"raw": s}
+        if len(s) in (32, 36) or s.isalnum():
+            return {"ok": True, "clientOid": s, "raw": s}
+        return {"raw": s}
+
+    out: List[Dict[str, Any]] = []
     if orders is None:
-        return []
+        return out
+
     if isinstance(orders, dict):
-        return [orders]
+        d = dict(orders)
+        data = d.get("data")
+        if isinstance(data, dict):
+            if "orderId" in data and "orderId" not in d:
+                d["orderId"] = data.get("orderId")
+            if "clientOid" in data and "clientOid" not in d:
+                d["clientOid"] = data.get("clientOid")
+        out.append(d)
+        return out
+
+    if isinstance(orders, str):
+        out.append(_from_str(orders))
+        return out
+
+    if isinstance(orders, tuple):
+        out.append({"raw": tuple(orders)})
+        return out
+
     if isinstance(orders, list):
-        out: List[Dict[str, Any]] = []
         for it in orders:
             if isinstance(it, dict):
-                out.append(it)
+                d = dict(it)
+                data = d.get("data")
+                if isinstance(data, dict):
+                    if "orderId" in data and "orderId" not in d:
+                        d["orderId"] = data.get("orderId")
+                    if "clientOid" in data and "clientOid" not in d:
+                        d["clientOid"] = data.get("clientOid")
+                out.append(d)
+            elif isinstance(it, str):
+                out.append(_from_str(it))
             elif isinstance(it, tuple):
                 out.append({"raw": tuple(it)})
             else:
                 out.append({"raw": it})
         return out
-    if isinstance(orders, tuple):
-        return [{"raw": tuple(orders)}]
+
     return [{"raw": orders}]
 
 def _maybe_configure_tranches(engine: SFIEngine, tp1: float, tp2: float) -> None:
@@ -601,13 +656,52 @@ async def handle_symbol_event(ev: Dict[str, Any], rg: RiskGuard, policy: MetaPol
         eng = SFIEngine(symbol, side, value_usdt, sl, tp1, tp2)
 
     orders = _safe_place_orders(eng, entry, sl, tp1, tp2)
+    orders = _normalize_orders(orders)
+
+    # Fallback direct KuCoin si pas d'ID exploitable
+    if not _has_real_order_id(orders):
+        try:
+            tick = float(get_symbol_meta(symbol).get("priceIncrement", 0.0)) or 0.0
+        except Exception:
+            tick = 0.0
+        entry_px = _round_to_tick(entry, tick)
+        post_only = os.getenv("KC_POST_ONLY", "1") == "1"
+
+        log.info("fallback KuCoin LIMIT: px=%s (tick=%s) postOnly=%s", fmt_price(entry_px), tick, post_only, extra={"symbol": symbol})
+        kc = place_limit_order(
+            symbol=symbol,
+            side=side,
+            price=float(entry_px),
+            value_usdt=float(value_usdt),
+            sl=float(sl),
+            tp1=float(tp1),
+            tp2=float(tp2),
+            post_only=post_only
+        )
+        if isinstance(kc, dict):
+            oid = kc.get("orderId") or kc.get("clientOid") or (kc.get("data", {}) or {}).get("orderId")
+            orders = [{"ok": kc.get("ok"), "orderId": oid, "code": kc.get("code"), "raw": kc.get("raw")}]
+        else:
+            orders = [{"raw": kc}]
+
     log.info("orders=%s", orders, extra={"symbol": symbol})
 
     # Telegram
+    ids = []
+    for o in orders:
+        if isinstance(o, dict):
+            oid = o.get("orderId") or o.get("clientOid")
+            if not oid and isinstance(o.get("raw"), str):
+                raw = o["raw"].strip()
+                if raw:
+                    oid = raw
+            if oid: ids.append(str(oid))
+    ids_str = ", ".join(ids) if ids else "—"
+
     lbl = label or "META_POLICY"
     msg = (f"🧠 *{symbol}* — *{side.upper()}* via *{lbl}*\n"
            f"RR: *{res.get('rr','—')}*  |  Entrée: *{fmt_price(entry)}*  |  SL: *{fmt_price(sl)}*  |  TP1: *{fmt_price(tp1)}*  TP2: *{fmt_price(tp2)}*\n"
-           f"Ordres: {orders if orders else '—'}")
+           f"Order IDs: {ids_str}")
     send_telegram(msg)
 
     key = f"{symbol}:{side}:{fmt_price(entry)}:{round(res.get('rr',0),2)}"
