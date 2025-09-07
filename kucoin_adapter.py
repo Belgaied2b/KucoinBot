@@ -1,12 +1,12 @@
-# kucoin_adapter.py — Adapter KuCoin Futures (REST v2 signé) prêt à coller
+# kucoin_adapter.py — Futures REST adapter (auto marginMode) prêt à coller
 import time
 import hmac
 import base64
 import hashlib
-import httpx
-import json
-from decimal import Decimal, ROUND_DOWN, getcontext
 from typing import Any, Dict, Optional
+
+import httpx
+import ujson as json
 
 from config import SETTINGS
 from logger_utils import get_logger
@@ -14,116 +14,106 @@ from logger_utils import get_logger
 log = get_logger("kucoin.adapter")
 
 BASE = SETTINGS.kucoin_base_url.rstrip("/")
-ORDERS_PATH = "/api/v1/orders"
-TIMESTAMP_PATH = "/api/v1/timestamp"
-CONTRACT_PATH = "/api/v1/contracts/{symbol}"
-CLIENT_QUERY_PATH = "/api/v1/order/client-order/{clientOid}"
-CLIENT_CANCEL_PATH = "/api/v1/order/cancelClientOrder?clientOid={clientOid}"
 
-getcontext().prec = 28
-_SERVER_OFFSET = 0.0
-
-def _sync_server_time() -> None:
-    global _SERVER_OFFSET
-    try:
-        r = httpx.get(BASE + TIMESTAMP_PATH, timeout=5.0)
-        r.raise_for_status()
-        server_ms = int(r.json().get("data", 0))
-        _SERVER_OFFSET = (server_ms / 1000.0) - time.time()
-        log.info(f"[time] offset={_SERVER_OFFSET:.3f}s")
-    except Exception as e:
-        log.warning(f"[time] sync failed: {e}")
-
+# ---------- low-level signing ----------
 def _ts_ms() -> int:
-    return int((time.time() + _SERVER_OFFSET) * 1000)
+    return int(time.time() * 1000)
 
 def _b64_hmac_sha256(secret: str, payload: str) -> str:
     return base64.b64encode(
         hmac.new(secret.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).digest()
     ).decode("utf-8")
 
-def _headers(method: str, path: str, body_str: str = "") -> Dict[str, str]:
+def _headers(method: str, path: str, body: str = "") -> Dict[str, str]:
     ts = str(_ts_ms())
-    sig_payload = ts + method.upper() + path + (body_str or "")
+    sig = _b64_hmac_sha256(SETTINGS.kucoin_secret, ts + method.upper() + path + body)
+    psp = _b64_hmac_sha256(SETTINGS.kucoin_secret, SETTINGS.kucoin_passphrase)
     return {
         "KC-API-KEY": SETTINGS.kucoin_key,
-        "KC-API-SIGN": _b64_hmac_sha256(SETTINGS.kucoin_secret, sig_payload),
+        "KC-API-SIGN": sig,
         "KC-API-TIMESTAMP": ts,
-        "KC-API-PASSPHRASE": _b64_hmac_sha256(SETTINGS.kucoin_secret, SETTINGS.kucoin_passphrase),
+        "KC-API-PASSPHRASE": psp,
         "KC-API-KEY-VERSION": "2",
         "Accept": "application/json",
         "Content-Type": "application/json",
+        "User-Agent": "runner/kucoin-adapter",
     }
 
-def _post(path: str, body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def _post(path: str, body: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    url = BASE + path
     body_str = "" if body is None else json.dumps(body, separators=(",", ":"), ensure_ascii=False)
-    try:
-        with httpx.Client(timeout=10.0) as c:
-            r = c.post(BASE + path, headers=_headers("POST", path, body_str),
-                       content=(body_str.encode("utf-8") if body_str else None))
+    with httpx.Client(timeout=10.0) as c:
+        r = c.post(url, headers=_headers("POST", path, body_str), content=(body_str.encode("utf-8") if body_str else None))
+        try:
             js = r.json() if r.content else {}
-            if r.status_code not in (200, 201):
-                log.error(f"[POST {path}] HTTP={r.status_code} {r.text[:200]}")
-            return js
-    except Exception as e:
-        log.exception(f"[POST {path}] exception: {e}")
-        return {"code": "EXC", "msg": str(e), "data": {}}
+        except Exception:
+            js = {"code": str(r.status_code), "msg": r.text}
+    if r.status_code >= 400:
+        log.error("[POST %s] HTTP=%s %s", path, r.status_code, r.text[:200])
+    return js
 
 def _get(path: str) -> Dict[str, Any]:
-    try:
-        with httpx.Client(timeout=10.0) as c:
-            r = c.get(BASE + path, headers=_headers("GET", path))
-            js = r.json() if r.content else {}
-            if r.status_code != 200:
-                log.error(f"[GET {path}] HTTP={r.status_code} {r.text[:200]}")
-            return js
-    except Exception as e:
-        log.exception(f"[GET {path}] exception: {e}")
-        return {"code": "EXC", "msg": str(e), "data": {}}
-
-def get_symbol_meta(symbol: str) -> Dict[str, Any]:
-    sym = symbol.upper().strip()
-    if not sym.endswith("USDTM") and sym.endswith("USDT"):
-        sym = sym + "M"
-    js = _get(CONTRACT_PATH.format(symbol=sym))
-    data = js.get("data", {}) if isinstance(js, dict) else {}
-    tick = None
-    for key in ("priceIncrement", "tickSize"):
-        v = data.get(key)
-        if v is None: 
-            continue
+    url = BASE + path
+    with httpx.Client(timeout=10.0) as c:
+        r = c.get(url, headers=_headers("GET", path, ""))
         try:
-            tick = Decimal(str(v)); break
+            js = r.json() if r.content else {}
         except Exception:
-            continue
-    if not tick or tick <= 0:
-        tick = Decimal("0.001")
-    tick_q = Decimal(str(tick.normalize()))
-    return {
-        "symbol_api": sym,
-        "priceIncrement": tick_q,
-        "pricePrecision": max(0, -tick_q.as_tuple().exponent),
-        "raw": data,
-    }
+            js = {"code": str(r.status_code), "msg": r.text}
+    if r.status_code >= 400:
+        log.error("[GET %s] HTTP=%s %s", path, r.status_code, r.text[:200])
+    return js
 
-def _quantize_to_tick(price: float, tick: Decimal) -> Decimal:
-    p = Decimal(str(price))
+# ---------- metadata ----------
+def get_symbol_meta(symbol: str) -> Dict[str, Any]:
+    """
+    Renvoie la fiche contrat KuCoin Futures: tick, lotSize, mark/last price...
+    symbol doit être le contrat (ex: BTCUSDTM).
+    """
+    p = f"/api/v1/contracts/{symbol}"
+    js = _get(p)
+    return js.get("data", {}) if isinstance(js, dict) else {}
+
+def _price_precision(meta: Dict[str, Any]) -> int:
+    inc = float(meta.get("priceIncrement", meta.get("tickSize", 0.0)) or 0.0)
+    if inc <= 0:
+        return 4
+    s = f"{inc:.12f}".rstrip("0").rstrip(".")
+    return len(s.split(".")[1]) if "." in s else 0
+
+def _round_price_to_tick(price: float, meta: Dict[str, Any]) -> float:
+    tick = float(meta.get("priceIncrement", meta.get("tickSize", 0.0)) or 0.0)
     if tick <= 0:
-        return p
-    mult = p / tick
-    mult_q = mult.quantize(Decimal("1"), rounding=ROUND_DOWN)
-    return mult_q * tick
+        return float(price)
+    # floor au tick inférieur (évite "Price parameter invalid")
+    stepped = (int(float(price) / tick)) * tick
+    prec = _price_precision(meta)
+    return round(stepped, prec)
 
-def _normalize_side(side: str) -> str:
-    s = (side or "").lower().strip()
-    if s in ("buy", "sell"):
-        return s
-    if s == "long":
-        return "buy"
-    if s == "short":
-        return "sell"
-    # default: assume engine gave us 'buy'/'sell'
-    return s or "buy"
+# ---------- margin mode detection ----------
+def get_position(symbol: str) -> Dict[str, Any]:
+    js = _get(f"/api/v1/position?symbol={symbol}")
+    return js.get("data", {}) if isinstance(js, dict) else {}
+
+def get_margin_mode(symbol: str) -> str:
+    """
+    Détermine le margin mode en interrogeant la position du contrat.
+    Retourne "cross" si crossMode==True, sinon "isolated".
+    """
+    pos = get_position(symbol) or {}
+    # KuCoin renvoie souvent 'crossMode': true/false
+    cross = bool(pos.get("crossMode")) if isinstance(pos, dict) else False
+    mm = "cross" if cross else "isolated"
+    log.info("[marginMode] %s -> %s", symbol, mm)
+    return mm
+
+# ---------- orders ----------
+def get_order_by_client_oid(client_oid: str) -> Optional[Dict[str, Any]]:
+    js = _get(f"/api/v1/order/client-order/{client_oid}")
+    # 404 => pas trouvé (ordre refusé), sinon code 200000 => OK
+    if isinstance(js, dict) and str(js.get("code")) in ("200000", "200", "0", "None"):
+        return js.get("data") or {}
+    return None
 
 def place_limit_order(
     symbol: str,
@@ -134,75 +124,107 @@ def place_limit_order(
     tp1: Optional[float] = None,
     tp2: Optional[float] = None,
     post_only: bool = True,
-    client_order_id: Optional[str] = None,
-    leverage: Optional[int] = None,
-    **kwargs,
+    time_in_force: str = "GTC",
+    margin_mode: Optional[str] = None,
 ) -> Dict[str, Any]:
-    _sync_server_time()
-    meta = get_symbol_meta(symbol)
-    tick: Decimal = meta.get("priceIncrement", Decimal("0.001"))
-    prec = meta.get("pricePrecision", 3)
-    sym_api = meta.get("symbol_api", symbol if symbol.endswith("USDTM") else symbol + "M")
+    """
+    Place un LIMIT avec notional (valueQty). Ajoute marginMode auto (cross/isolated).
+    N'ENVOIE PAS 'leverage' pour éviter 100001.
+    """
+    meta = get_symbol_meta(symbol) or {}
+    px = _round_price_to_tick(price, meta)
+    side_api = side.lower().strip()
+    if side_api == "long":  side_api = "buy"
+    if side_api == "short": side_api = "sell"
 
-    q_price = _quantize_to_tick(price, tick)
-    price_str = f"{q_price:.{prec}f}"
-    side_norm = _normalize_side(side)
-
-    lev = str(leverage if leverage else getattr(SETTINGS, "default_leverage", 10))
-    value_qty = float(value_usdt) * float(lev)
+    mm = (margin_mode or get_margin_mode(symbol)).lower()
+    if mm not in ("cross", "isolated"):
+        mm = "isolated"
 
     body = {
-        "clientOid": client_order_id or str(_ts_ms()),
-        "symbol": sym_api,
+        "clientOid": str(_ts_ms()),
+        "symbol": symbol,
         "type": "limit",
-        "side": side_norm,
-        "price": price_str,
-        "valueQty": f"{value_qty:.2f}",
-        "leverage": lev,
-        "timeInForce": "GTC",
+        "side": side_api,
+        "price": f"{px:.12f}",
+        "valueQty": f"{float(value_usdt):.2f}",
+        "timeInForce": time_in_force.upper(),
         "reduceOnly": False,
         "postOnly": bool(post_only),
+        "marginMode": mm,   # <<< clé pour éviter 330005
     }
 
-    log.info(f"[place_limit] {sym_api} {body['side']} px={price_str} valueQty={body['valueQty']} postOnly={body['postOnly']}")
-    js = _post(ORDERS_PATH, body)
+    log.info("[place_limit] %s %s px=%s valueQty=%.2f postOnly=%s marginMode=%s",
+             symbol, side_api, body["price"], float(value_usdt), body["postOnly"], mm)
 
-    ok_resp = bool(js.get("code") in ("200000", 200000) or js.get("success") is True)
-    code = str(js.get("code"))
-    msg = js.get("msg") or js.get("message") or ""
-    order_id = None
-    client_oid = body["clientOid"]
+    resp = _post("/api/v1/orders", body)
+    data = resp.get("data") or {}
+    ok = str(resp.get("code")) in ("200000", "200", "0", "None") and bool(data.get("orderId"))
+    # journal utile en cas d’erreur
+    if not ok:
+        log.info("[kc.place_limit_order] ok=%s code=%s msg=%s clientOid=%s orderId=%s",
+                 ok, resp.get("code"), resp.get("msg"), data.get("clientOid") or body["clientOid"], data.get("orderId"))
+    return {
+        "ok": ok,
+        "code": resp.get("code"),
+        "msg": resp.get("msg"),
+        "orderId": data.get("orderId"),
+        "clientOid": data.get("clientOid") or body["clientOid"],
+        "data": data,
+        "raw": resp,
+    }
 
-    if not ok_resp and ("Price parameter invalid" in msg or "multiple" in msg.lower()):
-        # retry sans postOnly si rejet maker
-        log.info("[place_limit] retry tick (postOnly=True->False)")
-        body["postOnly"] = False
-        js2 = _post(ORDERS_PATH, body)
-        ok_resp = bool(js2.get("code") in ("200000", 200000) or js2.get("success") is True)
-        code = str(js2.get("code"))
-        msg = js2.get("msg") or js2.get("message") or msg
-        if ok_resp:
-            d = js2.get("data") or {}
-            order_id = d.get("orderId")
-            return {"ok": True, "code": code, "msg": "", "orderId": order_id, "clientOid": client_oid, "raw": js2}
-        return {"ok": False, "code": code, "msg": msg, "orderId": None, "clientOid": None, "raw": js2}
+def place_market_order(
+    symbol: str,
+    side: str,
+    value_usdt: float,
+    reduce_only: bool = False,
+    margin_mode: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    MARKET notional (valueQty). Ajoute marginMode auto. Pas de leverage.
+    """
+    side_api = side.lower().strip()
+    if side_api == "long":  side_api = "buy"
+    if side_api == "short": side_api = "sell"
 
-    d = js.get("data") or {}
-    order_id = d.get("orderId")
-    return {"ok": ok_resp, "code": code, "msg": ("" if ok_resp else msg), "orderId": order_id, "clientOid": client_oid, "raw": js}
+    mm = (margin_mode or get_margin_mode(symbol)).lower()
+    if mm not in ("cross", "isolated"):
+        mm = "isolated"
 
-def get_order_by_client_oid(client_oid: str) -> Dict[str, Any]:
-    if not client_oid:
-        return {"ok": False, "code": "PARAM", "msg": "clientOid missing", "data": {}}
-    _sync_server_time()
-    js = _get(CLIENT_QUERY_PATH.format(clientOid=client_oid))
-    ok = bool(js.get("code") in ("200000", 200000))
-    return {"ok": ok, "code": str(js.get("code")), "msg": js.get("msg", ""), "data": js.get("data", {})}
+    body = {
+        "clientOid": str(_ts_ms()),
+        "symbol": symbol,
+        "type": "market",
+        "side": side_api,
+        "valueQty": f"{float(value_usdt):.2f}",
+        "reduceOnly": bool(reduce_only),
+        "marginMode": mm,
+    }
+    log.info("[place_market] %s %s valueQty=%.2f reduceOnly=%s marginMode=%s",
+             symbol, side_api, float(value_usdt), reduce_only, mm)
 
-def cancel_by_client_oid(client_oid: str) -> Dict[str, Any]:
-    if not client_oid:
-        return {"ok": False, "code": "PARAM", "msg": "clientOid missing", "data": {}}
-    _sync_server_time()
-    js = _get(CLIENT_CANCEL_PATH.format(clientOid=client_oid))
-    ok = bool(js.get("code") in ("200000", 200000))
-    return {"ok": ok, "code": str(js.get("code")), "msg": js.get("msg", ""), "data": js.get("data", {})}
+    resp = _post("/api/v1/orders", body)
+    data = resp.get("data") or {}
+    ok = str(resp.get("code")) in ("200000", "200", "0", "None") and bool(data.get("orderId"))
+    if not ok:
+        log.info("[kc.place_market_order] ok=%s code=%s msg=%s clientOid=%s orderId=%s",
+                 ok, resp.get("code"), resp.get("msg"), data.get("clientOid") or body["clientOid"], data.get("orderId"))
+    return {
+        "ok": ok,
+        "code": resp.get("code"),
+        "msg": resp.get("msg"),
+        "orderId": data.get("orderId"),
+        "clientOid": data.get("clientOid") or body["clientOid"],
+        "data": data,
+        "raw": resp,
+    }
+
+__all__ = [
+    "get_symbol_meta",
+    "get_position",
+    "get_margin_mode",
+    "get_order_by_client_oid",
+    "place_limit_order",
+    "place_market_order",
+]
