@@ -162,49 +162,54 @@ def _pick_setup(entry_price: float, inst: Dict[str, Any], df: pd.DataFrame):
 
 
 def _institutional_gate(inst: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
-    """Porte institutionnelle stricte: seuil score global + min composantes OK."""
+    """Gate institutionnel tolérant : 4/4 = pass, 3/4 = pass toléré, sinon score gate."""
     score = float(inst.get("score", 0.0) or 0.0)
-    oi_s = float(inst.get("oi_score", 0.0) or 0.0)
-    cvd_s = float(inst.get("cvd_score", 0.0) or 0.0)  # corrigé
+    oi_s   = float(inst.get("oi_score", 0.0) or 0.0)
+    cvd_s  = float(inst.get("cvd_score", 0.0) or 0.0)
     fund_s = float(inst.get("funding_score", 0.0) or 0.0)
-    liq_new = inst.get("liq_new_score", None)
-    liq_s = float(liq_new if liq_new is not None else (inst.get("liq_score", 0.0) or 0.0))
+    liq_s  = float(inst.get("liq_new_score", inst.get("liq_score", 0.0) or 0.0))
     book_s = float(inst.get("book_imbal_score", 0.0) or 0.0)
 
+    # Seuils min
     req_score_min = float(getattr(SETTINGS, "req_score_min", 1.5))
-    oi_min = float(getattr(SETTINGS, "oi_req_min", 0.4))
-    cvd_min = float(getattr(SETTINGS, "delta_req_min", 0.4))  # seuil rebaptisé pour cohérence
-    funding_min = float(getattr(SETTINGS, "funding_req_min", 0.2))
-    liq_min = float(getattr(SETTINGS, "liq_req_min", 0.5))
+    oi_min   = float(getattr(SETTINGS, "oi_req_min", 0.4))
+    cvd_min  = float(getattr(SETTINGS, "delta_req_min", 0.4))
+    fund_min = float(getattr(SETTINGS, "funding_req_min", 0.2))
+    liq_min  = float(getattr(SETTINGS, "liq_req_min", 0.5))
     book_min = float(getattr(SETTINGS, "book_req_min", 0.3))
     use_book = bool(getattr(SETTINGS, "use_book_imbal", True))
-    inst_components_min = int(getattr(SETTINGS, "inst_components_min", 2))
+    comps_min = int(getattr(SETTINGS, "inst_components_min", 2))
 
     comp_status = {
         "oi_ok": oi_s >= oi_min,
         "cvd_ok": cvd_s >= cvd_min,
-        "fund_ok": fund_s >= funding_min,
+        "fund_ok": fund_s >= fund_min,
         "liq_ok": liq_s >= liq_min,
         "book_ok": (book_s >= book_min) if use_book else None,
     }
-    used_flags = [v for v in comp_status.values() if v is not None]
-    nb_ok = sum(1 for v in used_flags if v)
+    used = [v for v in comp_status.values() if v is not None]
+    nb_ok = sum(1 for v in used if v)
 
-    gate_ok = (score >= req_score_min) and (nb_ok >= inst_components_min)
+    # Règle institutionnelle tolérante
+    force_pass = nb_ok >= 4
+    tol_pass   = (not force_pass) and (nb_ok >= 3)
+    score_gate = (score >= req_score_min) and (nb_ok >= comps_min)
+    gate_ok    = force_pass or tol_pass or score_gate
 
     return gate_ok, {
         "score": score,
-        "req_score_min": req_score_min,
-        "oi_score": oi_s, "cvd_score": cvd_s, "funding_score": fund_s,
-        "liq_score": liq_s, "book_score": book_s,
-        "liq_source": "liq_new_score" if liq_new is not None else "liq_score",
-        "thresholds": {
-            "oi_min": oi_min, "cvd_min": cvd_min, "funding_min": funding_min,
-            "liq_min": liq_min, "book_min": book_min,
-            "components_min": inst_components_min, "use_book": use_book,
-        },
         "components_ok": comp_status,
         "components_ok_count": nb_ok,
+        "req_score_min": req_score_min,
+        "thresholds": {
+            "oi_min": oi_min, "cvd_min": cvd_min,
+            "funding_min": fund_min, "liq_min": liq_min,
+            "book_min": book_min, "components_min": comps_min,
+            "use_book": use_book,
+        },
+        "reason": ("force_pass_4of4" if force_pass else
+                   ("tolerance_pass_3of4" if tol_pass else
+                    ("score_gate" if score_gate else "reject")))
     }
 
 
@@ -215,12 +220,7 @@ def _build_diagnostics(inst_diag: Dict[str, Any],
                        tolerated: List[str],
                        extra_rejects: Optional[List[str]] = None) -> Dict[str, Any]:
     return {
-        "inst": {
-            "score": inst_diag.get("score"),
-            "components_ok": inst_diag.get("components_ok"),
-            "components_ok_count": inst_diag.get("components_ok_count"),
-            "thresholds": inst_diag.get("thresholds"),
-        },
+        "inst": inst_diag,
         "tech": {
             "ema_trend_ok": bool(tech_diag.get("ema_trend", False)),
             "momentum_ok": bool(tech_diag.get("macd", False)),
@@ -249,7 +249,7 @@ def analyze_signal(symbol: str,
     inst_ok, inst_diag = _institutional_gate(inst)
     score = float(inst_diag["score"])
     if not inst_ok:
-        reason = f"REJET — Institutionnel insuffisant (score={score:.2f})"
+        reason = f"REJET — Institutionnel insuffisant ({inst_diag.get('reason')})"
         manage = {"diagnostics": _build_diagnostics(inst_diag, {}, {}, {"enabled": getattr(SETTINGS, "use_macro", False)}, [])}
         return Decision("NONE", "None", reason, [], 0.0, float(entry_price), 0.0, 0.0, 0.0, score, manage)
 
