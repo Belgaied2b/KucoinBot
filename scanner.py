@@ -223,7 +223,7 @@ def analyze_one(symbol: str, macro: MacroCache, gate: InstThreshold) -> Tuple[Op
     try:
         inst_snap = inst_data.build_institutional_snapshot(symbol)
         req = gate.threshold(symbol)
-        score = inst_snap.get("score", 0.0)
+        score = float(inst_snap.get("score", 0.0) or 0.0)
 
         oi_s   = float(inst_snap.get("oi_score", 0.0) or 0.0)
         fund_s = float(inst_snap.get("funding_score", 0.0) or 0.0)
@@ -259,6 +259,7 @@ def analyze_one(symbol: str, macro: MacroCache, gate: InstThreshold) -> Tuple[Op
             oi_ok, cvd_ok, fund_ok, liq_ok
         )
 
+        # Analyse principale
         res_raw = analyze_mod.analyze_signal(
             symbol=_canon_symbol(symbol),
             df_h1=df_h1, df_h4=df_h4,
@@ -299,20 +300,107 @@ def scan_and_send_signals(symbols: Optional[List[str]] = None) -> Dict[str, Any]
         if not res:
             continue
 
-        LOG.info("[%s] decision: %s", sym, res)
+        # --- Logs détaillés de décision
+        side = str(res.get("side", "none")).lower()
+        rr   = float(res.get("rr", 0) or 0.0)
+        entry= res.get("entry", None)
+        sl   = res.get("sl", None)
+        tp1  = res.get("tp1", None)
+        tp2  = res.get("tp2", None)
 
-        if res.get("inst_pass", False):
-            msg = (f"[{sym}] ✅ PASS ({res.get('inst_pass_reason')})\n"
-                   f"Score={res.get('inst_score'):.2f} | OK={res.get('inst_ok_count')}/4")
-            send_telegram(msg)
-            log_signal(sym, res)
+        comments = res.get("comments", []) or []
+        diag = (res.get("manage", {}) or {}).get("diagnostics", {})
+        tolerated = diag.get("tolerated", res.get("tolerated", []))
+
+        LOG.info("[%s] analysis: side=%s rr=%.2f score=%.2f comment=%s",
+                 sym, side, rr, float(res.get("inst_score", 0) or 0), (", ".join(map(str, comments)) or "—"))
+
+        # RR brut / net si possible
+        rr_b = None; rr_n = None
+        try:
+            if entry and sl and tp2:
+                rr_b = rr_gross(float(entry), float(sl), float(tp2))
+        except Exception:
+            pass
+        try:
+            if entry and sl and tp2:
+                rr_n = rr_net(_canon_symbol(sym), float(entry), float(sl), float(tp2))
+        except Exception:
+            pass
+        if rr_b is not None or rr_n is not None:
+            LOG.info("[%s] rr_gross=%s rr_net=%s", sym,
+                     f"{rr_b:.2f}" if rr_b is not None else "—",
+                     f"{rr_n:.2f}" if rr_n is not None else "—")
+
+        # ---- Pré-signal si insti OK mais setup invalide/non exploitable
+        if (not res.get("valid", False)) or (side not in ("long", "short")):
+            LOG.info("[%s] no-trade — rr=%.2f reason=%s tolerated=%s diag=%s",
+                     sym, rr, res.get("reason", "no reason"), tolerated, diag)
+
+            if res.get("inst_pass", False):
+                pre_msg = (
+                    f"🟡 *{sym}* — Pré-signal (insti OK: {res.get('inst_pass_reason')})\n"
+                    f"*Inst score*: {float(res.get('inst_score',0) or 0):.2f} | *OK*: {res.get('inst_ok_count')}/4\n"
+                    f"*RR*: {rr:.2f} | *Side*: {side.upper() if side!='none' else 'NONE'}\n"
+                    f"*Raison rejet*: {res.get('reason','—')}\n"
+                    f"*Tolérances*: {tolerated if tolerated else '—'}"
+                )
+                send_telegram(pre_msg)
+
+            try: update_perf_for_symbol(sym, df_h1=None)
+            except Exception: pass
+            continue
+
+        # ---- Anti-doublons (clé par symbole/side/entry/RR)
+        key = signal_key(sym, side, entry, rr or rr_b or rr_n)
+        if key in store:
+            LOG.info("[%s] duplicate skip (key=%s)", sym, key)
+            continue
+
+        # ---- Sizing par risque (fallback sur valeur fixe)
+        notional = VALUE_USDT
+        try:
+            if RISK_PER_TRADE_USDT > 0 and entry and sl and float(entry) != float(sl):
+                notional = valueqty_from_risk(_canon_symbol(sym),
+                                              float(entry), float(sl),
+                                              RISK_PER_TRADE_USDT,
+                                              min_notional=MIN_NOTIONAL_USDT)
+        except Exception as e:
+            LOG.warning("[%s] sizing par risque KO: %s -> fallback=%s", sym, e, VALUE_USDT)
+
+        # ---- Exécution SFI (format générique du projet)
+        try:
+            engine = SFIEngine()
+            # convention projet: run_signal(sym, res, notional=?)
             try:
-                engine = SFIEngine()
-                engine.run_signal(sym, res)
-                log_order(sym, res)
-            except Exception as e:
-                LOG.error("[%s] SFI exec KO: %s", sym, e)
-            sent += 1
+                engine.run_signal(sym, res, notional=notional)  # type: ignore
+            except TypeError:
+                engine.run_signal(sym, res)  # fallback si ancienne signature
+            log_order(sym, res)
+        except Exception as e:
+            LOG.error("[%s] SFI exec KO: %s", sym, e)
+
+        # ---- Telegram (signal exécuté)
+        msg = (
+            f"🧠 *{sym}* — *{side.upper()}*\n"
+            f"RR: *{res.get('rr','—')}* | Entrée: *{fmt_price(entry)}* | SL: *{fmt_price(sl)}* | "
+            f"TP1: *{fmt_price(tp1)}* | TP2: *{fmt_price(tp2)}*\n"
+            f"Notional: *{fmt_price(notional)}* USDT"
+        )
+        send_telegram(msg)
+        log_signal(sym, res)
+
+        # ---- Perf / anti-doublons persistants
+        store[key] = {"ts": time.time(), "side": side, "entry": entry, "rr": rr}
+        save_json(SENT_SIGNALS_PATH, store)
+
+        try:
+            register_signal_perf(key, sym, side, float(entry or 0))
+            update_perf_for_symbol(sym, df_h1=None)
+        except Exception:
+            pass
+
+        sent += 1
 
     return {"scanned": scanned, "sent": sent, "errors": errors, "ts": now_iso()}
 
