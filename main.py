@@ -4,11 +4,7 @@ main.py — Boucle event-driven + fallback institutionnel structuré (OTE, liqui
 - Direction H4, exécution H1 via OTE 62–79% et pools de liquidité
 - SL derrière la liquidité/swing + buffer ATR
 - TP1 swing/pool opposé, TP2 RR cible (2.0 par défaut)
-
-Ce build :
-- Normalise les retours SFI et tente plusieurs signatures (open_limit / place_initial / place_from_decision / place_market)
-- Vérifie réellement la présence d’un ordre côté KuCoin si une API de lookup par clientOid est dispo
-- Si rien n’est vérifié, crée un LIMIT direct via place_limit_order(...) avec arrondi au tick et postOnly configurable
+- Fallback direct KuCoin si SFI ne renvoie pas un vrai orderId/clientOid
 """
 
 import os, asyncio, logging, math, time
@@ -22,28 +18,12 @@ from perf_metrics import register_signal_perf, update_perf_for_symbol
 from kucoin_utils import fetch_klines, fetch_symbol_meta
 from log_setup import init_logging, enable_httpx
 
-# ---- Adaptateur KuCoin (place_limit + meta) + lookup optionnel par clientOid
-from kucoin_adapter import place_limit_order, get_symbol_meta  # noqa: F401
-
-# get_order_by_client_oid peut ne PAS exister dans votre fichier actuel.
-# On gère ça proprement : on tente d'abord via kucoin_adapter, sinon fallback via KucoinTrader, sinon no-op.
-try:
-    from kucoin_adapter import get_order_by_client_oid as kc_get_by_oid  # type: ignore
-    _HAS_KC_LOOKUP = True
-except Exception:
-    _HAS_KC_LOOKUP = False
-    try:
-        from kucoin_trader import KucoinTrader  # type: ignore
-        _KT = KucoinTrader()
-        def kc_get_by_oid(oid: str):
-            try:
-                return _KT.get_order_by_client_oid(oid)
-            except Exception:
-                return None
-        _HAS_KC_LOOKUP = True
-    except Exception:
-        def kc_get_by_oid(oid: str):
-            return None
+# ✅ Fallback direct KuCoin & utilitaires d'ordres
+from kucoin_adapter import (
+    place_limit_order,
+    get_symbol_meta,
+    get_order_by_client_oid,
+)
 
 # ---- Soft imports institutionnel / autotune
 HAS_INST = True
@@ -88,6 +68,7 @@ _LAST_ANALYSIS_TS: Dict[str, float] = {}
 
 log = logging.getLogger("runner")
 TUNER = InstAutoTune() if HAS_TUNER else None  # type: ignore
+
 
 # ------------------------
 # Utils
@@ -153,51 +134,43 @@ def _build_symbols() -> List[str]:
             syms.append(sym_api)
     return sorted(set(syms))
 
-def _round_to_tick(px: float, tick: float) -> float:
+def _round_to_tick(px: float, tick: float, side: str = "long") -> float:
+    """Arrondit au tick inférieur pour éviter rejet. Pour buy postOnly, on peut soulever d’1 tick si besoin."""
     if not tick or tick <= 0:
         return float(px)
-    # floor vers le tick inférieur (évite rejet prix)
-    return math.floor(float(px) / float(tick)) * float(tick)
+    n = math.floor(float(px) / float(tick))
+    out = n * float(tick)
+    # sécurité : si arrondi à zéro → ajoute un tick minuscule
+    if out == 0.0:
+        out = float(tick)
+    return out
+
+def _estimate_tick_from_price(px: float) -> float:
+    """Fallback de tick si meta indisponible."""
+    if px >= 100: return 0.1
+    if px >= 10:  return 0.01
+    if px >= 1:   return 0.001
+    if px >= 0.1: return 0.0001
+    return 0.00001
 
 def _has_real_order_id(orders: List[Dict[str, Any]]) -> bool:
+    """
+    ⚠️ Ne considère comme succès que la présence d'un vrai orderId ou clientOid.
+    Un 'raw' str SEUL ne valide PAS un ordre !
+    """
     for o in orders or []:
-        if isinstance(o, dict):
-            if o.get("orderId") or o.get("clientOid"):
-                return True
-            raw = o.get("raw")
-            if isinstance(raw, str) and raw.strip():
-                return True
+        if isinstance(o, dict) and (o.get("orderId") or o.get("clientOid")):
+            return True
     return False
 
-def _extract_client_oids(orders: List[Dict[str, Any]]) -> List[str]:
-    oids: List[str] = []
-    for o in orders or []:
-        if not isinstance(o, dict): continue
-        if o.get("clientOid"):
-            oids.append(str(o["clientOid"]))
-            continue
-        raw = o.get("raw")
-        if isinstance(raw, str) and raw.strip():
-            oids.append(raw.strip())
-    # unicité + non vide
-    return sorted({x for x in oids if x})
 
 # ------------------------
 # Exécution robuste SFI
 # ------------------------
 def _normalize_orders(orders: Union[None, dict, list, tuple, str]) -> List[Dict[str, Any]]:
     """
-    Uniformise la sortie en liste de dicts.
-    Extrait orderId/clientOid si possible même depuis 'raw' str.
+    Uniformise la sortie en liste de dicts. NE PROJETE PAS un 'raw' string en succès.
     """
-    def _from_str(s: str) -> Dict[str, Any]:
-        s = str(s).strip()
-        if not s:
-            return {"raw": s}
-        if len(s) in (32, 36) or s.isalnum():
-            return {"ok": True, "clientOid": s, "raw": s}
-        return {"raw": s}
-
     out: List[Dict[str, Any]] = []
     if orders is None:
         return out
@@ -214,7 +187,8 @@ def _normalize_orders(orders: Union[None, dict, list, tuple, str]) -> List[Dict[
         return out
 
     if isinstance(orders, str):
-        out.append(_from_str(orders))
+        # Un simple string ne suffit pas pour valider
+        out.append({"raw": orders})
         return out
 
     if isinstance(orders, tuple):
@@ -233,7 +207,7 @@ def _normalize_orders(orders: Union[None, dict, list, tuple, str]) -> List[Dict[
                         d["clientOid"] = data.get("clientOid")
                 out.append(d)
             elif isinstance(it, str):
-                out.append(_from_str(it))
+                out.append({"raw": it})
             elif isinstance(it, tuple):
                 out.append({"raw": tuple(it)})
             else:
@@ -351,6 +325,7 @@ def _safe_place_orders(engine: SFIEngine, entry: float, sl: float, tp1: float, t
 
     return []
 
+
 # ------------------------
 # Outils de structure "institutionnels"
 # ------------------------
@@ -366,10 +341,6 @@ def _compute_atr(df, period: int = 14) -> float:
         return 0.0
 
 def _swing_highs_lows(df, lookback: int = 3) -> Tuple[List[int], List[int]]:
-    """
-    Détection simple: swing high si High[i] est le max sur i-lookback..i+lookback.
-    Retourne index des swing_highs et swing_lows.
-    """
     hs, ls = [], []
     h = df['high'].astype(float).values
     l = df['low'].astype(float).values
@@ -382,11 +353,6 @@ def _swing_highs_lows(df, lookback: int = 3) -> Tuple[List[int], List[int]]:
     return hs, ls
 
 def _last_impulse(df, side_hint: str) -> Tuple[float, float]:
-    """
-    Trouve une jambe impulsive récente:
-     - LONG: dernier swing low -> dernier swing high plus récent
-     - SHORT: dernier swing high -> dernier swing low plus récent
-    """
     hs, ls = _swing_highs_lows(df, lookback=3)
     if not hs or not ls:
         c = float(df['close'].astype(float).iloc[-1])
@@ -405,15 +371,10 @@ def _last_impulse(df, side_hint: str) -> Tuple[float, float]:
             ll = float(df['low'].astype(float).iloc[later_lows[-1]])
             hh = float(df['high'].astype(float).iloc[last_high_idx])
             return hh, ll
-    # fallback: borne min/max sur 100 dernières barres
     win = df.tail(100)
     return float(win['low'].min()), float(win['high'].max())
 
 def _equal_levels(prices: List[float], tol_pct: float) -> List[float]:
-    """
-    Regroupe des niveaux “égaux” dans une tolérance en %.
-    Retourne la liste des niveaux (médianes de clusters).
-    """
     if not prices: return []
     prices = sorted(prices)
     clusters = [[prices[0]]]
@@ -422,22 +383,16 @@ def _equal_levels(prices: List[float], tol_pct: float) -> List[float]:
             clusters[-1].append(p)
         else:
             clusters.append([p])
-    # ne garder que les pools significatifs (>=2 touches)
     pools = [sum(c)/len(c) for c in clusters if len(c) >= 2]
     return pools
 
 def _liquidity_pools(df) -> Tuple[List[float], List[float]]:
-    """Pools de liquidité simples via equal highs / equal lows sur H1."""
     hs, ls = _swing_highs_lows(df, lookback=2)
     highs = [float(df['high'].iloc[i]) for i in hs]
     lows  = [float(df['low'].iloc[i])  for i in ls]
     return _equal_levels(highs, EQ_TOL_PCT), _equal_levels(lows, EQ_TOL_PCT)
 
 def _h4_direction(df_h4, inst: Dict[str, Any]) -> str:
-    """
-    Direction “institutionnelle”:
-      - BOS simplifié via HH/LL récents + CVD/Funding/Delta pour pondérer.
-    """
     hs, ls = _swing_highs_lows(df_h4, lookback=2)
     dir_struct = "long"
     if len(hs) >= 2 and len(ls) >= 2:
@@ -448,34 +403,22 @@ def _h4_direction(df_h4, inst: Dict[str, Any]) -> str:
         elif ll_new and not hh_new:
             dir_struct = "short"
         else:
-            # neutre → pondérer par insti
             pass
     cvd = float(inst.get("delta_cvd_usd", 0) or 0.0)
     d_s = float(inst.get("delta_score", 0) or 0.0)
     f_s = float(inst.get("funding_score", 0) or 0.0)
     bias = "long" if (cvd > 0 or (d_s >= 0.5 and f_s >= 0.6)) else "short"
-    # Si conflictuel, garder struct, sinon suivre bias
     return dir_struct if dir_struct != "neutral" else bias
 
 def _project_ote_entry(ll: float, hh: float, side: str) -> float:
     if side == "long":
-        # retracement depuis HH vers LL (Fib down)
         return hh - (hh - ll) * OTE_MID
     else:
-        # retracement depuis LL vers HH (Fib up)
         return ll + (hh - ll) * OTE_MID
 
 def _inst_structured_decision(symbol: str, inst: Dict[str, Any], df_h1, df_h4) -> Union[None, Dict[str, Any]]:
-    """
-    Décision fallback institutionnelle structurée:
-      - Direction H4 (BOS simplifié) + insti
-      - Impulsion H1 -> OTE 62–79%
-      - SL derrière pool de liquidité / swing + buffer ATR
-      - TP1 swing/pool opposé, TP2 RR cible
-    """
     try:
         side = _h4_direction(df_h4, inst)
-        # Jambe impulsive (H1)
         ll, hh = _last_impulse(df_h1, side)
         entry = _project_ote_entry(ll, hh, side)
 
@@ -483,18 +426,14 @@ def _inst_structured_decision(symbol: str, inst: Dict[str, Any], df_h1, df_h4) -
         if atr <= 0:
             atr = float(df_h1['close'].astype(float).iloc[-1]) * ATR_MIN_PCT
 
-        # Pools de liquidité (H1)
         eq_highs, eq_lows = _liquidity_pools(df_h1)
 
         if side == "long":
-            # SL sous le pool de lows le plus proche sous le swing low, sinon sous le swing low
             pool_below = [p for p in eq_lows if p <= ll * (1 + EQ_TOL_PCT)]
             sl_base = max(pool_below) if pool_below else ll
             sl = max(1e-12, sl_base - ATR_SL_MULT * atr)
-            # TP1 vers le dernier HH/pool
             tp1_candidate = max(eq_highs) if eq_highs else hh
-            tp1 = max(entry + atr, tp1_candidate)  # au moins +1*ATR, sinon pool
-            # TP2 par RR cible
+            tp1 = max(entry + atr, tp1_candidate)
             risk = max(entry - sl, 1e-12)
             tp2 = entry + RR_TARGET_TP2 * risk
         else:
@@ -502,7 +441,7 @@ def _inst_structured_decision(symbol: str, inst: Dict[str, Any], df_h1, df_h4) -
             sl_base = min(pool_above) if pool_above else hh
             sl = sl_base + ATR_SL_MULT * atr
             tp1_candidate = min(eq_lows) if eq_lows else ll
-            tp1 = min(entry - atr, tp1_candidate)  # au moins -1*ATR, sinon pool
+            tp1 = min(entry - atr, tp1_candidate)
             risk = max(sl - entry, 1e-12)
             tp2 = entry - RR_TARGET_TP2 * risk
 
@@ -522,6 +461,7 @@ def _inst_structured_decision(symbol: str, inst: Dict[str, Any], df_h1, df_h4) -
     except Exception as e:
         log.warning("inst_structured_decision KO: %s", e, extra={"symbol": symbol})
         return None
+
 
 # ------------------------
 # Event handler
@@ -570,7 +510,7 @@ async def handle_symbol_event(ev: Dict[str, Any], rg: RiskGuard, policy: MetaPol
             log.warning("inst snapshot KO: %s", e, extra={"symbol": symbol})
             inst = {}
 
-    if HAS_TUNER and TUNER is not None and inst:
+    if HAS_INST and HAS_TUNER and TUNER is not None:
         try:
             thr = TUNER.update_and_get(symbol, df_h1, inst)
             comps_cnt, comps_detail = components_ok(inst, thr)
@@ -698,35 +638,22 @@ async def handle_symbol_event(ev: Dict[str, Any], rg: RiskGuard, policy: MetaPol
     orders = _safe_place_orders(eng, entry, sl, tp1, tp2)
     orders = _normalize_orders(orders)
 
-    # ✅ Vérification côté KuCoin avec les éventuels clientOid retournés par SFI (si lookup dispo)
-    if _HAS_KC_LOOKUP:
-        verified: List[Dict[str, Any]] = []
-        client_oids = _extract_client_oids(orders)
-        for coid in client_oids:
-            try:
-                data = kc_get_by_oid(coid)
-                if isinstance(data, dict) and (data.get("orderId") or data.get("clientOid")):
-                    verified.append({"ok": True, "orderId": data.get("orderId"), "clientOid": data.get("clientOid") or coid})
-            except Exception as e:
-                log.debug("verify get_order_by_client_oid(%s) KO: %s", coid, e, extra={"symbol": symbol})
-
-        if verified:
-            log.info("✅ verified %d KuCoin orders: %s", len(verified), verified, extra={"symbol": symbol})
-            orders = verified
-
-    # Fallback direct KuCoin si pas d'ID exploitable/vérifié
+    # ---------- Fallback direct KuCoin si pas d'ID exploitable ----------
     if not _has_real_order_id(orders):
         try:
             tick = float(get_symbol_meta(symbol).get("priceIncrement", 0.0)) or 0.0
         except Exception:
             tick = 0.0
-        entry_px = _round_to_tick(entry, tick)
+        if tick <= 0:
+            tick = _estimate_tick_from_price(entry)
+
+        entry_px = _round_to_tick(entry, tick, side)
         post_only = os.getenv("KC_POST_ONLY", "1") == "1"
 
         log.info("fallback KuCoin LIMIT: px=%s (tick=%s) postOnly=%s", fmt_price(entry_px), tick, post_only, extra={"symbol": symbol})
         kc = place_limit_order(
             symbol=symbol,
-            side=side,
+            side="buy" if side == "long" else "sell",
             price=float(entry_px),
             value_usdt=float(value_usdt),
             sl=float(sl),
@@ -734,11 +661,20 @@ async def handle_symbol_event(ev: Dict[str, Any], rg: RiskGuard, policy: MetaPol
             tp2=float(tp2),
             post_only=post_only
         )
+        # Normalisation du retour adapter
         if isinstance(kc, dict):
             oid = kc.get("orderId") or kc.get("clientOid") or (kc.get("data", {}) or {}).get("orderId")
-            orders = [{"ok": kc.get("ok", True), "orderId": oid, "clientOid": kc.get("clientOid"), "code": kc.get("code"), "raw": kc.get("raw")}]
+            orders = [{"ok": kc.get("ok"), "orderId": oid, "clientOid": kc.get("clientOid"), "code": kc.get("code"), "msg": kc.get("msg"), "raw": kc.get("raw")}]
         else:
             orders = [{"raw": kc}]
+
+        # Vérification serveur si clientOid présent
+        if isinstance(kc, dict) and kc.get("clientOid"):
+            try:
+                st = get_order_by_client_oid(kc["clientOid"])
+                logging.getLogger("runner").info("[%s] verify order clientOid=%s -> %s", symbol, kc["clientOid"], st)
+            except Exception as e:
+                logging.getLogger("runner").warning("[%s] verify order failed: %s", symbol, e)
 
     log.info("orders=%s", orders, extra={"symbol": symbol})
 
@@ -764,6 +700,7 @@ async def handle_symbol_event(ev: Dict[str, Any], rg: RiskGuard, policy: MetaPol
     register_signal_perf(key, symbol, side, entry)
     try: update_perf_for_symbol(symbol, df_h1=df_h1)
     except Exception: pass
+
 
 # ------------------------
 # Main
