@@ -4,6 +4,7 @@ kucoin_trader.py — Client Futures minimal
 - Réponses NORMALISÉES (dict) -> jamais de tuples
 - Sync horloge serveur (offset) et headers v2
 - Helpers LIMIT / LIMIT IOC / MARKET / CLOSE reduce
+- ⚠️ Pas de 'leverage' dans le corps des ordres (évite 'Leverage parameter invalid.')
 """
 
 import time, hmac, base64, hashlib, httpx, json
@@ -21,7 +22,7 @@ _SERVER_OFFSET = 0.0
 def _sync_server_time():
     global _SERVER_OFFSET
     try:
-        r = httpx.get(SETTINGS.kucoin_base_url + "/api/v1/timestamp", timeout=5.0)
+        r = httpx.get(SETTINGS.kucoin_base_url.rstrip("/") + "/api/v1/timestamp", timeout=5.0)
         if r.status_code == 200:
             server_ms = int((r.json() or {}).get("data", 0))
             _SERVER_OFFSET = (server_ms / 1000.0) - time.time()
@@ -39,15 +40,15 @@ def _now_ms() -> int:
 # -------------------------------------------------
 def _normalize_response(resp: httpx.Response) -> Dict[str, Any]:
     """
-    KuCoin Futures retourne typiquement:
+    KuCoin Futures typique:
     { "code": "200000", "data": {...} }
-    On renvoie un dict homogène :
+    Retour homogène :
       - ok: bool
       - status: int (HTTP)
       - code: str (code API KuCoin)
-      - data: dict
+      - data: dict (si présent)
       - orderId: str si présent dans data
-      - raw: extrait brut si non JSON
+      - raw: json complet de la réponse
     """
     out: Dict[str, Any] = {"ok": False, "status": resp.status_code}
     try:
@@ -86,7 +87,7 @@ class KucoinTrader:
 
         # tailles / levier (fallbacks si non définis dans Settings)
         self.margin_per_trade = float(getattr(SETTINGS, "margin_per_trade", 20.0))
-        self.default_leverage = int(getattr(SETTINGS, "default_leverage", 10))
+        self.default_leverage = int(getattr(SETTINGS, "default_leverage", 10))  # utilisé si tu appelles set_leverage()
 
         _sync_server_time()
 
@@ -160,8 +161,26 @@ class KucoinTrader:
 
     # -------- helpers taille --------
     def _value_qty(self) -> float:
-        """valueQty envoyé à KuCoin Futures = marge * levier (ex: 20 * 10 = 200)."""
+        """valueQty envoyé à KuCoin Futures = marge * levier paramétré côté position (ou par défaut).
+        Ex: 20 * 10 = 200, mais on n'envoie PAS 'leverage' dans l'ordre."""
         return float(self.margin_per_trade) * float(self.default_leverage)
+
+    # (Optionnel) régler le levier côté position/symbole AVANT d'envoyer des ordres
+    def set_leverage(self, symbol: str, leverage: int) -> Dict[str, Any]:
+        """
+        Appelle ce setter une fois si tu veux forcer le levier (selon le mode margin de ton compte).
+        Si l'endpoint diffère sur ton compte, tu peux ignorer cette méthode et gérer le levier manuellement.
+        """
+        body = {"symbol": symbol, "leverage": str(int(leverage))}
+        # NB: certains comptes utilisent /api/v1/position/leverage ; d'autres /api/v1/positions/change-leverage
+        # On tente deux endpoints connus.
+        for path in ("/api/v1/position/leverage", "/api/v1/positions/change-leverage"):
+            out = self._post(path, body)
+            if out.get("ok"):
+                log.info("set_leverage OK %s -> %s via %s", symbol, leverage, path)
+                return out
+        log.warning("set_leverage KO %s -> %s (aucun endpoint n'a accepté)", symbol, leverage)
+        return {"ok": False, "error": "set_leverage failed"}
 
     # ------------------ ORDERS ------------------
     def place_limit(
@@ -179,13 +198,13 @@ class KucoinTrader:
             "side": side,
             "price": f"{price:.8f}",
             "valueQty": f"{self._value_qty():.2f}",      # ex: 200.00 si 20 * 10
-            "leverage": str(self.default_leverage),
             "timeInForce": "GTC",
             "reduceOnly": False,
             "postOnly": bool(post_only),
         }
-        log.info("[place_limit] %s %s px=%s valueQty=%s lev=%s postOnly=%s",
-                 symbol, side, body["price"], body["valueQty"], self.default_leverage, post_only)
+        # ⚠️ NE PAS ENVOYER 'leverage' dans l'ordre — cause 'Leverage parameter invalid.'
+        log.info("[place_limit] %s %s px=%s valueQty=%s postOnly=%s",
+                 symbol, side, body["price"], body["valueQty"], post_only)
         return self._post("/api/v1/orders", body)
 
     def place_limit_ioc(
@@ -201,13 +220,12 @@ class KucoinTrader:
             "side": side,
             "price": f"{price:.8f}",
             "valueQty": f"{self._value_qty():.2f}",
-            "leverage": str(self.default_leverage),
             "timeInForce": "IOC",
             "reduceOnly": False,
             "postOnly": False,
         }
-        log.info("[place_limit_ioc] %s %s px=%s valueQty=%s lev=%s",
-                 symbol, side, body["price"], body["valueQty"], self.default_leverage)
+        log.info("[place_limit_ioc] %s %s px=%s valueQty=%s",
+                 symbol, side, body["price"], body["valueQty"])
         return self._post("/api/v1/orders", body)
 
     def place_market(
@@ -222,10 +240,9 @@ class KucoinTrader:
             "side": side,
             "reduceOnly": False,
             "valueQty": f"{self._value_qty():.2f}",
-            "leverage": str(self.default_leverage),
         }
-        log.info("[place_market] %s %s valueQty=%s lev=%s",
-                 symbol, side, body["valueQty"], self.default_leverage)
+        log.info("[place_market] %s %s valueQty=%s",
+                 symbol, side, body["valueQty"])
         return self._post("/api/v1/orders", body)
 
     def close_reduce_market(
