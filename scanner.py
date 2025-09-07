@@ -204,7 +204,6 @@ class InstThreshold:
             self.scores = self.scores[-self.window:]
         self._save()
     def threshold(self, symbol: str) -> float:
-        """Combine seuil adaptatif (quantile) avec le seuil minimum BTC/ETH vs Alts"""
         base_req = get_required_score(symbol)
         if not self.scores:
             return max(self.floor, base_req)
@@ -212,7 +211,7 @@ class InstThreshold:
         k = max(0, min(len(arr)-1, int(math.ceil(self.q * len(arr)) - 1)))
         return max(arr[k], self.floor, base_req)
 
-# ---- Analyse d'un symbole (MTF strict)
+# ---- Analyse d'un symbole
 def analyze_one(symbol: str, macro: MacroCache, gate: InstThreshold) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     df_h1 = _ku_get_klines(symbol, "1h", H1_LIMIT)
     df_h4 = _ku_get_klines(symbol, "4h", H4_LIMIT)
@@ -226,7 +225,6 @@ def analyze_one(symbol: str, macro: MacroCache, gate: InstThreshold) -> Tuple[Op
         req = gate.threshold(symbol)
         score = inst_snap.get("score", 0.0)
 
-        # Composantes & "OK" booléens
         oi_s   = float(inst_snap.get("oi_score", 0.0) or 0.0)
         fund_s = float(inst_snap.get("funding_score", 0.0) or 0.0)
         liq_s  = float(inst_snap.get("liq_new_score", 0.0) or 0.0)
@@ -236,15 +234,11 @@ def analyze_one(symbol: str, macro: MacroCache, gate: InstThreshold) -> Tuple[Op
         fund_ok = fund_s >= INST_OK_MIN
         liq_ok  = liq_s  >= INST_OK_MIN
         cvd_ok  = cvd_s  >= INST_OK_MIN
-
         ok_count = int(oi_ok) + int(fund_ok) + int(liq_ok) + int(cvd_ok)
 
-        # Gate avec priorité tolérance:
-        # - 4/4 => force-pass
-        # - 3/4 => tolérance-pass
-        # - sinon => score gate
         tol_pass = False
-        reason = "score_gate"
+        reason = "reject"
+        passed = False
         if ok_count == 4:
             passed = True
             tol_pass = True
@@ -253,9 +247,9 @@ def analyze_one(symbol: str, macro: MacroCache, gate: InstThreshold) -> Tuple[Op
             passed = True
             tol_pass = True
             reason = "tolerance_pass_3of4"
-        else:
-            passed = (score >= req)
-            reason = "score_gate" if passed else "reject"
+        elif score >= req:
+            passed = True
+            reason = "score_gate"
 
         LOG.info(
             "[%s] inst-gate: pass=%s reason=%s score=%.2f req=%.2f comps=%d/4 "
@@ -276,7 +270,6 @@ def analyze_one(symbol: str, macro: MacroCache, gate: InstThreshold) -> Tuple[Op
         return None, f"analyze_signal error: {e}"
 
     res = res_raw if isinstance(res_raw, dict) else {}
-    # Champs utiles en aval pour l'exécution/envoi
     res["inst_score"] = score
     res["inst_ok_count"] = ok_count
     res["inst_tol_pass"] = tol_pass
@@ -306,28 +299,19 @@ def scan_and_send_signals(symbols: Optional[List[str]] = None) -> Dict[str, Any]
         if not res:
             continue
 
-        # Ici tu peux déclencher l'envoi si inst_pass == True
-        # (laisser comme c'était si c'est géré ailleurs)
-                LOG.info("[%s] decision: %s", sym, res)
+        LOG.info("[%s] decision: %s", sym, res)
 
         if res.get("inst_pass", False):
-            # 1) Telegram
             msg = (f"[{sym}] ✅ PASS ({res.get('inst_pass_reason')})\n"
                    f"Score={res.get('inst_score'):.2f} | OK={res.get('inst_ok_count')}/4")
             send_telegram(msg)
-
-            # 2) Log perf & CSV
             log_signal(sym, res)
-
-            # 3) Exécution SFI (adapter selon ton moteur)
             try:
                 engine = SFIEngine()
-                # Si ton SFIEngine a une méthode différente, adapte ici
                 engine.run_signal(sym, res)
                 log_order(sym, res)
             except Exception as e:
                 LOG.error("[%s] SFI exec KO: %s", sym, e)
-
             sent += 1
 
     return {"scanned": scanned, "sent": sent, "errors": errors, "ts": now_iso()}
