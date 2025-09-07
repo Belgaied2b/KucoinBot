@@ -1,4 +1,12 @@
-# kucoin_adapter.py — Futures REST adapter (crossMode auto + retry) prêt à coller
+# kucoin_adapter.py — version "ancien style robuste" prête à coller
+# - Signature v2 (timestamp + method + path + body)
+# - clientOid = timestamp
+# - valueQty = ORDER_VALUE_USDT * leverage (comme avant: marge * levier)
+# - Arrondi prix au priceIncrement
+# - Détection/flip crossMode si mismatch
+# - Retry si 100001 (leverage invalid)
+# - Vérification par clientOid
+
 import time
 import hmac
 import base64
@@ -14,19 +22,39 @@ from logger_utils import get_logger
 log = get_logger("kucoin.adapter")
 
 BASE = SETTINGS.kucoin_base_url.rstrip("/")
+ORDERS_PATH = "/api/v1/orders"
+POS_PATH    = "/api/v1/position"
+CNTR_PATH   = "/api/v1/contracts"
+TIME_PATH   = "/api/v1/timestamp"
+GET_BY_COID = "/api/v1/order/client-order/{clientOid}"
 
-# ---------- low-level signing ----------
+# --------- Horloge (offset serveur) ----------
+_SERVER_OFFSET = 0.0
+
+def _sync_server_time() -> None:
+    global _SERVER_OFFSET
+    try:
+        with httpx.Client(timeout=5.0) as c:
+            r = c.get(BASE + TIME_PATH)
+            r.raise_for_status()
+            server_ms = int(r.json().get("data", 0))
+            _SERVER_OFFSET = (server_ms / 1000.0) - time.time()
+            log.info(f"[time] offset={_SERVER_OFFSET:.3f}s")
+    except Exception as e:
+        log.warning(f"time sync failed: {e}")
+
 def _ts_ms() -> int:
-    return int(time.time() * 1000)
+    return int((time.time() + _SERVER_OFFSET) * 1000)
 
+# --------- Signature v2 ----------
 def _b64_hmac_sha256(secret: str, payload: str) -> str:
     return base64.b64encode(
         hmac.new(secret.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).digest()
     ).decode("utf-8")
 
-def _headers(method: str, path: str, body: str = "") -> Dict[str, str]:
+def _headers(method: str, path: str, body_str: str = "") -> Dict[str, str]:
     ts = str(_ts_ms())
-    sig = _b64_hmac_sha256(SETTINGS.kucoin_secret, ts + method.upper() + path + body)
+    sig = _b64_hmac_sha256(SETTINGS.kucoin_secret, ts + method.upper() + path + (body_str or ""))
     psp = _b64_hmac_sha256(SETTINGS.kucoin_secret, SETTINGS.kucoin_passphrase)
     return {
         "KC-API-KEY": SETTINGS.kucoin_key,
@@ -36,229 +64,197 @@ def _headers(method: str, path: str, body: str = "") -> Dict[str, str]:
         "KC-API-KEY-VERSION": "2",
         "Accept": "application/json",
         "Content-Type": "application/json",
-        "User-Agent": "runner/kucoin-adapter",
+        "User-Agent": "bot/kucoin-adapter",
     }
 
-def _post(path: str, body: Optional[Dict[str, Any]]) -> Tuple[int, Dict[str, Any]]:
+# --------- HTTP helpers ----------
+def _post(path: str, body: Optional[Dict[str, Any]]) -> Tuple[bool, Dict[str, Any]]:
     url = BASE + path
     body_str = "" if body is None else json.dumps(body, separators=(",", ":"), ensure_ascii=False)
-    with httpx.Client(timeout=10.0) as c:
-        r = c.post(url, headers=_headers("POST", path, body_str), content=(body_str.encode("utf-8") if body_str else None))
-        try:
-            js = r.json() if r.content else {}
-        except Exception:
-            js = {"code": str(r.status_code), "msg": r.text}
-    if r.status_code >= 400:
-        log.error("[POST %s] HTTP=%s %s", path, r.status_code, r.text[:200])
-    return r.status_code, js
+    hdrs = _headers("POST", path, body_str)
+    try:
+        with httpx.Client(timeout=10.0) as c:
+            r = c.post(url, headers=hdrs, content=(body_str.encode("utf-8") if body_str else None))
+            ok = (r.status_code == 200)
+            data = r.json() if r.content else {}
+            if not ok:
+                log.error(f"[POST {path}] HTTP={r.status_code} {r.text[:200]}")
+            return ok, (data if isinstance(data, dict) else {})
+    except Exception as e:
+        log.error(f"[POST {path}] EXC={e}")
+        return False, {"error": str(e)}
 
-def _get(path: str) -> Tuple[int, Dict[str, Any]]:
+def _get(path: str) -> Tuple[bool, Dict[str, Any]]:
     url = BASE + path
-    with httpx.Client(timeout=10.0) as c:
-        r = c.get(url, headers=_headers("GET", path, ""))
-        try:
-            js = r.json() if r.content else {}
-        except Exception:
-            js = {"code": str(r.status_code), "msg": r.text}
-    if r.status_code >= 400:
-        log.error("[GET %s] HTTP=%s %s", path, r.status_code, r.text[:200])
-    return r.status_code, js
+    hdrs = _headers("GET", path, "")
+    try:
+        with httpx.Client(timeout=10.0) as c:
+            r = c.get(url, headers=hdrs)
+            ok = (r.status_code == 200)
+            data = r.json() if r.content else {}
+            if not ok:
+                log.error(f"[GET {path}] HTTP={r.status_code} {r.text[:200]}")
+            return ok, (data if isinstance(data, dict) else {})
+    except Exception as e:
+        log.error(f"[GET {path}] EXC={e}")
+        return False, {"error": str(e)}
 
-# ---------- metadata ----------
+# --------- Métadonnées contrat / position ----------
 def get_symbol_meta(symbol: str) -> Dict[str, Any]:
-    """
-    Renvoie la fiche contrat KuCoin Futures: tick, lotSize...
-    symbol doit être le contrat (ex: BTCUSDTM).
-    """
-    _, js = _get(f"/api/v1/contracts/{symbol}")
-    return js.get("data", {}) if isinstance(js, dict) else {}
+    """Retourne /contracts/{symbol} (KuCoin Futures)."""
+    path = f"{CNTR_PATH}/{symbol}"
+    ok, js = _get(path)
+    if ok:
+        return js.get("data", {}) or {}
+    return {}
 
-def _price_precision(meta: Dict[str, Any]) -> int:
-    inc = float(meta.get("priceIncrement", meta.get("tickSize", 0.0)) or 0.0)
-    if inc <= 0:
-        return 4
-    s = f"{inc:.12f}".rstrip("0").rstrip(".")
-    return len(s.split(".")[1]) if "." in s else 0
+def _price_increment(symbol: str) -> float:
+    meta = get_symbol_meta(symbol)
+    inc = meta.get("priceIncrement")
+    try:
+        return float(inc or 0.0)
+    except Exception:
+        return 0.0
 
-def _round_price_to_tick(price: float, meta: Dict[str, Any]) -> float:
-    tick = float(meta.get("priceIncrement", meta.get("tickSize", 0.0)) or 0.0)
-    if tick <= 0:
+def _round_to_tick(price: float, tick: float) -> float:
+    if not tick or tick <= 0:
         return float(price)
-    # floor au tick inférieur
-    stepped = (int(float(price) / tick)) * tick
-    prec = _price_precision(meta)
-    return round(stepped, prec)
+    # KuCoin accepte price multiples du tick exact → arrondi au plus proche multiple
+    steps = round(float(price) / tick)
+    return float(steps) * tick
 
-# ---------- position / margin mode ----------
-def get_position(symbol: str) -> Dict[str, Any]:
-    _, js = _get(f"/api/v1/position?symbol={symbol}")
-    return js.get("data", {}) if isinstance(js, dict) else {}
-
-def detect_cross_mode(symbol: str) -> Optional[bool]:
+def _position_mode(symbol: str) -> Optional[bool]:
     """
-    Retourne True si cross, False si isolated, None si inconnu (pas de position).
+    Retourne crossMode (True/False) si dispo.
+    GET /api/v1/position?symbol=...
     """
-    pos = get_position(symbol) or {}
-    if not isinstance(pos, dict) or pos == {}:
-        log.info("[marginMode] %s -> unknown (no position)", symbol)
+    path = f"{POS_PATH}?symbol={symbol}"
+    ok, js = _get(path)
+    if not ok:
         return None
-    cross = bool(pos.get("crossMode"))
-    log.info("[marginMode] %s -> %s", symbol, "cross" if cross else "isolated")
-    return cross
+    d = js.get("data") or {}
+    try:
+        # crossMode: True si mode cross, False si isolated
+        cm = d.get("crossMode")
+        if cm is None:
+            return None
+        return bool(cm)
+    except Exception:
+        return None
 
-# ---------- helpers ----------
-def _side_to_api(side: str) -> str:
-    s = side.lower().strip()
-    if s == "long":  return "buy"
-    if s == "short": return "sell"
-    return s
-
-def _ok_from_resp(resp: Dict[str, Any]) -> bool:
-    code = str(resp.get("code"))
-    data = resp.get("data") or {}
-    return (code in ("200000", "200", "0", "None")) and bool(data.get("orderId"))
-
-def _pack_result(resp: Dict[str, Any], fallback_client_oid: Optional[str] = None) -> Dict[str, Any]:
-    data = resp.get("data") or {}
-    return {
-        "ok": _ok_from_resp(resp),
-        "code": resp.get("code"),
-        "msg": resp.get("msg"),
-        "orderId": data.get("orderId"),
-        "clientOid": data.get("clientOid") or fallback_client_oid,
-        "data": data,
-        "raw": resp,
-    }
-
-def _should_flip_mode(code: Any, msg: Any) -> bool:
-    code_s = str(code)
-    m = str(msg or "").lower()
-    # codes/msgs observés quand le mode ne correspond pas
-    return (code_s in ("330005", "400100")) or ("margin mode" in m and "match" in m)
-
-# ---------- orders ----------
+# --------- Vérification ordre par clientOid ----------
 def get_order_by_client_oid(client_oid: str) -> Optional[Dict[str, Any]]:
-    status, js = _get(f"/api/v1/order/client-order/{client_oid}")
-    if status == 404:
-        log.error("[GET /api/v1/order/client-order/%s] HTTP=404 %s", client_oid, json.dumps(js)[:200])
+    path = GET_BY_COID.format(clientOid=client_oid)
+    ok, js = _get(path)
+    if not ok:
         return None
-    if isinstance(js, dict) and str(js.get("code")) in ("200000", "200", "0", "None"):
-        return js.get("data") or {}
-    return None
+    return js.get("data") or None
 
-def _place_limit_once(
-    symbol: str,
-    side_api: str,
-    price: float,
-    value_usdt: float,
-    post_only: bool,
-    tif: str,
-    cross_mode: Optional[bool],
-) -> Dict[str, Any]:
-    meta = get_symbol_meta(symbol) or {}
-    px = _round_price_to_tick(price, meta)
-    body = {
-        "clientOid": str(_ts_ms()),
-        "symbol": symbol,
-        "type": "limit",
-        "side": side_api,
-        "price": f"{px:.12f}",
-        "valueQty": f"{float(value_usdt):.2f}",
-        "timeInForce": tif,
-        "reduceOnly": False,
-        "postOnly": bool(post_only),
-    }
-    if cross_mode is not None:
-        body["crossMode"] = bool(cross_mode)
-
-    log.info("[place_limit] %s %s px=%s valueQty=%.2f postOnly=%s%s",
-             symbol, side_api, body["price"], float(value_usdt), body["postOnly"],
-             f" crossMode={body.get('crossMode')}" if "crossMode" in body else "")
-
-    _, resp = _post("/api/v1/orders", body)
-    if not _ok_from_resp(resp):
-        data = resp.get("data") or {}
-        log.info("[kc.place_limit_order] ok=%s code=%s msg=%s clientOid=%s orderId=%s",
-                 False, resp.get("code"), resp.get("msg"), data.get("clientOid") or body["clientOid"], data.get("orderId"))
-    return resp
-
+# --------- Place LIMIT (style ancien + robustesse) ----------
 def place_limit_order(
     symbol: str,
     side: str,
     price: float,
-    value_usdt: float,
+    value_usdt: float = 20.0,
     sl: Optional[float] = None,
     tp1: Optional[float] = None,
     tp2: Optional[float] = None,
     post_only: bool = True,
-    time_in_force: str = "GTC",
+    client_order_id: Optional[str] = None,
+    leverage: Optional[int] = None,
+    cross_mode: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """
-    LIMIT notional (valueQty). Utilise crossMode (bool) et RETENTE en inversant si mismatch.
-    N'envoie PAS 'leverage'.
+    - Envoie un LIMIT avec valueQty = value_usdt * leverage (ancien comportement)
+    - Envoie TJRS 'leverage' (si None → SETTINGS.default_leverage ou 5)
+    - Respect du tick
+    - Détection du crossMode courant; si mismatch → retente en flipant
+    - Retente si 100001 (Leverage invalid) en forçant un levier fallback
+    - Renvoie dict {"ok":bool, "code":..., "msg":..., "orderId":..., "clientOid":..., "data": {...}}
     """
-    side_api = _side_to_api(side)
-    tif = time_in_force.upper()
+    _sync_server_time()
 
-    cross_guess = detect_cross_mode(symbol)  # None si inconnu
-    # 1st try
-    resp1 = _place_limit_once(symbol, side_api, price, value_usdt, post_only, tif, cross_guess)
-    if _ok_from_resp(resp1):
-        return _pack_result(resp1)
+    lev = int(leverage or getattr(SETTINGS, "default_leverage", 5))
+    # Ancien calcul: notionnel = marge * levier
+    # value_usdt = marge (ex: 20) -> valueQty = marge * levier
+    value_qty = float(value_usdt) * float(lev)
 
-    # mismatch ? flip et retente 1 fois
-    if _should_flip_mode(resp1.get("code"), resp1.get("msg")):
-        flipped = (not cross_guess) if cross_guess is not None else True  # si inconnu, tente cross=True
-        log.info("[place_limit] retry with crossMode=%s", flipped)
-        resp2 = _place_limit_once(symbol, side_api, price, value_usdt, post_only, tif, flipped)
-        return _pack_result(resp2, fallback_client_oid=(resp2.get("data") or {}).get("clientOid"))
+    tick = _price_increment(symbol)
+    px   = _round_to_tick(float(price), tick)
 
-    return _pack_result(resp1)
+    # crossMode: si non fourni → lire /position
+    if cross_mode is None:
+        cm = _position_mode(symbol)
+        cross_mode = cm if cm is not None else False  # défaut: isolated
 
-def place_market_order(
-    symbol: str,
-    side: str,
-    value_usdt: float,
-    reduce_only: bool = False,
-) -> Dict[str, Any]:
-    """
-    MARKET notional (valueQty). crossMode auto + retry flip si mismatch.
-    """
-    side_api = _side_to_api(side)
-    cross_guess = detect_cross_mode(symbol)
+    coid = client_order_id or str(_ts_ms())
 
-    def _once(cm: Optional[bool]) -> Dict[str, Any]:
+    def _make_body(cross_flag: bool, lev_force: Optional[int] = None) -> Dict[str, Any]:
         body = {
-            "clientOid": str(_ts_ms()),
+            "clientOid": coid,
             "symbol": symbol,
-            "type": "market",
-            "side": side_api,
-            "valueQty": f"{float(value_usdt):.2f}",
-            "reduceOnly": bool(reduce_only),
+            "side": side.lower(),
+            "type": "limit",
+            "price": f"{px:.12f}",
+            "valueQty": f"{value_qty:.4f}",
+            "timeInForce": "GTC",
+            "postOnly": bool(post_only),
+            # KuCoin futures:
+            # - leverage peut être string ou int; on envoie string pour sûreté
+            "leverage": str(lev_force if lev_force is not None else lev),
+            # crossMode: True (cross) / False (isolated)
+            "crossMode": bool(cross_flag),
+            # "reduceOnly": False   # si nécessaire
         }
-        if cm is not None:
-            body["crossMode"] = bool(cm)
-        log.info("[place_market] %s %s valueQty=%.2f reduceOnly=%s%s",
-                 symbol, side_api, float(value_usdt), reduce_only,
-                 f" crossMode={body.get('crossMode')}" if "crossMode" in body else "")
-        _, resp = _post("/api/v1/orders", body)
-        return resp
+        return body
 
-    resp1 = _once(cross_guess)
-    if _ok_from_resp(resp1):
-        return _pack_result(resp1)
-    if _should_flip_mode(resp1.get("code"), resp1.get("msg")):
-        flipped = (not cross_guess) if cross_guess is not None else True
-        log.info("[place_market] retry with crossMode=%s", flipped)
-        resp2 = _once(flipped)
-        return _pack_result(resp2, fallback_client_oid=(resp2.get("data") or {}).get("clientOid"))
-    return _pack_result(resp1)
+    def _send(body: Dict[str, Any]) -> Dict[str, Any]:
+        log.info(
+            "[place_limit] %s %s px=%s valueQty=%.2f postOnly=%s crossMode=%s",
+            symbol, body.get("side"), body.get("price"),
+            float(value_qty), body.get("postOnly"), body.get("crossMode"),
+        )
+        ok, js = _post(ORDERS_PATH, body)
+        data = js.get("data") if isinstance(js, dict) else None
+        order_id = None
+        if isinstance(data, dict):
+            order_id = data.get("orderId")
+        code = (js.get("code") or "")
+        msg  = js.get("msg") or ""
+        res = {
+            "ok": ok and (code == "200000"),
+            "code": code,
+            "msg": msg,
+            "orderId": order_id,
+            "clientOid": body.get("clientOid"),
+            "data": (data or {}),
+        }
+        if not res["ok"]:
+            log.info("[kc.place_limit_order] ok=%s code=%s msg=%s clientOid=%s orderId=%s",
+                     res["ok"], res["code"], res["msg"], res["clientOid"], res["orderId"])
+        return res
 
-__all__ = [
-    "get_symbol_meta",
-    "get_position",
-    "detect_cross_mode",
-    "get_order_by_client_oid",
-    "place_limit_order",
-    "place_market_order",
-]
+    # 1) tentative avec cross_mode déterminé
+    body = _make_body(cross_mode)
+    resp = _send(body)
+
+    # 2) mismatch margin mode → flip et retenter
+    if (not resp["ok"]) and any(x in str(resp["msg"]) for x in [
+        "margin mode does not match", "margin mode", "330005", "400100"
+    ]):
+        flipped = not bool(cross_mode)
+        log.info("[marginMode] %s -> %s", symbol, ("cross" if flipped else "isolated"))
+        body = _make_body(flipped)
+        resp = _send(body)
+
+    # 3) leverage invalid → retenter avec levier fallback
+    if (not resp["ok"]) and ("Leverage parameter invalid" in str(resp["msg"]) or resp["code"] == "100001"):
+        lev_fb = int(getattr(SETTINGS, "default_leverage", 5) or 5)
+        if lev_fb == lev:
+            # si déjà identique, tente 3 ou 5 par défaut
+            lev_fb = 5 if lev != 5 else 3
+        log.info("[leverage] retry %s with leverage=%s", symbol, lev_fb)
+        body = _make_body(body.get("crossMode", False), lev_force=lev_fb)
+        resp = _send(body)
+
+    return resp
