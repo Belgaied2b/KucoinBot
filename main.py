@@ -233,6 +233,7 @@ async def handle_symbol_event(ev: Dict[str, Any], rg: RiskGuard, policy: MetaPol
     # --- Institutionnel + autotune (si dispo)
     inst: Dict[str, Any] = {}
     inst_gate_pass = True  # par défaut: si pas d'autotune, on ne bloque pas
+    inst_gate_reason = "n/a"
     comps_cnt = 0
     comps_min = 0
     thr = {}
@@ -254,10 +255,28 @@ async def handle_symbol_event(ev: Dict[str, Any], rg: RiskGuard, policy: MetaPol
             thr = TUNER.update_and_get(symbol, df_h1, inst)  # seuils adaptatifs
             comps_cnt, comps_detail = components_ok(inst, thr)
             comps_min = thr["components_min"]
-            inst_gate_pass = (float(inst.get("score",0)) >= thr["req_score"]) and (comps_cnt >= comps_min)
-            log.info("inst-gate: pass=%s score=%.2f req=%.2f comps=%d/%d q=%.2f atr%%=%.2f",
-                     inst_gate_pass, float(inst.get("score",0)), thr["req_score"], comps_cnt, comps_min,
+
+            # --- NOUVEL GATING CONFORME À LA SPÉCIFICATION ---
+            score_val = float(inst.get("score", 0) or 0.0)
+            req_score = float(thr.get("req_score", 1.2) or 1.2)
+
+            if comps_cnt >= 4:
+                inst_gate_pass = True
+                inst_gate_reason = "force_pass_4of4"
+            elif comps_cnt >= 3:
+                inst_gate_pass = True
+                inst_gate_reason = "tolerance_pass_3of4"
+            elif score_val >= req_score:
+                inst_gate_pass = True
+                inst_gate_reason = "score_gate"
+            else:
+                inst_gate_pass = False
+                inst_gate_reason = "reject"
+
+            log.info("inst-gate: pass=%s reason=%s score=%.2f req=%.2f comps=%d/%d q=%.2f atr%%=%.2f",
+                     inst_gate_pass, inst_gate_reason, score_val, req_score, comps_cnt, comps_min,
                      float(thr.get("q_used", 0.0)), float(thr.get("atr_pct", 0.0)), extra={"symbol": symbol})
+
             if not inst_gate_pass:
                 log.info("inst-reject details: %s", comps_detail, extra={"symbol": symbol})
                 try: update_perf_for_symbol(symbol, df_h1=df_h1)
@@ -267,6 +286,7 @@ async def handle_symbol_event(ev: Dict[str, Any], rg: RiskGuard, policy: MetaPol
             log.warning("autotune failed: %s", e, extra={"symbol": symbol})
             # on continue sans gating si l'autotune a un souci
             inst_gate_pass = True
+            inst_gate_reason = "autotune_fail_bypass"
 
     # --- Analyse (avec institutional si supporté)
     try:
@@ -311,10 +331,10 @@ async def handle_symbol_event(ev: Dict[str, Any], rg: RiskGuard, policy: MetaPol
                  rr, score, res.get("reason", "no reason"), tolerated, diag, extra={"symbol": symbol})
 
         # Conditions d'envoi de pré-signal : gate insti passé OU flag pre_shoot OU inst_score élevé
-        inst_score_res = float(res.get("inst_score", inst.get("score", 0)) or 0)
+        inst_score_res = float(res.get("inst_score", (inst or {}).get("score", 0)) or 0)
         if (HAS_INST and inst_gate_pass) or res.get("pre_shoot", False) or inst_score_res >= 0.70:
             pre_msg = (
-                f"🟡 *{symbol}* — Pré-signal (insti OK)\n"
+                f"🟡 *{symbol}* — Pré-signal (insti OK: {inst_gate_reason})\n"
                 f"*Inst score*: {inst_score_res:.2f}  |  *Composantes*: {comps_cnt}/{max(1, comps_min)}\n"
                 f"*RR*: {rr:.2f}  |  *Side*: {side.upper() if side!='none' else 'NONE'}\n"
                 f"*Raison rejet*: {res.get('reason','—')}\n"
