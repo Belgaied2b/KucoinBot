@@ -4,7 +4,7 @@ main.py — Boucle event-driven + fallback institutionnel structuré (OTE, liqui
 - Direction H4, exécution H1 via OTE 62–79% et pools de liquidité
 - SL derrière la liquidité/swing + buffer ATR
 - TP1 swing/pool opposé, TP2 RR cible (2.0 par défaut)
-- Exécution SFI + fallback direct KuCoin avec vérif par clientOid
+- Exécution SFI + fallback direct KuCoin avec vérif par clientOid (si disponible)
 """
 
 import os, asyncio, logging, math, time
@@ -20,8 +20,13 @@ from log_setup import init_logging, enable_httpx
 from kucoin_adapter import (
     place_limit_order,
     get_symbol_meta,
-    get_order_by_client_oid,   # vérif serveur après envoi
 )
+
+# get_order_by_client_oid est optionnel : pas d'ImportError si absent
+try:
+    from kucoin_adapter import get_order_by_client_oid  # type: ignore
+except Exception:
+    get_order_by_client_oid = None  # type: ignore
 
 # ---- Soft imports institutionnel / autotune
 HAS_INST = True
@@ -140,16 +145,21 @@ def _build_symbols() -> List[str]:
 def _round_to_tick(px: float, tick: float) -> float:
     if not tick or tick <= 0:
         return float(px)
-    # floor vers le tick inférieur (évite rejet prix). Pour "sell", c'est passif si <= meilleur bid,
-    # mais sans carnet ici on se contente du respect du tick.
+    # floor vers le tick inférieur (évite rejet prix)
     return math.floor(float(px) / float(tick)) * float(tick)
+
+def _side_to_adapter(side: str) -> str:
+    s = (side or "").lower()
+    if s in ("buy", "sell"):
+        return s
+    return "buy" if s == "long" else "sell"
 
 def _has_real_order_id(orders: List[Dict[str, Any]]) -> bool:
     """
     VRAIE détection d'un ordre exchange:
       - orderId présent (KuCoin)
-      - OU payload normalisé avec ok=True ET code 200000 (success) ET clientOid **et**/ou orderId
-    Un simple 'clientOid' isolé ou une string 'raw' ne compte plus.
+      - OU payload normalisé avec ok=True ET code 200000 (success) ET clientOid et/ou orderId
+    Un simple 'clientOid' isolé ou une string 'raw' ne compte pas.
     """
     for o in orders or []:
         if not isinstance(o, dict):
@@ -378,25 +388,18 @@ def _last_impulse(df, side_hint: str) -> Tuple[float, float]:
         last_low_idx = ls[-1]
         later_highs = [i for i in hs if i > last_low_idx]
         if later_highs:
-            hh = float(df['high'].astype(float).iloc[later_highs[-1]])
-            ll = float(df['low'].astype(float).iloc[last_low_idx])
+            hh = float(df['high'].astype(float).iloc[later_highs[-1]]); ll = float(df['low'].astype(float).iloc[last_low_idx])
             return ll, hh
     else:
         last_high_idx = hs[-1]
         later_lows = [i for i in ls if i > last_high_idx]
         if later_lows:
-            ll = float(df['low'].astype(float).iloc[later_lows[-1]])
-            hh = float(df['high'].astype(float).iloc[last_high_idx])
+            ll = float(df['low'].astype(float).iloc[later_lows[-1]]); hh = float(df['high'].astype(float).iloc[last_high_idx])
             return hh, ll
-    # fallback: borne min/max sur 100 dernières barres
     win = df.tail(100)
     return float(win['low'].min()), float(win['high'].max())
 
 def _equal_levels(prices: List[float], tol_pct: float) -> List[float]:
-    """
-    Regroupe des niveaux “égaux” dans une tolérance en %.
-    Retourne la liste des niveaux (médianes de clusters).
-    """
     if not prices: return []
     prices = sorted(prices)
     clusters = [[prices[0]]]
@@ -405,22 +408,16 @@ def _equal_levels(prices: List[float], tol_pct: float) -> List[float]:
             clusters[-1].append(p)
         else:
             clusters.append([p])
-    # ne garder que les pools significatifs (>=2 touches)
     pools = [sum(c)/len(c) for c in clusters if len(c) >= 2]
     return pools
 
 def _liquidity_pools(df) -> Tuple[List[float], List[float]]:
-    """Pools de liquidité simples via equal highs / equal lows sur H1."""
     hs, ls = _swing_highs_lows(df, lookback=2)
     highs = [float(df['high'].iloc[i]) for i in hs]
     lows  = [float(df['low'].iloc[i])  for i in ls]
     return _equal_levels(highs, EQ_TOL_PCT), _equal_levels(lows, EQ_TOL_PCT)
 
 def _h4_direction(df_h4, inst: Dict[str, Any]) -> str:
-    """
-    Direction “institutionnelle”:
-      - BOS simplifié via HH/LL récents + CVD/Funding/Delta pour pondérer.
-    """
     hs, ls = _swing_highs_lows(df_h4, lookback=2)
     dir_struct = "long"
     if len(hs) >= 2 and len(ls) >= 2:
@@ -430,35 +427,21 @@ def _h4_direction(df_h4, inst: Dict[str, Any]) -> str:
             dir_struct = "long"
         elif ll_new and not hh_new:
             dir_struct = "short"
-        else:
-            # neutre → pondérer par insti
-            pass
     cvd = float(inst.get("delta_cvd_usd", 0) or 0.0)
     d_s = float(inst.get("delta_score", 0) or 0.0)
     f_s = float(inst.get("funding_score", 0) or 0.0)
     bias = "long" if (cvd > 0 or (d_s >= 0.5 and f_s >= 0.6)) else "short"
-    # Si conflictuel, garder struct, sinon suivre bias
     return dir_struct if dir_struct != "neutral" else bias
 
 def _project_ote_entry(ll: float, hh: float, side: str) -> float:
     if side == "long":
-        # retracement depuis HH vers LL (Fib down)
         return hh - (hh - ll) * OTE_MID
     else:
-        # retracement depuis LL vers HH (Fib up)
         return ll + (hh - ll) * OTE_MID
 
 def _inst_structured_decision(symbol: str, inst: Dict[str, Any], df_h1, df_h4) -> Union[None, Dict[str, Any]]:
-    """
-    Décision fallback institutionnelle structurée:
-      - Direction H4 (BOS simplifié) + insti
-      - Impulsion H1 -> OTE 62–79%
-      - SL derrière pool de liquidité / swing + buffer ATR
-      - TP1 swing/pool opposé, TP2 RR cible
-    """
     try:
         side = _h4_direction(df_h4, inst)
-        # Jambe impulsive (H1)
         ll, hh = _last_impulse(df_h1, side)
         entry = _project_ote_entry(ll, hh, side)
 
@@ -466,7 +449,6 @@ def _inst_structured_decision(symbol: str, inst: Dict[str, Any], df_h1, df_h4) -
         if atr <= 0:
             atr = float(df_h1['close'].astype(float).iloc[-1]) * ATR_MIN_PCT
 
-        # Pools de liquidité (H1)
         eq_highs, eq_lows = _liquidity_pools(df_h1)
 
         if side == "long":
@@ -474,7 +456,7 @@ def _inst_structured_decision(symbol: str, inst: Dict[str, Any], df_h1, df_h4) -
             sl_base = max(pool_below) if pool_below else ll
             sl = max(1e-12, sl_base - ATR_SL_MULT * atr)
             tp1_candidate = max(eq_highs) if eq_highs else hh
-            tp1 = max(entry + atr, tp1_candidate)  # au moins +1*ATR, sinon pool
+            tp1 = max(entry + atr, tp1_candidate)
             risk = max(entry - sl, 1e-12)
             tp2 = entry + RR_TARGET_TP2 * risk
         else:
@@ -482,7 +464,7 @@ def _inst_structured_decision(symbol: str, inst: Dict[str, Any], df_h1, df_h4) -
             sl_base = min(pool_above) if pool_above else hh
             sl = sl_base + ATR_SL_MULT * atr
             tp1_candidate = min(eq_lows) if eq_lows else ll
-            tp1 = min(entry - atr, tp1_candidate)  # au moins -1*ATR, sinon pool
+            tp1 = min(entry - atr, tp1_candidate)
             risk = max(sl - entry, 1e-12)
             tp2 = entry - RR_TARGET_TP2 * risk
 
@@ -560,7 +542,6 @@ async def handle_symbol_event(ev: Dict[str, Any], rg: RiskGuard, policy: MetaPol
             score_val = float(inst.get("score", 0) or 0.0)
             req_score = float(thr.get("req_score", 1.2) or 1.2)
 
-            # Passer si 3/4 ou 4/4 même si score < req_score
             if comps_cnt >= 4:
                 inst_gate_pass = True;  inst_gate_reason = "force_pass_4of4"
             elif comps_cnt >= 3:
@@ -674,7 +655,6 @@ async def handle_symbol_event(ev: Dict[str, Any], rg: RiskGuard, policy: MetaPol
     try:
         eng = SFIEngine(symbol, side, {"notional": value_usdt, "sl": sl, "tp1": tp1, "tp2": tp2})
     except TypeError:
-        # fallback anciens moteurs
         eng = SFIEngine(symbol, side, value_usdt, sl, tp1, tp2)
 
     orders = _safe_place_orders(eng, entry, sl, tp1, tp2)
@@ -690,13 +670,14 @@ async def handle_symbol_event(ev: Dict[str, Any], rg: RiskGuard, policy: MetaPol
 
         entry_px = _round_to_tick(entry, tick)
         post_only = KC_POST_ONLY_DEFAULT
+        side_for_adapter = _side_to_adapter(side)
 
         log.info("fallback KuCoin LIMIT: px=%s (tick=%s) postOnly=%s",
                  fmt_price(entry_px), tick, post_only, extra={"symbol": symbol})
 
         kc = place_limit_order(
             symbol=symbol,
-            side=side,
+            side=side_for_adapter,
             price=float(entry_px),
             value_usdt=float(value_usdt),
             sl=float(sl),
@@ -716,11 +697,15 @@ async def handle_symbol_event(ev: Dict[str, Any], rg: RiskGuard, policy: MetaPol
             log.info("[kc.place_limit_order] ok=%s code=%s msg=%s clientOid=%s orderId=%s",
                      ok, code, msg, clientOid, orderId, extra={"symbol": symbol})
 
-        # Si pas d'orderId mais on a un clientOid, on vérifie côté serveur (poll léger)
-        if (not orderId) and clientOid:
+        # Si pas d'orderId mais on a un clientOid, on vérifie côté serveur (poll léger) — seulement si la fonction existe
+        if (not orderId) and clientOid and callable(get_order_by_client_oid or None):  # type: ignore
             for _ in range(KC_VERIFY_MAX_TRIES):
                 time.sleep(KC_VERIFY_DELAY_SEC)
-                od = get_order_by_client_oid(clientOid)
+                try:
+                    od = get_order_by_client_oid(clientOid)  # type: ignore
+                except Exception as e:
+                    log.debug("verify clientOid error: %s", e, extra={"symbol": symbol})
+                    od = None
                 if od and isinstance(od, dict):
                     orderId = od.get("orderId") or od.get("id")
                     status  = od.get("status") or od.get("state")
@@ -732,7 +717,6 @@ async def handle_symbol_event(ev: Dict[str, Any], rg: RiskGuard, policy: MetaPol
         if orderId or clientOid:
             orders = [{"ok": True, "orderId": orderId, "clientOid": clientOid}]
         else:
-            # garder le 'raw' pour debug
             orders = [{"ok": False, "raw": kc}]
 
     log.info("orders=%s", orders, extra={"symbol": symbol})
