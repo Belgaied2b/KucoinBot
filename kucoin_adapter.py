@@ -1,10 +1,9 @@
-# kucoin_adapter.py — version "ancien style robuste" prête à coller
+# kucoin_adapter.py — version robuste sans crossMode dans le body (fix 330005)
 # - Signature v2 (timestamp + method + path + body)
 # - clientOid = timestamp
 # - valueQty = ORDER_VALUE_USDT * leverage (comme avant)
-# - Arrondi prix au tick (tickSize/priceIncrement/pricePrecision)
-# - Quantification directionnelle (BUY=floor, SELL=ceil)
-# - Détection/flip crossMode si mismatch
+# - Prix quantifié au tick (tickSize/priceIncrement/pricePrecision)
+# - N'ENVOIE PAS crossMode (évite 330005)
 # - Retry si 100001 (leverage invalid)
 # - Vérification par clientOid
 
@@ -116,7 +115,7 @@ def _price_increment(symbol: str) -> float:
       1) contracts/{symbol}: tickSize -> priceIncrement
       2) contracts/active fallback
       3) pricePrecision -> 10^-pp
-      4) ultime fallback non nul
+      4) fallback non nul
     """
     def _to_f(x) -> float:
         try:
@@ -180,7 +179,7 @@ def _quantize_price(price: float, tick: float, side: str) -> float:
 
 def _position_mode(symbol: str) -> Optional[bool]:
     """
-    Retourne crossMode (True/False) si dispo.
+    Retourne crossMode (True/False) si dispo pour LOG UNIQUEMENT.
     GET /api/v1/position?symbol=...
     """
     path = f"{POS_PATH}?symbol={symbol}"
@@ -216,13 +215,13 @@ def place_limit_order(
     post_only: bool = True,
     client_order_id: Optional[str] = None,
     leverage: Optional[int] = None,
-    cross_mode: Optional[bool] = None,
+    cross_mode: Optional[bool] = None,  # ignoré à l'envoi; conservé pour logs
 ) -> Dict[str, Any]:
     """
     - LIMIT avec valueQty = value_usdt * leverage (ancien comportement)
     - Envoie toujours 'leverage' (string)
     - Prix quantifié au tick (directionnel)
-    - Détection du crossMode courant; si mismatch → flip et retry
+    - **N'envoie pas crossMode** → évite 330005
     - Retry si 100001 (Leverage invalid) avec levier fallback
     - Renvoie {"ok":bool, "code":..., "msg":..., "orderId":..., "clientOid":..., "data": {...}}
     """
@@ -234,14 +233,16 @@ def place_limit_order(
     tick = _price_increment(symbol)
     px   = _quantize_price(float(price), tick, side)
 
-    # crossMode: si non fourni → lire /position
+    # On lit le mode juste pour INFO (mais on ne l'envoie PAS)
     if cross_mode is None:
         cm = _position_mode(symbol)
-        cross_mode = cm if cm is not None else False  # défaut: isolated
+        cross_mode = cm if cm is not None else None
+    if cross_mode is not None:
+        log.info("[marginMode] %s -> %s", symbol, ("cross" if cross_mode else "isolated"))
 
     coid = client_order_id or str(_ts_ms())
 
-    def _make_body(cross_flag: bool, lev_force: Optional[int] = None) -> Dict[str, Any]:
+    def _make_body(lev_force: Optional[int] = None) -> Dict[str, Any]:
         body = {
             "clientOid": coid,
             "symbol": symbol,
@@ -252,15 +253,16 @@ def place_limit_order(
             "timeInForce": "GTC",
             "postOnly": bool(post_only),
             "leverage": str(lev_force if lev_force is not None else lev),
-            "crossMode": bool(cross_flag),
+            # ⚠️ NE PAS ENVOYER crossMode
+            # "reduceOnly": False  # si besoin
         }
         return body
 
     def _send(body: Dict[str, Any]) -> Dict[str, Any]:
         log.info(
-            "[place_limit] %s %s px=%s valueQty=%.2f postOnly=%s crossMode=%s",
+            "[place_limit] %s %s px=%s valueQty=%.2f postOnly=%s",
             symbol, body.get("side"), body.get("price"),
-            float(value_qty), body.get("postOnly"), body.get("crossMode"),
+            float(value_qty), body.get("postOnly"),
         )
         ok, js = _post(ORDERS_PATH, body)
         data = js.get("data") if isinstance(js, dict) else None
@@ -282,26 +284,17 @@ def place_limit_order(
                      res["ok"], res["code"], res["msg"], res["clientOid"], res["orderId"])
         return res
 
-    # 1) tentative avec cross_mode déterminé
-    body = _make_body(cross_mode)
+    # 1) tentative standard (sans crossMode)
+    body = _make_body()
     resp = _send(body)
 
-    # 2) mismatch margin mode → flip et retenter
-    if (not resp["ok"]) and any(x in str(resp["msg"]) for x in [
-        "margin mode does not match", "margin mode", "330005", "400100"
-    ]):
-        flipped = not bool(cross_mode)
-        log.info("[marginMode] %s -> %s", symbol, ("cross" if flipped else "isolated"))
-        body = _make_body(flipped)
-        resp = _send(body)
-
-    # 3) leverage invalid → retenter avec levier fallback
+    # 2) leverage invalid → retenter avec levier fallback
     if (not resp["ok"]) and ("Leverage parameter invalid" in str(resp["msg"]) or resp["code"] == "100001"):
         lev_fb = int(getattr(SETTINGS, "default_leverage", 5) or 5)
         if lev_fb == lev:
             lev_fb = 5 if lev != 5 else 3
         log.info("[leverage] retry %s with leverage=%s", symbol, lev_fb)
-        body = _make_body(body.get("crossMode", False), lev_force=lev_fb)
+        body = _make_body(lev_force=lev_fb)
         resp = _send(body)
 
     return resp
