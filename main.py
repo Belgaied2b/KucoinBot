@@ -7,7 +7,7 @@ main.py — Boucle event-driven + fallback institutionnel structuré (OTE, liqui
 
 Ce build :
 - Normalise les retours SFI et tente plusieurs signatures (open_limit / place_initial / place_from_decision / place_market)
-- Vérifie réellement la présence d’un ordre côté KuCoin via get_order_by_client_oid(...)
+- Vérifie réellement la présence d’un ordre côté KuCoin si une API de lookup par clientOid est dispo
 - Si rien n’est vérifié, crée un LIMIT direct via place_limit_order(...) avec arrondi au tick et postOnly configurable
 """
 
@@ -21,11 +21,29 @@ from meta_policy import MetaPolicy
 from perf_metrics import register_signal_perf, update_perf_for_symbol
 from kucoin_utils import fetch_klines, fetch_symbol_meta
 from log_setup import init_logging, enable_httpx
-from kucoin_adapter import (
-    place_limit_order,
-    get_symbol_meta,
-    get_order_by_client_oid,   # ✅ vérification côté KuCoin
-)
+
+# ---- Adaptateur KuCoin (place_limit + meta) + lookup optionnel par clientOid
+from kucoin_adapter import place_limit_order, get_symbol_meta  # noqa: F401
+
+# get_order_by_client_oid peut ne PAS exister dans votre fichier actuel.
+# On gère ça proprement : on tente d'abord via kucoin_adapter, sinon fallback via KucoinTrader, sinon no-op.
+try:
+    from kucoin_adapter import get_order_by_client_oid as kc_get_by_oid  # type: ignore
+    _HAS_KC_LOOKUP = True
+except Exception:
+    _HAS_KC_LOOKUP = False
+    try:
+        from kucoin_trader import KucoinTrader  # type: ignore
+        _KT = KucoinTrader()
+        def kc_get_by_oid(oid: str):
+            try:
+                return _KT.get_order_by_client_oid(oid)
+            except Exception:
+                return None
+        _HAS_KC_LOOKUP = True
+    except Exception:
+        def kc_get_by_oid(oid: str):
+            return None
 
 # ---- Soft imports institutionnel / autotune
 HAS_INST = True
@@ -552,7 +570,7 @@ async def handle_symbol_event(ev: Dict[str, Any], rg: RiskGuard, policy: MetaPol
             log.warning("inst snapshot KO: %s", e, extra={"symbol": symbol})
             inst = {}
 
-    if HAS_INST and HAS_TUNER and TUNER is not None:
+    if HAS_TUNER and TUNER is not None and inst:
         try:
             thr = TUNER.update_and_get(symbol, df_h1, inst)
             comps_cnt, comps_detail = components_ok(inst, thr)
@@ -680,20 +698,21 @@ async def handle_symbol_event(ev: Dict[str, Any], rg: RiskGuard, policy: MetaPol
     orders = _safe_place_orders(eng, entry, sl, tp1, tp2)
     orders = _normalize_orders(orders)
 
-    # ✅ Vérification côté KuCoin avec les éventuels clientOid retournés par SFI
-    verified: List[Dict[str, Any]] = []
-    client_oids = _extract_client_oids(orders)
-    for coid in client_oids:
-        try:
-            data = get_order_by_client_oid(coid)
-            if isinstance(data, dict) and data.get("orderId") or data.get("clientOid"):
-                verified.append({"ok": True, "orderId": data.get("orderId"), "clientOid": data.get("clientOid") or coid})
-        except Exception as e:
-            log.debug("verify get_order_by_client_oid(%s) KO: %s", coid, e, extra={"symbol": symbol})
+    # ✅ Vérification côté KuCoin avec les éventuels clientOid retournés par SFI (si lookup dispo)
+    if _HAS_KC_LOOKUP:
+        verified: List[Dict[str, Any]] = []
+        client_oids = _extract_client_oids(orders)
+        for coid in client_oids:
+            try:
+                data = kc_get_by_oid(coid)
+                if isinstance(data, dict) and (data.get("orderId") or data.get("clientOid")):
+                    verified.append({"ok": True, "orderId": data.get("orderId"), "clientOid": data.get("clientOid") or coid})
+            except Exception as e:
+                log.debug("verify get_order_by_client_oid(%s) KO: %s", coid, e, extra={"symbol": symbol})
 
-    if verified:
-        log.info("✅ verified %d KuCoin orders: %s", len(verified), verified, extra={"symbol": symbol})
-        orders = verified
+        if verified:
+            log.info("✅ verified %d KuCoin orders: %s", len(verified), verified, extra={"symbol": symbol})
+            orders = verified
 
     # Fallback direct KuCoin si pas d'ID exploitable/vérifié
     if not _has_real_order_id(orders):
