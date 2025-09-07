@@ -39,12 +39,12 @@ except Exception:
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID")
 
-H1_LIMIT                 = int(os.getenv("H1_LIMIT", "500"))
-H4_LIMIT                 = int(os.getenv("H4_LIMIT", "400"))
-H1_REFRESH_SEC           = int(os.getenv("H1_REFRESH_SEC", "60"))
-H4_REFRESH_SEC           = int(os.getenv("H4_REFRESH_SEC", "300"))
-ANALYSIS_MIN_INTERVAL_SEC= int(os.getenv("ANALYSIS_MIN_INTERVAL_SEC", "15"))
-WS_POLL_SEC              = int(os.getenv("WS_POLL_SEC", "5"))
+H1_LIMIT                  = int(os.getenv("H1_LIMIT", "500"))
+H4_LIMIT                  = int(os.getenv("H4_LIMIT", "400"))
+H1_REFRESH_SEC            = int(os.getenv("H1_REFRESH_SEC", "60"))
+H4_REFRESH_SEC            = int(os.getenv("H4_REFRESH_SEC", "300"))
+ANALYSIS_MIN_INTERVAL_SEC = int(os.getenv("ANALYSIS_MIN_INTERVAL_SEC", "15"))
+WS_POLL_SEC               = int(os.getenv("WS_POLL_SEC", "5"))
 
 _KLINE_CACHE: Dict[str, Dict[str, Any]] = {}
 _LAST_ANALYSIS_TS: Dict[str, float] = {}
@@ -127,22 +127,18 @@ def _normalize_orders(orders: Union[None, dict, list, tuple]) -> List[Dict[str, 
     if isinstance(orders, dict):
         return [orders]
     if isinstance(orders, list):
-        # si la liste contient des tuples, convertis en dict minimal
         out: List[Dict[str, Any]] = []
         for it in orders:
             if isinstance(it, dict):
                 out.append(it)
             elif isinstance(it, tuple):
-                # on mappe génériquement
                 d = {"raw": tuple(it)}
                 out.append(d)
             else:
                 out.append({"raw": it})
         return out
     if isinstance(orders, tuple):
-        # évite l'erreur "'tuple' object has no attribute 'get'"
         return [{"raw": tuple(orders)}]
-    # fallback
     return [{"raw": orders}]
 
 def _maybe_configure_tranches(engine: SFIEngine, tp1: float, tp2: float) -> None:
@@ -160,7 +156,7 @@ def _safe_place_orders(engine: SFIEngine, entry: float, sl: float, tp1: float, t
     """Essaie plusieurs signatures usuelles des engines SFI, normalise la sortie."""
     _maybe_configure_tranches(engine, tp1, tp2)
 
-    # 1) Signature la plus explicite (kwargs)
+    # 1) Signature kwargs
     try:
         orders = engine.place_initial(entry=float(entry), sl=float(sl), tp1=float(tp1), tp2=float(tp2))  # type: ignore
         return _normalize_orders(orders)
@@ -187,7 +183,7 @@ def _safe_place_orders(engine: SFIEngine, entry: float, sl: float, tp1: float, t
     except Exception as e:
         log.error("place_initial(positional) KO: %s", e)
 
-    # 4) Decision dict si exposé
+    # 4) Decision dict
     try:
         dec = {"entry": float(entry), "sl": float(sl), "tp1": float(tp1), "tp2": float(tp2)}
         if hasattr(engine, "place_from_decision") and callable(engine.place_from_decision):
@@ -196,7 +192,7 @@ def _safe_place_orders(engine: SFIEngine, entry: float, sl: float, tp1: float, t
     except Exception as e:
         log.error("place_from_decision KO: %s", e)
 
-    # 5) Dernier recours market si dispo
+    # 5) Market fallback
     try:
         if hasattr(engine, "place_market") and callable(engine.place_market):
             orders = engine.place_market()  # type: ignore
@@ -235,7 +231,12 @@ async def handle_symbol_event(ev: Dict[str, Any], rg: RiskGuard, policy: MetaPol
         return
 
     # --- Institutionnel + autotune (si dispo)
-    inst = {}
+    inst: Dict[str, Any] = {}
+    inst_gate_pass = True  # par défaut: si pas d'autotune, on ne bloque pas
+    comps_cnt = 0
+    comps_min = 0
+    thr = {}
+
     if HAS_INST:
         try:
             inst = get_institutional_snapshot(symbol)
@@ -252,11 +253,12 @@ async def handle_symbol_event(ev: Dict[str, Any], rg: RiskGuard, policy: MetaPol
         try:
             thr = TUNER.update_and_get(symbol, df_h1, inst)  # seuils adaptatifs
             comps_cnt, comps_detail = components_ok(inst, thr)
-            inst_ok = (float(inst.get("score",0)) >= thr["req_score"]) and (comps_cnt >= thr["components_min"])
+            comps_min = thr["components_min"]
+            inst_gate_pass = (float(inst.get("score",0)) >= thr["req_score"]) and (comps_cnt >= comps_min)
             log.info("inst-gate: pass=%s score=%.2f req=%.2f comps=%d/%d q=%.2f atr%%=%.2f",
-                     inst_ok, float(inst.get("score",0)), thr["req_score"], comps_cnt, thr["components_min"],
+                     inst_gate_pass, float(inst.get("score",0)), thr["req_score"], comps_cnt, comps_min,
                      float(thr.get("q_used", 0.0)), float(thr.get("atr_pct", 0.0)), extra={"symbol": symbol})
-            if not inst_ok:
+            if not inst_gate_pass:
                 log.info("inst-reject details: %s", comps_detail, extra={"symbol": symbol})
                 try: update_perf_for_symbol(symbol, df_h1=df_h1)
                 except Exception: pass
@@ -264,17 +266,20 @@ async def handle_symbol_event(ev: Dict[str, Any], rg: RiskGuard, policy: MetaPol
         except Exception as e:
             log.warning("autotune failed: %s", e, extra={"symbol": symbol})
             # on continue sans gating si l'autotune a un souci
+            inst_gate_pass = True
 
     # --- Analyse (avec institutional si supporté)
     try:
         log.debug("analyze...", extra={"symbol": symbol})
         try:
-            # nouvelle signature dict (valid=True/False) privilégiée
-            res = analyze_signal.analyze_signal(symbol=symbol,
-                                                entry_price=float(df_h1['close'].iloc[-1]),
-                                                df_h1=df_h1, df_h4=df_h4,
-                                                df_d1=df_h1, df_m15=df_h1,  # placeholders si non utilisés
-                                                inst=inst, macro={})
+            # signature dict (valid=True/False) privilégiée
+            res = analyze_signal.analyze_signal(
+                symbol=symbol,
+                entry_price=float(df_h1['close'].iloc[-1]),
+                df_h1=df_h1, df_h4=df_h4,
+                df_d1=df_h1, df_m15=df_h1,  # placeholders si non utilisés
+                inst=inst, macro={}
+            )
         except TypeError:
             # signature plus simple
             res = analyze_signal.analyze_signal(symbol=symbol, df_h1=df_h1, df_h4=df_h4)
@@ -288,17 +293,35 @@ async def handle_symbol_event(ev: Dict[str, Any], rg: RiskGuard, policy: MetaPol
         except Exception: pass
         return
 
-    side = str(res.get("side", "none")).lower()
-    rr   = float(res.get("rr", 0) or 0)
-    score= float(res.get("inst_score", 0) or 0)
-    comments_list = res.get("comments", []) or []
-    comments = ", ".join([str(c) for c in comments_list]) if comments_list else ""
+    side   = str(res.get("side", "none")).lower()
+    rr     = float(res.get("rr", 0) or 0)
+    score  = float(res.get("inst_score", 0) or 0)
+    c_list = res.get("comments", []) or []
+    comments = ", ".join([str(c) for c in c_list]) if c_list else ""
     log.info("analysis: side=%s rr=%.2f score=%.2f comment=%s",
              side, rr, score, comments or "—", extra={"symbol": symbol})
 
-    if not res.get("valid", False):
-        log.info("no-trade (invalid signal) — rr=%.2f score=%.2f reason=%s",
-                 rr, score, res.get("reason", "no reason"), extra={"symbol": symbol})
+    # Diagnostics communs pour logs/pré-signal
+    diag = (res.get("manage", {}) or {}).get("diagnostics", {})
+    tolerated = diag.get("tolerated", res.get("tolerated", []))
+
+    # --- Cas: signal invalide -> log enrichi + PRE-SIGNAL si inst OK
+    if not res.get("valid", False) or side not in ("long", "short"):
+        log.info("no-trade (invalid signal) — rr=%.2f score=%.2f reason=%s tolerated=%s diag=%s",
+                 rr, score, res.get("reason", "no reason"), tolerated, diag, extra={"symbol": symbol})
+
+        # Conditions d'envoi de pré-signal : gate insti passé OU flag pre_shoot OU inst_score élevé
+        inst_score_res = float(res.get("inst_score", inst.get("score", 0)) or 0)
+        if (HAS_INST and inst_gate_pass) or res.get("pre_shoot", False) or inst_score_res >= 0.70:
+            pre_msg = (
+                f"🟡 *{symbol}* — Pré-signal (insti OK)\n"
+                f"*Inst score*: {inst_score_res:.2f}  |  *Composantes*: {comps_cnt}/{max(1, comps_min)}\n"
+                f"*RR*: {rr:.2f}  |  *Side*: {side.upper() if side!='none' else 'NONE'}\n"
+                f"*Raison rejet*: {res.get('reason','—')}\n"
+                f"*Tolérances*: {tolerated if tolerated else '—'}"
+            )
+            send_telegram(pre_msg)
+
         try: update_perf_for_symbol(symbol, df_h1=df_h1)
         except Exception: pass
         return
@@ -307,12 +330,20 @@ async def handle_symbol_event(ev: Dict[str, Any], rg: RiskGuard, policy: MetaPol
     rg_ok, rg_reason = rg.can_enter(symbol, ws_latency_ms=50, last_data_age_s=5)
     if not rg_ok:
         log.info("blocked by risk_guard: %s", rg_reason, extra={"symbol": symbol})
+        # on envoie aussi un pré-signal si l'insti est OK pour ne pas perdre l'info
+        if HAS_INST and inst_gate_pass:
+            send_telegram(f"🟡 *{symbol}* — Pré-signal bloqué par *RiskGuard*: {rg_reason}")
         return
 
     # --- Policy
     arm, weight, label = policy.choose({"atr_pct": res.get("atr_pct", 0), "adx_proxy": res.get("adx_proxy", 0)})
     if weight < 0.25 and rr < 1.5:
         log.info("policy reject — arm=%s w=%.2f rr=%.2f", arm, weight, rr, extra={"symbol": symbol})
+        # pré-signal si insti OK
+        if HAS_INST and inst_gate_pass:
+            send_telegram(
+                f"🟡 *{symbol}* — Pré-signal rejeté par *Policy* (arm={arm}, w={weight:.2f}, RR={rr:.2f})"
+            )
         try: update_perf_for_symbol(symbol, df_h1=df_h1)
         except Exception: pass
         return
@@ -337,7 +368,7 @@ async def handle_symbol_event(ev: Dict[str, Any], rg: RiskGuard, policy: MetaPol
     orders = _safe_place_orders(eng, entry, sl, tp1, tp2)
     log.info("orders=%s", orders, extra={"symbol": symbol})
 
-    # Telegram
+    # Telegram (signal exécuté)
     msg = (f"🧠 *{symbol}* — *{side.upper()}* via *{label}*\n"
            f"RR: *{res.get('rr','—')}*  |  Entrée: *{fmt_price(entry)}*  |  SL: *{fmt_price(sl)}*  |  TP1: *{fmt_price(tp1)}*  TP2: *{fmt_price(tp2)}*\n"
            f"Ordres: {orders if orders else '—'}")
