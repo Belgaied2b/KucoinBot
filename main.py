@@ -4,6 +4,11 @@ main.py — Boucle event-driven + fallback institutionnel structuré (OTE, liqui
 - Direction H4, exécution H1 via OTE 62–79% et pools de liquidité
 - SL derrière la liquidité/swing + buffer ATR
 - TP1 swing/pool opposé, TP2 RR cible (2.0 par défaut)
+
+Ce build :
+- Normalise les retours SFI et tente plusieurs signatures (open_limit / place_initial / place_from_decision / place_market)
+- Vérifie réellement la présence d’un ordre côté KuCoin via get_order_by_client_oid(...)
+- Si rien n’est vérifié, crée un LIMIT direct via place_limit_order(...) avec arrondi au tick et postOnly configurable
 """
 
 import os, asyncio, logging, math, time
@@ -16,7 +21,11 @@ from meta_policy import MetaPolicy
 from perf_metrics import register_signal_perf, update_perf_for_symbol
 from kucoin_utils import fetch_klines, fetch_symbol_meta
 from log_setup import init_logging, enable_httpx
-from kucoin_adapter import place_limit_order, get_symbol_meta  # fallback direct KuCoin
+from kucoin_adapter import (
+    place_limit_order,
+    get_symbol_meta,
+    get_order_by_client_oid,   # ✅ vérification côté KuCoin
+)
 
 # ---- Soft imports institutionnel / autotune
 HAS_INST = True
@@ -141,6 +150,19 @@ def _has_real_order_id(orders: List[Dict[str, Any]]) -> bool:
             if isinstance(raw, str) and raw.strip():
                 return True
     return False
+
+def _extract_client_oids(orders: List[Dict[str, Any]]) -> List[str]:
+    oids: List[str] = []
+    for o in orders or []:
+        if not isinstance(o, dict): continue
+        if o.get("clientOid"):
+            oids.append(str(o["clientOid"]))
+            continue
+        raw = o.get("raw")
+        if isinstance(raw, str) and raw.strip():
+            oids.append(raw.strip())
+    # unicité + non vide
+    return sorted({x for x in oids if x})
 
 # ------------------------
 # Exécution robuste SFI
@@ -658,7 +680,22 @@ async def handle_symbol_event(ev: Dict[str, Any], rg: RiskGuard, policy: MetaPol
     orders = _safe_place_orders(eng, entry, sl, tp1, tp2)
     orders = _normalize_orders(orders)
 
-    # Fallback direct KuCoin si pas d'ID exploitable
+    # ✅ Vérification côté KuCoin avec les éventuels clientOid retournés par SFI
+    verified: List[Dict[str, Any]] = []
+    client_oids = _extract_client_oids(orders)
+    for coid in client_oids:
+        try:
+            data = get_order_by_client_oid(coid)
+            if isinstance(data, dict) and data.get("orderId") or data.get("clientOid"):
+                verified.append({"ok": True, "orderId": data.get("orderId"), "clientOid": data.get("clientOid") or coid})
+        except Exception as e:
+            log.debug("verify get_order_by_client_oid(%s) KO: %s", coid, e, extra={"symbol": symbol})
+
+    if verified:
+        log.info("✅ verified %d KuCoin orders: %s", len(verified), verified, extra={"symbol": symbol})
+        orders = verified
+
+    # Fallback direct KuCoin si pas d'ID exploitable/vérifié
     if not _has_real_order_id(orders):
         try:
             tick = float(get_symbol_meta(symbol).get("priceIncrement", 0.0)) or 0.0
@@ -680,7 +717,7 @@ async def handle_symbol_event(ev: Dict[str, Any], rg: RiskGuard, policy: MetaPol
         )
         if isinstance(kc, dict):
             oid = kc.get("orderId") or kc.get("clientOid") or (kc.get("data", {}) or {}).get("orderId")
-            orders = [{"ok": kc.get("ok"), "orderId": oid, "code": kc.get("code"), "raw": kc.get("raw")}]
+            orders = [{"ok": kc.get("ok", True), "orderId": oid, "clientOid": kc.get("clientOid"), "code": kc.get("code"), "raw": kc.get("raw")}]
         else:
             orders = [{"raw": kc}]
 
