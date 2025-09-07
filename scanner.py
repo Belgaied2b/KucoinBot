@@ -308,7 +308,27 @@ def scan_and_send_signals(symbols: Optional[List[str]] = None) -> Dict[str, Any]
 
         # Ici tu peux déclencher l'envoi si inst_pass == True
         # (laisser comme c'était si c'est géré ailleurs)
-        LOG.info("[%s] decision: %s", sym, res)
+                LOG.info("[%s] decision: %s", sym, res)
+
+        if res.get("inst_pass", False):
+            # 1) Telegram
+            msg = (f"[{sym}] ✅ PASS ({res.get('inst_pass_reason')})\n"
+                   f"Score={res.get('inst_score'):.2f} | OK={res.get('inst_ok_count')}/4")
+            send_telegram(msg)
+
+            # 2) Log perf & CSV
+            log_signal(sym, res)
+
+            # 3) Exécution SFI (adapter selon ton moteur)
+            try:
+                engine = SFIEngine()
+                # Si ton SFIEngine a une méthode différente, adapte ici
+                engine.run_signal(sym, res)
+                log_order(sym, res)
+            except Exception as e:
+                LOG.error("[%s] SFI exec KO: %s", sym, e)
+
+            sent += 1
 
     return {"scanned": scanned, "sent": sent, "errors": errors, "ts": now_iso()}
 
