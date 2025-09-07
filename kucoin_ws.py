@@ -4,7 +4,7 @@ import hmac
 import base64
 import hashlib
 import httpx
-import ujson as json
+import json  # ← standard json pour la signature
 import asyncio
 import websockets
 import random
@@ -22,6 +22,7 @@ log = get_logger("kucoin.ws")
 # Décalage local -> serveur (en secondes)
 _SERVER_OFFSET = 0.0
 
+
 def _sync_server_time() -> None:
     """Synchronise l'heure locale sur l'heure serveur KuCoin Futures (ms)."""
     global _SERVER_OFFSET
@@ -35,13 +36,16 @@ def _sync_server_time() -> None:
     except Exception as e:
         log.warning(f"time sync failed: {e}")
 
+
 def _ts_ms() -> int:
     return int((time.time() + _SERVER_OFFSET) * 1000)
+
 
 def _b64_hmac_sha256(secret: str, payload: str) -> str:
     return base64.b64encode(
         hmac.new(secret.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).digest()
     ).decode("utf-8")
+
 
 class KucoinPrivateWS:
     def __init__(self):
@@ -94,17 +98,15 @@ class KucoinPrivateWS:
     def _post_signed(self, path: str, body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """
         POST signé en envoyant exactement la même chaîne que celle utilisée dans la signature.
-        ⚠️ N'utilise PAS le paramètre httpx `json=` pour éviter toute re-sérialisation.
+        ⚠️ On évite httpx json= pour contrôler *exactement* ce qui est envoyé.
         """
         url = self.base + path
-        # sérialisation compacte et stable (ordre non garanti côté dict -> ok car on signe EXACTEMENT ce qu'on envoie)
         body_str = "" if body is None else json.dumps(body, separators=(",", ":"), ensure_ascii=False)
         headers = self._headers("POST", path, body_str)
 
         with httpx.Client(timeout=10.0) as c:
             r = c.post(url, headers=headers, content=(body_str.encode("utf-8") if body_str else None))
             if r.status_code >= 400:
-                # messages d'aide si 401 signature invalide
                 if r.status_code == 401:
                     log.error(
                         f"HTTP {path} 401: {r.text[:200]} — "
@@ -132,7 +134,7 @@ class KucoinPrivateWS:
         # resync avant demande (drift max 5s côté KuCoin)
         _sync_server_time()
 
-        # Body vide recommandé par la doc (pas nécessaire d'envoyer "{}")
+        # Body vide recommandé par la doc
         data = self._post_signed(TOKEN_PATH, None)
         d = data.get("data", {}) if isinstance(data, dict) else {}
         inst_list = d.get("instanceServers") or []
