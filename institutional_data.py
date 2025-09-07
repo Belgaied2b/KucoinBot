@@ -247,3 +247,14 @@ def build_institutional_snapshot(symbol: str, price_series: Optional[List[float]
             "liq_source": liq_p["liq_source"],
         }
     }
+
+# --------------------------------------------------------------------------------------
+# Required score by symbol type
+# --------------------------------------------------------------------------------------
+def get_required_score(symbol: str) -> float:
+    """Retourne le seuil requis pour valider un signal institutionnel.
+       BTC/ETH = seuil plus bas (1.0), Alts = plus strict (1.2)."""
+    sym = map_symbol_to_binance(symbol)
+    if sym in ("BTCUSDT", "ETHUSDT"):
+        return 1.0
+    return 1.2
