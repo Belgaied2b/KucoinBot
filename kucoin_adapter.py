@@ -1,8 +1,9 @@
 # kucoin_adapter.py — version "ancien style robuste" prête à coller
 # - Signature v2 (timestamp + method + path + body)
 # - clientOid = timestamp
-# - valueQty = ORDER_VALUE_USDT * leverage (comme avant: marge * levier)
-# - Arrondi prix au priceIncrement
+# - valueQty = ORDER_VALUE_USDT * leverage (comme avant)
+# - Arrondi prix au tick (tickSize/priceIncrement/pricePrecision)
+# - Quantification directionnelle (BUY=floor, SELL=ceil)
 # - Détection/flip crossMode si mismatch
 # - Retry si 100001 (leverage invalid)
 # - Vérification par clientOid
@@ -11,6 +12,7 @@ import time
 import hmac
 import base64
 import hashlib
+import math
 from typing import Any, Dict, Optional, Tuple
 
 import httpx
@@ -109,19 +111,72 @@ def get_symbol_meta(symbol: str) -> Dict[str, Any]:
     return {}
 
 def _price_increment(symbol: str) -> float:
-    meta = get_symbol_meta(symbol)
-    inc = meta.get("priceIncrement")
-    try:
-        return float(inc or 0.0)
-    except Exception:
-        return 0.0
+    """
+    Tick robuste:
+      1) contracts/{symbol}: tickSize -> priceIncrement
+      2) contracts/active fallback
+      3) pricePrecision -> 10^-pp
+      4) ultime fallback non nul
+    """
+    def _to_f(x) -> float:
+        try:
+            return float(x)
+        except Exception:
+            return 0.0
 
-def _round_to_tick(price: float, tick: float) -> float:
-    if not tick or tick <= 0:
-        return float(price)
-    # KuCoin accepte price multiples du tick exact → arrondi au plus proche multiple
-    steps = round(float(price) / tick)
-    return float(steps) * tick
+    meta = get_symbol_meta(symbol) or {}
+    tick = meta.get("tickSize", None)
+    if not _to_f(tick):
+        tick = meta.get("priceIncrement", None)
+
+    t = _to_f(tick)
+    if t > 0:
+        return t
+
+    # fallback active list
+    ok, js = _get(f"{CNTR_PATH}/active")
+    if ok:
+        for it in js.get("data", []) or []:
+            if str(it.get("symbol", "")).strip().upper() == symbol.upper():
+                t = _to_f(it.get("tickSize") or it.get("priceIncrement"))
+                if t > 0:
+                    return t
+                pp = it.get("pricePrecision")
+                try:
+                    pp = int(pp)
+                    if pp is not None and pp >= 0:
+                        return 10 ** (-pp)
+                except Exception:
+                    pass
+
+    # derive from pricePrecision in meta
+    pp = meta.get("pricePrecision", None)
+    try:
+        pp = int(pp)
+        if pp is not None and pp >= 0:
+            return 10 ** (-pp)
+    except Exception:
+        pass
+
+    # ultimate non-zero (évite "multiple of 0")
+    return 1e-8
+
+def _quantize_price(price: float, tick: float, side: str) -> float:
+    """
+    Quantifie le prix au multiple exact de tick.
+    BUY  -> floor (reste passif en postOnly)
+    SELL -> ceil  (reste passif en postOnly)
+    """
+    price = float(price)
+    tick  = float(tick)
+    if tick <= 0:
+        return price
+    steps = price / tick
+    if str(side).lower() == "buy":
+        qsteps = math.floor(steps + 1e-12)
+    else:
+        qsteps = math.ceil(steps - 1e-12)
+    return float(qsteps) * tick
 
 def _position_mode(symbol: str) -> Optional[bool]:
     """
@@ -134,7 +189,6 @@ def _position_mode(symbol: str) -> Optional[bool]:
         return None
     d = js.get("data") or {}
     try:
-        # crossMode: True si mode cross, False si isolated
         cm = d.get("crossMode")
         if cm is None:
             return None
@@ -165,22 +219,20 @@ def place_limit_order(
     cross_mode: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """
-    - Envoie un LIMIT avec valueQty = value_usdt * leverage (ancien comportement)
-    - Envoie TJRS 'leverage' (si None → SETTINGS.default_leverage ou 5)
-    - Respect du tick
-    - Détection du crossMode courant; si mismatch → retente en flipant
-    - Retente si 100001 (Leverage invalid) en forçant un levier fallback
-    - Renvoie dict {"ok":bool, "code":..., "msg":..., "orderId":..., "clientOid":..., "data": {...}}
+    - LIMIT avec valueQty = value_usdt * leverage (ancien comportement)
+    - Envoie toujours 'leverage' (string)
+    - Prix quantifié au tick (directionnel)
+    - Détection du crossMode courant; si mismatch → flip et retry
+    - Retry si 100001 (Leverage invalid) avec levier fallback
+    - Renvoie {"ok":bool, "code":..., "msg":..., "orderId":..., "clientOid":..., "data": {...}}
     """
     _sync_server_time()
 
     lev = int(leverage or getattr(SETTINGS, "default_leverage", 5))
-    # Ancien calcul: notionnel = marge * levier
-    # value_usdt = marge (ex: 20) -> valueQty = marge * levier
-    value_qty = float(value_usdt) * float(lev)
+    value_qty = float(value_usdt) * float(lev)  # notionnel = marge * levier
 
     tick = _price_increment(symbol)
-    px   = _round_to_tick(float(price), tick)
+    px   = _quantize_price(float(price), tick, side)
 
     # crossMode: si non fourni → lire /position
     if cross_mode is None:
@@ -199,12 +251,8 @@ def place_limit_order(
             "valueQty": f"{value_qty:.4f}",
             "timeInForce": "GTC",
             "postOnly": bool(post_only),
-            # KuCoin futures:
-            # - leverage peut être string ou int; on envoie string pour sûreté
             "leverage": str(lev_force if lev_force is not None else lev),
-            # crossMode: True (cross) / False (isolated)
             "crossMode": bool(cross_flag),
-            # "reduceOnly": False   # si nécessaire
         }
         return body
 
@@ -251,7 +299,6 @@ def place_limit_order(
     if (not resp["ok"]) and ("Leverage parameter invalid" in str(resp["msg"]) or resp["code"] == "100001"):
         lev_fb = int(getattr(SETTINGS, "default_leverage", 5) or 5)
         if lev_fb == lev:
-            # si déjà identique, tente 3 ou 5 par défaut
             lev_fb = 5 if lev != 5 else 3
         log.info("[leverage] retry %s with leverage=%s", symbol, lev_fb)
         body = _make_body(body.get("crossMode", False), lev_force=lev_fb)
