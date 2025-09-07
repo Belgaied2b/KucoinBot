@@ -6,8 +6,8 @@ main.py — Boucle event-driven optimisée + logs détaillés
 - Logs clairs à chaque étape
 """
 
-import os, asyncio, logging, math, time
-from typing import Dict, Any, Tuple, List
+import os, asyncio, logging, math, time, inspect
+from typing import Dict, Any, Tuple, List, Union
 
 from ws_router import EventBus, PollingSource
 from execution_sfi import SFIEngine
@@ -118,6 +118,96 @@ def _build_symbols() -> List[str]:
 
 
 # ------------------------
+# Exécution robuste SFI
+# ------------------------
+def _normalize_orders(orders: Union[None, dict, list, tuple]) -> List[Dict[str, Any]]:
+    """Uniformise la sortie des méthodes d'exécution en liste de dicts."""
+    if orders is None:
+        return []
+    if isinstance(orders, dict):
+        return [orders]
+    if isinstance(orders, list):
+        # si la liste contient des tuples, convertis en dict minimal
+        out: List[Dict[str, Any]] = []
+        for it in orders:
+            if isinstance(it, dict):
+                out.append(it)
+            elif isinstance(it, tuple):
+                # on mappe génériquement
+                d = {"raw": tuple(it)}
+                out.append(d)
+            else:
+                out.append({"raw": it})
+        return out
+    if isinstance(orders, tuple):
+        # évite l'erreur "'tuple' object has no attribute 'get'"
+        return [{"raw": tuple(orders)}]
+    # fallback
+    return [{"raw": orders}]
+
+def _maybe_configure_tranches(engine: SFIEngine, tp1: float, tp2: float) -> None:
+    """Si l'engine supporte la config des tranches, configure une structure simple 2 TP."""
+    try:
+        if hasattr(engine, "configure_tranches") and callable(engine.configure_tranches):
+            engine.configure_tranches([
+                {"size": 0.5, "tp": float(tp1)},
+                {"size": 0.5, "tp": float(tp2)},
+            ])
+    except Exception as e:
+        log.debug("configure_tranches KO: %s", e)
+
+def _safe_place_orders(engine: SFIEngine, entry: float, sl: float, tp1: float, tp2: float) -> List[Dict[str, Any]]:
+    """Essaie plusieurs signatures usuelles des engines SFI, normalise la sortie."""
+    _maybe_configure_tranches(engine, tp1, tp2)
+
+    # 1) Signature la plus explicite (kwargs)
+    try:
+        orders = engine.place_initial(entry=float(entry), sl=float(sl), tp1=float(tp1), tp2=float(tp2))  # type: ignore
+        return _normalize_orders(orders)
+    except TypeError:
+        pass
+    except Exception as e:
+        log.error("place_initial(kwargs) KO: %s", e)
+
+    # 2) entry_hint
+    try:
+        orders = engine.place_initial(entry_hint=float(entry))  # type: ignore
+        return _normalize_orders(orders)
+    except TypeError:
+        pass
+    except Exception as e:
+        log.error("place_initial(entry_hint) KO: %s", e)
+
+    # 3) Positionnel (legacy)
+    try:
+        orders = engine.place_initial(float(entry), float(sl), float(tp1), float(tp2))  # type: ignore
+        return _normalize_orders(orders)
+    except TypeError:
+        pass
+    except Exception as e:
+        log.error("place_initial(positional) KO: %s", e)
+
+    # 4) Decision dict si exposé
+    try:
+        dec = {"entry": float(entry), "sl": float(sl), "tp1": float(tp1), "tp2": float(tp2)}
+        if hasattr(engine, "place_from_decision") and callable(engine.place_from_decision):
+            orders = engine.place_from_decision(dec)  # type: ignore
+            return _normalize_orders(orders)
+    except Exception as e:
+        log.error("place_from_decision KO: %s", e)
+
+    # 5) Dernier recours market si dispo
+    try:
+        if hasattr(engine, "place_market") and callable(engine.place_market):
+            orders = engine.place_market()  # type: ignore
+            return _normalize_orders(orders)
+    except Exception as e:
+        log.error("place_market KO: %s", e)
+
+    return []
+
+
+# ------------------------
 # Event handler
 # ------------------------
 async def handle_symbol_event(ev: Dict[str, Any], rg: RiskGuard, policy: MetaPolicy):
@@ -162,31 +252,14 @@ async def handle_symbol_event(ev: Dict[str, Any], rg: RiskGuard, policy: MetaPol
         try:
             thr = TUNER.update_and_get(symbol, df_h1, inst)  # seuils adaptatifs
             comps_cnt, comps_detail = components_ok(inst, thr)
-            score_val = float(inst.get("score", 0.0) or 0.0)
-
-            # ====== GATE TOLÉRANT (INSTITUTIONNEL) ======
-            # 4/4 => pass forcé, 3/4 => pass toléré, sinon => score gate classique
-            force_pass = comps_cnt >= 4
-            tol_pass   = (not force_pass) and (comps_cnt >= 3)
-            score_gate = (score_val >= float(thr["req_score"])) and (comps_cnt >= int(thr["components_min"]))
-            inst_ok    = force_pass or tol_pass or score_gate
-            reason     = ("force_pass_4of4" if force_pass else
-                          ("tolerance_pass_3of4" if tol_pass else
-                           ("score_gate" if score_gate else "reject")))
-
-            log.info(
-                "inst-gate: pass=%s reason=%s score=%.2f req=%.2f comps=%d/%d q=%.2f atr%%=%.2f",
-                inst_ok, reason, score_val, float(thr["req_score"]), comps_cnt, int(thr["components_min"]),
-                float(thr.get("q_used", 0.0)), float(thr.get("atr_pct", 0.0)),
-                extra={"symbol": symbol}
-            )
-
+            inst_ok = (float(inst.get("score",0)) >= thr["req_score"]) and (comps_cnt >= thr["components_min"])
+            log.info("inst-gate: pass=%s score=%.2f req=%.2f comps=%d/%d q=%.2f atr%%=%.2f",
+                     inst_ok, float(inst.get("score",0)), thr["req_score"], comps_cnt, thr["components_min"],
+                     float(thr.get("q_used", 0.0)), float(thr.get("atr_pct", 0.0)), extra={"symbol": symbol})
             if not inst_ok:
                 log.info("inst-reject details: %s", comps_detail, extra={"symbol": symbol})
-                try:
-                    update_perf_for_symbol(symbol, df_h1=df_h1)
-                except Exception:
-                    pass
+                try: update_perf_for_symbol(symbol, df_h1=df_h1)
+                except Exception: pass
                 return
         except Exception as e:
             log.warning("autotune failed: %s", e, extra={"symbol": symbol})
@@ -196,7 +269,12 @@ async def handle_symbol_event(ev: Dict[str, Any], rg: RiskGuard, policy: MetaPol
     try:
         log.debug("analyze...", extra={"symbol": symbol})
         try:
-            res = analyze_signal.analyze_signal(symbol=symbol, df_h1=df_h1, df_h4=df_h4, institutional=inst)
+            # nouvelle signature dict (valid=True/False) privilégiée
+            res = analyze_signal.analyze_signal(symbol=symbol,
+                                                entry_price=float(df_h1['close'].iloc[-1]),
+                                                df_h1=df_h1, df_h4=df_h4,
+                                                df_d1=df_h1, df_m15=df_h1,  # placeholders si non utilisés
+                                                inst=inst, macro={})
         except TypeError:
             # signature plus simple
             res = analyze_signal.analyze_signal(symbol=symbol, df_h1=df_h1, df_h4=df_h4)
@@ -204,7 +282,6 @@ async def handle_symbol_event(ev: Dict[str, Any], rg: RiskGuard, policy: MetaPol
         log.warning("analyze_signal KO: %s", e, extra={"symbol": symbol})
         return
 
-    # ---- Logs d'analyse détaillés
     if not isinstance(res, dict):
         log.info("no-trade (bad result type)", extra={"symbol": symbol})
         try: update_perf_for_symbol(symbol, df_h1=df_h1)
@@ -213,7 +290,7 @@ async def handle_symbol_event(ev: Dict[str, Any], rg: RiskGuard, policy: MetaPol
 
     side = str(res.get("side", "none")).lower()
     rr   = float(res.get("rr", 0) or 0)
-    score= float(res.get("inst_score", inst.get("score", 0) if isinstance(inst, dict) else 0) or 0)
+    score= float(res.get("inst_score", 0) or 0)
     comments_list = res.get("comments", []) or []
     comments = ", ".join([str(c) for c in comments_list]) if comments_list else ""
     log.info("analysis: side=%s rr=%.2f score=%.2f comment=%s",
@@ -221,15 +298,15 @@ async def handle_symbol_event(ev: Dict[str, Any], rg: RiskGuard, policy: MetaPol
 
     if not res.get("valid", False):
         log.info("no-trade (invalid signal) — rr=%.2f score=%.2f reason=%s",
-                 rr, score, (comments or "no reason"), extra={"symbol": symbol})
+                 rr, score, res.get("reason", "no reason"), extra={"symbol": symbol})
         try: update_perf_for_symbol(symbol, df_h1=df_h1)
         except Exception: pass
         return
 
     # --- Risk guard
-    ok, reason = rg.can_enter(symbol, ws_latency_ms=50, last_data_age_s=5)
-    if not ok:
-        log.info("blocked by risk_guard: %s", reason, extra={"symbol": symbol})
+    rg_ok, rg_reason = rg.can_enter(symbol, ws_latency_ms=50, last_data_age_s=5)
+    if not rg_ok:
+        log.info("blocked by risk_guard: %s", rg_reason, extra={"symbol": symbol})
         return
 
     # --- Policy
@@ -240,22 +317,30 @@ async def handle_symbol_event(ev: Dict[str, Any], rg: RiskGuard, policy: MetaPol
         except Exception: pass
         return
 
-    # --- Exécution
-    entry = res.get("entry"); sl, tp1, tp2 = res.get("sl"), res.get("tp1"), res.get("tp2")
+    # --- Exécution robuste
+    entry = float(res.get("entry") or df_h1["close"].astype(float).iloc[-1])
+    sl    = float(res.get("sl", 0.0) or 0.0)
+    tp1   = float(res.get("tp1", 0.0) or 0.0)
+    tp2   = float(res.get("tp2", 0.0) or 0.0)
     value_usdt = float(os.environ.get("ORDER_VALUE_USDT", "20"))
 
     log.info("EXEC %s entry=%s sl=%s tp1=%s tp2=%s val=%s",
              side.upper(), fmt_price(entry), fmt_price(sl), fmt_price(tp1), fmt_price(tp2), value_usdt,
              extra={"symbol": symbol})
 
-    eng = SFIEngine(symbol, side, value_usdt, sl, tp1, tp2)
-    orders = eng.place_initial(entry_hint=entry)
-    eng.maybe_requote()
+    try:
+        eng = SFIEngine(symbol, side, value_usdt, sl, tp1, tp2)
+    except TypeError:
+        # certaines versions attendent (symbol, side, config={...})
+        eng = SFIEngine(symbol, side, {"notional": value_usdt, "sl": sl, "tp1": tp1, "tp2": tp2})
+
+    orders = _safe_place_orders(eng, entry, sl, tp1, tp2)
     log.info("orders=%s", orders, extra={"symbol": symbol})
 
+    # Telegram
     msg = (f"🧠 *{symbol}* — *{side.upper()}* via *{label}*\n"
            f"RR: *{res.get('rr','—')}*  |  Entrée: *{fmt_price(entry)}*  |  SL: *{fmt_price(sl)}*  |  TP1: *{fmt_price(tp1)}*  TP2: *{fmt_price(tp2)}*\n"
-           f"Ordres: {orders}")
+           f"Ordres: {orders if orders else '—'}")
     send_telegram(msg)
 
     key = f"{symbol}:{side}:{fmt_price(entry)}:{round(res.get('rr',0),2)}"
