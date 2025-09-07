@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*- 
 """
 main.py — Boucle event-driven + fallback institutionnel structuré (OTE, liquidité, swings)
 - Direction H4, exécution H1 via OTE 62–79% et pools de liquidité
@@ -148,51 +148,112 @@ def _normalize_orders(orders: Union[None, dict, list, tuple]) -> List[Dict[str, 
     return [{"raw": orders}]
 
 def _maybe_configure_tranches(engine: SFIEngine, tp1: float, tp2: float) -> None:
+    """
+    Configure 2 tranches en testant plusieurs formats pour compat SFI :
+    1) [{"size":0.5,"tp":tp1}, {"size":0.5,"tp":tp2}]
+    2) [(0.5, tp1), (0.5, tp2)]
+    3) [tp1, tp2]
+    """
     try:
-        if hasattr(engine, "configure_tranches") and callable(engine.configure_tranches):
+        if not hasattr(engine, "configure_tranches") or not callable(engine.configure_tranches):
+            return
+
+        try:
             engine.configure_tranches([
                 {"size": 0.5, "tp": float(tp1)},
                 {"size": 0.5, "tp": float(tp2)},
             ])
+            return
+        except Exception as e:
+            log.debug("configure_tranches(dict) KO: %s", e)
+
+        try:
+            engine.configure_tranches([
+                (0.5, float(tp1)),
+                (0.5, float(tp2)),
+            ])
+            return
+        except Exception as e:
+            log.debug("configure_tranches(tuple) KO: %s", e)
+
+        try:
+            engine.configure_tranches([float(tp1), float(tp2)])
+            return
+        except Exception as e:
+            log.debug("configure_tranches(list-tp) KO: %s", e)
+
     except Exception as e:
-        log.debug("configure_tranches KO: %s", e)
+        log.debug("configure_tranches (wrapper) KO: %s", e)
 
 def _safe_place_orders(engine: SFIEngine, entry: float, sl: float, tp1: float, tp2: float) -> List[Dict[str, Any]]:
+    """
+    Essaie différentes signatures usuelles et normalise la sortie.
+    Ordre :
+      1) open_limit (si dispo)
+      2) place_initial (kwargs → entry_hint → positional)
+      3) place_from_decision
+      4) place_market
+    """
     _maybe_configure_tranches(engine, tp1, tp2)
+
+    # 1) open_limit (preferred)
     try:
+        if hasattr(engine, "open_limit") and callable(engine.open_limit):
+            log.info("try: open_limit(entry, sl, tp1, tp2)")
+            orders = engine.open_limit(float(entry), float(sl), float(tp1), float(tp2))  # type: ignore
+            return _normalize_orders(orders)
+    except Exception as e:
+        log.error("open_limit KO: %s", e)
+
+    # 2) place_initial kwargs
+    try:
+        log.info("try: place_initial(entry=, sl=, tp1=, tp2=)")
         orders = engine.place_initial(entry=float(entry), sl=float(sl), tp1=float(tp1), tp2=float(tp2))  # type: ignore
         return _normalize_orders(orders)
     except TypeError:
         pass
     except Exception as e:
         log.error("place_initial(kwargs) KO: %s", e)
+
+    # 2b) place_initial entry_hint
     try:
+        log.info("try: place_initial(entry_hint=)")
         orders = engine.place_initial(entry_hint=float(entry))  # type: ignore
         return _normalize_orders(orders)
     except TypeError:
         pass
     except Exception as e:
         log.error("place_initial(entry_hint) KO: %s", e)
+
+    # 2c) place_initial positional
     try:
+        log.info("try: place_initial(positional)")
         orders = engine.place_initial(float(entry), float(sl), float(tp1), float(tp2))  # type: ignore
         return _normalize_orders(orders)
     except TypeError:
         pass
     except Exception as e:
         log.error("place_initial(positional) KO: %s", e)
+
+    # 3) place_from_decision
     try:
+        log.info("try: place_from_decision({entry,sl,tp1,tp2})")
         dec = {"entry": float(entry), "sl": float(sl), "tp1": float(tp1), "tp2": float(tp2)}
         if hasattr(engine, "place_from_decision") and callable(engine.place_from_decision):
             orders = engine.place_from_decision(dec)  # type: ignore
             return _normalize_orders(orders)
     except Exception as e:
         log.error("place_from_decision KO: %s", e)
+
+    # 4) place_market
     try:
         if hasattr(engine, "place_market") and callable(engine.place_market):
+            log.info("try: place_market()")
             orders = engine.place_market()  # type: ignore
             return _normalize_orders(orders)
     except Exception as e:
         log.error("place_market KO: %s", e)
+
     return []
 
 # ------------------------
@@ -532,10 +593,12 @@ async def handle_symbol_event(ev: Dict[str, Any], rg: RiskGuard, policy: MetaPol
              side.upper(), fmt_price(entry), fmt_price(sl), fmt_price(tp1), fmt_price(tp2), value_usdt,
              extra={"symbol": symbol})
 
+    # ✅ Construction moteur dict-first (évite ambiguïtés de signatures)
     try:
-        eng = SFIEngine(symbol, side, value_usdt, sl, tp1, tp2)
-    except TypeError:
         eng = SFIEngine(symbol, side, {"notional": value_usdt, "sl": sl, "tp1": tp1, "tp2": tp2})
+    except TypeError:
+        # fallback anciens moteurs
+        eng = SFIEngine(symbol, side, value_usdt, sl, tp1, tp2)
 
     orders = _safe_place_orders(eng, entry, sl, tp1, tp2)
     log.info("orders=%s", orders, extra={"symbol": symbol})
