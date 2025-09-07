@@ -220,10 +220,25 @@ def analyze_one(symbol: str, macro: MacroCache, gate: InstThreshold) -> Tuple[Op
 
     try:
         inst_snap = inst_data.build_institutional_snapshot(symbol)
-        req = gate.threshold(symbol)  # NEW
+        req = gate.threshold(symbol)
         score = inst_snap.get("score", 0.0)
+
+        # Comptage des critères OK
+        oi_ok = inst_snap.get("oi_score", 0) > 0.2
+        fund_ok = inst_snap.get("funding_score", 0) > 0.2
+        liq_ok = inst_snap.get("liq_new_score", 0) > 0.2
+        cvd_ok = inst_snap.get("cvd_score", 0) > 0.2
+        ok_count = sum([oi_ok, fund_ok, liq_ok, cvd_ok])
+
+        # Règle stricte + tolérance 3/4
         passed = score >= req
-        LOG.info("[%s] inst-gate: pass=%s score=%.2f req=%.2f", symbol, passed, score, req)
+        tol_pass = False
+        if not passed and ok_count >= 3:
+            passed = True
+            tol_pass = True
+
+        LOG.info("[%s] inst-gate: pass=%s score=%.2f req=%.2f comps=%d tol=%s",
+                 symbol, passed, score, req, ok_count, tol_pass)
 
         res_raw = analyze_mod.analyze_signal(symbol=_canon_symbol(symbol),
                                              df_h1=df_h1, df_h4=df_h4,
@@ -235,7 +250,8 @@ def analyze_one(symbol: str, macro: MacroCache, gate: InstThreshold) -> Tuple[Op
 
     res = res_raw if isinstance(res_raw, dict) else {}
     res.setdefault("inst_score", inst_snap.get("score", 0.0))
-    res.setdefault("inst_ok_count", 0)
+    res.setdefault("inst_ok_count", ok_count)
+    res.setdefault("inst_tol_pass", tol_pass)
     return res, None
 
 # ---- Boucle principale
