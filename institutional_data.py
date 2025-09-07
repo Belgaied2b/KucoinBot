@@ -233,7 +233,8 @@ def build_institutional_snapshot(symbol: str, price_series: Optional[List[float]
     if sym in ("BTCUSDT", "ETHUSDT"):
         score = (0.45 * oi_s) + (0.35 * cvd_s) + (0.15 * fund_s) + (0.05 * liq_p["liq_new_score"])
     else:
-        score = (0.25 * oi_s) + (0.35 * cvd_s) + (0.25 * fund_s) + (0.15 * liq_p["liq_new_score"])
+        # CVD pèse moins, OI et Liq un peu plus
+        score = (0.30 * oi_s) + (0.25 * cvd_s) + (0.25 * fund_s) + (0.20 * liq_p["liq_new_score"])
 
     return {
         "oi_score": oi_s,
