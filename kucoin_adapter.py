@@ -1,23 +1,20 @@
 # -*- coding: utf-8 -*-
 """
-kucoin_adapter.py — Pont simplifié vers KuCoin Futures
-- S'aligne sur KucoinTrader (valueQty + leverage)
-- Expose: place_limit_order, get_symbol_meta, get_order_by_client_oid
-- Loggue et remonte les champs utiles (ok, code, msg, orderId/clientOid)
+kucoin_adapter.py — Pont simple vers KuCoin Futures via KucoinTrader
+- Normalise les retours: {"ok": bool, "orderId": str|None, "clientOid": str|None, "code": "...", "msg": "...", "data": {...}, "raw": "..."}
+- Tolère les kwargs inattendus (compat moteurs SFI/bridges)
+- Gère postOnly → retry auto si "post only" rejeté (ou si ordre devient taker)
 """
 
-import time
-from typing import Dict, Any, Optional
+import time, math, uuid, httpx
+from typing import Optional, Dict, Any
 
 from logger_utils import get_logger
-from kucoin_utils import fetch_symbol_meta
 from kucoin_trader import KucoinTrader
 
 log = get_logger("kucoin.adapter")
 
-# instance unique réutilisée (keep-alive httpx)
 _TRADER: Optional[KucoinTrader] = None
-
 
 def _trader() -> KucoinTrader:
     global _TRADER
@@ -25,134 +22,164 @@ def _trader() -> KucoinTrader:
         _TRADER = KucoinTrader()
     return _TRADER
 
-
+# ---------- META ----------
 def get_symbol_meta(symbol: str) -> Dict[str, Any]:
     """
-    Renvoie la meta d'un symbole au format de fetch_symbol_meta().
-    Les clés attendues: priceIncrement, lotSize, etc.
+    Essaie d'obtenir le meta depuis /api/v1/contracts/{symbol};
+    fallback à /api/v1/contracts/active puis filtre.
     """
+    base = _trader().base
+    headers = _trader()._headers("GET", "/api/v1/contracts/active")
     try:
-        meta = fetch_symbol_meta()
-        # meta keys comme "BTCUSDT": {"symbol_api": "BTCUSDTM", ...}
-        # on tente par symbol (ex: BTCUSDTM) et par racine (BTCUSDT)
-        s = symbol.upper().strip()
-        # essayer direct
-        for k, v in meta.items():
-            if str(v.get("symbol_api", "")).upper() == s:
-                return v or {}
-        # fallback: enlever le "M" final si fourni
-        if s.endswith("M"):
-            core = s[:-1]
-            if core in meta:
-                return meta.get(core, {}) or {}
-        # dernier fallback: renvoyer dict vide
+        # 1) direct
+        path = f"/api/v1/contracts/{symbol}"
+        r = httpx.get(base + path, headers=_trader()._headers("GET", path), timeout=5.0)
+        if r.status_code == 200:
+            js = r.json()
+            data = js.get("data") or {}
+            if isinstance(data, dict) and data.get("symbol"):
+                return data
+    except Exception:
+        pass
+
+    # 2) active list
+    try:
+        path = "/api/v1/contracts/active"
+        r = httpx.get(base + path, headers=headers, timeout=5.0)
+        if r.status_code == 200:
+            arr = (r.json() or {}).get("data") or []
+            for it in arr:
+                if (it or {}).get("symbol") == symbol:
+                    return it
     except Exception as e:
-        log.warning("get_symbol_meta KO: %s", e)
+        log.warning(f"get_symbol_meta fallback KO: {e}")
+
     return {}
 
+def _round_to_tick(px: float, tick: float) -> float:
+    if not tick or tick <= 0:
+        return float(px)
+    return math.floor(float(px) / float(tick)) * float(tick)
 
-def get_order_by_client_oid(client_oid: str) -> Optional[Dict[str, Any]]:
+def _estimate_tick_from_price(px: float) -> float:
+    if px >= 100: return 0.1
+    if px >= 10:  return 0.01
+    if px >= 1:   return 0.001
+    if px >= 0.1: return 0.0001
+    return 0.00001
+
+def _normalize_ok_json(ok: bool, js: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Wrapper simple vers KucoinTrader.get_order_by_client_oid
-    Renvoie None si pas trouvé / erreur, sinon un dict KuCoin (avec .data dedans).
+    Met à plat orderId/clientOid s'ils sont dans data.
+    Ajoute code/msg si présents.
     """
-    try:
-        t = _trader()
-        data = t.get_order_by_client_oid(client_oid)
-        # t.get_order_by_client_oid renvoie déjà js.get("data") si ok → data = {...} ou None
-        if isinstance(data, dict):
-            # normalise quelques champs racine
-            out = dict(data)
-            if "orderId" not in out and data.get("id"):
-                out["orderId"] = data["id"]
-            if "clientOid" not in out and data.get("clientOid"):
-                out["clientOid"] = data["clientOid"]
-            return out
-        return None
-    except Exception as e:
-        log.warning("get_order_by_client_oid(%s) KO: %s", client_oid, e)
-        return None
+    data = js.get("data") if isinstance(js, dict) else None
+    order_id = None
+    client_oid = None
+    if isinstance(data, dict):
+        order_id = data.get("orderId") or data.get("orderid") or data.get("id")
+        client_oid = data.get("clientOid") or data.get("clientOidId") or data.get("client_id")
 
+    return {
+        "ok": bool(ok),
+        "orderId": order_id,
+        "clientOid": client_oid,
+        "code": js.get("code"),
+        "msg": js.get("msg") or js.get("message"),
+        "data": data,
+        "raw": js,
+    }
 
+# ---------- ORDERS ----------
 def place_limit_order(
     symbol: str,
     side: str,
     price: float,
     value_usdt: float,
-    sl: float = 0.0,
-    tp1: float = 0.0,
-    tp2: float = 0.0,
-    post_only: bool = True,
+    sl: Optional[float] = None,
+    tp1: Optional[float] = None,
+    tp2: Optional[float] = None,
+    post_only: bool = False,
+    **kwargs
 ) -> Dict[str, Any]:
     """
-    Crée un LIMIT d'entrée via KucoinTrader.place_limit (valueQty + leverage).
-    Retourne un dict normalisé:
-      {
-        "ok": bool,
-        "code": "...",            # code d'erreur éventuel
-        "msg": "...",             # message éventuel
-        "orderId": "...",         # si disponible
-        "clientOid": "...",       # si disponible
-        "raw": {...}              # réponse complète KuCoin (si dispo)
-      }
-    NB: La pose des SL/TP réels (stop orders) n'est pas faite ici pour rester simple.
+    Place un LIMIT (postOnly configurable). Si rejet "post only" → retente sans postOnly.
+    Retour normalisé avec orderId/clientOid si succès.
     """
-    t = _trader()
+    tr = _trader()
 
-    # KuCoin veut buy/sell en minuscule
-    sd = side.lower().strip()
-    if sd not in ("buy", "sell"):
-        # on mappe "long"/"short" → "buy"/"sell"
-        if sd == "long":
-            sd = "buy"
-        elif sd == "short":
-            sd = "sell"
+    # Tick
+    meta = get_symbol_meta(symbol)
+    tick = float(meta.get("priceIncrement") or 0.0)
+    if tick <= 0:
+        tick = _estimate_tick_from_price(price)
+    px = _round_to_tick(price, tick)
 
-    client_oid = str(int(time.time() * 1000))
-    # place_limit de KucoinTrader utilise valueQty (= marge * leverage dans _value_qty())
-    # Ici on n'écrase PAS la logique interne: margin_per_trade et default_leverage sont dans Settings
-    # mais on peut surdimensionner en passant par place_limit_ioc/place_market si besoin.
-    ok, js = t.place_limit(
+    client_oid = kwargs.get("client_oid") or kwargs.get("clientOrderId") or kwargs.get("client_order_id")
+    if not client_oid:
+        client_oid = uuid.uuid4().hex
+
+    # 1) Essai avec postOnly (si demandé)
+    ok, js = tr.place_limit(
         symbol=symbol,
-        side=sd,
-        price=float(price),
+        side=side.lower(),
+        price=float(px),
         client_oid=client_oid,
         post_only=bool(post_only),
     )
+    res = _normalize_ok_json(ok, js)
 
-    out: Dict[str, Any] = {
-        "ok": bool(ok),
-        "clientOid": client_oid,
-        "raw": js,
-    }
+    # KuCoin peut renvoyer HTTP 200 mais code != "200000" → ok==False ci-dessus
+    msg = (res.get("msg") or "").lower()
+    is_postonly_reject = ("post only" in msg) or ("post-only" in msg) or ("postonly" in msg)
 
-    try:
-        # KuCoin renvoie typiquement {"code":"200000","data":{"orderId":"..."}}
-        if isinstance(js, dict):
-            code = js.get("code")
-            out["code"] = code
-            if "data" in js and isinstance(js["data"], dict):
-                data = js["data"]
-                if data.get("orderId"):
-                    out["orderId"] = data["orderId"]
-                if data.get("clientOid") and not out.get("clientOid"):
-                    out["clientOid"] = data["clientOid"]
-            # certains wrappers retournent {"msg":"...","code":"100001"} pour erreurs
-            if js.get("msg"):
-                out["msg"] = js.get("msg")
-                # si code != 200000 → force ok=False
-                if str(js.get("code", "")) != "200000":
-                    out["ok"] = False
-    except Exception as e:
-        log.warning("place_limit_order parse KO: %s", e)
+    if not res["ok"] and post_only and is_postonly_reject:
+        log.info(f"[{symbol}] postOnly rejeté → retry sans postOnly (clientOid={client_oid})")
+        ok2, js2 = tr.place_limit(
+            symbol=symbol,
+            side=side.lower(),
+            price=float(px),
+            client_oid=client_oid,  # on garde le même clientOid
+            post_only=False,
+        )
+        res = _normalize_ok_json(ok2, js2)
 
-    # log utile pour le debug terrain
-    if out.get("ok"):
-        log.info("[OK] LIMIT %s %s px=%.8f clientOid=%s orderId=%s",
-                 symbol, sd, price, out.get("clientOid"), out.get("orderId"))
-    else:
-        log.error("[ERR] LIMIT %s %s px=%.8f clientOid=%s code=%s msg=%s raw=%s",
-                  symbol, sd, price, out.get("clientOid"), out.get("code"),
-                  out.get("msg"), str(out.get("raw"))[:240])
+    # (Optionnel) Enregistrement d'un SL/TP serveur ici si tu implémentes des OCO séparés.
 
+    return res
+
+
+def get_order_by_client_oid(client_oid: str) -> Dict[str, Any]:
+    """
+    Retour JSON KuCoin pour un clientOid; normalise légèrement.
+    """
+    tr = _trader()
+    data = tr.get_order_by_client_oid(client_oid)
+    if not data:
+        return {"ok": False, "msg": "not found"}
+    out = {"ok": True, "data": data}
+    if isinstance(data, dict):
+        out["orderId"] = data.get("orderId")
+        out["clientOid"] = data.get("clientOid")
+        out["status"] = data.get("status") or data.get("state")
     return out
+
+
+def get_order_status(order_id: str) -> Dict[str, Any]:
+    """
+    Exemple si tu ajoutes plus tard un read par orderId (non strictement nécessaire si tu as clientOid).
+    Ici on passe par clientOid uniquement.
+    """
+    return {"ok": False, "msg": "not_implemented"}
+
+
+def cancel_order(order_id: str) -> Dict[str, Any]:
+    tr = _trader()
+    ok, js = tr.cancel(order_id)
+    return _normalize_ok_json(ok, js)
+
+
+def cancel_by_client_oid(client_oid: str) -> Dict[str, Any]:
+    tr = _trader()
+    ok, js = tr.cancel_by_client_oid(client_oid)
+    return _normalize_ok_json(ok, js)
