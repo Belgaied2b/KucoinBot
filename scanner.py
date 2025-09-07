@@ -25,6 +25,7 @@ from kucoin_utils import fetch_all_symbols, fetch_klines as _ku_get_klines  # ty
 from risk_sizing import valueqty_from_risk  # type: ignore
 from rr_costs import rr_gross, rr_net       # type: ignore
 import institutional_data as inst_data
+from institutional_data import get_required_score  # NEW
 
 # WebSocket Binance (liquidations temps réel)
 try:
@@ -199,11 +200,14 @@ class InstThreshold:
         if len(self.scores) > self.window:
             self.scores = self.scores[-self.window:]
         self._save()
-    def threshold(self) -> float:
-        if not self.scores: return self.floor
+    def threshold(self, symbol: str) -> float:
+        """Combine seuil adaptatif (quantile) avec le seuil minimum BTC/ETH vs Alts"""
+        base_req = get_required_score(symbol)  # NEW
+        if not self.scores:
+            return max(self.floor, base_req)
         arr = sorted(self.scores)
         k = max(0, min(len(arr)-1, int(math.ceil(self.q * len(arr)) - 1)))
-        return max(arr[k], self.floor)
+        return max(arr[k], self.floor, base_req)
 
 # ---- Analyse d'un symbole (MTF strict)
 def analyze_one(symbol: str, macro: MacroCache, gate: InstThreshold) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
@@ -216,7 +220,11 @@ def analyze_one(symbol: str, macro: MacroCache, gate: InstThreshold) -> Tuple[Op
 
     try:
         inst_snap = inst_data.build_institutional_snapshot(symbol)
-        LOG.info("[%s] inst_snap: %s", symbol, inst_snap)
+        req = gate.threshold(symbol)  # NEW
+        score = inst_snap.get("score", 0.0)
+        passed = score >= req
+        LOG.info("[%s] inst-gate: pass=%s score=%.2f req=%.2f", symbol, passed, score, req)
+
         res_raw = analyze_mod.analyze_signal(symbol=_canon_symbol(symbol),
                                              df_h1=df_h1, df_h4=df_h4,
                                              df_d1=df_d1, df_m15=df_m15,
