@@ -25,7 +25,7 @@ from kucoin_utils import fetch_all_symbols, fetch_klines as _ku_get_klines  # ty
 from risk_sizing import valueqty_from_risk  # type: ignore
 from rr_costs import rr_gross, rr_net       # type: ignore
 import institutional_data as inst_data
-from institutional_data import get_required_score  # NEW
+from institutional_data import get_required_score  # seuil mini BTC/ETH vs Alts
 
 # WebSocket Binance (liquidations temps réel)
 try:
@@ -115,6 +115,9 @@ SYMBOLS = [s.strip() for s in os.environ.get("SYMBOLS", "BTCUSDTM,ETHUSDTM,SOLUS
 SYMBOLS_MAX = _env_int("SYMBOLS_MAX", 450)
 
 LOG_DETAIL = os.environ.get("LOG_DETAIL", "1") == "1"
+
+# Seuil de validation d'un "critère OK" (OI, Funding, Liq, CVD)
+INST_OK_MIN = _env_float("INST_OK_MIN", 0.20)
 
 # ---- Utils généraux
 def now_iso() -> str:
@@ -223,41 +226,62 @@ def analyze_one(symbol: str, macro: MacroCache, gate: InstThreshold) -> Tuple[Op
         req = gate.threshold(symbol)
         score = inst_snap.get("score", 0.0)
 
-        # Comptage des critères OK
-        oi_ok = inst_snap.get("oi_score", 0) > 0.2
-        fund_ok = inst_snap.get("funding_score", 0) > 0.2
-        liq_ok = inst_snap.get("liq_new_score", 0) > 0.2
-        cvd_ok = inst_snap.get("cvd_score", 0) > 0.2
-        ok_count = sum([oi_ok, fund_ok, liq_ok, cvd_ok])
+        # Composantes & "OK" booléens
+        oi_s   = float(inst_snap.get("oi_score", 0.0) or 0.0)
+        fund_s = float(inst_snap.get("funding_score", 0.0) or 0.0)
+        liq_s  = float(inst_snap.get("liq_new_score", 0.0) or 0.0)
+        cvd_s  = float(inst_snap.get("cvd_score", 0.0) or 0.0)
 
-        # Règle stricte + tolérance 3/4
-        passed = score >= req
+        oi_ok   = oi_s   >= INST_OK_MIN
+        fund_ok = fund_s >= INST_OK_MIN
+        liq_ok  = liq_s  >= INST_OK_MIN
+        cvd_ok  = cvd_s  >= INST_OK_MIN
+
+        ok_count = int(oi_ok) + int(fund_ok) + int(liq_ok) + int(cvd_ok)
+
+        # Gate avec priorité tolérance:
+        # - 4/4 => force-pass
+        # - 3/4 => tolérance-pass
+        # - sinon => score gate
         tol_pass = False
-
-        # Force-pass si 4/4 critères OK
+        reason = "score_gate"
         if ok_count == 4:
             passed = True
             tol_pass = True
-        # Sinon tolérance classique 3/4
-        elif not passed and ok_count >= 3:
+            reason = "force_pass_4of4"
+        elif ok_count >= 3:
             passed = True
             tol_pass = True
+            reason = "tolerance_pass_3of4"
+        else:
+            passed = (score >= req)
+            reason = "score_gate" if passed else "reject"
 
-        LOG.info("[%s] inst-gate: pass=%s score=%.2f req=%.2f comps=%d tol=%s",
-                 symbol, passed, score, req, ok_count, tol_pass)
+        LOG.info(
+            "[%s] inst-gate: pass=%s reason=%s score=%.2f req=%.2f comps=%d/4 "
+            "vals(oi=%.2f,cvd=%.2f,fund=%.2f,liq=%.2f) oks(oi=%s,cvd=%s,fund=%s,liq=%s)",
+            symbol, passed, reason, score, req, ok_count,
+            oi_s, cvd_s, fund_s, liq_s,
+            oi_ok, cvd_ok, fund_ok, liq_ok
+        )
 
-        res_raw = analyze_mod.analyze_signal(symbol=_canon_symbol(symbol),
-                                             df_h1=df_h1, df_h4=df_h4,
-                                             df_d1=df_d1, df_m15=df_m15,
-                                             inst=inst_snap,
-                                             macro=macro.snapshot())
+        res_raw = analyze_mod.analyze_signal(
+            symbol=_canon_symbol(symbol),
+            df_h1=df_h1, df_h4=df_h4,
+            df_d1=df_d1, df_m15=df_m15,
+            inst=inst_snap,
+            macro=macro.snapshot()
+        )
     except Exception as e:
         return None, f"analyze_signal error: {e}"
 
     res = res_raw if isinstance(res_raw, dict) else {}
-    res.setdefault("inst_score", inst_snap.get("score", 0.0))
-    res.setdefault("inst_ok_count", ok_count)
-    res.setdefault("inst_tol_pass", tol_pass)
+    # Champs utiles en aval pour l'exécution/envoi
+    res["inst_score"] = score
+    res["inst_ok_count"] = ok_count
+    res["inst_tol_pass"] = tol_pass
+    res["inst_pass"] = passed
+    res["inst_pass_reason"] = reason
     return res, None
 
 # ---- Boucle principale
@@ -281,7 +305,11 @@ def scan_and_send_signals(symbols: Optional[List[str]] = None) -> Dict[str, Any]
             LOG.info("[%s] %s", sym, err); errors += 1; continue
         if not res:
             continue
+
+        # Ici tu peux déclencher l'envoi si inst_pass == True
+        # (laisser comme c'était si c'est géré ailleurs)
         LOG.info("[%s] decision: %s", sym, res)
+
     return {"scanned": scanned, "sent": sent, "errors": errors, "ts": now_iso()}
 
 if __name__ == "__main__":
