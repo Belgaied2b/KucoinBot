@@ -202,7 +202,7 @@ class InstThreshold:
         self._save()
     def threshold(self, symbol: str) -> float:
         """Combine seuil adaptatif (quantile) avec le seuil minimum BTC/ETH vs Alts"""
-        base_req = get_required_score(symbol)  # NEW
+        base_req = get_required_score(symbol)
         if not self.scores:
             return max(self.floor, base_req)
         arr = sorted(self.scores)
@@ -233,7 +233,13 @@ def analyze_one(symbol: str, macro: MacroCache, gate: InstThreshold) -> Tuple[Op
         # Règle stricte + tolérance 3/4
         passed = score >= req
         tol_pass = False
-        if not passed and ok_count >= 3:
+
+        # Force-pass si 4/4 critères OK
+        if ok_count == 4:
+            passed = True
+            tol_pass = True
+        # Sinon tolérance classique 3/4
+        elif not passed and ok_count >= 3:
             passed = True
             tol_pass = True
 
