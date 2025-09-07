@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-main.py — Boucle event-driven optimisée + logs détaillés
-- Build des symboles via fetch_symbol_meta() (contrats USDTM)
-- Institutionnel + autotune si présents (soft import)
-- Logs clairs à chaque étape
+main.py — Boucle event-driven + fallback institutionnel structuré (OTE, liquidité, swings)
+- Direction H4, exécution H1 via OTE 62–79% et pools de liquidité
+- SL derrière la liquidité/swing + buffer ATR
+- TP1 swing/pool opposé, TP2 RR cible (2.0 par défaut)
 """
 
-import os, asyncio, logging, math, time, inspect
+import os, asyncio, logging, math, time
 from typing import Dict, Any, Tuple, List, Union
 
 from ws_router import EventBus, PollingSource
@@ -17,7 +17,7 @@ from perf_metrics import register_signal_perf, update_perf_for_symbol
 from kucoin_utils import fetch_klines, fetch_symbol_meta
 from log_setup import init_logging, enable_httpx
 
-# ---- Soft imports pour l'institutionnel / autotune (optionnels)
+# ---- Soft imports institutionnel / autotune
 HAS_INST = True
 try:
     from inst_enrich import get_institutional_snapshot  # type: ignore
@@ -46,12 +46,20 @@ H4_REFRESH_SEC            = int(os.getenv("H4_REFRESH_SEC", "300"))
 ANALYSIS_MIN_INTERVAL_SEC = int(os.getenv("ANALYSIS_MIN_INTERVAL_SEC", "15"))
 WS_POLL_SEC               = int(os.getenv("WS_POLL_SEC", "5"))
 
+# Cibles / buffers institutionnels
+RR_TARGET_TP2             = float(os.getenv("INST_RR_TARGET_TP2", "2.0"))
+ATR_SL_MULT               = float(os.getenv("INST_ATR_SL_MULT", "1.0"))     # buffer ajouté derrière le swing/liquidité
+ATR_MIN_PCT               = float(os.getenv("INST_ATR_MIN_PCT", "0.003"))   # fallback ATR min = 0.3% prix
+EQ_TOL_PCT                = float(os.getenv("INST_EQ_TOL_PCT", "0.0006"))   # tolérance equal highs/lows (0.06%)
+OTE_LOW                   = float(os.getenv("INST_OTE_LOW", "0.62"))
+OTE_HIGH                  = float(os.getenv("INST_OTE_HIGH", "0.79"))
+OTE_MID                   = (OTE_LOW + OTE_HIGH) / 2.0
+
 _KLINE_CACHE: Dict[str, Dict[str, Any]] = {}
 _LAST_ANALYSIS_TS: Dict[str, float] = {}
 
 log = logging.getLogger("runner")
 TUNER = InstAutoTune() if HAS_TUNER else None  # type: ignore
-
 
 # ------------------------
 # Utils
@@ -68,13 +76,18 @@ def fmt_price(x):
 def send_telegram(text: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         log.info("[TG OFF] %s", text); return
-    import requests
+    import httpx
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    try:
-        requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text,
-                                 "parse_mode":"Markdown", "disable_web_page_preview": True}, timeout=10)
-    except Exception as e:
-        log.error("Telegram KO: %s", e)
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode":"Markdown", "disable_web_page_preview": True}
+    for attempt in (1, 2):
+        try:
+            resp = httpx.post(url, json=payload, timeout=10)
+            if resp.status_code == 200 and (resp.json().get("ok") is True):
+                log.info("Telegram OK (len=%s)", len(text)); return
+            else:
+                log.warning("Telegram HTTP=%s body=%s (attempt %s)", resp.status_code, resp.text[:200], attempt)
+        except Exception as e:
+            log.error("Telegram KO: %s (attempt %s)", e, attempt)
 
 def _get_klines_cached(symbol: str) -> Tuple[Any, Any]:
     now = time.time()
@@ -100,15 +113,11 @@ def _get_klines_cached(symbol: str) -> Tuple[Any, Any]:
     return ent.get("h1"), ent.get("h4")
 
 def _build_symbols() -> List[str]:
-    """
-    Construit la liste des contrats USDTM (ex: BTCUSDTM) à partir de fetch_symbol_meta().
-    - Respecte l'env SYMBOLS="BTCUSDTM,ETHUSDTM" si fourni.
-    """
     env_syms = os.getenv("SYMBOLS", "").strip()
     if env_syms:
         lst = [s.strip().upper() for s in env_syms.split(",") if s.strip()]
         return sorted(set(lst))
-    meta = fetch_symbol_meta()  # clés = "BTCUSDT", valeurs -> {"symbol_api":"BTCUSDTM", ...}
+    meta = fetch_symbol_meta()
     syms = []
     for v in meta.values():
         sym_api = str(v.get("symbol_api", "")).strip().upper()
@@ -116,12 +125,10 @@ def _build_symbols() -> List[str]:
             syms.append(sym_api)
     return sorted(set(syms))
 
-
 # ------------------------
 # Exécution robuste SFI
 # ------------------------
 def _normalize_orders(orders: Union[None, dict, list, tuple]) -> List[Dict[str, Any]]:
-    """Uniformise la sortie des méthodes d'exécution en liste de dicts."""
     if orders is None:
         return []
     if isinstance(orders, dict):
@@ -132,8 +139,7 @@ def _normalize_orders(orders: Union[None, dict, list, tuple]) -> List[Dict[str, 
             if isinstance(it, dict):
                 out.append(it)
             elif isinstance(it, tuple):
-                d = {"raw": tuple(it)}
-                out.append(d)
+                out.append({"raw": tuple(it)})
             else:
                 out.append({"raw": it})
         return out
@@ -142,7 +148,6 @@ def _normalize_orders(orders: Union[None, dict, list, tuple]) -> List[Dict[str, 
     return [{"raw": orders}]
 
 def _maybe_configure_tranches(engine: SFIEngine, tp1: float, tp2: float) -> None:
-    """Si l'engine supporte la config des tranches, configure une structure simple 2 TP."""
     try:
         if hasattr(engine, "configure_tranches") and callable(engine.configure_tranches):
             engine.configure_tranches([
@@ -153,10 +158,7 @@ def _maybe_configure_tranches(engine: SFIEngine, tp1: float, tp2: float) -> None
         log.debug("configure_tranches KO: %s", e)
 
 def _safe_place_orders(engine: SFIEngine, entry: float, sl: float, tp1: float, tp2: float) -> List[Dict[str, Any]]:
-    """Essaie plusieurs signatures usuelles des engines SFI, normalise la sortie."""
     _maybe_configure_tranches(engine, tp1, tp2)
-
-    # 1) Signature kwargs
     try:
         orders = engine.place_initial(entry=float(entry), sl=float(sl), tp1=float(tp1), tp2=float(tp2))  # type: ignore
         return _normalize_orders(orders)
@@ -164,8 +166,6 @@ def _safe_place_orders(engine: SFIEngine, entry: float, sl: float, tp1: float, t
         pass
     except Exception as e:
         log.error("place_initial(kwargs) KO: %s", e)
-
-    # 2) entry_hint
     try:
         orders = engine.place_initial(entry_hint=float(entry))  # type: ignore
         return _normalize_orders(orders)
@@ -173,8 +173,6 @@ def _safe_place_orders(engine: SFIEngine, entry: float, sl: float, tp1: float, t
         pass
     except Exception as e:
         log.error("place_initial(entry_hint) KO: %s", e)
-
-    # 3) Positionnel (legacy)
     try:
         orders = engine.place_initial(float(entry), float(sl), float(tp1), float(tp2))  # type: ignore
         return _normalize_orders(orders)
@@ -182,8 +180,6 @@ def _safe_place_orders(engine: SFIEngine, entry: float, sl: float, tp1: float, t
         pass
     except Exception as e:
         log.error("place_initial(positional) KO: %s", e)
-
-    # 4) Decision dict
     try:
         dec = {"entry": float(entry), "sl": float(sl), "tp1": float(tp1), "tp2": float(tp2)}
         if hasattr(engine, "place_from_decision") and callable(engine.place_from_decision):
@@ -191,17 +187,185 @@ def _safe_place_orders(engine: SFIEngine, entry: float, sl: float, tp1: float, t
             return _normalize_orders(orders)
     except Exception as e:
         log.error("place_from_decision KO: %s", e)
-
-    # 5) Market fallback
     try:
         if hasattr(engine, "place_market") and callable(engine.place_market):
             orders = engine.place_market()  # type: ignore
             return _normalize_orders(orders)
     except Exception as e:
         log.error("place_market KO: %s", e)
-
     return []
 
+# ------------------------
+# Outils de structure "institutionnels"
+# ------------------------
+def _compute_atr(df, period: int = 14) -> float:
+    try:
+        h = df['high'].astype(float); l = df['low'].astype(float); c = df['close'].astype(float)
+        prev_c = c.shift(1)
+        tr = (h - l).abs()
+        tr = tr.combine((h - prev_c).abs(), max).combine((l - prev_c).abs(), max)
+        atr = tr.rolling(window=period, min_periods=period).mean().iloc[-1]
+        return float(atr) if atr and atr > 0 else 0.0
+    except Exception:
+        return 0.0
+
+def _swing_highs_lows(df, lookback: int = 3) -> Tuple[List[int], List[int]]:
+    """
+    Détection simple: swing high si High[i] est le max sur i-lookback..i+lookback.
+    Retourne index des swing_highs et swing_lows.
+    """
+    hs, ls = [], []
+    h = df['high'].astype(float).values
+    l = df['low'].astype(float).values
+    n = len(df)
+    for i in range(lookback, n - lookback):
+        if h[i] == max(h[i-lookback:i+lookback+1]):
+            hs.append(i)
+        if l[i] == min(l[i-lookback:i+lookback+1]):
+            ls.append(i)
+    return hs, ls
+
+def _last_impulse(df, side_hint: str) -> Tuple[float, float]:
+    """
+    Trouve une jambe impulsive récente:
+     - LONG: dernier swing low -> dernier swing high plus récent
+     - SHORT: dernier swing high -> dernier swing low plus récent
+    """
+    hs, ls = _swing_highs_lows(df, lookback=3)
+    if not hs or not ls:
+        c = float(df['close'].astype(float).iloc[-1])
+        return (c * 0.98, c * 1.02) if side_hint == "long" else (c * 1.02, c * 0.98)
+    if side_hint == "long":
+        last_low_idx = ls[-1]
+        later_highs = [i for i in hs if i > last_low_idx]
+        if later_highs:
+            hh = float(df['high'].astype(float).iloc[later_highs[-1]])
+            ll = float(df['low'].astype(float).iloc[last_low_idx])
+            return ll, hh
+    else:
+        last_high_idx = hs[-1]
+        later_lows = [i for i in ls if i > last_high_idx]
+        if later_lows:
+            ll = float(df['low'].astype(float).iloc[later_lows[-1]])
+            hh = float(df['high'].astype(float).iloc[last_high_idx])
+            return hh, ll
+    # fallback: borne min/max sur 100 dernières barres
+    win = df.tail(100)
+    return float(win['low'].min()), float(win['high'].max())
+
+def _equal_levels(prices: List[float], tol_pct: float) -> List[float]:
+    """
+    Regroupe des niveaux “égaux” dans une tolérance en %.
+    Retourne la liste des niveaux (médianes de clusters).
+    """
+    if not prices: return []
+    prices = sorted(prices)
+    clusters = [[prices[0]]]
+    for p in prices[1:]:
+        if abs(p - clusters[-1][-1]) / clusters[-1][-1] <= tol_pct:
+            clusters[-1].append(p)
+        else:
+            clusters.append([p])
+    # ne garder que les pools significatifs (>=2 touches)
+    pools = [sum(c)/len(c) for c in clusters if len(c) >= 2]
+    return pools
+
+def _liquidity_pools(df) -> Tuple[List[float], List[float]]:
+    """Pools de liquidité simples via equal highs / equal lows sur H1."""
+    hs, ls = _swing_highs_lows(df, lookback=2)
+    highs = [float(df['high'].iloc[i]) for i in hs]
+    lows  = [float(df['low'].iloc[i])  for i in ls]
+    return _equal_levels(highs, EQ_TOL_PCT), _equal_levels(lows, EQ_TOL_PCT)
+
+def _h4_direction(df_h4, inst: Dict[str, Any]) -> str:
+    """
+    Direction “institutionnelle”:
+      - BOS simplifié via HH/LL récents + CVD/Funding/Delta pour pondérer.
+    """
+    hs, ls = _swing_highs_lows(df_h4, lookback=2)
+    dir_struct = "long"
+    if len(hs) >= 2 and len(ls) >= 2:
+        hh_new = df_h4['high'].iloc[hs[-1]] > df_h4['high'].iloc[hs[-2]]
+        ll_new = df_h4['low'].iloc[ls[-1]]  < df_h4['low'].iloc[ls[-2]]
+        if hh_new and not ll_new:
+            dir_struct = "long"
+        elif ll_new and not hh_new:
+            dir_struct = "short"
+        else:
+            # neutre → pondérer par insti
+            pass
+    cvd = float(inst.get("delta_cvd_usd", 0) or 0.0)
+    d_s = float(inst.get("delta_score", 0) or 0.0)
+    f_s = float(inst.get("funding_score", 0) or 0.0)
+    bias = "long" if (cvd > 0 or (d_s >= 0.5 and f_s >= 0.6)) else "short"
+    # Si conflictuel, garder struct, sinon suivre bias
+    return dir_struct if dir_struct != "neutral" else bias
+
+def _project_ote_entry(ll: float, hh: float, side: str) -> float:
+    if side == "long":
+        # retracement depuis HH vers LL (Fib down)
+        return hh - (hh - ll) * OTE_MID
+    else:
+        # retracement depuis LL vers HH (Fib up)
+        return ll + (hh - ll) * OTE_MID
+
+def _inst_structured_decision(symbol: str, inst: Dict[str, Any], df_h1, df_h4) -> Union[None, Dict[str, Any]]:
+    """
+    Décision fallback institutionnelle structurée:
+      - Direction H4 (BOS simplifié) + insti
+      - Impulsion H1 -> OTE 62–79%
+      - SL derrière pool de liquidité / swing + buffer ATR
+      - TP1 swing/pool opposé, TP2 RR cible
+    """
+    try:
+        side = _h4_direction(df_h4, inst)
+        # Jambe impulsive (H1)
+        ll, hh = _last_impulse(df_h1, side)
+        entry = _project_ote_entry(ll, hh, side)
+
+        atr = _compute_atr(df_h1, period=14)
+        if atr <= 0:
+            atr = float(df_h1['close'].astype(float).iloc[-1]) * ATR_MIN_PCT
+
+        # Pools de liquidité (H1)
+        eq_highs, eq_lows = _liquidity_pools(df_h1)
+
+        if side == "long":
+            # SL sous le pool de lows le plus proche sous le swing low, sinon sous le swing low
+            pool_below = [p for p in eq_lows if p <= ll * (1 + EQ_TOL_PCT)]
+            sl_base = max(pool_below) if pool_below else ll
+            sl = max(1e-12, sl_base - ATR_SL_MULT * atr)
+            # TP1 vers le dernier HH/pool
+            tp1_candidate = max(eq_highs) if eq_highs else hh
+            tp1 = max(entry + atr, tp1_candidate)  # au moins +1*ATR, sinon pool
+            # TP2 par RR cible
+            risk = max(entry - sl, 1e-12)
+            tp2 = entry + RR_TARGET_TP2 * risk
+        else:
+            pool_above = [p for p in eq_highs if p >= hh * (1 - EQ_TOL_PCT)]
+            sl_base = min(pool_above) if pool_above else hh
+            sl = sl_base + ATR_SL_MULT * atr
+            tp1_candidate = min(eq_lows) if eq_lows else ll
+            tp1 = min(entry - atr, tp1_candidate)  # au moins -1*ATR, sinon pool
+            risk = max(sl - entry, 1e-12)
+            tp2 = entry - RR_TARGET_TP2 * risk
+
+        rr = abs((tp2 - entry) / (entry - sl))
+
+        return {
+            "valid": True,
+            "side": side,
+            "entry": float(entry),
+            "sl": float(sl),
+            "tp1": float(tp1),
+            "tp2": float(tp2),
+            "rr": float(rr),
+            "reason": "INST_STRUCT_FALLBACK",
+            "comments": ["inst_struct", f"atr={atr:.8f}", f"impulse=({ll:.10f},{hh:.10f})"]
+        }
+    except Exception as e:
+        log.warning("inst_structured_decision KO: %s", e, extra={"symbol": symbol})
+        return None
 
 # ------------------------
 # Event handler
@@ -213,14 +377,14 @@ async def handle_symbol_event(ev: Dict[str, Any], rg: RiskGuard, policy: MetaPol
         return
     log.info("event: %s", etype, extra={"symbol": symbol})
 
-    # anti-spam analyse
+    # anti-spam
     last = _LAST_ANALYSIS_TS.get(symbol, 0.0)
     if time.time() - last < ANALYSIS_MIN_INTERVAL_SEC:
         log.debug("skip: analysis throttle", extra={"symbol": symbol})
         return
     _LAST_ANALYSIS_TS[symbol] = time.time()
 
-    # klines cache
+    # klines
     try:
         df_h1, df_h4 = _get_klines_cached(symbol)
     except Exception as e:
@@ -230,9 +394,9 @@ async def handle_symbol_event(ev: Dict[str, Any], rg: RiskGuard, policy: MetaPol
         log.warning("klines vides", extra={"symbol": symbol})
         return
 
-    # --- Institutionnel + autotune (si dispo)
+    # --- Institutionnel + autotune
     inst: Dict[str, Any] = {}
-    inst_gate_pass = True  # par défaut: si pas d'autotune, on ne bloque pas
+    inst_gate_pass = True
     inst_gate_reason = "n/a"
     comps_cnt = 0
     comps_min = 0
@@ -252,26 +416,21 @@ async def handle_symbol_event(ev: Dict[str, Any], rg: RiskGuard, policy: MetaPol
 
     if HAS_INST and HAS_TUNER and TUNER is not None:
         try:
-            thr = TUNER.update_and_get(symbol, df_h1, inst)  # seuils adaptatifs
+            thr = TUNER.update_and_get(symbol, df_h1, inst)
             comps_cnt, comps_detail = components_ok(inst, thr)
             comps_min = thr["components_min"]
 
-            # --- NOUVEL GATING CONFORME À LA SPÉCIFICATION ---
             score_val = float(inst.get("score", 0) or 0.0)
             req_score = float(thr.get("req_score", 1.2) or 1.2)
 
             if comps_cnt >= 4:
-                inst_gate_pass = True
-                inst_gate_reason = "force_pass_4of4"
+                inst_gate_pass = True;  inst_gate_reason = "force_pass_4of4"
             elif comps_cnt >= 3:
-                inst_gate_pass = True
-                inst_gate_reason = "tolerance_pass_3of4"
+                inst_gate_pass = True;  inst_gate_reason = "tolerance_pass_3of4"
             elif score_val >= req_score:
-                inst_gate_pass = True
-                inst_gate_reason = "score_gate"
+                inst_gate_pass = True;  inst_gate_reason = "score_gate"
             else:
-                inst_gate_pass = False
-                inst_gate_reason = "reject"
+                inst_gate_pass = False; inst_gate_reason = "reject"
 
             log.info("inst-gate: pass=%s reason=%s score=%.2f req=%.2f comps=%d/%d q=%.2f atr%%=%.2f",
                      inst_gate_pass, inst_gate_reason, score_val, req_score, comps_cnt, comps_min,
@@ -284,24 +443,21 @@ async def handle_symbol_event(ev: Dict[str, Any], rg: RiskGuard, policy: MetaPol
                 return
         except Exception as e:
             log.warning("autotune failed: %s", e, extra={"symbol": symbol})
-            # on continue sans gating si l'autotune a un souci
             inst_gate_pass = True
             inst_gate_reason = "autotune_fail_bypass"
 
-    # --- Analyse (avec institutional si supporté)
+    # --- Analyse “classique”
     try:
         log.debug("analyze...", extra={"symbol": symbol})
         try:
-            # signature dict (valid=True/False) privilégiée
             res = analyze_signal.analyze_signal(
                 symbol=symbol,
                 entry_price=float(df_h1['close'].iloc[-1]),
                 df_h1=df_h1, df_h4=df_h4,
-                df_d1=df_h1, df_m15=df_h1,  # placeholders si non utilisés
+                df_d1=df_h1, df_m15=df_h1,
                 inst=inst, macro={}
             )
         except TypeError:
-            # signature plus simple
             res = analyze_signal.analyze_signal(symbol=symbol, df_h1=df_h1, df_h4=df_h4)
     except Exception as e:
         log.warning("analyze_signal KO: %s", e, extra={"symbol": symbol})
@@ -321,54 +477,51 @@ async def handle_symbol_event(ev: Dict[str, Any], rg: RiskGuard, policy: MetaPol
     log.info("analysis: side=%s rr=%.2f score=%.2f comment=%s",
              side, rr, score, comments or "—", extra={"symbol": symbol})
 
-    # Diagnostics communs pour logs/pré-signal
     diag = (res.get("manage", {}) or {}).get("diagnostics", {})
     tolerated = diag.get("tolerated", res.get("tolerated", []))
 
-    # --- Cas: signal invalide -> log enrichi + PRE-SIGNAL si inst OK
+    # --- Fallback institutionnel STRUCTURÉ si signal invalide et gate OK
+    force_exec = False
     if not res.get("valid", False) or side not in ("long", "short"):
+        reason = res.get("reason") or "REJET — analyse classique invalide"
         log.info("no-trade (invalid signal) — rr=%.2f score=%.2f reason=%s tolerated=%s diag=%s",
-                 rr, score, res.get("reason", "no reason"), tolerated, diag, extra={"symbol": symbol})
+                 rr, score, reason, tolerated, diag, extra={"symbol": symbol})
 
-        # Conditions d'envoi de pré-signal : gate insti passé OU flag pre_shoot OU inst_score élevé
-        inst_score_res = float(res.get("inst_score", (inst or {}).get("score", 0)) or 0)
-        if (HAS_INST and inst_gate_pass) or res.get("pre_shoot", False) or inst_score_res >= 0.70:
-            pre_msg = (
-                f"🟡 *{symbol}* — Pré-signal (insti OK: {inst_gate_reason})\n"
-                f"*Inst score*: {inst_score_res:.2f}  |  *Composantes*: {comps_cnt}/{max(1, comps_min)}\n"
-                f"*RR*: {rr:.2f}  |  *Side*: {side.upper() if side!='none' else 'NONE'}\n"
-                f"*Raison rejet*: {res.get('reason','—')}\n"
-                f"*Tolérances*: {tolerated if tolerated else '—'}"
-            )
-            send_telegram(pre_msg)
-
-        try: update_perf_for_symbol(symbol, df_h1=df_h1)
-        except Exception: pass
-        return
+        if HAS_INST and inst_gate_pass:
+            fb = _inst_structured_decision(symbol, inst, df_h1, df_h4)
+            if fb:
+                res.update(fb)
+                side = fb["side"]; rr = float(fb["rr"])
+                log.info("INST_STRUCT_FALLBACK applied — side=%s rr=%.2f entry=%s sl=%s tp1=%s tp2=%s",
+                         side, rr, fmt_price(fb["entry"]), fmt_price(fb["sl"]),
+                         fmt_price(fb["tp1"]), fmt_price(fb["tp2"]), extra={"symbol": symbol})
+                force_exec = True
+            else:
+                try: update_perf_for_symbol(symbol, df_h1=df_h1)
+                except Exception: pass
+                return
+        else:
+            try: update_perf_for_symbol(symbol, df_h1=df_h1)
+            except Exception: pass
+            return
 
     # --- Risk guard
     rg_ok, rg_reason = rg.can_enter(symbol, ws_latency_ms=50, last_data_age_s=5)
     if not rg_ok:
         log.info("blocked by risk_guard: %s", rg_reason, extra={"symbol": symbol})
-        # on envoie aussi un pré-signal si l'insti est OK pour ne pas perdre l'info
-        if HAS_INST and inst_gate_pass:
-            send_telegram(f"🟡 *{symbol}* — Pré-signal bloqué par *RiskGuard*: {rg_reason}")
         return
 
-    # --- Policy
-    arm, weight, label = policy.choose({"atr_pct": res.get("atr_pct", 0), "adx_proxy": res.get("adx_proxy", 0)})
-    if weight < 0.25 and rr < 1.5:
-        log.info("policy reject — arm=%s w=%.2f rr=%.2f", arm, weight, rr, extra={"symbol": symbol})
-        # pré-signal si insti OK
-        if HAS_INST and inst_gate_pass:
-            send_telegram(
-                f"🟡 *{symbol}* — Pré-signal rejeté par *Policy* (arm={arm}, w={weight:.2f}, RR={rr:.2f})"
-            )
-        try: update_perf_for_symbol(symbol, df_h1=df_h1)
-        except Exception: pass
-        return
+    # --- Policy (bypass si fallback insti)
+    label = "INST_STRUCT" if force_exec else None
+    if not force_exec:
+        arm, weight, label = policy.choose({"atr_pct": res.get("atr_pct", 0), "adx_proxy": res.get("adx_proxy", 0)})
+        if weight < 0.25 and rr < 1.5:
+            log.info("policy reject — arm=%s w=%.2f rr=%.2f", arm, weight, rr, extra={"symbol": symbol})
+            try: update_perf_for_symbol(symbol, df_h1=df_h1)
+            except Exception: pass
+            return
 
-    # --- Exécution robuste
+    # --- Exécution
     entry = float(res.get("entry") or df_h1["close"].astype(float).iloc[-1])
     sl    = float(res.get("sl", 0.0) or 0.0)
     tp1   = float(res.get("tp1", 0.0) or 0.0)
@@ -382,14 +535,14 @@ async def handle_symbol_event(ev: Dict[str, Any], rg: RiskGuard, policy: MetaPol
     try:
         eng = SFIEngine(symbol, side, value_usdt, sl, tp1, tp2)
     except TypeError:
-        # certaines versions attendent (symbol, side, config={...})
         eng = SFIEngine(symbol, side, {"notional": value_usdt, "sl": sl, "tp1": tp1, "tp2": tp2})
 
     orders = _safe_place_orders(eng, entry, sl, tp1, tp2)
     log.info("orders=%s", orders, extra={"symbol": symbol})
 
-    # Telegram (signal exécuté)
-    msg = (f"🧠 *{symbol}* — *{side.upper()}* via *{label}*\n"
+    # Telegram
+    lbl = label or "META_POLICY"
+    msg = (f"🧠 *{symbol}* — *{side.upper()}* via *{lbl}*\n"
            f"RR: *{res.get('rr','—')}*  |  Entrée: *{fmt_price(entry)}*  |  SL: *{fmt_price(sl)}*  |  TP1: *{fmt_price(tp1)}*  TP2: *{fmt_price(tp2)}*\n"
            f"Ordres: {orders if orders else '—'}")
     send_telegram(msg)
@@ -398,7 +551,6 @@ async def handle_symbol_event(ev: Dict[str, Any], rg: RiskGuard, policy: MetaPol
     register_signal_perf(key, symbol, side, entry)
     try: update_perf_for_symbol(symbol, df_h1=df_h1)
     except Exception: pass
-
 
 # ------------------------
 # Main
@@ -410,7 +562,6 @@ async def main():
 
     logging.getLogger("runner").info("start")
 
-    # Build des symboles contrats via meta (ou via env SYMBOLS)
     try:
         symbols = _build_symbols()
     except Exception as e:
