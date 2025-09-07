@@ -145,12 +145,20 @@ def _round_to_tick(px: float, tick: float) -> float:
     return math.floor(float(px) / float(tick)) * float(tick)
 
 def _has_real_order_id(orders: List[Dict[str, Any]]) -> bool:
+    """
+    VRAIE détection d'un ordre exchange:
+      - orderId présent (KuCoin)
+      - OU payload normalisé avec ok=True ET code 200000 (success) ET clientOid **et**/ou orderId
+    Un simple 'clientOid' isolé ou une string 'raw' ne compte plus.
+    """
     for o in orders or []:
-        if isinstance(o, dict):
+        if not isinstance(o, dict):
+            continue
+        if o.get("orderId"):
+            return True
+        code = str(o.get("code", "")).strip()
+        if o.get("ok") is True and code in ("200000",):
             if o.get("orderId") or o.get("clientOid"):
-                return True
-            raw = o.get("raw")
-            if isinstance(raw, str) and raw.strip():
                 return True
     return False
 
