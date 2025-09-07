@@ -133,6 +133,10 @@ def round_price(symbol: str, price: float, meta: Dict[str, Dict[str, Any]], defa
 def _fetch_klines_minutes(symbol_api: str, granularity: int = 1, limit: int = 300) -> pd.DataFrame:
     """
     Implémentation minute-based. symbol_api doit être un contrat KuCoin (ex: BTCUSDTM).
+
+    ⚠️ KuCoin Futures /api/v1/kline/query renvoie:
+        [startAt, open, close, high, low, volume, turnover]
+    => Mapping correct: open=1, close=2, high=3, low=4
     """
     now_ms = int(time.time() * 1000)
     # fenêtre temps = limit * granularity minutes
@@ -155,17 +159,19 @@ def _fetch_klines_minutes(symbol_api: str, granularity: int = 1, limit: int = 30
     except Exception:
         arr = []
 
-    # KuCoin Futures renvoie: [time(ms|s), open, high, low, close, volume, ...]
+    # KuCoin Futures renvoie: [time(ms|s), open, close, high, low, volume, turnover]
     for it in arr:
         try:
             ts_raw = int(it[0])
             # tolérance: si <= 10^10, on considère que c'est en secondes -> converti en ms
             ts = ts_raw * 1000 if ts_raw < 10_000_000_000 else ts_raw
-            o = float(it[1])
-            h = float(it[2])
-            l = float(it[3])
-            c = float(it[4])
-            v = float(it[5])
+
+            o = float(it[1])  # open
+            c = float(it[2])  # close
+            h = float(it[3])  # high
+            l = float(it[4])  # low
+            v = float(it[5])  # volume
+
             rows.append({"time": ts, "open": o, "high": h, "low": l, "close": c, "volume": v})
         except Exception:
             continue
