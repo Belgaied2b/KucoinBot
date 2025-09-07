@@ -106,7 +106,6 @@ def _build_symbols() -> List[str]:
     """
     env_syms = os.getenv("SYMBOLS", "").strip()
     if env_syms:
-        # on fait confiance à l'utilisateur pour donner des contrats valides
         lst = [s.strip().upper() for s in env_syms.split(",") if s.strip()]
         return sorted(set(lst))
     meta = fetch_symbol_meta()  # clés = "BTCUSDT", valeurs -> {"symbol_api":"BTCUSDTM", ...}
@@ -163,14 +162,31 @@ async def handle_symbol_event(ev: Dict[str, Any], rg: RiskGuard, policy: MetaPol
         try:
             thr = TUNER.update_and_get(symbol, df_h1, inst)  # seuils adaptatifs
             comps_cnt, comps_detail = components_ok(inst, thr)
-            inst_ok = (float(inst.get("score",0)) >= thr["req_score"]) and (comps_cnt >= thr["components_min"])
-            log.info("inst-gate: pass=%s score=%.2f req=%.2f comps=%d/%d q=%.2f atr%%=%.2f",
-                     inst_ok, float(inst.get("score",0)), thr["req_score"], comps_cnt, thr["components_min"],
-                     float(thr.get("q_used", 0.0)), float(thr.get("atr_pct", 0.0)), extra={"symbol": symbol})
+            score_val = float(inst.get("score", 0.0) or 0.0)
+
+            # ====== GATE TOLÉRANT (INSTITUTIONNEL) ======
+            # 4/4 => pass forcé, 3/4 => pass toléré, sinon => score gate classique
+            force_pass = comps_cnt >= 4
+            tol_pass   = (not force_pass) and (comps_cnt >= 3)
+            score_gate = (score_val >= float(thr["req_score"])) and (comps_cnt >= int(thr["components_min"]))
+            inst_ok    = force_pass or tol_pass or score_gate
+            reason     = ("force_pass_4of4" if force_pass else
+                          ("tolerance_pass_3of4" if tol_pass else
+                           ("score_gate" if score_gate else "reject")))
+
+            log.info(
+                "inst-gate: pass=%s reason=%s score=%.2f req=%.2f comps=%d/%d q=%.2f atr%%=%.2f",
+                inst_ok, reason, score_val, float(thr["req_score"]), comps_cnt, int(thr["components_min"]),
+                float(thr.get("q_used", 0.0)), float(thr.get("atr_pct", 0.0)),
+                extra={"symbol": symbol}
+            )
+
             if not inst_ok:
                 log.info("inst-reject details: %s", comps_detail, extra={"symbol": symbol})
-                try: update_perf_for_symbol(symbol, df_h1=df_h1)
-                except Exception: pass
+                try:
+                    update_perf_for_symbol(symbol, df_h1=df_h1)
+                except Exception:
+                    pass
                 return
         except Exception as e:
             log.warning("autotune failed: %s", e, extra={"symbol": symbol})
@@ -197,7 +213,6 @@ async def handle_symbol_event(ev: Dict[str, Any], rg: RiskGuard, policy: MetaPol
 
     side = str(res.get("side", "none")).lower()
     rr   = float(res.get("rr", 0) or 0)
-    # si l'analyse ne renvoie pas 'inst_score', on reprend celui du snapshot
     score= float(res.get("inst_score", inst.get("score", 0) if isinstance(inst, dict) else 0) or 0)
     comments_list = res.get("comments", []) or []
     comments = ", ".join([str(c) for c in comments_list]) if comments_list else ""
