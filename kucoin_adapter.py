@@ -1,11 +1,12 @@
-# kucoin_adapter.py — version robuste sans crossMode dans le body (fix 330005)
+# kucoin_adapter.py — version robuste (fix 330011 + tick fallback + no crossMode)
 # - Signature v2 (timestamp + method + path + body)
 # - clientOid = timestamp
 # - valueQty = ORDER_VALUE_USDT * leverage (comme avant)
 # - Prix quantifié au tick (tickSize/priceIncrement/pricePrecision)
 # - N'ENVOIE PAS crossMode (évite 330005)
 # - Retry si 100001 (leverage invalid)
-# - Vérification par clientOid
+# - Retry si 330011 (position mode mismatch) avec/ sans positionSide
+# - Vérification: NE PAS poller si création échoue (orderId None)
 
 import time
 import hmac
@@ -109,6 +110,24 @@ def get_symbol_meta(symbol: str) -> Dict[str, Any]:
         return js.get("data", {}) or {}
     return {}
 
+def _safe_tick_from_meta(d: Dict[str, Any]) -> float:
+    """tickSize sûr (>0) à partir du meta contrat + pricePrecision si besoin."""
+    def _to_f(x) -> float:
+        try: return float(x)
+        except Exception: return 0.0
+
+    tick = _to_f(d.get("tickSize")) or _to_f(d.get("priceIncrement"))
+    if tick and tick > 0:
+        return tick
+    pp = d.get("pricePrecision")
+    try:
+        pp = int(pp)
+        if pp is not None and pp >= 0:
+            return 10 ** (-pp)
+    except Exception:
+        pass
+    return 1e-8  # ultime fallback non-nul
+
 def _price_increment(symbol: str) -> float:
     """
     Tick robuste:
@@ -117,18 +136,8 @@ def _price_increment(symbol: str) -> float:
       3) pricePrecision -> 10^-pp
       4) fallback non nul
     """
-    def _to_f(x) -> float:
-        try:
-            return float(x)
-        except Exception:
-            return 0.0
-
     meta = get_symbol_meta(symbol) or {}
-    tick = meta.get("tickSize", None)
-    if not _to_f(tick):
-        tick = meta.get("priceIncrement", None)
-
-    t = _to_f(tick)
+    t = _safe_tick_from_meta(meta)
     if t > 0:
         return t
 
@@ -137,27 +146,9 @@ def _price_increment(symbol: str) -> float:
     if ok:
         for it in js.get("data", []) or []:
             if str(it.get("symbol", "")).strip().upper() == symbol.upper():
-                t = _to_f(it.get("tickSize") or it.get("priceIncrement"))
-                if t > 0:
-                    return t
-                pp = it.get("pricePrecision")
-                try:
-                    pp = int(pp)
-                    if pp is not None and pp >= 0:
-                        return 10 ** (-pp)
-                except Exception:
-                    pass
+                return _safe_tick_from_meta(it)
 
-    # derive from pricePrecision in meta
-    pp = meta.get("pricePrecision", None)
-    try:
-        pp = int(pp)
-        if pp is not None and pp >= 0:
-            return 10 ** (-pp)
-    except Exception:
-        pass
-
-    # ultimate non-zero (évite "multiple of 0")
+    # ultimate non-zero
     return 1e-8
 
 def _quantize_price(price: float, tick: float, side: str) -> float:
@@ -177,7 +168,7 @@ def _quantize_price(price: float, tick: float, side: str) -> float:
         qsteps = math.ceil(steps - 1e-12)
     return float(qsteps) * tick
 
-def _position_mode(symbol: str) -> Optional[bool]:
+def _margin_mode(symbol: str) -> Optional[bool]:
     """
     Retourne crossMode (True/False) si dispo pour LOG UNIQUEMENT.
     GET /api/v1/position?symbol=...
@@ -195,6 +186,47 @@ def _position_mode(symbol: str) -> Optional[bool]:
     except Exception:
         return None
 
+# --------- Position mode (hedge / one-way) ----------
+def _get_position_raw(symbol: str) -> Dict[str, Any]:
+    ok, js = _get(f"{POS_PATH}?symbol={symbol}")
+    if not ok or not isinstance(js, dict):
+        return {}
+    data = js.get("data")
+    if isinstance(data, dict):
+        return data
+    if isinstance(data, list) and data:
+        return data[0]
+    return {}
+
+def _infer_position_mode_from_payload(pos_json: Dict[str, Any]) -> str:
+    """
+    Retourne 'hedge' ou 'oneway' selon la payload position (heuristique tolérante).
+    """
+    if not pos_json:
+        return "oneway"
+    for k in ("positionMode", "posMode", "mode"):
+        v = pos_json.get(k)
+        if isinstance(v, str):
+            v_low = v.lower()
+            if "hedge" in v_low: return "hedge"
+            if "one" in v_low or "single" in v_low: return "oneway"
+    # indices long/short distincts
+    long_keys = ("longQty", "longSize", "longOpen", "longAvailable")
+    short_keys = ("shortQty", "shortSize", "shortOpen", "shortAvailable")
+    if any(k in pos_json for k in long_keys) and any(k in pos_json for k in short_keys):
+        return "hedge"
+    # structures imbriquées
+    for k in ("positions", "items", "data"):
+        arr = pos_json.get(k)
+        if isinstance(arr, list) and len(arr) >= 2:
+            sides = {str(x.get("side", "")).lower() for x in arr if isinstance(x, dict)}
+            if "long" in sides and "short" in sides:
+                return "hedge"
+    return "oneway"
+
+def _needs_position_side(position_mode: str) -> bool:
+    return str(position_mode).lower() == "hedge"
+
 # --------- Vérification ordre par clientOid ----------
 def get_order_by_client_oid(client_oid: str) -> Optional[Dict[str, Any]]:
     path = GET_BY_COID.format(clientOid=client_oid)
@@ -203,7 +235,7 @@ def get_order_by_client_oid(client_oid: str) -> Optional[Dict[str, Any]]:
         return None
     return js.get("data") or None
 
-# --------- Place LIMIT (style ancien + robustesse) ----------
+# --------- Place LIMIT (robuste) ----------
 def place_limit_order(
     symbol: str,
     side: str,
@@ -222,7 +254,9 @@ def place_limit_order(
     - Envoie toujours 'leverage' (string)
     - Prix quantifié au tick (directionnel)
     - **N'envoie pas crossMode** → évite 330005
-    - Retry si 100001 (Leverage invalid) avec levier fallback
+    - **GÈRE le position mode**: en Hedge, ajoute positionSide=long/short
+    - Retry si 100001 (Leverage invalid)
+    - Retry 1x si 330011 (position mode mismatch) en inversant la présence de positionSide
     - Renvoie {"ok":bool, "code":..., "msg":..., "orderId":..., "clientOid":..., "data": {...}}
     """
     _sync_server_time()
@@ -233,20 +267,27 @@ def place_limit_order(
     tick = _price_increment(symbol)
     px   = _quantize_price(float(price), tick, side)
 
-    # On lit le mode juste pour INFO (mais on ne l'envoie PAS)
+    # Log margin mode (cross/isolated) pour info seulement
     if cross_mode is None:
-        cm = _position_mode(symbol)
+        cm = _margin_mode(symbol)
         cross_mode = cm if cm is not None else None
     if cross_mode is not None:
         log.info("[marginMode] %s -> %s", symbol, ("cross" if cross_mode else "isolated"))
 
-    coid = client_order_id or str(_ts_ms())
+    # Déterminer position mode (hedge/oneway) pour positionSide
+    pos_raw = _get_position_raw(symbol)
+    pos_mode = _infer_position_mode_from_payload(pos_raw)
+    include_ps = _needs_position_side(pos_mode)
+    log.info("[positionMode] %s -> %s (include positionSide=%s)", symbol, pos_mode, include_ps)
 
-    def _make_body(lev_force: Optional[int] = None) -> Dict[str, Any]:
+    coid = client_order_id or str(_ts_ms())
+    s_low = str(side).lower()
+
+    def _make_body(lev_force: Optional[int] = None, include_position_side: bool = include_ps) -> Dict[str, Any]:
         body = {
             "clientOid": coid,
             "symbol": symbol,
-            "side": side.lower(),
+            "side": s_low,                   # "buy" | "sell"
             "type": "limit",
             "price": f"{px:.12f}",
             "valueQty": f"{value_qty:.4f}",
@@ -254,15 +295,18 @@ def place_limit_order(
             "postOnly": bool(post_only),
             "leverage": str(lev_force if lev_force is not None else lev),
             # ⚠️ NE PAS ENVOYER crossMode
-            # "reduceOnly": False  # si besoin
+            # "reduceOnly": False
         }
+        if include_position_side:
+            body["positionSide"] = "long" if s_low == "buy" else "short"
         return body
 
     def _send(body: Dict[str, Any]) -> Dict[str, Any]:
         log.info(
-            "[place_limit] %s %s px=%s valueQty=%.2f postOnly=%s",
+            "[place_limit] %s %s px=%s valueQty=%.2f postOnly=%s%s",
             symbol, body.get("side"), body.get("price"),
             float(value_qty), body.get("postOnly"),
+            f" positionSide={body.get('positionSide')}" if "positionSide" in body else ""
         )
         ok, js = _post(ORDERS_PATH, body)
         data = js.get("data") if isinstance(js, dict) else None
@@ -284,7 +328,7 @@ def place_limit_order(
                      res["ok"], res["code"], res["msg"], res["clientOid"], res["orderId"])
         return res
 
-    # 1) tentative standard (sans crossMode)
+    # 1) tentative standard (avec/ sans positionSide selon mode)
     body = _make_body()
     resp = _send(body)
 
@@ -296,5 +340,18 @@ def place_limit_order(
         log.info("[leverage] retry %s with leverage=%s", symbol, lev_fb)
         body = _make_body(lev_force=lev_fb)
         resp = _send(body)
+        if resp["ok"]:
+            return resp
+
+    # 3) mismatch position mode (330011) → inverse la présence de positionSide et retente 1x
+    if (not resp["ok"]) and (resp.get("code") == "330011"):
+        pos_raw2 = _get_position_raw(symbol)
+        pos_mode2 = _infer_position_mode_from_payload(pos_raw2)
+        include_ps2 = _needs_position_side(pos_mode2)
+        alternate = not include_ps2 if include_ps2 == include_ps else include_ps2
+        log.info("[positionMode] retry %s with include positionSide=%s (detected=%s)", symbol, alternate, pos_mode2)
+        body2 = _make_body(lev_force=None, include_position_side=alternate)
+        resp2 = _send(body2)
+        return resp2
 
     return resp
