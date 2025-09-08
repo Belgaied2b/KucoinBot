@@ -1,5 +1,12 @@
-# kucoin_adapter.py — robuste (no positionSide, positionId fallback, ticker top, 330011/300012/100001 fixes)
-# + hooks SFI: get_orderbook_top, place_market_by_value, cancel_order, get_order_status
+# kucoin_adapter.py — minimal robuste (comme l'ancien)
+# - AUCUN envoi de positionSide
+# - N'envoie PAS crossMode
+# - Signature V2 + sync horloge
+# - Prix quantifié au tick + clamp passif sur bestBid/bestAsk (via /api/v1/ticker)
+# - 300012: retry 1x au bord autorisé (option: coupe postOnly si autorisé)
+# - 100001: retry 1x avec levier fallback
+# - 330011: on log et on remonte l'erreur (pas de bidouille positionId/positionSide)
+# - Hooks SFI: get_orderbook_top, place_market_by_value (optionnel), cancel_order, get_order_status
 
 import re
 import time, hmac, base64, hashlib, math
@@ -21,9 +28,10 @@ TIME_PATH   = "/api/v1/timestamp"
 GET_BY_COID = "/api/v1/order/client-order/{clientOid}"
 TICKER_PATH = "/api/v1/ticker"
 
-# --- options (env / settings)
-ALLOW_TAKER_ON_BAND_RETRY = bool(int(getattr(SETTINGS, "kc_allow_taker_on_band_retry", 1)))  # coupe postOnly au retry 300012
+# ---- options
 DEFAULT_LEVERAGE = int(getattr(SETTINGS, "default_leverage", 5))
+ALLOW_TAKER_ON_BAND_RETRY = bool(int(getattr(SETTINGS, "kc_allow_taker_on_band_retry", 0)))  # 0 = reste maker
+ALLOW_MARKET_ON_330011    = bool(int(getattr(SETTINGS, "kc_allow_market_on_330011", 0)))     # 0 = pas de market auto
 
 _SERVER_OFFSET = 0.0
 
@@ -60,7 +68,7 @@ def _headers(method: str, path: str, body_str: str = "") -> Dict[str, str]:
         "KC-API-KEY-VERSION": "2",
         "Accept": "application/json",
         "Content-Type": "application/json",
-        "User-Agent": "bot/kucoin-adapter",
+        "User-Agent": "bot/kucoin-minimal",
     }
 
 # ---------------- http helpers ----------------
@@ -167,64 +175,6 @@ def _quantize_price(price: float, tick: float, side: str) -> float:
     qsteps = math.floor(steps + 1e-12) if str(side).lower() == "buy" else math.ceil(steps - 1e-12)
     return float(qsteps) * tick
 
-# --------- Position / hedge helpers ----------
-def _margin_mode(symbol: str) -> Optional[bool]:
-    ok, js = _get(f"{POS_PATH}?symbol={symbol}")
-    if not ok: return None
-    d = js.get("data") or {}
-    try:
-        cm = d.get("crossMode")
-        return bool(cm) if cm is not None else None
-    except Exception:
-        return None
-
-def _get_position_raw(symbol: str) -> Dict[str, Any]:
-    ok, js = _get(f"{POS_PATH}?symbol={symbol}")
-    if not ok or not isinstance(js, dict): return {}
-    data = js.get("data")
-    if isinstance(data, dict): return data
-    if isinstance(data, list) and data: return data[0]
-    return {}
-
-def _extract_position_ids(pos_json: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
-    candidates = [
-        ("longPositionId", "shortPositionId"),
-        ("longId", "shortId"),
-        ("positionIdLong", "positionIdShort"),
-        ("longPosId", "shortPosId"),
-    ]
-    for lkey, skey in candidates:
-        lid = pos_json.get(lkey); sid = pos_json.get(skey)
-        if lid or sid:
-            return (str(lid) if lid else None, str(sid) if sid else None)
-    items = pos_json.get("positions") or pos_json.get("items") or pos_json.get("data")
-    if isinstance(items, list):
-        l_id = s_id = None
-        for it in items:
-            if not isinstance(it, dict): continue
-            sd = str(it.get("side","")).lower()
-            pid = it.get("positionId") or it.get("id")
-            if not pid: continue
-            if sd == "long" and not l_id: l_id = str(pid)
-            if sd == "short" and not s_id: s_id = str(pid)
-        if l_id or s_id:
-            return l_id, s_id
-    return None, None
-
-def _needs_position_id(pos_json: Dict[str, Any]) -> bool:
-    long_keys = ("longQty", "longSize", "longOpen", "longAvailable")
-    short_keys = ("shortQty", "shortSize", "shortOpen", "shortAvailable")
-    if any(k in pos_json for k in long_keys) and any(k in pos_json for k in short_keys):
-        return True
-    l_id, s_id = _extract_position_ids(pos_json)
-    return bool(l_id or s_id)
-
-# --------- Lookup by clientOid ----------
-def get_order_by_client_oid(client_oid: str) -> Optional[Dict[str, Any]]:
-    ok, js = _get(GET_BY_COID.format(clientOid=client_oid))
-    if not ok: return None
-    return js.get("data") or None
-
 # --------- Post-only clamp ----------
 def _clamp_postonly_price(symbol: str, side: str, raw_px: float, tick: float) -> float:
     quotes = get_orderbook_top(symbol)
@@ -259,7 +209,7 @@ def _parse_band(msg: str) -> Tuple[Optional[str], Optional[float]]:
         except Exception: pass
     return None, None
 
-# ---------------- MARKET helper ----------------
+# ---------------- MARKET helper (optionnel) ----------------
 def place_market_by_value(symbol: str, side: str, value_usdt: float, leverage: Optional[int] = None,
                           client_order_id: Optional[str] = None) -> Dict[str, Any]:
     _sync_server_time()
@@ -293,7 +243,13 @@ def get_order_status(order_id: str) -> Dict[str, Any]:
     data = js.get("data") if ok else None
     return {"ok": ok and (js.get("code") == "200000"), "data": data}
 
-# ---------------- Place LIMIT (robuste) ----------------
+# --------- Lookup by clientOid ----------
+def get_order_by_client_oid(client_oid: str) -> Optional[Dict[str, Any]]:
+    ok, js = _get(GET_BY_COID.format(clientOid=client_oid))
+    if not ok: return None
+    return js.get("data") or None
+
+# ---------------- Place LIMIT (comme l'ancien, durci) ----------------
 def place_limit_order(
     symbol: str,
     side: str,
@@ -305,7 +261,7 @@ def place_limit_order(
     post_only: bool = True,
     client_order_id: Optional[str] = None,
     leverage: Optional[int] = None,
-    cross_mode: Optional[bool] = None,
+    cross_mode: Optional[bool] = None,   # ignoré: on ne l'envoie jamais
 ) -> Dict[str, Any]:
     _sync_server_time()
 
@@ -317,24 +273,26 @@ def place_limit_order(
     if post_only:
         px = _clamp_postonly_price(symbol, side, px, tick)
 
-    if cross_mode is None:
-        cm = _margin_mode(symbol); cross_mode = cm if cm is not None else None
-    if cross_mode is not None:
-        log.info("[marginMode] %s -> %s", symbol, ("cross" if cross_mode else "isolated"))
-
-    pos_raw = _get_position_raw(symbol)
-    log.info("[positionMode] %s -> oneway/hedge autodetect (no positionSide sent)", symbol)
+    # INFO uniquement
+    try:
+        ok_mm, js_mm = _get(f"{POS_PATH}?symbol={symbol}")
+        if ok_mm and isinstance(js_mm, dict):
+            d = js_mm.get("data") or {}
+            cm = d.get("crossMode")
+            if cm is not None:
+                log.info("[marginMode] %s -> %s", symbol, ("cross" if cm else "isolated"))
+    except Exception:
+        pass
 
     coid = client_order_id or str(_ts_ms())
     s_low = str(side).lower()
 
-    def _make_body(lev_force: Optional[int] = None, price_override: Optional[float] = None,
-                   position_id: Optional[str] = None, force_post_only: Optional[bool] = None) -> Dict[str, Any]:
+    def _make_body(lev_force: Optional[int] = None, price_override: Optional[float] = None, force_post_only: Optional[bool] = None) -> Dict[str, Any]:
         use_px = float(price_override) if (price_override is not None) else float(px)
         body = {
             "clientOid": coid,
             "symbol": symbol,
-            "side": s_low,
+            "side": s_low,              # "buy" | "sell"
             "type": "limit",
             "price": f"{use_px:.12f}",
             "valueQty": f"{value_qty:.4f}",
@@ -342,14 +300,12 @@ def place_limit_order(
             "postOnly": bool(post_only if force_post_only is None else force_post_only),
             "leverage": str(lev_force if lev_force is not None else lev),
         }
-        if position_id:
-            body["positionId"] = str(position_id)
+        # ⚠️ NE PAS ENVOYER crossMode NI positionSide
         return body
 
     def _send(body: Dict[str, Any]) -> Dict[str, Any]:
-        log.info("[place_limit] %s %s px=%s valueQty=%.2f postOnly=%s%s",
-                 symbol, body.get("side"), body.get("price"), float(value_qty), body.get("postOnly"),
-                 f" positionId={body.get('positionId')}" if "positionId" in body else "")
+        log.info("[place_limit] %s %s px=%s valueQty=%.2f postOnly=%s",
+                 symbol, body.get("side"), body.get("price"), float(value_qty), body.get("postOnly"))
         ok_http, js = _post(ORDERS_PATH, body)
         data = js.get("data") if isinstance(js, dict) else None
         order_id = data.get("orderId") if isinstance(data, dict) else None
@@ -361,11 +317,10 @@ def place_limit_order(
                      res["ok"], res["code"], res["msg"], res["clientOid"], res["orderId"])
         return res
 
-    # 1) tentative standard (NE JAMAIS envoyer positionSide)
-    body = _make_body()
-    resp = _send(body)
+    # 1) tentative standard (aucun positionSide)
+    resp = _send(_make_body())
 
-    # 2) leverage invalid (100001) → retry avec levier fallback
+    # 2) leverage invalid (100001) → retry 1x avec levier fallback
     if (not resp["ok"]) and ("Leverage parameter invalid" in str(resp.get("msg","")) or resp.get("code") == "100001"):
         lev_fb = int(DEFAULT_LEVERAGE or 5)
         if lev_fb == lev: lev_fb = 5 if lev != 5 else 3
@@ -374,32 +329,26 @@ def place_limit_order(
         if resp_fb["ok"]: return resp_fb
         resp = resp_fb
 
-    # 3) position mode mismatch (330011) → tenter avec positionId si dispo (hedge réel)
+    # 3) mismatch position mode (330011) — comme l'ancien: on ne bricole pas, on remonte l'erreur
     if (not resp["ok"]) and (resp.get("code") == "330011"):
-        if _needs_position_id(pos_raw):
-            long_id, short_id = _extract_position_ids(pos_raw)
-            want_id = long_id if s_low == "buy" else short_id
-            log.info("[positionMode] retry %s with positionId=%s", symbol, want_id or "None")
-            resp2 = _send(_make_body(position_id=want_id))
-            if resp2["ok"]:
-                return resp2
-            resp = resp2
-        else:
-            log.info("[positionMode] no positionId available; keeping one-way semantics")
+        if ALLOW_MARKET_ON_330011:
+            log.info("[330011] optional fallback: small taker")
+            # petit trade taker pour éviter blocage (ex: 25% notionnel)
+            _ = place_market_by_value(symbol, side, value_usdt * 0.25, leverage=lev)
+        return resp
 
-    # 4) prix hors bande (300012) → lire le seuil et reclamp; couper postOnly si autorisé
+    # 4) prix hors bande (300012) → lire le seuil, reclamp et retry 1x; option: couper postOnly
     if (not resp["ok"]) and (resp.get("code") == "300012"):
         kind, edge = _parse_band(resp.get("msg",""))
         px_retry = float(price)
-        if kind == "max":  # buy trop haut (ou sell aussi haut)
+        if kind == "max":      # prix > bande max → recule un peu
             px_retry = edge - (tick * 0.5)
-        elif kind == "min":  # sell trop bas
+        elif kind == "min":    # prix < bande min → avance un peu
             px_retry = edge + (tick * 0.5)
         px_retry = _quantize_price(px_retry, tick, side)
         force_po = False if ALLOW_TAKER_ON_BAND_RETRY else None
-        log.info("[price] retry %s band-kind=%s edge=%s px=%s (postOnly=%s)",
-                 symbol, kind, edge, f"{px_retry:.12f}", False if force_po is False else post_only)
-        resp3 = _send(_make_body(price_override=px_retry, force_post_only=force_po))
-        return resp3
+        log.info("[price] retry %s band=%s edge=%s px=%s (postOnly=%s)",
+                 symbol, kind, edge, f"{px_retry:.12f}", False if force_po is False else postOnly)
+        return _send(_make_body(price_override=px_retry, force_post_only=force_po))
 
     return resp
