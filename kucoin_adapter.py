@@ -4,7 +4,7 @@
 # - valueQty = ORDER_VALUE_USDT * leverage (comme avant)
 # - Prix quantifié au tick (tickSize/priceIncrement/pricePrecision)
 # - N'ENVOIE PAS crossMode (évite 330005)
-# - Retry si 100001 (leverage invalid)
+# - Retry si 100001 : levier fallback
 # - Retry si 330011 : réémet en respectant le mode détecté (hedge -> avec positionSide, oneway -> sans)
 # - Vérification: NE PAS poller si création échoue (orderId None)
 
@@ -39,7 +39,7 @@ def _sync_server_time() -> None:
         with httpx.Client(timeout=5.0) as c:
             r = c.get(BASE + TIME_PATH)
             r.raise_for_status()
-            server_ms = int(r.json().get("data", 0))
+            server_ms = int((r.json() or {}).get("data", 0))
             _SERVER_OFFSET = (server_ms / 1000.0) - time.time()
             log.info(f"[time] offset={_SERVER_OFFSET:.3f}s")
     except Exception as e:
@@ -113,12 +113,16 @@ def get_symbol_meta(symbol: str) -> Dict[str, Any]:
 def _safe_tick_from_meta(d: Dict[str, Any]) -> float:
     """tickSize sûr (>0) à partir du meta contrat + pricePrecision si besoin."""
     def _to_f(x) -> float:
-        try: return float(x)
-        except Exception: return 0.0
+        try:
+            return float(x)
+        except Exception:
+            return 0.0
 
     tick = _to_f(d.get("tickSize")) or _to_f(d.get("priceIncrement"))
     if tick and tick > 0:
         return tick
+
+    # derive from pricePrecision if present
     pp = d.get("pricePrecision")
     try:
         pp = int(pp)
@@ -126,7 +130,9 @@ def _safe_tick_from_meta(d: Dict[str, Any]) -> float:
             return 10 ** (-pp)
     except Exception:
         pass
-    return 1e-8  # ultime fallback non-nul
+
+    # ultimate non-zero (évite 'multiple of 0')
+    return 1e-8
 
 def _price_increment(symbol: str) -> float:
     """
@@ -204,17 +210,25 @@ def _infer_position_mode_from_payload(pos_json: Dict[str, Any]) -> str:
     """
     if not pos_json:
         return "oneway"
+
+    # indicateurs explicites
     for k in ("positionMode", "posMode", "mode"):
         v = pos_json.get(k)
         if isinstance(v, str):
             v_low = v.lower()
             if "hedge" in v_low: return "hedge"
             if "one" in v_low or "single" in v_low: return "oneway"
+
+    # booleen éventuel
+    if isinstance(pos_json.get("isHedgeMode"), bool):
+        return "hedge" if pos_json["isHedgeMode"] else "oneway"
+
     # indices long/short distincts
     long_keys = ("longQty", "longSize", "longOpen", "longAvailable")
     short_keys = ("shortQty", "shortSize", "shortOpen", "shortAvailable")
     if any(k in pos_json for k in long_keys) and any(k in pos_json for k in short_keys):
         return "hedge"
+
     # structures imbriquées
     for k in ("positions", "items", "data"):
         arr = pos_json.get(k)
@@ -222,6 +236,7 @@ def _infer_position_mode_from_payload(pos_json: Dict[str, Any]) -> str:
             sides = {str(x.get("side", "")).lower() for x in arr if isinstance(x, dict)}
             if "long" in sides and "short" in sides:
                 return "hedge"
+
     return "oneway"
 
 def _needs_position_side(position_mode: str) -> bool:
@@ -254,7 +269,7 @@ def place_limit_order(
     - Envoie toujours 'leverage' (string)
     - Prix quantifié au tick (directionnel)
     - **N'envoie pas crossMode** → évite 330005
-    - **GÈRE le position mode**: en Hedge, ajoute positionSide=long/short
+    - **GÈRE le position mode**: en Hedge, ajoute positionSide=long/short; en One-way, ne l'envoie pas
     - Retry si 100001 (Leverage invalid)
     - Retry 1x si 330011 : réémet en respectant le mode détecté (hedge => avec, oneway => sans)
     - Renvoie {"ok":bool, "code":..., "msg":..., "orderId":..., "clientOid":..., "data": {...}}
@@ -336,7 +351,7 @@ def place_limit_order(
     resp = _send(body)
 
     # 2) leverage invalid → retenter avec levier fallback
-    if (not resp["ok"]) and ("Leverage parameter invalid" in str(resp["msg"]) or resp["code"] == "100001"):
+    if (not resp["ok"]) and ("Leverage parameter invalid" in str(resp["msg"]) or resp.get("code") == "100001"):
         lev_fb = int(getattr(SETTINGS, "default_leverage", 5) or 5)
         if lev_fb == lev:
             lev_fb = 5 if lev != 5 else 3
