@@ -1,4 +1,4 @@
-# kucoin_adapter.py — robuste (ticker top, fix 330011 toggle, 300012 clamp, no crossMode)
+# kucoin_adapter.py — robuste (no positionSide, positionId fallback, ticker top, 330011/300012/100001 fixes)
 import time, hmac, base64, hashlib, math
 from typing import Any, Dict, Optional, Tuple
 
@@ -84,7 +84,7 @@ def _get(path: str, params: Optional[Dict[str, Any]] = None) -> Tuple[bool, Dict
         log.error(f"[GET {path}] EXC={e}")
         return False, {"error": str(e)}
 
-# --------- Top of book (ticker only: depth1 peut 404 en Futures) ----------
+# --------- Top of book via ticker (depth1 peut 404) ----------
 def get_orderbook_top(symbol: str) -> Dict[str, Optional[float]]:
     ok, js = _get(TICKER_PATH, params={"symbol": symbol})
     if ok and isinstance(js, dict) and isinstance(js.get("data"), dict):
@@ -159,37 +159,57 @@ def _get_position_raw(symbol: str) -> Dict[str, Any]:
     if isinstance(data, list) and data: return data[0]
     return {}
 
-def _infer_position_mode_from_payload(pos_json: Dict[str, Any]) -> str:
-    if not pos_json: return "oneway"
-    for k in ("positionMode", "posMode", "mode"):
-        v = pos_json.get(k)
-        if isinstance(v, str):
-            v_low = v.lower()
-            if "hedge" in v_low: return "hedge"
-            if "one" in v_low or "single" in v_low: return "oneway"
-    if isinstance(pos_json.get("isHedgeMode"), bool):
-        return "hedge" if pos_json["isHedgeMode"] else "oneway"
+# --------- positionId helpers (hedge mode KuCoin) ----------
+def _extract_position_ids(pos_json: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Essaie plusieurs clés usuelles pour trouver les IDs long/short.
+    Retourne (long_id, short_id).
+    """
+    candidates = [
+        ("longPositionId", "shortPositionId"),
+        ("longId", "shortId"),
+        ("positionIdLong", "positionIdShort"),
+        ("longPosId", "shortPosId"),
+    ]
+    for lkey, skey in candidates:
+        lid = pos_json.get(lkey); sid = pos_json.get(skey)
+        if lid or sid:
+            return (str(lid) if lid else None, str(sid) if sid else None)
+    # parfois dans un tableau
+    items = pos_json.get("positions") or pos_json.get("items") or pos_json.get("data")
+    if isinstance(items, list):
+        l_id = s_id = None
+        for it in items:
+            if not isinstance(it, dict): continue
+            sd = str(it.get("side","")).lower()
+            pid = it.get("positionId") or it.get("id")
+            if not pid: continue
+            if sd == "long" and not l_id: l_id = str(pid)
+            if sd == "short" and not s_id: s_id = str(pid)
+        if l_id or s_id:
+            return l_id, s_id
+    # aucun id trouvé
+    return None, None
+
+def _needs_position_id(pos_json: Dict[str, Any]) -> bool:
+    """
+    Heuristique: si le compte/symbole est en hedge ET que l'API refuse sans détail (330011),
+    on tentera avec positionId.
+    """
+    # signes d'un hedge réel: présence de métriques long/short séparées OU champs d'ID
     long_keys = ("longQty", "longSize", "longOpen", "longAvailable")
     short_keys = ("shortQty", "shortSize", "shortOpen", "shortAvailable")
     if any(k in pos_json for k in long_keys) and any(k in pos_json for k in short_keys):
-        return "hedge"
-    for k in ("positions", "items", "data"):
-        arr = pos_json.get(k)
-        if isinstance(arr, list) and len(arr) >= 2:
-            sides = {str(x.get("side", "")).lower() for x in arr if isinstance(x, dict)}
-            if "long" in sides and "short" in sides:
-                return "hedge"
-    return "oneway"
-
-def _needs_position_side(position_mode: str) -> bool:
-    return str(position_mode).lower() == "hedge"
+        return True
+    l_id, s_id = _extract_position_ids(pos_json)
+    return bool(l_id or s_id)
 
 def get_order_by_client_oid(client_oid: str) -> Optional[Dict[str, Any]]:
     ok, js = _get(GET_BY_COID.format(clientOid=client_oid))
     if not ok: return None
     return js.get("data") or None
 
-# ---------- Prix passif pour postOnly ----------
+# ---------- Post-only clamp ----------
 def _clamp_postonly_price(symbol: str, side: str, raw_px: float, tick: float) -> float:
     quotes = get_orderbook_top(symbol)
     bb, ba = quotes.get("bestBid"), quotes.get("bestAsk")
@@ -237,14 +257,12 @@ def place_limit_order(
         log.info("[marginMode] %s -> %s", symbol, ("cross" if cross_mode else "isolated"))
 
     pos_raw = _get_position_raw(symbol)
-    pos_mode = _infer_position_mode_from_payload(pos_raw)
-    include_ps = _needs_position_side(pos_mode)
-    log.info("[positionMode] %s -> %s (include positionSide=%s)", symbol, pos_mode, include_ps)
+    log.info("[positionMode] %s -> oneway/hedge autodetect (no positionSide sent)", symbol)
 
     coid = client_order_id or str(_ts_ms())
     s_low = str(side).lower()
 
-    def _make_body(lev_force: Optional[int] = None, include_position_side: bool = include_ps, price_override: Optional[float] = None) -> Dict[str, Any]:
+    def _make_body(lev_force: Optional[int] = None, price_override: Optional[float] = None, position_id: Optional[str] = None) -> Dict[str, Any]:
         use_px = float(price_override) if (price_override is not None) else float(px)
         body = {
             "clientOid": coid,
@@ -257,16 +275,14 @@ def place_limit_order(
             "postOnly": bool(post_only),
             "leverage": str(lev_force if lev_force is not None else lev),
         }
-        if include_position_side:
-            body["positionSide"] = "long" if s_low == "buy" else "short"
-        else:
-            body.pop("positionSide", None)
+        if position_id:
+            body["positionId"] = str(position_id)
         return body
 
     def _send(body: Dict[str, Any]) -> Dict[str, Any]:
         log.info("[place_limit] %s %s px=%s valueQty=%.2f postOnly=%s%s",
                  symbol, body.get("side"), body.get("price"), float(value_qty), body.get("postOnly"),
-                 f" positionSide={body.get('positionSide')}" if "positionSide" in body else "")
+                 f" positionId={body.get('positionId')}" if "positionId" in body else "")
         ok_http, js = _post(ORDERS_PATH, body)
         data = js.get("data") if isinstance(js, dict) else None
         order_id = data.get("orderId") if isinstance(data, dict) else None
@@ -278,7 +294,7 @@ def place_limit_order(
                      res["ok"], res["code"], res["msg"], res["clientOid"], res["orderId"])
         return res
 
-    # 1) essai initial (selon mode détecté)
+    # 1) essai initial (sans positionSide — jamais envoyé)
     body = _make_body()
     resp = _send(body)
 
@@ -287,21 +303,22 @@ def place_limit_order(
         lev_fb = int(getattr(SETTINGS, "default_leverage", 5) or 5)
         if lev_fb == lev: lev_fb = 5 if lev != 5 else 3
         log.info("[leverage] retry %s with leverage=%s", symbol, lev_fb)
-        resp_fb = _send(_make_body(lev_force=lev_fb, include_position_side=include_ps))
+        resp_fb = _send(_make_body(lev_force=lev_fb))
         if resp_fb["ok"]: return resp_fb
         resp = resp_fb
 
-    # 3) position mode mismatch → toggle explicite (test both)
+    # 3) position mode mismatch → tenter avec positionId si dispo (hedge réel)
     if (not resp["ok"]) and (resp.get("code") == "330011"):
-        # a) inverse par rapport à include_ps
-        alt = not include_ps
-        log.info("[positionMode] toggle retry %s with include positionSide=%s", symbol, alt)
-        resp2 = _send(_make_body(lev_force=None, include_position_side=alt))
-        if resp2["ok"]: return resp2
-
-        # b) si encore KO, retente avec include_ps original mais positionSide explicite long/short (déjà le cas)
-        #    rien à faire ici; on garde resp2 comme dernière réponse
-        resp = resp2
+        if _needs_position_id(pos_raw):
+            long_id, short_id = _extract_position_ids(pos_raw)
+            want_id = long_id if s_low == "buy" else short_id
+            log.info("[positionMode] retry %s with positionId=%s", symbol, want_id or "None")
+            resp2 = _send(_make_body(position_id=want_id))
+            if resp2["ok"]:
+                return resp2
+            resp = resp2
+        else:
+            log.info("[positionMode] no positionId available; keeping one-way semantics")
 
     # 4) prix hors bande → clamp via carnet et retry 1x
     if (not resp["ok"]) and (resp.get("code") == "300012"):
