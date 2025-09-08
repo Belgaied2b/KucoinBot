@@ -168,11 +168,33 @@ class SFIEngine:
         return p1, p2, microprice(bid, ask, bid_sz, ask_sz)
 
     def _place_tranche(self, price: float, value: float) -> Optional[str]:
+        """
+        Place une tranche LIMIT via backend KuCoin.
+        ✅ Retourne uniquement un **vrai** orderId (exchange).
+        ❌ N'utilise plus clientOid/uuid en secours (évite faux positifs).
+        """
         try:
-            resp = place_limit(self.symbol, self.side, price, value, self.sl, self.tp1, self.tp2,
-                               post_only=POST_ONLY_DEFAULT)
-            oid = str(resp.get("orderId") or resp.get("id") or resp.get("clientOid") or uuid.uuid4().hex)
-            return oid
+            resp = place_limit(
+                self.symbol, self.side, price, value,
+                self.sl, self.tp1, self.tp2,
+                post_only=POST_ONLY_DEFAULT
+            )
+            if not isinstance(resp, dict):
+                logging.info("[%s] tranche refusée (bad resp type): %s", self.symbol, resp)
+                return None
+
+            data = resp.get("data") or {}
+            code = resp.get("code")
+            msg  = resp.get("msg")
+            order_id = resp.get("orderId") or data.get("orderId")
+
+            if order_id:
+                return str(order_id)
+
+            # Pas d'orderId -> on log le code/message pour debug et on renvoie None
+            logging.info("[%s] tranche refusée: code=%s msg=%s data=%s",
+                         self.symbol, code, msg, {k: data.get(k) for k in ("clientOid", "orderId")})
+            return None
         except Exception as e:
             logging.error("[%s] tranche place KO: %s", self.symbol, e)
             return None
