@@ -4,7 +4,7 @@ main.py — Boucle event-driven + fallback institutionnel structuré (OTE, liqui
 - Direction H4, exécution H1 via OTE 62–79% et pools de liquidité
 - SL derrière la liquidité/swing + buffer ATR
 - TP1 swing/pool opposé, TP2 RR cible (2.0 par défaut)
-- Exécution SFI + fallback direct KuCoin avec vérif par clientOid (si disponible)
+- Exécution SFI + fallback direct KuCoin avec vérif clientOid SEULEMENT si insertion acceptée
 """
 
 import os, asyncio, logging, math, time
@@ -158,7 +158,7 @@ def _has_real_order_id(orders: List[Dict[str, Any]]) -> bool:
     """
     VRAIE détection d'un ordre exchange:
       - orderId présent (KuCoin)
-      - OU payload normalisé avec ok=True ET code 200000 (success) ET clientOid et/ou orderId
+      - OU payload normalisé avec ok=True ET code 200000 ET clientOid et/ou orderId
     Un simple 'clientOid' isolé ou une string 'raw' ne compte pas.
     """
     for o in orders or []:
@@ -688,17 +688,20 @@ async def handle_symbol_event(ev: Dict[str, Any], rg: RiskGuard, policy: MetaPol
 
         clientOid = None
         orderId   = None
+        ok = False; code = None; msg = None
+
         if isinstance(kc, dict):
-            orderId   = kc.get("orderId") or (kc.get("data") or {}).get("orderId")
-            clientOid = kc.get("clientOid") or (kc.get("data") or {}).get("clientOid")
-            ok = bool(kc.get("ok", False))
+            data = kc.get("data") or {}
+            orderId   = kc.get("orderId") or data.get("orderId")
+            clientOid = kc.get("clientOid") or data.get("clientOid")
+            ok   = bool(kc.get("ok", False))
             code = kc.get("code")
             msg  = kc.get("msg")
             log.info("[kc.place_limit_order] ok=%s code=%s msg=%s clientOid=%s orderId=%s",
                      ok, code, msg, clientOid, orderId, extra={"symbol": symbol})
 
-        # Si pas d'orderId mais on a un clientOid, on vérifie côté serveur (poll léger) — seulement si la fonction existe
-        if (not orderId) and clientOid and callable(get_order_by_client_oid or None):  # type: ignore
+        # 🔒 Poll UNIQUEMENT si l'API a accepté l'ordre (ok==True) mais sans orderId inline
+        if ok and (not orderId) and clientOid and callable(get_order_by_client_oid or None):  # type: ignore
             for _ in range(KC_VERIFY_MAX_TRIES):
                 time.sleep(KC_VERIFY_DELAY_SEC)
                 try:
@@ -709,15 +712,16 @@ async def handle_symbol_event(ev: Dict[str, Any], rg: RiskGuard, policy: MetaPol
                 if od and isinstance(od, dict):
                     orderId = od.get("orderId") or od.get("id")
                     status  = od.get("status") or od.get("state")
-                    log.info("[kc.verify] clientOid=%s status=%s orderId=%s", clientOid, status, orderId, extra={"symbol": symbol})
+                    log.info("[kc.verify] clientOid=%s status=%s orderId=%s",
+                             clientOid, status, orderId, extra={"symbol": symbol})
                     if orderId:
                         break
 
-        # Met à jour 'orders' pour la suite/Telegram
-        if orderId or clientOid:
+        # ✅ Ne considère OK que si on a un vrai orderId
+        if orderId:
             orders = [{"ok": True, "orderId": orderId, "clientOid": clientOid}]
         else:
-            orders = [{"ok": False, "raw": kc}]
+            orders = [{"ok": False, "clientOid": clientOid, "raw": kc}]
 
     log.info("orders=%s", orders, extra={"symbol": symbol})
 
