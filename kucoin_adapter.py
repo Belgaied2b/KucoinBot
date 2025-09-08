@@ -1,12 +1,9 @@
-# kucoin_adapter.py — verbose diagnostics (old-style flow + detailed logs)
+# kucoin_adapter.py — verbose diagnostics (old-style flow + authoritative 330011 fallback)
 # - 1er essai: jamais positionSide, jamais crossMode (comme l'ancien)
 # - Retries: 100001 (leverage fallback), 300012 (clamp price et retry),
-#            330011 (UNIQUEMENT si hedge détecté → alors positionSide long/short)
-# - Logs détaillés:
-#     * HTTP status + body JSON/texte (tronqué)
-#     * Décision hedge/oneway avec indices trouvés
-#     * Prix: brut → quantized → clamp (si postOnly)
-#     * Corps d'ordre envoyé (sans secrets)
+#            330011 (TOUJOURS re-essayer avec positionSide long/short)
+#            si 400100 après ça → on log que le symbole est en one-way strict
+# - Logs détaillés (HTTP, payload, détection hedge, pipeline prix)
 # - KC_VERBOSE=1 pour logs DEBUG verbeux
 
 import os, time, hmac, base64, hashlib, math
@@ -87,9 +84,10 @@ def _log_http_outcome(verb: str, path: str, r: httpx.Response):
     code = (js or {}).get("code")
     msg  = (js or {}).get("msg")
     if r.status_code == 200:
-        log.debug("[%s %s] HTTP=200 code=%s msg=%s", verb, path, code, msg)
         if KC_VERBOSE:
-            log.debug("[%s %s] body=%s", verb, path, (js or {}))
+            log.debug("[%s %s] HTTP=200 code=%s msg=%s body=%s", verb, path, code, msg, (js or {}))
+        else:
+            log.debug("[%s %s] HTTP=200 code=%s msg=%s", verb, path, code, msg)
     else:
         log.error("[%s %s] HTTP=%s body=%s", verb, path, r.status_code, raw)
     return js
@@ -98,7 +96,6 @@ def _post(path: str, body: Optional[Dict[str, Any]]) -> Tuple[bool, Dict[str, An
     url = BASE + path
     body_str = "" if body is None else json.dumps(body, separators=(",", ":"), ensure_ascii=False)
     hdrs = _headers("POST", path, body_str)
-    # log en DEBUG le payload envoyé (sans secrets)
     if KC_VERBOSE:
         log.debug("[POST %s] payload=%s", path, body)
     try:
@@ -299,7 +296,7 @@ def place_limit_order(
         log.debug("[px] %s %s input=%.12f tick=%.12f → quant=%.12f → final=%.12f postOnly=%s",
                   symbol, side, float(price), tick, px_q, px, post_only)
 
-    # margin mode info only (no crossMode sent)
+    # info only (no crossMode sent)
     pos_raw = _get_position_raw(symbol)
     is_hedge, hedge_reason = _detect_hedge(pos_raw)
     if cross_mode is not None:
@@ -375,14 +372,17 @@ def place_limit_order(
             return resp3
         resp = resp3
 
-    # 4) Mode mismatch → retry ONLY if hedge detected → add positionSide (long/short)
-    if (not resp["ok"]) and (resp.get("code") == "330011") and is_hedge:
-        pos_long_id, pos_short_id = _extract_position_ids(pos_raw)
+    # 4) Mode mismatch (authoritative) → ALWAYS retry with positionSide;
+    #    if it answers 400100, we log that the symbol/account is one-way strict.
+    if (not resp["ok"]) and (resp.get("code") == "330011"):
         ps = "long" if s_low == "buy" else "short"
+        pos_long_id, pos_short_id = _extract_position_ids(pos_raw)
         use_pid = pos_long_id if ps == "long" else pos_short_id
-        log.info("[mode] retry %s hedge=%s: positionSide=%s positionId=%s (reason=%s)",
-                 symbol, is_hedge, ps, use_pid or "None", hedge_reason)
-        resp4 = _send(_make_body(position_side=ps, position_id=use_pid), tag=":hedge")
+        log.info("[mode] 330011 authoritative → retry with positionSide=%s positionId=%s (hedge_detected=%s reason=%s)",
+                 ps, use_pid or "None", is_hedge, hedge_reason)
+        resp4 = _send(_make_body(position_side=ps, position_id=use_pid), tag=":ps")
+        if (not resp4["ok"]) and resp4.get("code") == "400100":
+            log.info("[mode] positionSide not accepted (400100) → one-way strict for %s. Keep legacy semantics.", symbol)
         return resp4
 
     return resp
