@@ -91,7 +91,7 @@ def _log_http_outcome(verb: str, path: str, r: httpx.Response):
         if KC_VERBOSE:
             log.debug("[%s %s] body=%s", verb, path, (js or {}))
     else:
-        log.error("[%s %s] HTTP=%s body=%s", verb, path, r.status_code, raw[:800])
+        log.error("[%s %s] HTTP=%s body=%s", verb, path, r.status_code, raw)
     return js
 
 def _post(path: str, body: Optional[Dict[str, Any]]) -> Tuple[bool, Dict[str, Any]]:
@@ -299,7 +299,7 @@ def place_limit_order(
         log.debug("[px] %s %s input=%.12f tick=%.12f → quant=%.12f → final=%.12f postOnly=%s",
                   symbol, side, float(price), tick, px_q, px, post_only)
 
-    # margin mode info only
+    # margin mode info only (no crossMode sent)
     pos_raw = _get_position_raw(symbol)
     is_hedge, hedge_reason = _detect_hedge(pos_raw)
     if cross_mode is not None:
@@ -379,7 +379,6 @@ def place_limit_order(
     if (not resp["ok"]) and (resp.get("code") == "330011") and is_hedge:
         pos_long_id, pos_short_id = _extract_position_ids(pos_raw)
         ps = "long" if s_low == "buy" else "short"
-        # On privilégie positionSide; si un positionId correspondant existe, on l’envoie aussi.
         use_pid = pos_long_id if ps == "long" else pos_short_id
         log.info("[mode] retry %s hedge=%s: positionSide=%s positionId=%s (reason=%s)",
                  symbol, is_hedge, ps, use_pid or "None", hedge_reason)
