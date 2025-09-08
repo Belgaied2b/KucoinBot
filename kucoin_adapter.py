@@ -1,10 +1,13 @@
-# kucoin_adapter.py — verbose diagnostics (old-style flow + authoritative 330011 fallback)
+# kucoin_adapter.py — verbose diagnostics (old-style + 330011 → ps, puis positionId-only; anti-zero price)
 # - 1er essai: jamais positionSide, jamais crossMode (comme l'ancien)
-# - Retries: 100001 (leverage fallback), 300012 (clamp price et retry),
-#            330011 (TOUJOURS re-essayer avec positionSide long/short)
-#            si 400100 après ça → on log que le symbole est en one-way strict
-# - Logs détaillés (HTTP, payload, détection hedge, pipeline prix)
-# - KC_VERBOSE=1 pour logs DEBUG verbeux
+# - Retries:
+#    * 100001 (leverage fallback)
+#    * 300012 (clamp price et retry)
+#    * 330011:
+#         (1) retry avec positionSide (+ positionId si dispo)
+#         (2) si 400100 → retry **positionId seul** (sans positionSide)
+# - Garde: si prix ≤ 0 → reprise du last/mark ticker, puis quantize+clamp
+# - KC_VERBOSE=1 → logs DEBUG détaillés
 
 import os, time, hmac, base64, hashlib, math
 from typing import Any, Dict, Optional, Tuple
@@ -132,11 +135,13 @@ def get_orderbook_top(symbol: str) -> Dict[str, Optional[float]]:
             "bestAsk": _f(d.get("bestAskPrice") or d.get("sell") or d.get("bestAsk")),
             "bidSize": _f(d.get("bestBidSize")),
             "askSize": _f(d.get("bestAskSize")),
+            "last": _f(d.get("lastTradedPrice") or d.get("lastPrice") or d.get("price")),
+            "mark": _f(d.get("indexPrice") or d.get("markPrice")),
         }
         if KC_VERBOSE:
             log.debug("[ticker] %s %s", symbol, out)
         return out
-    return {"bestBid": None, "bestAsk": None, "bidSize": None, "askSize": None}
+    return {"bestBid": None, "bestAsk": None, "bidSize": None, "askSize": None, "last": None, "mark": None}
 
 # ---------------- Symbol meta / tick ----------------
 def get_symbol_meta(symbol: str) -> Dict[str, Any]:
@@ -193,10 +198,8 @@ def _get_position_raw(symbol: str) -> Dict[str, Any]:
     return {}
 
 def _detect_hedge(pos_json: Dict[str, Any]) -> Tuple[bool, str]:
-    """Retourne (is_hedge, reason_str) avec indices trouvés (pour logs)."""
     if not pos_json:
         return False, "empty-payload"
-    # flags explicites
     for k in ("positionMode", "posMode", "mode"):
         v = pos_json.get(k)
         if isinstance(v, str):
@@ -205,12 +208,10 @@ def _detect_hedge(pos_json: Dict[str, Any]) -> Tuple[bool, str]:
             if "one" in v_low or "single" in v_low: return False, f"{k}=oneway"
     if isinstance(pos_json.get("isHedgeMode"), bool):
         return (pos_json["isHedgeMode"], "isHedgeMode")
-    # inventaires disjoints long/short
     long_keys = ("longQty", "longSize", "longOpen", "longAvailable")
     short_keys = ("shortQty", "shortSize", "shortOpen", "shortAvailable")
     if any(k in pos_json for k in long_keys) and any(k in pos_json for k in short_keys):
         return True, "split-long-short-metrics"
-    # liste de positions
     items = pos_json.get("positions") or pos_json.get("items") or pos_json.get("data")
     if isinstance(items, list) and len(items) >= 2:
         sides = {str(x.get("side","")).lower() for x in items if isinstance(x, dict)}
@@ -247,7 +248,18 @@ def get_order_by_client_oid(client_oid: str) -> Optional[Dict[str, Any]]:
     if not ok: return None
     return js.get("data") or None
 
-# ---------------- Price clamp for postOnly ----------------
+# ---------------- Price helpers ----------------
+def _ensure_positive_price(symbol: str, side: str, px: float, tick: float) -> float:
+    """Si px <= 0: utilise last/mark du ticker puis quantize/clamp."""
+    if px and px > 0:
+        return px
+    quotes = get_orderbook_top(symbol)
+    ref = quotes.get("last") or quotes.get("mark") or quotes.get("bestAsk") or quotes.get("bestBid")
+    if not ref or ref <= 0:
+        return max(tick, 1e-8)  # ultime garde (évite 0)
+    px_q = _quantize_price(float(ref), tick, side)
+    return _clamp_postonly_price(symbol, side, px_q, tick)
+
 def _clamp_postonly_price(symbol: str, side: str, raw_px: float, tick: float) -> float:
     quotes = get_orderbook_top(symbol)
     bb, ba = quotes.get("bestBid"), quotes.get("bestAsk")
@@ -291,9 +303,10 @@ def place_limit_order(
     tick = _price_increment(symbol)
     px_q = _quantize_price(float(price), tick, side)
     px   = _clamp_postonly_price(symbol, side, px_q, tick) if post_only else px_q
+    px   = _ensure_positive_price(symbol, side, px, tick)
 
     if KC_VERBOSE:
-        log.debug("[px] %s %s input=%.12f tick=%.12f → quant=%.12f → final=%.12f postOnly=%s",
+        log.debug("[px] %s %s input=%.12f tick=%.12f → quant=%.12f → clamped=%.12f postOnly=%s",
                   symbol, side, float(price), tick, px_q, px, post_only)
 
     # info only (no crossMode sent)
@@ -323,7 +336,6 @@ def place_limit_order(
             "postOnly": bool(post_only),
             "leverage": str(lev_force if lev_force is not None else lev),
         }
-        # 1er essai: jamais positionSide / crossMode
         if position_side:
             body["positionSide"] = position_side
         if position_id:
@@ -372,17 +384,25 @@ def place_limit_order(
             return resp3
         resp = resp3
 
-    # 4) Mode mismatch (authoritative) → ALWAYS retry with positionSide;
-    #    if it answers 400100, we log that the symbol/account is one-way strict.
+    # 4) Mode mismatch (330011) → try positionSide (+positionId if any).
     if (not resp["ok"]) and (resp.get("code") == "330011"):
         ps = "long" if s_low == "buy" else "short"
         pos_long_id, pos_short_id = _extract_position_ids(pos_raw)
         use_pid = pos_long_id if ps == "long" else pos_short_id
-        log.info("[mode] 330011 authoritative → retry with positionSide=%s positionId=%s (hedge_detected=%s reason=%s)",
+        log.info("[mode] 330011 → retry with positionSide=%s positionId=%s (hedge_detected=%s reason=%s)",
                  ps, use_pid or "None", is_hedge, hedge_reason)
         resp4 = _send(_make_body(position_side=ps, position_id=use_pid), tag=":ps")
-        if (not resp4["ok"]) and resp4.get("code") == "400100":
-            log.info("[mode] positionSide not accepted (400100) → one-way strict for %s. Keep legacy semantics.", symbol)
+        if resp4["ok"]:
+            return resp4
+
+        # 4b) Si 400100, tenter **positionId seul** (sans positionSide)
+        if resp4.get("code") == "400100" and use_pid:
+            log.info("[mode] 400100 with positionSide; retry with positionId only=%s", use_pid)
+            resp5 = _send(_make_body(position_side=None, position_id=use_pid), tag=":pid")
+            return resp5
+
+        if resp4.get("code") == "400100":
+            log.info("[mode] positionSide not accepted and no positionId available → one-way strict for %s.", symbol)
         return resp4
 
     return resp
