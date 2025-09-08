@@ -5,7 +5,7 @@
 # - Prix quantifié au tick (tickSize/priceIncrement/pricePrecision)
 # - N'ENVOIE PAS crossMode (évite 330005)
 # - Retry si 100001 (leverage invalid)
-# - Retry si 330011 (position mode mismatch) avec/ sans positionSide
+# - Retry si 330011 : réémet en respectant le mode détecté (hedge -> avec positionSide, oneway -> sans)
 # - Vérification: NE PAS poller si création échoue (orderId None)
 
 import time
@@ -256,7 +256,7 @@ def place_limit_order(
     - **N'envoie pas crossMode** → évite 330005
     - **GÈRE le position mode**: en Hedge, ajoute positionSide=long/short
     - Retry si 100001 (Leverage invalid)
-    - Retry 1x si 330011 (position mode mismatch) en inversant la présence de positionSide
+    - Retry 1x si 330011 : réémet en respectant le mode détecté (hedge => avec, oneway => sans)
     - Renvoie {"ok":bool, "code":..., "msg":..., "orderId":..., "clientOid":..., "data": {...}}
     """
     _sync_server_time()
@@ -299,6 +299,8 @@ def place_limit_order(
         }
         if include_position_side:
             body["positionSide"] = "long" if s_low == "buy" else "short"
+        else:
+            body.pop("positionSide", None)
         return body
 
     def _send(body: Dict[str, Any]) -> Dict[str, Any]:
@@ -308,15 +310,16 @@ def place_limit_order(
             float(value_qty), body.get("postOnly"),
             f" positionSide={body.get('positionSide')}" if "positionSide" in body else ""
         )
-        ok, js = _post(ORDERS_PATH, body)
+        ok_http, js = _post(ORDERS_PATH, body)
         data = js.get("data") if isinstance(js, dict) else None
-        order_id = None
-        if isinstance(data, dict):
-            order_id = data.get("orderId")
+        order_id = data.get("orderId") if isinstance(data, dict) else None
         code = (js.get("code") or "")
         msg  = js.get("msg") or ""
+
+        # ✅ ok seulement si HTTP OK, code 200000 ET orderId présent
+        api_ok = bool(ok_http and code == "200000" and order_id)
         res = {
-            "ok": ok and (code == "200000"),
+            "ok": api_ok,
             "code": code,
             "msg": msg,
             "orderId": order_id,
@@ -328,7 +331,7 @@ def place_limit_order(
                      res["ok"], res["code"], res["msg"], res["clientOid"], res["orderId"])
         return res
 
-    # 1) tentative standard (avec/ sans positionSide selon mode)
+    # 1) tentative standard (avec/sans positionSide selon mode)
     body = _make_body()
     resp = _send(body)
 
@@ -338,19 +341,20 @@ def place_limit_order(
         if lev_fb == lev:
             lev_fb = 5 if lev != 5 else 3
         log.info("[leverage] retry %s with leverage=%s", symbol, lev_fb)
-        body = _make_body(lev_force=lev_fb)
-        resp = _send(body)
-        if resp["ok"]:
-            return resp
+        body_fb = _make_body(lev_force=lev_fb, include_position_side=include_ps)
+        resp_fb = _send(body_fb)
+        if resp_fb["ok"]:
+            return resp_fb
+        resp = resp_fb  # continue avec dernière réponse
 
-    # 3) mismatch position mode (330011) → inverse la présence de positionSide et retente 1x
+    # 3) mismatch position mode (330011) → réémet STRICTEMENT selon mode détecté
     if (not resp["ok"]) and (resp.get("code") == "330011"):
         pos_raw2 = _get_position_raw(symbol)
         pos_mode2 = _infer_position_mode_from_payload(pos_raw2)
-        include_ps2 = _needs_position_side(pos_mode2)
-        alternate = not include_ps2 if include_ps2 == include_ps else include_ps2
-        log.info("[positionMode] retry %s with include positionSide=%s (detected=%s)", symbol, alternate, pos_mode2)
-        body2 = _make_body(lev_force=None, include_position_side=alternate)
+        include_ps_correct = _needs_position_side(pos_mode2)
+        log.info("[positionMode] retry %s with include positionSide=%s (detected=%s)",
+                 symbol, include_ps_correct, pos_mode2)
+        body2 = _make_body(lev_force=None, include_position_side=include_ps_correct)
         resp2 = _send(body2)
         return resp2
 
