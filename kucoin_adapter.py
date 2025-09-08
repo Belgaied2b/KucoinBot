@@ -1,15 +1,15 @@
-# kucoin_adapter.py — minimal robuste (comme l'ancien)
-# - AUCUN envoi de positionSide
-# - N'envoie PAS crossMode
-# - Signature V2 + sync horloge
-# - Prix quantifié au tick + clamp passif sur bestBid/bestAsk (via /api/v1/ticker)
-# - 300012: retry 1x au bord autorisé (option: coupe postOnly si autorisé)
-# - 100001: retry 1x avec levier fallback
-# - 330011: on log et on remonte l'erreur (pas de bidouille positionId/positionSide)
-# - Hooks SFI: get_orderbook_top, place_market_by_value (optionnel), cancel_order, get_order_status
+# kucoin_adapter.py — verbose diagnostics (old-style flow + detailed logs)
+# - 1er essai: jamais positionSide, jamais crossMode (comme l'ancien)
+# - Retries: 100001 (leverage fallback), 300012 (clamp price et retry),
+#            330011 (UNIQUEMENT si hedge détecté → alors positionSide long/short)
+# - Logs détaillés:
+#     * HTTP status + body JSON/texte (tronqué)
+#     * Décision hedge/oneway avec indices trouvés
+#     * Prix: brut → quantized → clamp (si postOnly)
+#     * Corps d'ordre envoyé (sans secrets)
+# - KC_VERBOSE=1 pour logs DEBUG verbeux
 
-import re
-import time, hmac, base64, hashlib, math
+import os, time, hmac, base64, hashlib, math
 from typing import Any, Dict, Optional, Tuple
 
 import httpx
@@ -28,29 +28,35 @@ TIME_PATH   = "/api/v1/timestamp"
 GET_BY_COID = "/api/v1/order/client-order/{clientOid}"
 TICKER_PATH = "/api/v1/ticker"
 
-# ---- options
+KC_VERBOSE = os.getenv("KC_VERBOSE", "0") == "1"
 DEFAULT_LEVERAGE = int(getattr(SETTINGS, "default_leverage", 5))
-ALLOW_TAKER_ON_BAND_RETRY = bool(int(getattr(SETTINGS, "kc_allow_taker_on_band_retry", 0)))  # 0 = reste maker
-ALLOW_MARKET_ON_330011    = bool(int(getattr(SETTINGS, "kc_allow_market_on_330011", 0)))     # 0 = pas de market auto
 
 _SERVER_OFFSET = 0.0
 
-# ---------------- time & auth ----------------
+# ---------------- Time sync ----------------
 def _sync_server_time() -> None:
     global _SERVER_OFFSET
     try:
         with httpx.Client(timeout=5.0) as c:
             r = c.get(BASE + TIME_PATH)
-            r.raise_for_status()
-            server_ms = int((r.json() or {}).get("data", 0))
-            _SERVER_OFFSET = (server_ms / 1000.0) - time.time()
-            log.info(f"[time] offset={_SERVER_OFFSET:.3f}s")
+            raw = r.text[:400]
+            try:
+                js = r.json()
+            except Exception:
+                js = {}
+            if r.status_code == 200:
+                server_ms = int((js or {}).get("data", 0))
+                _SERVER_OFFSET = (server_ms / 1000.0) - time.time()
+                log.info("[time] offset=%.3fs http=200 data=%s", _SERVER_OFFSET, (js or {}))
+            else:
+                log.error("[time] HTTP=%s body=%s", r.status_code, raw)
     except Exception as e:
-        log.warning(f"time sync failed: {e}")
+        log.warning("time sync failed: %s", e)
 
 def _ts_ms() -> int:
     return int((time.time() + _SERVER_OFFSET) * 1000)
 
+# ---------------- Signatures ----------------
 def _b64_hmac_sha256(secret: str, payload: str) -> str:
     return base64.b64encode(
         hmac.new(secret.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).digest()
@@ -68,24 +74,40 @@ def _headers(method: str, path: str, body_str: str = "") -> Dict[str, str]:
         "KC-API-KEY-VERSION": "2",
         "Accept": "application/json",
         "Content-Type": "application/json",
-        "User-Agent": "bot/kucoin-minimal",
+        "User-Agent": "bot/kucoin-adapter",
     }
 
-# ---------------- http helpers ----------------
+# ---------------- HTTP helpers (verbose) ----------------
+def _log_http_outcome(verb: str, path: str, r: httpx.Response):
+    raw = r.text[:800] if r.text else ""
+    try:
+        js = r.json() if r.content else {}
+    except Exception:
+        js = {}
+    code = (js or {}).get("code")
+    msg  = (js or {}).get("msg")
+    if r.status_code == 200:
+        log.debug("[%s %s] HTTP=200 code=%s msg=%s", verb, path, code, msg)
+        if KC_VERBOSE:
+            log.debug("[%s %s] body=%s", verb, path, (js or {}))
+    else:
+        log.error("[%s %s] HTTP=%s body=%s", verb, path, r.status_code, raw[:800])
+    return js
+
 def _post(path: str, body: Optional[Dict[str, Any]]) -> Tuple[bool, Dict[str, Any]]:
     url = BASE + path
     body_str = "" if body is None else json.dumps(body, separators=(",", ":"), ensure_ascii=False)
     hdrs = _headers("POST", path, body_str)
+    # log en DEBUG le payload envoyé (sans secrets)
+    if KC_VERBOSE:
+        log.debug("[POST %s] payload=%s", path, body)
     try:
         with httpx.Client(timeout=10.0) as c:
             r = c.post(url, headers=hdrs, content=(body_str.encode("utf-8") if body_str else None))
-            ok = (r.status_code == 200)
-            data = r.json() if r.content else {}
-            if not ok:
-                log.error(f"[POST {path}] HTTP={r.status_code} {r.text[:200]}")
-            return ok, (data if isinstance(data, dict) else {})
+            js = _log_http_outcome("POST", path, r)
+            return (r.status_code == 200), (js if isinstance(js, dict) else {})
     except Exception as e:
-        log.error(f"[POST {path}] EXC={e}")
+        log.error("[POST %s] EXC=%s", path, e)
         return False, {"error": str(e)}
 
 def _get(path: str, params: Optional[Dict[str, Any]] = None) -> Tuple[bool, Dict[str, Any]]:
@@ -94,31 +116,13 @@ def _get(path: str, params: Optional[Dict[str, Any]] = None) -> Tuple[bool, Dict
     try:
         with httpx.Client(timeout=10.0) as c:
             r = c.get(url, headers=hdrs, params=params)
-            ok = (r.status_code == 200)
-            data = r.json() if r.content else {}
-            if not ok:
-                log.error(f"[GET {path}] HTTP={r.status_code} {r.text[:200]}")
-            return ok, (data if isinstance(data, dict) else {})
+            js = _log_http_outcome("GET", path, r)
+            return (r.status_code == 200), (js if isinstance(js, dict) else {})
     except Exception as e:
-        log.error(f"[GET {path}] EXC={e}")
+        log.error("[GET %s] EXC=%s", path, e)
         return False, {"error": str(e)}
 
-def _delete(path: str) -> Tuple[bool, Dict[str, Any]]:
-    url = BASE + path
-    hdrs = _headers("DELETE", path, "")
-    try:
-        with httpx.Client(timeout=10.0) as c:
-            r = c.delete(url, headers=hdrs)
-            ok = (r.status_code == 200)
-            data = r.json() if r.content else {}
-            if not ok:
-                log.error(f"[DELETE {path}] HTTP={r.status_code} {r.text[:200]}")
-            return ok, (data if isinstance(data, dict) else {})
-    except Exception as e:
-        log.error(f"[DELETE {path}] EXC={e}")
-        return False, {"error": str(e)}
-
-# --------- Ticker top (depth1 peut 404) ----------
+# ---------------- Market data helpers ----------------
 def get_orderbook_top(symbol: str) -> Dict[str, Optional[float]]:
     ok, js = _get(TICKER_PATH, params={"symbol": symbol})
     if ok and isinstance(js, dict) and isinstance(js.get("data"), dict):
@@ -126,18 +130,25 @@ def get_orderbook_top(symbol: str) -> Dict[str, Optional[float]]:
         def _f(x):
             try: return float(x)
             except Exception: return None
-        bb = _f(d.get("bestBidPrice") or d.get("buy") or d.get("bestBid"))
-        ba = _f(d.get("bestAskPrice") or d.get("sell") or d.get("bestAsk"))
-        bsz = _f(d.get("bestBidSize"))
-        asz = _f(d.get("bestAskSize"))
-        return {"bestBid": bb, "bestAsk": ba, "bidSize": bsz, "askSize": asz}
+        out = {
+            "bestBid": _f(d.get("bestBidPrice") or d.get("buy") or d.get("bestBid")),
+            "bestAsk": _f(d.get("bestAskPrice") or d.get("sell") or d.get("bestAsk")),
+            "bidSize": _f(d.get("bestBidSize")),
+            "askSize": _f(d.get("bestAskSize")),
+        }
+        if KC_VERBOSE:
+            log.debug("[ticker] %s %s", symbol, out)
+        return out
     return {"bestBid": None, "bestAsk": None, "bidSize": None, "askSize": None}
 
-# --------- Métadonnées / tick ----------
+# ---------------- Symbol meta / tick ----------------
 def get_symbol_meta(symbol: str) -> Dict[str, Any]:
     ok, js = _get(f"{CNTR_PATH}/{symbol}")
     if ok:
-        return js.get("data", {}) or {}
+        data = js.get("data", {}) or {}
+        if KC_VERBOSE:
+            log.debug("[contracts/%s] %s", symbol, data)
+        return data
     return {}
 
 def _safe_tick_from_meta(d: Dict[str, Any]) -> float:
@@ -172,17 +183,81 @@ def _quantize_price(price: float, tick: float, side: str) -> float:
     price = float(price); tick = float(tick)
     if tick <= 0: return price
     steps = price / tick
-    qsteps = math.floor(steps + 1e-12) if str(side).lower() == "buy" else math.ceil(steps - 1e-12)
-    return float(qsteps) * tick
+    return (math.floor(steps + 1e-12) if str(side).lower() == "buy"
+            else math.ceil(steps - 1e-12)) * tick
 
-# --------- Post-only clamp ----------
+# ---------------- Position helpers ----------------
+def _get_position_raw(symbol: str) -> Dict[str, Any]:
+    ok, js = _get(f"{POS_PATH}?symbol={symbol}")
+    if not ok or not isinstance(js, dict): return {}
+    data = js.get("data")
+    if isinstance(data, dict): return data
+    if isinstance(data, list) and data: return data[0]
+    return {}
+
+def _detect_hedge(pos_json: Dict[str, Any]) -> Tuple[bool, str]:
+    """Retourne (is_hedge, reason_str) avec indices trouvés (pour logs)."""
+    if not pos_json:
+        return False, "empty-payload"
+    # flags explicites
+    for k in ("positionMode", "posMode", "mode"):
+        v = pos_json.get(k)
+        if isinstance(v, str):
+            v_low = v.lower()
+            if "hedge" in v_low: return True, f"{k}=hedge"
+            if "one" in v_low or "single" in v_low: return False, f"{k}=oneway"
+    if isinstance(pos_json.get("isHedgeMode"), bool):
+        return (pos_json["isHedgeMode"], "isHedgeMode")
+    # inventaires disjoints long/short
+    long_keys = ("longQty", "longSize", "longOpen", "longAvailable")
+    short_keys = ("shortQty", "shortSize", "shortOpen", "shortAvailable")
+    if any(k in pos_json for k in long_keys) and any(k in pos_json for k in short_keys):
+        return True, "split-long-short-metrics"
+    # liste de positions
+    items = pos_json.get("positions") or pos_json.get("items") or pos_json.get("data")
+    if isinstance(items, list) and len(items) >= 2:
+        sides = {str(x.get("side","")).lower() for x in items if isinstance(x, dict)}
+        if "long" in sides and "short" in sides:
+            return True, "positions-array-long+short"
+    return False, "no-hedge-indicator"
+
+def _extract_position_ids(pos_json: Dict[str, Any]) -> Tuple[Optional[str], Optional[str]]:
+    candidates = [
+        ("longPositionId", "shortPositionId"),
+        ("longId", "shortId"),
+        ("positionIdLong", "positionIdShort"),
+        ("longPosId", "shortPosId"),
+    ]
+    for lkey, skey in candidates:
+        lid = pos_json.get(lkey); sid = pos_json.get(skey)
+        if lid or sid:
+            return (str(lid) if lid else None, str(sid) if sid else None)
+    items = pos_json.get("positions") or pos_json.get("items") or pos_json.get("data")
+    if isinstance(items, list):
+        l_id = s_id = None
+        for it in items:
+            if not isinstance(it, dict): continue
+            sd = str(it.get("side","")).lower()
+            pid = it.get("positionId") or it.get("id")
+            if not pid: continue
+            if sd == "long" and not l_id: l_id = str(pid)
+            if sd == "short" and not s_id: s_id = str(pid)
+        if l_id or s_id: return l_id, s_id
+    return None, None
+
+def get_order_by_client_oid(client_oid: str) -> Optional[Dict[str, Any]]:
+    ok, js = _get(GET_BY_COID.format(clientOid=client_oid))
+    if not ok: return None
+    return js.get("data") or None
+
+# ---------------- Price clamp for postOnly ----------------
 def _clamp_postonly_price(symbol: str, side: str, raw_px: float, tick: float) -> float:
     quotes = get_orderbook_top(symbol)
     bb, ba = quotes.get("bestBid"), quotes.get("bestAsk")
     px = float(raw_px)
+    s = str(side).lower()
     if bb is None and ba is None:
         return _quantize_price(px, tick, side)
-    s = str(side).lower()
     if s == "buy":
         anchor = bb if bb is not None else ba
         if anchor is not None:
@@ -191,65 +266,13 @@ def _clamp_postonly_price(symbol: str, side: str, raw_px: float, tick: float) ->
         anchor = ba if ba is not None else bb
         if anchor is not None:
             px = max(px, anchor + tick)
-    return _quantize_price(px, tick, side)
+    qpx = _quantize_price(px, tick, side)
+    if KC_VERBOSE:
+        log.debug("[clamp] %s %s raw=%.12f → clamped=%.12f (bb=%s ba=%s, tick=%s)",
+                  symbol, side, raw_px, qpx, bb, ba, tick)
+    return qpx
 
-# --------- Parse KuCoin band error (300012) ----------
-_band_hi = re.compile(r"cannot be higher than\s*([0-9]*\.?[0-9]+)", re.I)
-_band_lo = re.compile(r"cannot be lower than\s*([0-9]*\.?[0-9]+)", re.I)
-
-def _parse_band(msg: str) -> Tuple[Optional[str], Optional[float]]:
-    if not msg: return None, None
-    m = _band_hi.search(msg)
-    if m:
-        try: return "max", float(m.group(1))
-        except Exception: pass
-    m = _band_lo.search(msg)
-    if m:
-        try: return "min", float(m.group(1))
-        except Exception: pass
-    return None, None
-
-# ---------------- MARKET helper (optionnel) ----------------
-def place_market_by_value(symbol: str, side: str, value_usdt: float, leverage: Optional[int] = None,
-                          client_order_id: Optional[str] = None) -> Dict[str, Any]:
-    _sync_server_time()
-    lev = int(leverage or DEFAULT_LEVERAGE)
-    value_qty = float(value_usdt) * float(lev)
-    coid = client_order_id or str(_ts_ms())
-    body = {
-        "clientOid": coid,
-        "symbol": symbol,
-        "side": str(side).lower(),       # buy|sell
-        "type": "market",
-        "valueQty": f"{value_qty:.4f}",
-        "leverage": str(lev),
-    }
-    log.info("[place_market] %s %s valueQty=%.2f", symbol, body["side"], value_qty)
-    ok_http, js = _post(ORDERS_PATH, body)
-    data = js.get("data") if isinstance(js, dict) else None
-    order_id = data.get("orderId") if isinstance(data, dict) else None
-    code = (js.get("code") or ""); msg = js.get("msg") or ""
-    api_ok = bool(ok_http and code == "200000" and order_id)
-    res = {"ok": api_ok, "code": code, "msg": msg, "orderId": order_id, "clientOid": coid, "data": (data or {})}
-    return res
-
-# ---------------- CANCEL / STATUS ----------------
-def cancel_order(order_id: str) -> Dict[str, Any]:
-    ok, js = _delete(f"{ORDERS_PATH}/{order_id}")
-    return {"ok": ok and (js.get("code") == "200000"), "data": js.get("data")}
-
-def get_order_status(order_id: str) -> Dict[str, Any]:
-    ok, js = _get(f"{ORDERS_PATH}/{order_id}")
-    data = js.get("data") if ok else None
-    return {"ok": ok and (js.get("code") == "200000"), "data": data}
-
-# --------- Lookup by clientOid ----------
-def get_order_by_client_oid(client_oid: str) -> Optional[Dict[str, Any]]:
-    ok, js = _get(GET_BY_COID.format(clientOid=client_oid))
-    if not ok: return None
-    return js.get("data") or None
-
-# ---------------- Place LIMIT (comme l'ancien, durci) ----------------
+# ---------------- Place LIMIT (with rich logs) ----------------
 def place_limit_order(
     symbol: str,
     side: str,
@@ -261,7 +284,7 @@ def place_limit_order(
     post_only: bool = True,
     client_order_id: Optional[str] = None,
     leverage: Optional[int] = None,
-    cross_mode: Optional[bool] = None,   # ignoré: on ne l'envoie jamais
+    cross_mode: Optional[bool] = None,
 ) -> Dict[str, Any]:
     _sync_server_time()
 
@@ -269,43 +292,56 @@ def place_limit_order(
     value_qty = float(value_usdt) * float(lev)
 
     tick = _price_increment(symbol)
-    px = _quantize_price(float(price), tick, side)
-    if post_only:
-        px = _clamp_postonly_price(symbol, side, px, tick)
+    px_q = _quantize_price(float(price), tick, side)
+    px   = _clamp_postonly_price(symbol, side, px_q, tick) if post_only else px_q
 
-    # INFO uniquement
-    try:
-        ok_mm, js_mm = _get(f"{POS_PATH}?symbol={symbol}")
-        if ok_mm and isinstance(js_mm, dict):
-            d = js_mm.get("data") or {}
-            cm = d.get("crossMode")
-            if cm is not None:
-                log.info("[marginMode] %s -> %s", symbol, ("cross" if cm else "isolated"))
-    except Exception:
-        pass
+    if KC_VERBOSE:
+        log.debug("[px] %s %s input=%.12f tick=%.12f → quant=%.12f → final=%.12f postOnly=%s",
+                  symbol, side, float(price), tick, px_q, px, post_only)
+
+    # margin mode info only
+    pos_raw = _get_position_raw(symbol)
+    is_hedge, hedge_reason = _detect_hedge(pos_raw)
+    if cross_mode is not None:
+        log.info("[marginMode] %s -> %s", symbol, "cross" if cross_mode else "isolated")
+    log.info("[position] %s -> hedge=%s reason=%s (no positionSide on first try)",
+             symbol, is_hedge, hedge_reason)
 
     coid = client_order_id or str(_ts_ms())
     s_low = str(side).lower()
 
-    def _make_body(lev_force: Optional[int] = None, price_override: Optional[float] = None, force_post_only: Optional[bool] = None) -> Dict[str, Any]:
+    def _make_body(lev_force: Optional[int] = None,
+                   price_override: Optional[float] = None,
+                   position_side: Optional[str] = None,
+                   position_id: Optional[str] = None) -> Dict[str, Any]:
         use_px = float(price_override) if (price_override is not None) else float(px)
         body = {
             "clientOid": coid,
             "symbol": symbol,
-            "side": s_low,              # "buy" | "sell"
+            "side": s_low,
             "type": "limit",
             "price": f"{use_px:.12f}",
             "valueQty": f"{value_qty:.4f}",
             "timeInForce": "GTC",
-            "postOnly": bool(post_only if force_post_only is None else force_post_only),
+            "postOnly": bool(post_only),
             "leverage": str(lev_force if lev_force is not None else lev),
         }
-        # ⚠️ NE PAS ENVOYER crossMode NI positionSide
+        # 1er essai: jamais positionSide / crossMode
+        if position_side:
+            body["positionSide"] = position_side
+        if position_id:
+            body["positionId"] = str(position_id)
         return body
 
-    def _send(body: Dict[str, Any]) -> Dict[str, Any]:
-        log.info("[place_limit] %s %s px=%s valueQty=%.2f postOnly=%s",
-                 symbol, body.get("side"), body.get("price"), float(value_qty), body.get("postOnly"))
+    def _send(body: Dict[str, Any], tag: str) -> Dict[str, Any]:
+        log.info(
+            "[place_limit%s] %s %s px=%s valueQty=%.4f postOnly=%s%s%s",
+            tag,
+            symbol, body.get("side"), body.get("price"),
+            float(value_qty), body.get("postOnly"),
+            f" positionSide={body.get('positionSide')}" if "positionSide" in body else "",
+            f" positionId={body.get('positionId')}" if "positionId" in body else ""
+        )
         ok_http, js = _post(ORDERS_PATH, body)
         data = js.get("data") if isinstance(js, dict) else None
         order_id = data.get("orderId") if isinstance(data, dict) else None
@@ -313,42 +349,41 @@ def place_limit_order(
         api_ok = bool(ok_http and code == "200000" and order_id)
         res = {"ok": api_ok, "code": code, "msg": msg, "orderId": order_id, "clientOid": body.get("clientOid"), "data": (data or {})}
         if not res["ok"]:
-            log.info("[kc.place_limit_order] ok=%s code=%s msg=%s clientOid=%s orderId=%s",
-                     res["ok"], res["code"], res["msg"], res["clientOid"], res["orderId"])
+            log.info("[kc.place_limit_order%s] ok=%s code=%s msg=%s clientOid=%s orderId=%s",
+                     tag, res["ok"], res["code"], res["msg"], res["clientOid"], res["orderId"])
         return res
 
-    # 1) tentative standard (aucun positionSide)
-    resp = _send(_make_body())
+    # 1) First try – legacy (no positionSide)
+    resp = _send(_make_body(), tag="")
 
-    # 2) leverage invalid (100001) → retry 1x avec levier fallback
+    # 2) Leverage invalid → retry with fallback
     if (not resp["ok"]) and ("Leverage parameter invalid" in str(resp.get("msg","")) or resp.get("code") == "100001"):
-        lev_fb = int(DEFAULT_LEVERAGE or 5)
+        lev_fb = int(getattr(SETTINGS, "default_leverage", DEFAULT_LEVERAGE) or DEFAULT_LEVERAGE)
         if lev_fb == lev: lev_fb = 5 if lev != 5 else 3
         log.info("[leverage] retry %s with leverage=%s", symbol, lev_fb)
-        resp_fb = _send(_make_body(lev_force=lev_fb))
-        if resp_fb["ok"]: return resp_fb
-        resp = resp_fb
+        resp2 = _send(_make_body(lev_force=lev_fb), tag=":lev")
+        if resp2["ok"]:
+            return resp2
+        resp = resp2
 
-    # 3) mismatch position mode (330011) — comme l'ancien: on ne bricole pas, on remonte l'erreur
-    if (not resp["ok"]) and (resp.get("code") == "330011"):
-        if ALLOW_MARKET_ON_330011:
-            log.info("[330011] optional fallback: small taker")
-            # petit trade taker pour éviter blocage (ex: 25% notionnel)
-            _ = place_market_by_value(symbol, side, value_usdt * 0.25, leverage=lev)
-        return resp
-
-    # 4) prix hors bande (300012) → lire le seuil, reclamp et retry 1x; option: couper postOnly
+    # 3) Price out-of-band → clamp again and retry once
     if (not resp["ok"]) and (resp.get("code") == "300012"):
-        kind, edge = _parse_band(resp.get("msg",""))
-        px_retry = float(price)
-        if kind == "max":      # prix > bande max → recule un peu
-            px_retry = edge - (tick * 0.5)
-        elif kind == "min":    # prix < bande min → avance un peu
-            px_retry = edge + (tick * 0.5)
-        px_retry = _quantize_price(px_retry, tick, side)
-        force_po = False if ALLOW_TAKER_ON_BAND_RETRY else None
-        log.info("[price] retry %s band=%s edge=%s px=%s (postOnly=%s)",
-                 symbol, kind, edge, f"{px_retry:.12f}", False if force_po is False else postOnly)
-        return _send(_make_body(price_override=px_retry, force_post_only=force_po))
+        px_retry = _clamp_postonly_price(symbol, side, float(price), tick)
+        log.info("[price] retry %s with passive px=%s (clamped)", symbol, f"{px_retry:.12f}")
+        resp3 = _send(_make_body(price_override=px_retry), tag=":px")
+        if resp3["ok"]:
+            return resp3
+        resp = resp3
+
+    # 4) Mode mismatch → retry ONLY if hedge detected → add positionSide (long/short)
+    if (not resp["ok"]) and (resp.get("code") == "330011") and is_hedge:
+        pos_long_id, pos_short_id = _extract_position_ids(pos_raw)
+        ps = "long" if s_low == "buy" else "short"
+        # On privilégie positionSide; si un positionId correspondant existe, on l’envoie aussi.
+        use_pid = pos_long_id if ps == "long" else pos_short_id
+        log.info("[mode] retry %s hedge=%s: positionSide=%s positionId=%s (reason=%s)",
+                 symbol, is_hedge, ps, use_pid or "None", hedge_reason)
+        resp4 = _send(_make_body(position_side=ps, position_id=use_pid), tag=":hedge")
+        return resp4
 
     return resp
