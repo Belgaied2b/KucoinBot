@@ -17,6 +17,9 @@ QUEUE_THRESHOLD = float(os.environ.get("QUEUE_THRESHOLD", "2000"))
 REQUOTE_COOLDOWN_MS = int(os.environ.get("REQUOTE_COOLDOWN_MS", "800"))
 MAKER_TO_TAKER_SWITCH = os.environ.get("MAKER_TO_TAKER_SWITCH", "0") == "1"
 
+log = logging.getLogger(__name__)
+
+# --- Backends ---
 try:
     import kucoin_adapter as kt
 except Exception:
@@ -27,7 +30,8 @@ except Exception:
         logging.warning("execution_sfi: aucun backend KuCoin importable.")
 
 def _side_to_kucoin(side: str) -> str:
-    return "buy" if side.lower() == "long" else "sell"
+    s = (side or "").lower()
+    return "buy" if s in ("long", "buy") else "sell"
 
 def get_symbol_meta(symbol: str) -> Dict[str, Any]:
     if kt and hasattr(kt, "get_symbol_meta"):
@@ -57,6 +61,10 @@ def get_orderbook_top(symbol: str) -> Tuple[Optional[float], Optional[float], Op
 def place_limit(symbol: str, side: str, price: float, value_usdt: float,
                 sl: Optional[float]=None, tp1: Optional[float]=None, tp2: Optional[float]=None,
                 post_only: bool = POST_ONLY_DEFAULT, client_order_id: Optional[str]=None) -> Dict[str, Any]:
+    """
+    Appelle l’adapter KuCoin en mode LIMIT.
+    Retourne le dict brut de l’adapter (incluant ok/code/msg/orderId/...).
+    """
     if kt is None:
         raise RuntimeError("execution_sfi: backend KuCoin indisponible")
     if client_order_id is None:
@@ -66,23 +74,44 @@ def place_limit(symbol: str, side: str, price: float, value_usdt: float,
         try:
             return fn(**kwargs)
         except TypeError:
+            # compat anciennes signatures
             kwargs.pop("post_only", None)
-            kwargs.pop("extra_kwargs", None)
             return fn(**kwargs)
 
     if hasattr(kt, "place_limit_order"):
-        return _try(kt.place_limit_order, symbol=symbol, side=_side_to_kucoin(side),
-                    price=price, value_usdt=value_usdt, sl=sl, tp1=tp1, tp2=tp2,
-                    post_only=post_only, client_order_id=client_order_id, extra_kwargs={})
+        return _try(
+            kt.place_limit_order,
+            symbol=symbol,
+            side=_side_to_kucoin(side),
+            price=price,
+            value_usdt=value_usdt,
+            sl=sl, tp1=tp1, tp2=tp2,
+            post_only=post_only,
+            client_order_id=client_order_id
+        )
     if hasattr(kt, "place_order"):
-        return _try(kt.place_order, symbol=symbol, side=_side_to_kucoin(side),
-                    order_type="limit", price=price, value_usdt=value_usdt,
-                    sl=sl, tp1=tp1, tp2=tp2, post_only=post_only,
-                    client_order_id=client_order_id, extra_kwargs={})
+        return _try(
+            kt.place_order,
+            symbol=symbol,
+            side=_side_to_kucoin(side),
+            order_type="limit",
+            price=price,
+            value_usdt=value_usdt,
+            sl=sl, tp1=tp1, tp2=tp2,
+            post_only=post_only,
+            client_order_id=client_order_id
+        )
     if hasattr(kt, "place_limit_valueqty"):
-        return _try(kt.place_limit_valueqty, symbol=symbol, side=_side_to_kucoin(side),
-                    price=price, value_usdt=value_usdt, sl=sl, tp1=tp1, tp2=tp2,
-                    post_only=post_only, client_order_id=client_order_id, extra_kwargs={})
+        return _try(
+            kt.place_limit_valueqty,
+            symbol=symbol,
+            side=_side_to_kucoin(side),
+            price=price,
+            value_usdt=value_usdt,
+            sl=sl, tp1=tp1, tp2=tp2,
+            post_only=post_only,
+            client_order_id=client_order_id
+        )
     raise RuntimeError("execution_sfi: aucune méthode LIMIT compatible")
 
 def cancel_order(order_id: str) -> Any:
@@ -170,8 +199,8 @@ class SFIEngine:
     def _place_tranche(self, price: float, value: float) -> Optional[str]:
         """
         Place une tranche LIMIT via backend KuCoin.
-        ✅ Retourne uniquement un **vrai** orderId (exchange).
-        ❌ N'utilise plus clientOid/uuid en secours (évite faux positifs).
+        ✅ Retourne uniquement un **vrai** orderId (exchange) ET si ok=True.
+        ❌ N'utilise jamais clientOid/uuid en secours (évite faux positifs).
         """
         try:
             resp = place_limit(
@@ -179,31 +208,42 @@ class SFIEngine:
                 self.sl, self.tp1, self.tp2,
                 post_only=POST_ONLY_DEFAULT
             )
+
+            # --- Diagnostics détaillés si pas OK
             if not isinstance(resp, dict):
-                logging.info("[%s] tranche refusée (bad resp type): %s", self.symbol, resp)
+                log.info("[%s] tranche refusée (bad resp type): %s", self.symbol, resp)
                 return None
 
+            ok_flag = bool(resp.get("ok"))
             data = resp.get("data") or {}
             code = resp.get("code")
             msg  = resp.get("msg")
             order_id = resp.get("orderId") or data.get("orderId")
 
-            if order_id:
+            if ok_flag and order_id:
                 return str(order_id)
 
-            # Pas d'orderId -> on log le code/message pour debug et on renvoie None
-            logging.info("[%s] tranche refusée: code=%s msg=%s data=%s",
-                         self.symbol, code, msg, {k: data.get(k) for k in ("clientOid", "orderId")})
+            # Logs verbeux pour debug (tronqués si énormes)
+            try:
+                # afficher le JSON brut renvoyé par l'adapter (utile pour 330011/400100/300012)
+                raw_preview = {k: resp.get(k) for k in ("ok","code","msg","orderId","clientOid","data")}
+            except Exception:
+                raw_preview = {"error": "unprintable resp"}
+
+            log.info("[%s] tranche refusée: code=%s msg=%s data_keys=%s raw=%s",
+                     self.symbol, code, msg, list(data.keys()) if isinstance(data, dict) else type(data).__name__,
+                     str(raw_preview)[:600])
             return None
+
         except Exception as e:
-            logging.error("[%s] tranche place KO: %s", self.symbol, e)
+            log.error("[%s] tranche place KO: %s", self.symbol, e)
             return None
 
     def place_initial(self, entry_hint: Optional[float] = None) -> List[str]:
         p1, p2, _ = self._quote_prices()
         splits = PEGMID_SPLIT if len(PEGMID_SPLIT) >= 2 else [0.6, 0.4]
         sizes = [max(0.0, self.total_value * s) for s in splits[:2]]
-        orders = []
+        orders: List[str] = []
         if p1 is not None and p2 is not None:
             for price, val in zip([p1, p2], sizes):
                 oid = self._place_tranche(price, val)
@@ -211,7 +251,8 @@ class SFIEngine:
                     orders.append(oid)
         elif entry_hint is not None:
             oid = self._place_tranche(entry_hint, self.total_value)
-            if oid: orders.append(oid)
+            if oid:
+                orders.append(oid)
         self.order_ids = orders
         return orders
 
@@ -243,7 +284,10 @@ class SFIEngine:
             return None
         try:
             if hasattr(kt, "place_market_by_value"):
-                return str(kt.place_market_by_value(self.symbol, self.side, self.total_value * pct).get("orderId"))
+                # envoyer 'buy'/'sell' au backend
+                return str(
+                    kt.place_market_by_value(self.symbol, _side_to_kucoin(self.side), self.total_value * pct).get("orderId")
+                )
         except Exception:
             pass
         return None
