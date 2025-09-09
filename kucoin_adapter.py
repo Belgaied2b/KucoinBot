@@ -1,12 +1,11 @@
-# kucoin_adapter.py — verbose diagnostics (old-style + 330011 → ps, puis positionId-only; anti-zero price)
-# - 1er essai: jamais positionSide, jamais crossMode (comme l'ancien)
-# - Retries:
-#    * 100001 (leverage fallback)
-#    * 300012 (clamp price et retry)
-#    * 330011:
-#         (1) retry avec positionSide (+ positionId si dispo)
-#         (2) si 400100 → retry **positionId seul** (sans positionSide)
-# - Garde: si prix ≤ 0 → reprise du last/mark ticker, puis quantize+clamp
+# kucoin_adapter.py — verbose diagnostics (legacy first; 330011 -> ONLY if hedge; pid-only path; anti-zero price)
+# - 1er essai : jamais positionSide, jamais crossMode
+# - Retries :
+#     * 100001 (leverage fallback)
+#     * 300012 (clamp price + retry)
+#     * 330011 : **UNIQUEMENT si hedge détecté** → retry positionSide (+ positionId si dispo),
+#                si 400100 → retry positionId seul. Sinon, on rend l’erreur telle quelle.
+# - Garde prix : si px <= 0 → last/mark du ticker puis quantize+clamp
 # - KC_VERBOSE=1 → logs DEBUG détaillés
 
 import os, time, hmac, base64, hashlib, math
@@ -30,6 +29,7 @@ TICKER_PATH = "/api/v1/ticker"
 
 KC_VERBOSE = os.getenv("KC_VERBOSE", "0") == "1"
 DEFAULT_LEVERAGE = int(getattr(SETTINGS, "default_leverage", 5))
+HEDGE_RECHECK_MS = int(os.getenv("HEDGE_RECHECK_MS", "120"))
 
 _SERVER_OFFSET = 0.0
 
@@ -250,13 +250,12 @@ def get_order_by_client_oid(client_oid: str) -> Optional[Dict[str, Any]]:
 
 # ---------------- Price helpers ----------------
 def _ensure_positive_price(symbol: str, side: str, px: float, tick: float) -> float:
-    """Si px <= 0: utilise last/mark du ticker puis quantize/clamp."""
     if px and px > 0:
         return px
     quotes = get_orderbook_top(symbol)
     ref = quotes.get("last") or quotes.get("mark") or quotes.get("bestAsk") or quotes.get("bestBid")
     if not ref or ref <= 0:
-        return max(tick, 1e-8)  # ultime garde (évite 0)
+        return max(tick, 1e-8)
     px_q = _quantize_price(float(ref), tick, side)
     return _clamp_postonly_price(symbol, side, px_q, tick)
 
@@ -384,13 +383,29 @@ def place_limit_order(
             return resp3
         resp = resp3
 
-    # 4) Mode mismatch (330011) → try positionSide (+positionId if any).
+    # 4) Mode mismatch (330011)
     if (not resp["ok"]) and (resp.get("code") == "330011"):
+        # Petit re-check (certains comptes mettent quelques ms à exposer hedge)
+        if not is_hedge and HEDGE_RECHECK_MS > 0:
+            time.sleep(HEDGE_RECHECK_MS / 1000.0)
+            pos_raw2 = _get_position_raw(symbol)
+            is_hedge2, reason2 = _detect_hedge(pos_raw2)
+            if is_hedge2:
+                is_hedge, pos_raw = is_hedge2, pos_raw2
+                hedge_reason = f"recheck:{reason2}"
+                log.info("[position] recheck hedge=%s reason=%s", is_hedge, hedge_reason)
+
+        if not is_hedge:
+            # ⚠️ Nouveau : NE PAS tenter positionSide si hedge pas avéré
+            log.info("[mode] 330011 but hedge not detected → keep one-way semantics and return error.")
+            return resp
+
+        # hedge avéré → try positionSide (+positionId si dispo)
         ps = "long" if s_low == "buy" else "short"
         pos_long_id, pos_short_id = _extract_position_ids(pos_raw)
         use_pid = pos_long_id if ps == "long" else pos_short_id
-        log.info("[mode] 330011 → retry with positionSide=%s positionId=%s (hedge_detected=%s reason=%s)",
-                 ps, use_pid or "None", is_hedge, hedge_reason)
+        log.info("[mode] 330011 (hedge) → retry with positionSide=%s positionId=%s (reason=%s)",
+                 ps, use_pid or "None", hedge_reason)
         resp4 = _send(_make_body(position_side=ps, position_id=use_pid), tag=":ps")
         if resp4["ok"]:
             return resp4
@@ -402,7 +417,7 @@ def place_limit_order(
             return resp5
 
         if resp4.get("code") == "400100":
-            log.info("[mode] positionSide not accepted and no positionId available → one-way strict for %s.", symbol)
+            log.info("[mode] positionSide rejected and no positionId available → one-way strict for %s.", symbol)
         return resp4
 
     return resp
