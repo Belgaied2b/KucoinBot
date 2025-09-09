@@ -1,4 +1,4 @@
-# config.py — prêt à coller (institutionnel 2/4 OK)
+# config.py — prêt à coller (institutionnel 2/4 OK, sans secrets en dur)
 import os
 from typing import List
 from pydantic import BaseModel, Field
@@ -32,19 +32,28 @@ def _get_list(name: str, default: List[str]) -> List[str]:
     return [s.strip().upper() for s in raw.split(",") if s.strip()]
 
 
+def _mask(s: str, keep: int = 4) -> str:
+    if not s:
+        return "∅"
+    s = str(s)
+    if len(s) <= keep:
+        return "*" * len(s)
+    return s[:keep] + "*" * (len(s) - keep)
+
+
 class Settings(BaseModel):
     # --- KUCOIN EXECUTION ---
     kucoin_base_url: str   = Field(default_factory=lambda: os.getenv("KUCOIN_BASE_URL", "https://api-futures.kucoin.com"))
     kucoin_ws_url: str     = Field(default_factory=lambda: os.getenv("KUCOIN_WS_URL", "wss://ws-api-futures.kucoin.com/endpoint"))
 
-    # Identifiants (⚠️ remplace par tes vraies clés Futures)
-    kucoin_key: str        = Field(default_factory=lambda: os.getenv("KUCOIN_API_KEY", "6890cfb4dffe710001e6edb0"))
-    kucoin_secret: str     = Field(default_factory=lambda: os.getenv("KUCOIN_API_SECRET", "889e4492-c2ff-4c9d-9136-64afe6d5e780"))
-    kucoin_passphrase: str = Field(default_factory=lambda: os.getenv("KUCOIN_API_PASSPHRASE", "Nad1703-_"))
+    # Identifiants (⚠️ DOIVENT venir de l'env Railway)
+    kucoin_key: str        = Field(default_factory=lambda: os.getenv("KUCOIN_API_KEY", ""))
+    kucoin_secret: str     = Field(default_factory=lambda: os.getenv("KUCOIN_API_SECRET", ""))
+    kucoin_passphrase: str = Field(default_factory=lambda: os.getenv("KUCOIN_API_PASSPHRASE", ""))
 
-    # --- SYMBOLS ---
+    # --- SYMBOLS (Futures) ---
     auto_symbols: bool     = Field(default_factory=lambda: _get_bool("AUTO_SYMBOLS", True))  # scan auto
-    symbols: List[str]     = Field(default_factory=lambda: _get_list("SYMBOLS", ["BTCUSDT", "ETHUSDT", "SOLUSDT"]))
+    symbols: List[str]     = Field(default_factory=lambda: _get_list("SYMBOLS", ["BTCUSDTM", "ETHUSDTM", "SOLUSDTM"]))
     symbols_max: int       = Field(default_factory=lambda: _get_int("SYMBOLS_MAX", 450))     # ~400+
     exclude_symbols: str   = Field(default_factory=lambda: os.getenv("EXCLUDE_SYMBOLS", ""))
 
@@ -93,36 +102,36 @@ class Settings(BaseModel):
     oi_fund_refresh_sec: int = Field(default_factory=lambda: _get_int("OI_FUND_REFRESH_SEC", 30))
 
     # --- DELTA (CVD Binance) utilisés par scanner ---
-    delta_window_sec: int    = Field(default_factory=lambda: _get_int("DELTA_WINDOW_SEC", 300))
-    delta_notional_ref: float= Field(default_factory=lambda: _get_float("DELTA_NOTIONAL_REF", 150_000.0))
+    delta_window_sec: int      = Field(default_factory=lambda: _get_int("DELTA_WINDOW_SEC", 300))
+    delta_notional_ref: float  = Field(default_factory=lambda: _get_float("DELTA_NOTIONAL_REF", 150_000.0))
 
     # --- LIQ PACK ---
     use_legacy_binance_liq: bool = Field(default_factory=lambda: _get_bool("USE_LEGACY_BINANCE_LIQ", False))
-    liq_refresh_sec: int       = Field(default_factory=lambda: _get_int("LIQ_REFRESH_SEC", 20))
-    liq_notional_norm: float   = Field(default_factory=lambda: _get_float("LIQ_NOTIONAL_NORM", 30000.0))
-    liq_imbal_weight: float    = Field(default_factory=lambda: _get_float("LIQ_IMBAL_WEIGHT", 0.35))
-    liq_notional_overrides: str = Field(default_factory=lambda: os.getenv("LIQ_NOTIONAL_OVERRIDES", "{}"))
+    liq_refresh_sec: int         = Field(default_factory=lambda: _get_int("LIQ_REFRESH_SEC", 20))
+    liq_notional_norm: float     = Field(default_factory=lambda: _get_float("LIQ_NOTIONAL_NORM", 30000.0))
+    liq_imbal_weight: float      = Field(default_factory=lambda: _get_float("LIQ_IMBAL_WEIGHT", 0.35))
+    liq_notional_overrides: str  = Field(default_factory=lambda: os.getenv("LIQ_NOTIONAL_OVERRIDES", "{}"))
 
     # --- PERSISTENCE / COOLDOWN ---
-    persist_win: int          = Field(default_factory=lambda: _get_int("PERSIST_WIN", 2))
-    persist_min_ok: int       = Field(default_factory=lambda: _get_int("PERSIST_MIN_OK", 1))
-    symbol_cooldown_sec: int  = Field(default_factory=lambda: _get_int("SYMBOL_COOLDOWN_SEC", 45))
-    min_liq_norm: float       = Field(default_factory=lambda: _get_float("MIN_LIQ_NORM", 0.0))
+    persist_win: int            = Field(default_factory=lambda: _get_int("PERSIST_WIN", 2))
+    persist_min_ok: int         = Field(default_factory=lambda: _get_int("PERSIST_MIN_OK", 1))
+    symbol_cooldown_sec: int    = Field(default_factory=lambda: _get_int("SYMBOL_COOLDOWN_SEC", 45))
+    min_liq_norm: float         = Field(default_factory=lambda: _get_float("MIN_LIQ_NORM", 0.0))
 
     # --- MACRO ---
-    use_macro: bool           = Field(default_factory=lambda: _get_bool("USE_MACRO", False))
-    use_total2: bool          = Field(default_factory=lambda: _get_bool("USE_TOTAL2", False))
-    macro_refresh_minutes: int = Field(default_factory=lambda: _get_int("MACRO_REFRESH_MINUTES", 5))
+    use_macro: bool             = Field(default_factory=lambda: _get_bool("USE_MACRO", False))
+    use_total2: bool            = Field(default_factory=lambda: _get_bool("USE_TOTAL2", False))
+    macro_refresh_minutes: int  = Field(default_factory=lambda: _get_int("MACRO_REFRESH_MINUTES", 5))
 
     # --- EXECUTION TACTICS (moins bloquant) ---
-    post_only_entries: bool   = Field(default_factory=lambda: _get_bool("POST_ONLY_ENTRIES", True))
-    entry_timeout_sec: float  = Field(default_factory=lambda: _get_float("ENTRY_TIMEOUT_SEC", 2.2))
-    max_requotes: int         = Field(default_factory=lambda: _get_int("MAX_REQUOTES", 1))
+    post_only_entries: bool       = Field(default_factory=lambda: _get_bool("POST_ONLY_ENTRIES", True))
+    entry_timeout_sec: float      = Field(default_factory=lambda: _get_float("ENTRY_TIMEOUT_SEC", 2.2))
+    max_requotes: int             = Field(default_factory=lambda: _get_int("MAX_REQUOTES", 1))
     max_maker_slippage_ticks: int = Field(default_factory=lambda: _get_int("MAX_MAKER_SLIPPAGE_TICKS", 25))
     adverse_sweep_threshold: float = Field(default_factory=lambda: _get_float("ADVERSE_SWEEP_THRESHOLD", 0.50))
-    cancel_on_adverse: bool   = Field(default_factory=lambda: _get_bool("CANCEL_ON_ADVERSE", False))
-    two_stage_entry: bool     = Field(default_factory=lambda: _get_bool("TWO_STAGE_ENTRY", False))
-    stage1_fraction: float    = Field(default_factory=lambda: _get_float("STAGE1_FRACTION", 0.35))
+    cancel_on_adverse: bool       = Field(default_factory=lambda: _get_bool("CANCEL_ON_ADVERSE", False))
+    two_stage_entry: bool         = Field(default_factory=lambda: _get_bool("TWO_STAGE_ENTRY", False))
+    stage1_fraction: float        = Field(default_factory=lambda: _get_float("STAGE1_FRACTION", 0.35))
 
     # --- EXECUTION (V1.1-bis) ---
     use_ioc_fallback: bool    = Field(default_factory=lambda: _get_bool("USE_IOC_FALLBACK", True))
@@ -137,8 +146,26 @@ class Settings(BaseModel):
     persist_path: str         = Field(default_factory=lambda: os.getenv("PERSIST_PATH", "./runtime_state.json"))
 
     # --- TELEGRAM ---
-    tg_token: str             = Field(default_factory=lambda: os.getenv("TELEGRAM_BOT_TOKEN", "7605602027:AAFTBVopeZQYBh8ZtoudgU5oykuWbZtDz2o"))
-    tg_chat: str              = Field(default_factory=lambda: os.getenv("TELEGRAM_CHAT_ID", "5485398553"))
+    tg_token: str             = Field(default_factory=lambda: os.getenv("TELEGRAM_BOT_TOKEN", ""))
+    tg_chat: str              = Field(default_factory=lambda: os.getenv("TELEGRAM_CHAT_ID", ""))
+
+    # ---- Helpers
+    def masked_summary(self) -> str:
+        return (
+            f"KUCOIN_BASE_URL={self.kucoin_base_url} | "
+            f"KEY={_mask(self.kucoin_key)} | "
+            f"SECRET={_mask(self.kucoin_secret)} | "
+            f"PASSPHRASE={_mask(self.kucoin_passphrase)} | "
+            f"TG_TOKEN={_mask(self.tg_token)} | TG_CHAT={_mask(self.tg_chat)}"
+        )
+
+    def assert_env(self):
+        missing = []
+        if not self.kucoin_key:        missing.append("KUCOIN_API_KEY")
+        if not self.kucoin_secret:     missing.append("KUCOIN_API_SECRET")
+        if not self.kucoin_passphrase: missing.append("KUCOIN_API_PASSPHRASE")
+        if missing:
+            raise RuntimeError(f"Variables d'environnement manquantes: {', '.join(missing)}")
 
 
 SETTINGS = Settings()
