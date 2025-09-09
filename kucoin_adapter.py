@@ -362,9 +362,51 @@ def place_limit_order(
             return resp2
         resp = resp2
 
+    # ... tout le haut du fichier reste identique ...
+
     # 3) Prix hors bande (300012) → reclamp & retry
     if (not resp["ok"]) and (resp.get("code") == "300012"):
         px_retry = _clamp_postonly_price(symbol, side, float(price), tick)
         log.info("[price] retry %s with passive px=%s (clamped)", symbol, f"{px_retry:.12f}")
         resp3 = _send(_make_body(price_override=px_retry), tag=":px")
-        if resp3["ok
+        if resp3["ok"]:
+            return resp3
+        resp = resp3
+
+    # 4) Mode mismatch (330011) → si *hedge détecté*, ajouter positionSide (+ positionId si dispo)
+    if (not resp["ok"]) and (resp.get("code") == "330011"):
+        if is_hedge:
+            pos_long_id, pos_short_id = _extract_position_ids(pos_raw)
+            ps = "long" if s_low == "buy" else "short"
+            use_pid = pos_long_id if ps == "long" else pos_short_id
+            log.info("[mode] 330011 → retry with positionSide=%s positionId=%s (hedge_detected=%s reason=%s)",
+                     ps, use_pid or "None", is_hedge, hedge_reason)
+            resp4 = _send(_make_body(position_side=ps, position_id=use_pid), tag=":ps")
+            return resp4
+        else:
+            log.info("[mode] 330011 but hedge not detected → keep one-way semantics and return error.")
+            return resp
+
+    return resp
+
+# ====== STUBS (compat SFI) ======
+def cancel_order(order_id: str) -> Dict[str, Any]:
+    # Fut: DELETE /api/v1/orders/{orderId}
+    try:
+        path = f"/api/v1/orders/{order_id}"
+        url = BASE + path
+        hdrs = _headers("DELETE", path, "")
+        with httpx.Client(timeout=6.0) as c:
+            r = c.delete(url, headers=hdrs)
+            js = _log_http_outcome("DELETE", path, r)
+            return {"ok": r.status_code == 200, "data": js}
+    except Exception as e:
+        log.error("[cancel] EXC=%s", e)
+        return {"ok": False, "error": str(e)}
+
+def replace_order(order_id: str, new_price: float) -> Dict[str, Any]:
+    c = cancel_order(order_id)
+    return {"replaced": False, "cancelled": bool(c.get("ok"))}
+
+def get_order_status(order_id: str) -> Dict[str, Any]:
+    return {"status": "unknown"}
