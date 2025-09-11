@@ -1,3 +1,7 @@
+# /app/kucoin_utils.py
+# Utilitaires KuCoin Futures : fetch klines, symbol meta, helpers
+# Corrigé pour retourner des dicts complets dans fetch_all_symbols()
+
 import time
 from typing import Dict, Any, List, Optional, Union
 
@@ -18,10 +22,6 @@ def _client(timeout: float = 10.0) -> httpx.Client:
 # Compat: mapping d'intervalle texte -> granularité minutes
 # ---------------------------------------------------------
 def _to_granularity(interval: Any) -> int:
-    """
-    Accepte '1m','2m','3m','5m','15m','30m','1h','2h','4h','6h','12h','1d'
-    ou déjà un int (minutes).
-    """
     if isinstance(interval, (int, float)):
         return int(interval)
     s = str(interval).lower().strip()
@@ -69,7 +69,6 @@ def fetch_symbol_meta() -> Dict[str, Dict[str, Any]]:
 
             display = sym_api.replace("USDTM", "USDT")
 
-            # Certains champs peuvent être str -> cast float
             tick_raw: Optional[Any] = it.get("tickSize", it.get("priceIncrement", None))
             tick = float(tick_raw) if tick_raw not in (None, "", 0, "0", "0.0") else 0.0
 
@@ -84,8 +83,10 @@ def fetch_symbol_meta() -> Dict[str, Dict[str, Any]]:
 
             meta[display] = {
                 "symbol_api": sym_api,
-                "tickSize": tick,  # peut être 0.0 si manquant; cf. price_tick_size pour fallback sûr
+                "tickSize": tick,
                 "pricePrecision": prec,
+                # garder raw au besoin
+                "_raw": it,
             }
         except Exception:
             continue
@@ -94,10 +95,6 @@ def fetch_symbol_meta() -> Dict[str, Dict[str, Any]]:
 
 
 def symbol_to_api(symbol: str, meta: Optional[Dict[str, Dict[str, Any]]] = None) -> str:
-    """
-    Convertit un symbole d'affichage 'BTCUSDT' vers le contrat API 'BTCUSDTM'.
-    Si c'est déjà un USDTM, on renvoie tel quel. Si impossible, on renvoie l'original.
-    """
     if symbol.upper().endswith("USDTM"):
         return symbol
     if meta is None:
@@ -107,44 +104,29 @@ def symbol_to_api(symbol: str, meta: Optional[Dict[str, Dict[str, Any]]] = None)
             meta = {}
     if symbol in meta and "symbol_api" in meta[symbol]:
         return str(meta[symbol]["symbol_api"])
-    # fallback léger
     if symbol.upper().endswith("USDT"):
-        cand = symbol.upper() + "M"
-        return cand
+        return symbol.upper() + "M"
     return symbol
 
 
 def price_tick_size(symbol: str, meta: Dict[str, Dict[str, Any]], default_tick: float = 1e-8) -> float:
-    """
-    Retourne un tickSize **garanti > 0** pour le symbole d'affichage (ex: BTCUSDT).
-    - utilise meta[symbol]['tickSize'] si > 0
-    - sinon derive via pricePrecision (10^-pp)
-    - sinon retourne default_tick (1e-8) pour éviter les 'multiple of 0'
-    """
     m = meta.get(symbol, {})
-    # 1) tick direct
     try:
         t = float(m.get("tickSize", 0))
         if t and t > 0:
             return t
     except Exception:
         pass
-    # 2) derive de pricePrecision
     try:
         pp = int(m.get("pricePrecision", None))
         if pp is not None and pp >= 0:
             return 10 ** (-pp)
     except Exception:
         pass
-    # 3) fallback
     return float(default_tick)
 
 
 def round_price(symbol: str, price: float, meta: Dict[str, Dict[str, Any]], default_tick: float = 0.1) -> float:
-    """
-    Arrondit le prix au multiple de tick du symbole affiché (ex: BTCUSDT),
-    en utilisant tickSize/pricePrecision de meta. (arrondi standard)
-    """
     tick = price_tick_size(symbol, meta, default_tick=default_tick)
     prec = _infer_precision_from_tick(tick)
     stepped = round(price / tick) * tick
@@ -158,45 +140,30 @@ def round_price_directional(
     meta: Dict[str, Dict[str, Any]],
     default_tick: float = 0.1
 ) -> float:
-    """
-    Arrondi directionnel pour rester passif en postOnly:
-      - BUY  -> floor (prix <= demandé, évite d'être exécuté immédiatement)
-      - SELL -> ceil
-    """
     s = side.lower().strip()
     tick = price_tick_size(symbol, meta, default_tick=default_tick)
     prec = _infer_precision_from_tick(tick)
     if tick <= 0:
-        # impossible normalement grâce à price_tick_size, mais on sécurise
         return round(price, prec)
     steps = price / tick
     if s == "buy":
         qsteps = int(steps // 1)  # floor
     else:
-        # sell ou inconnu -> on privilégie la sécurité côté vendeur
         qsteps = int(steps) if steps == int(steps) else int(steps) + 1  # ceil
     return round(qsteps * tick, prec)
 
 
 # ---------------------------------------------------------
-# Klines (implé minutes) + wrapper compat "interval"
+# Klines
 # ---------------------------------------------------------
 def _fetch_klines_minutes(symbol_api: str, granularity: int = 1, limit: int = 300) -> pd.DataFrame:
-    """
-    Implémentation minute-based. symbol_api doit être un contrat KuCoin (ex: BTCUSDTM).
-
-    ⚠️ KuCoin Futures /api/v1/kline/query renvoie:
-        [startAt, open, close, high, low, volume, turnover]
-    => Mapping correct: open=1, close=2, high=3, low=4
-    """
     now_ms = int(time.time() * 1000)
-    # fenêtre temps = limit * granularity minutes
     window_ms = limit * granularity * 60_000
     start_ms = max(0, now_ms - window_ms)
 
     params = {
         "symbol": symbol_api,
-        "granularity": granularity,  # minutes
+        "granularity": granularity,
         "from": start_ms,
         "to": now_ms,
     }
@@ -210,38 +177,28 @@ def _fetch_klines_minutes(symbol_api: str, granularity: int = 1, limit: int = 30
     except Exception:
         arr = []
 
-    # KuCoin Futures renvoie: [time(ms|s), open, close, high, low, volume, turnover]
     for it in arr:
         try:
             ts_raw = int(it[0])
-            # tolérance: si <= 10^10, on considère que c'est en secondes -> converti en ms
             ts = ts_raw * 1000 if ts_raw < 10_000_000_000 else ts_raw
-
-            o = float(it[1])  # open
-            c = float(it[2])  # close
-            h = float(it[3])  # high
-            l = float(it[4])  # low
-            v = float(it[5])  # volume
-
+            o = float(it[1])
+            c = float(it[2])
+            h = float(it[3])
+            l = float(it[4])
+            v = float(it[5])
             rows.append({"time": ts, "open": o, "high": h, "low": l, "close": c, "volume": v})
         except Exception:
             continue
 
     if not rows:
         return pd.DataFrame(columns=["time", "open", "high", "low", "close", "volume"])
-
     return pd.DataFrame(rows).sort_values("time").reset_index(drop=True)
 
 
 def fetch_klines(symbol: str, interval: Any = "1h", limit: int = 300, **kwargs) -> pd.DataFrame:
-    """
-    Compat: accepte interval str ('1m','1h','4h','1d',...) ou granularity int via kwargs.
-    - symbol: 'BTCUSDT' (affichage) ou 'BTCUSDTM' (contrat)
-    """
     gran = kwargs.pop("granularity", None)
     if gran is None:
         gran = _to_granularity(interval)
-    # map d'affichage -> contrat si nécessaire
     sym_api = symbol_to_api(symbol)
     return _fetch_klines_minutes(sym_api, granularity=gran, limit=limit)
 
@@ -250,9 +207,6 @@ def fetch_klines(symbol: str, interval: Any = "1h", limit: int = 300, **kwargs) 
 # Helpers découverte de symboles
 # -----------------------------
 def kucoin_active_usdt_symbols() -> List[str]:
-    """
-    Liste des symboles USDT actifs côté KuCoin Futures (version affichage 'XXXUSDT').
-    """
     url = f"{BASE}/api/v1/contracts/active"
     out: List[str] = []
     try:
@@ -262,20 +216,14 @@ def kucoin_active_usdt_symbols() -> List[str]:
             data = r.json().get("data", []) or []
     except Exception:
         data = []
-
     for it in data:
         sym = (it.get("symbol") or "").strip()
         if sym.endswith("USDTM"):
             out.append(sym.replace("USDTM", "USDT"))
-
-    # dédup + tri alphabétique
     return sorted(set(out))
 
 
 def binance_usdt_perp_symbols() -> List[str]:
-    """
-    Liste des PERPETUAL USDT-M côté Binance Futures (pour croiser avec KuCoin).
-    """
     url = "https://fapi.binance.com/fapi/v1/exchangeInfo"
     out: List[str] = []
     try:
@@ -285,7 +233,6 @@ def binance_usdt_perp_symbols() -> List[str]:
             data = r.json().get("symbols", []) or []
     except Exception:
         data = []
-
     for s in data:
         try:
             if (
@@ -298,22 +245,15 @@ def binance_usdt_perp_symbols() -> List[str]:
                     out.append(sym)
         except Exception:
             continue
-
     return sorted(set(out))
 
 
 def common_usdt_symbols(limit: int = 0, exclude_csv: str = "") -> List[str]:
-    """
-    Renvoie les symboles USDT communs KuCoin/Binance (version affichage).
-    - limit: nombre max (0 = pas de limite)
-    - exclude_csv: "ABCUSDT,XYZUSDT" à exclure
-    """
     try:
         k = set(kucoin_active_usdt_symbols())
         b = set(binance_usdt_perp_symbols())
         common = [s for s in sorted(k & b)]
     except Exception:
-        # fallback: au pire, uniquement KuCoin
         common = kucoin_active_usdt_symbols()
 
     if exclude_csv:
@@ -325,26 +265,20 @@ def common_usdt_symbols(limit: int = 0, exclude_csv: str = "") -> List[str]:
     return common
 
 
-def fetch_all_symbols() -> List[str]:
+def fetch_all_symbols() -> List[Dict[str, Any]]:
     """
-    Renvoie la liste des **contrats** USDT-M (suffixe 'USDTM'), comme attendu par le pack.
+    Renvoie la liste complète des contrats actifs (dicts KuCoin Futures USDT-M).
+    Chaque dict contient toutes les métadonnées de l’API.
     """
     url = f"{BASE}/api/v1/contracts/active"
-    out: List[str] = []
     try:
         with _client() as c:
             r = c.get(url)
             r.raise_for_status()
             data = r.json().get("data", []) or []
+            return data
     except Exception:
-        data = []
-
-    for it in data:
-        sym = (it.get("symbol") or "").strip()
-        if sym.endswith("USDTM"):
-            out.append(sym)
-
-    return sorted(set(out))
+        return []
 
 
 __all__ = [
