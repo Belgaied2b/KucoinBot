@@ -1,22 +1,55 @@
-# kucoin_adapter.py — module de test "brut" prêt à coller (clés en dur)
+# kucoin_adapter.py — module "env-based" prêt à coller (Railway)
+# - Lit les clés via env: KUCOIN_API_KEY / KUCOIN_API_SECRET / KUCOIN_API_PASSPHRASE
 # - Signature V2 (TIMESTAMP + METHOD + PATH + BODY)
 # - 1er essai: jamais positionSide, jamais crossMode
 # - Retries: 100001 (leverage fallback), 300012 (clamp prix), 330011 (si hedge → positionSide/positionId)
-# - Ticker pour top of book (depth1 404 parfois)
-# - Logs détaillés quand KC_VERBOSE=1
+# - Ticker pour top of book (depth1 peut 404)
+# - Logs détaillés quand KC_VERBOSE=1 (payload sortant + réponses API tronquées)
+# - Fail-fast si variables d’env manquantes (avec logs masqués)
 
-import os, time, hmac, base64, hashlib, math
+import os, time, hmac, base64, hashlib, math, logging
 from typing import Any, Dict, Optional, Tuple, List
 
 import httpx
 import ujson as json
 
-# ====== CLÉS EN DUR (TEST UNIQUEMENT) ======
-KUCOIN_API_KEY        = "6890cfb4dffe710001e6edb0"
-KUCOIN_API_SECRET     = "889e4492-c2ff-4c9d-9136-64afe6d5e780"
-KUCOIN_API_PASSPHRASE = "Nad1703-_"
+# ====== LOGGING ======
+log = logging.getLogger("kucoin.adapter")
+if not log.handlers:
+    _h = logging.StreamHandler()
+    _fmt = logging.Formatter("%(asctime)s | %(levelname)5s | %(name)s | [-] %(message)s")
+    _h.setFormatter(_fmt)
+    log.addHandler(_h)
 
-# ====== CONF ======
+KC_VERBOSE = os.getenv("KC_VERBOSE", "0") == "1"
+log.setLevel(logging.DEBUG if KC_VERBOSE else logging.INFO)
+
+# ====== CONFIG (env) ======
+def _mask(s: Optional[str]) -> str:
+    if not s:
+        return "MISSING"
+    s = str(s)
+    if len(s) <= 8:
+        return s[0] + "***" + s[-1]
+    return s[:4] + "..." + s[-4:]
+
+def _require_env(name: str) -> str:
+    v = os.getenv(name, "").strip()
+    if not v:
+        log.error("ENV %s manquante. Vérifie Railway → Variables.", name)
+        raise RuntimeError(f"Missing required env var: {name}")
+    return v
+
+KUCOIN_API_KEY        = _require_env("KUCOIN_API_KEY")
+KUCOIN_API_SECRET     = _require_env("KUCOIN_API_SECRET")
+KUCOIN_API_PASSPHRASE = _require_env("KUCOIN_API_PASSPHRASE")
+
+# Sanity log (masqué)
+log.info(
+    "KUCOIN_API_KEY=%s KUCOIN_API_SECRET=%s KUCOIN_API_PASSPHRASE=%s",
+    _mask(KUCOIN_API_KEY), _mask(KUCOIN_API_SECRET), _mask(KUCOIN_API_PASSPHRASE)
+)
+
 BASE = os.getenv("KUCOIN_BASE_URL", "https://api-futures.kucoin.com").rstrip("/")
 ORDERS_PATH = "/api/v1/orders"
 POS_PATH    = "/api/v1/position"
@@ -25,19 +58,9 @@ TIME_PATH   = "/api/v1/timestamp"
 GET_BY_COID = "/api/v1/order/client-order/{clientOid}"
 TICKER_PATH = "/api/v1/ticker"
 
-KC_VERBOSE = os.getenv("KC_VERBOSE", "0") == "1"
 DEFAULT_LEVERAGE = int(os.getenv("DEFAULT_LEVERAGE", "10"))
 DEFAULT_TICK_FALLBACK = float(os.getenv("DEFAULT_TICK_SIZE", "0.00000001"))
-
-# ====== LOGGING LIGHT ======
-import logging
-log = logging.getLogger("kucoin.adapter")
-if not log.handlers:
-    h = logging.StreamHandler()
-    fmt = logging.Formatter("%(asctime)s | %(levelname)5s | %(name)s | [-] %(message)s")
-    h.setFormatter(fmt)
-    log.addHandler(h)
-log.setLevel(logging.INFO if not KC_VERBOSE else logging.DEBUG)
+HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT_SEC", "10.0"))
 
 # ====== TIME SYNC ======
 _SERVER_OFFSET = 0.0
@@ -66,7 +89,9 @@ def _ts_ms() -> int:
 
 # ====== SIGNATURE V2 ======
 def _b64_hmac_sha256(secret: str, payload: str) -> str:
-    return base64.b64encode(hmac.new(secret.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).digest()).decode("utf-8")
+    return base64.b64encode(
+        hmac.new(secret.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).digest()
+    ).decode("utf-8")
 
 def _headers(method: str, path: str, body_str: str = "") -> Dict[str, str]:
     ts = str(_ts_ms())
@@ -80,7 +105,7 @@ def _headers(method: str, path: str, body_str: str = "") -> Dict[str, str]:
         "KC-API-KEY-VERSION": "2",
         "Accept": "application/json",
         "Content-Type": "application/json",
-        "User-Agent": "bot/kucoin-adapter-brut",
+        "User-Agent": "bot/kucoin-adapter-env",
     }
 
 # ====== HTTP HELPERS ======
@@ -107,7 +132,7 @@ def _post(path: str, body: Optional[Dict[str, Any]]) -> Tuple[bool, Dict[str, An
     if KC_VERBOSE:
         log.debug("[POST %s] payload=%s", path, body)
     try:
-        with httpx.Client(timeout=10.0) as c:
+        with httpx.Client(timeout=HTTP_TIMEOUT) as c:
             r = c.post(url, headers=hdrs, content=(body_str.encode("utf-8") if body_str else None))
             js = _log_http_outcome("POST", path, r)
             return (r.status_code == 200), (js if isinstance(js, dict) else {})
@@ -119,7 +144,7 @@ def _get(path: str, params: Optional[Dict[str, Any]] = None) -> Tuple[bool, Dict
     url = BASE + path
     hdrs = _headers("GET", path, "")
     try:
-        with httpx.Client(timeout=10.0) as c:
+        with httpx.Client(timeout=HTTP_TIMEOUT) as c:
             r = c.get(url, headers=hdrs, params=params)
             js = _log_http_outcome("GET", path, r)
             return (r.status_code == 200), (js if isinstance(js, dict) else {})
@@ -146,9 +171,8 @@ def get_orderbook_top(symbol: str) -> Dict[str, Optional[float]]:
         return out
     return {"bestBid": None, "bestAsk": None, "bidSize": None, "askSize": None}
 
-# Optionnel pour SFI: on renvoie une liste vide si indispo
 def get_orderbook_levels(symbol: str, depth: int = 5) -> List[Dict[str, Any]]:
-    # Endpoints level2 futures sont capricieux / 404 → on évite
+    # endpoints depth/level2 des futures sont instables — on évite (compat SFI)
     return []
 
 # ====== META / TICK ======
@@ -171,7 +195,8 @@ def _safe_tick_from_meta(d: Dict[str, Any]) -> float:
     try:
         pp = int(pp)
         if pp is not None and pp >= 0: return 10 ** (-pp)
-    except Exception: pass
+    except Exception:
+        pass
     return DEFAULT_TICK_FALLBACK
 
 def _price_increment(symbol: str) -> float:
@@ -209,7 +234,8 @@ def _clamp_postonly_price(symbol: str, side: str, raw_px: float, tick: float) ->
             px = max(px, anchor + tick)
     qpx = _quantize_price(px, tick, side)
     if KC_VERBOSE:
-        log.debug("[clamp] %s %s raw=%.12f → clamped=%.12f (bb=%s ba=%s, tick=%s)", symbol, side, raw_px, qpx, bb, ba, tick)
+        log.debug("[clamp] %s %s raw=%.12f → clamped=%.12f (bb=%s ba=%s, tick=%s)",
+                  symbol, side, raw_px, qpx, bb, ba, tick)
     return qpx
 
 # ====== POSITION / MODE ======
@@ -267,7 +293,6 @@ def _extract_position_ids(pos_json: Dict[str, Any]) -> Tuple[Optional[str], Opti
         if l_id or s_id: return l_id, s_id
     return None, None
 
-# ====== LOOKUP ======
 def get_order_by_client_oid(client_oid: str) -> Optional[Dict[str, Any]]:
     ok, js = _get(GET_BY_COID.format(clientOid=client_oid))
     if not ok: return None
@@ -345,6 +370,8 @@ def place_limit_order(
         code = (js.get("code") or ""); msg = js.get("msg") or ""
         api_ok = bool(ok_http and code == "200000" and order_id)
         res = {"ok": api_ok, "code": code, "msg": msg, "orderId": order_id, "clientOid": body.get("clientOid"), "data": (data or {})}
+        if not res["ok"] and KC_VERBOSE:
+            log.debug("[kc.place_limit_order%s] resp=%s", tag, js)
         if not res["ok"]:
             log.info("[kc.place_limit_order%s] ok=%s code=%s msg=%s clientOid=%s orderId=%s",
                      tag, res["ok"], res["code"], res["msg"], res["clientOid"], res["orderId"])
@@ -361,8 +388,6 @@ def place_limit_order(
         if resp2["ok"]:
             return resp2
         resp = resp2
-
-    # ... tout le haut du fichier reste identique ...
 
     # 3) Prix hors bande (300012) → reclamp & retry
     if (not resp["ok"]) and (resp.get("code") == "300012"):
@@ -391,7 +416,6 @@ def place_limit_order(
 
 # ====== STUBS (compat SFI) ======
 def cancel_order(order_id: str) -> Dict[str, Any]:
-    # Fut: DELETE /api/v1/orders/{orderId}
     try:
         path = f"/api/v1/orders/{order_id}"
         url = BASE + path
