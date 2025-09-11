@@ -22,7 +22,7 @@ from kucoin_adapter import (
     get_symbol_meta,
 )
 
-# get_order_by_client_oid est optionnel : pas d'ImportError si absent
+# get_order_by_client_oid est optionnel
 try:
     from kucoin_adapter import get_order_by_client_oid  # type: ignore
 except Exception:
@@ -41,7 +41,7 @@ try:
 except Exception:
     HAS_TUNER = False
 
-# ---- Analyse: bridge prioritaire, sinon fallback
+# ---- Analyse
 try:
     import analyze_bridge as analyze_signal  # type: ignore
 except Exception:
@@ -57,16 +57,14 @@ H4_REFRESH_SEC            = int(os.getenv("H4_REFRESH_SEC", "300"))
 ANALYSIS_MIN_INTERVAL_SEC = int(os.getenv("ANALYSIS_MIN_INTERVAL_SEC", "15"))
 WS_POLL_SEC               = int(os.getenv("WS_POLL_SEC", "5"))
 
-# Cibles / buffers institutionnels
 RR_TARGET_TP2             = float(os.getenv("INST_RR_TARGET_TP2", "2.0"))
-ATR_SL_MULT               = float(os.getenv("INST_ATR_SL_MULT", "1.0"))     # buffer ajouté derrière le swing/liquidité
-ATR_MIN_PCT               = float(os.getenv("INST_ATR_MIN_PCT", "0.003"))   # fallback ATR min = 0.3% prix
-EQ_TOL_PCT                = float(os.getenv("INST_EQ_TOL_PCT", "0.0006"))   # tolérance equal highs/lows (0.06%)
+ATR_SL_MULT               = float(os.getenv("INST_ATR_SL_MULT", "1.0"))
+ATR_MIN_PCT               = float(os.getenv("INST_ATR_MIN_PCT", "0.003"))
+EQ_TOL_PCT                = float(os.getenv("INST_EQ_TOL_PCT", "0.0006"))
 OTE_LOW                   = float(os.getenv("INST_OTE_LOW", "0.62"))
 OTE_HIGH                  = float(os.getenv("INST_OTE_HIGH", "0.79"))
 OTE_MID                   = (OTE_LOW + OTE_HIGH) / 2.0
 
-# Fallback KuCoin
 KC_POST_ONLY_DEFAULT      = os.getenv("KC_POST_ONLY", "1") == "1"
 KC_VERIFY_MAX_TRIES       = int(os.getenv("KC_VERIFY_MAX_TRIES", "5"))
 KC_VERIFY_DELAY_SEC       = float(os.getenv("KC_VERIFY_DELAY_SEC", "0.35"))
@@ -96,15 +94,10 @@ def send_telegram(text: str):
     import httpx
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode":"Markdown", "disable_web_page_preview": True}
-    for attempt in (1, 2):
-        try:
-            resp = httpx.post(url, json=payload, timeout=10)
-            if resp.status_code == 200 and (resp.json().get("ok") is True):
-                log.info("Telegram OK (len=%s)", len(text)); return
-            else:
-                log.warning("Telegram HTTP=%s body=%s (attempt %s)", resp.status_code, resp.text[:200], attempt)
-        except Exception as e:
-            log.error("Telegram KO: %s (attempt %s)", e, attempt)
+    try:
+        httpx.post(url, json=payload, timeout=10)
+    except Exception as e:
+        log.error("Telegram KO: %s", e)
 
 def _get_klines_cached(symbol: str) -> Tuple[Any, Any]:
     now = time.time()
@@ -115,30 +108,17 @@ def _get_klines_cached(symbol: str) -> Tuple[Any, Any]:
     if need_h1:
         ent["h1"] = fetch_klines(symbol, interval="1h", limit=H1_LIMIT)
         ent["ts_h1"] = now
-        log.debug("H1 fetch", extra={"symbol": symbol})
-    else:
-        log.debug("H1 cache hit", extra={"symbol": symbol})
-
     if need_h4:
         ent["h4"] = fetch_klines(symbol, interval="4h", limit=H4_LIMIT)
         ent["ts_h4"] = now
-        log.debug("H4 fetch", extra={"symbol": symbol})
-    else:
-        log.debug("H4 cache hit", extra={"symbol": symbol})
 
     _KLINE_CACHE[symbol] = ent
     return ent.get("h1"), ent.get("h4")
 
 def _build_symbols() -> List[str]:
-    """
-    Construit la liste des symboles à scanner.
-    - Si $SYMBOLS est défini → utilise cette liste.
-    - Sinon → fetch_symbol_meta() et renvoie les versions display (ex: BTCUSDT).
-    """
     env_syms = os.getenv("SYMBOLS", "").strip()
     if env_syms:
-        lst = [s.strip().upper() for s in env_syms.split(",") if s.strip()]
-        return sorted(set(lst))
+        return sorted(set(s.strip().upper() for s in env_syms.split(",") if s.strip()))
 
     try:
         meta = fetch_symbol_meta()
@@ -146,24 +126,85 @@ def _build_symbols() -> List[str]:
         log.warning("fetch_symbol_meta KO: %s", e)
         return []
 
-    syms: List[str] = []
+    syms = []
     for display, v in meta.items():
-        sym_api = str(v.get("symbol_api", "")).strip().upper()
-        if sym_api.endswith("USDTM"):
+        if str(v.get("symbol_api", "")).endswith("USDTM"):
             syms.append(display)
-
-    if not syms:
-        log.warning("Aucun symbole USDTM trouvé dans fetch_symbol_meta()")
-
     return sorted(set(syms))
 
-# ------------------------
-# Exécution robuste SFI
-# ------------------------
-# (… reste du code identique : _normalize_orders, _safe_place_orders,
-# outils institutionnels, handle_symbol_event, et boucle main)
-# ------------------------
 
+# ------------------------
+# Event handler
+# ------------------------
+async def handle_symbol_event(ev: Dict[str, Any], rg: RiskGuard, policy: MetaPolicy):
+    symbol = ev.get("symbol")
+    etype  = ev.get("type")
+    if etype != "bar":
+        return
+    log.info("event: %s", etype, extra={"symbol": symbol})
+
+    last = _LAST_ANALYSIS_TS.get(symbol, 0.0)
+    if time.time() - last < ANALYSIS_MIN_INTERVAL_SEC:
+        return
+    _LAST_ANALYSIS_TS[symbol] = time.time()
+
+    try:
+        df_h1, df_h4 = _get_klines_cached(symbol)
+    except Exception as e:
+        log.warning("fetch_klines KO: %s", e, extra={"symbol": symbol})
+        return
+    if df_h1 is None or df_h4 is None:
+        return
+
+    # simplifié : appel à analyze_signal
+    try:
+        res = analyze_signal.analyze_signal(symbol=symbol, df_h1=df_h1, df_h4=df_h4)
+    except Exception as e:
+        log.warning("analyze_signal KO: %s", e, extra={"symbol": symbol})
+        return
+
+    if not isinstance(res, dict) or not res.get("valid"):
+        return
+
+    side   = res.get("side")
+    entry  = res.get("entry", float(df_h1['close'].iloc[-1]))
+    sl     = res.get("sl")
+    tp1    = res.get("tp1")
+    tp2    = res.get("tp2")
+    rr     = res.get("rr", 0)
+
+    log.info("analysis OK %s rr=%.2f", side, rr, extra={"symbol": symbol})
+
+    # --- Risk guard
+    rg_ok, _ = rg.can_enter(symbol)
+    if not rg_ok:
+        return
+
+    # --- Execution fallback KuCoin direct
+    try:
+        meta = get_symbol_meta(symbol) or {}
+        tick = float(meta.get("priceIncrement", 0.0)) or 0.0
+    except Exception:
+        tick = 0.0
+
+    price = entry
+    post_only = KC_POST_ONLY_DEFAULT
+    kc = place_limit_order(
+        symbol=symbol,
+        side=side,
+        price=float(price),
+        value_usdt=20,
+        sl=sl,
+        tp1=tp1,
+        tp2=tp2,
+        post_only=post_only
+    )
+    log.info("kc resp: %s", kc, extra={"symbol": symbol})
+
+
+# ------------------------
+# Main
+# ------------------------
 async def main():
     init_logging()
     if os.getenv("LOG_HTTP", "0") == "1":
