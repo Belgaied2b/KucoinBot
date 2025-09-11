@@ -1,15 +1,31 @@
 # /app/kucoin_adapter.py
-# Robust adapter to expose get_symbol_meta and common rounding/helpers
+# Robust adapter to expose get_symbol_meta, place_limit_order and common rounding/helpers
 # Works with KuCoin Futures USDT-M contracts and tolerates missing fields.
 
 from __future__ import annotations
 import math
 import time
+import os
+import json
+import hmac
+import base64
+import hashlib
 from typing import Any, Dict, Optional
 
+import httpx
 from kucoin_utils import fetch_all_symbols  # already in your project
 
-# Simple in-process cache to avoid hammering the API
+# =============================
+# API Auth config
+# =============================
+KC_API_KEY        = os.getenv("KUCOIN_API_KEY", "")
+KC_API_SECRET     = os.getenv("KUCOIN_API_SECRET", "")
+KC_API_PASSPHRASE = os.getenv("KUCOIN_API_PASSPHRASE", "")
+KC_BASE           = "https://api-futures.kucoin.com"
+
+# =============================
+# Symbol metadata cache
+# =============================
 _SYMBOLS_CACHE: Optional[Dict[str, Dict[str, Any]]] = None
 _SYMBOLS_CACHE_TS: float = 0.0
 _CACHE_TTL_SEC = 300  # 5 minutes
@@ -37,20 +53,16 @@ def _load_symbols(force: bool = False) -> Dict[str, Dict[str, Any]]:
     if (not force) and _SYMBOLS_CACHE and (now - _SYMBOLS_CACHE_TS < _CACHE_TTL_SEC):
         return _SYMBOLS_CACHE
 
-    # Expecting fetch_all_symbols() -> List[dict] with KuCoin Futures contract fields
     all_contracts = fetch_all_symbols()
     by_symbol: Dict[str, Dict[str, Any]] = {}
 
     for c in all_contracts or []:
-        # Normalize common fields with safe defaults
         symbol = c.get("symbol") or c.get("name")
         if not symbol:
             continue
 
-        # KuCoin Futures fields vary; try multiple keys and fall back safely
         contract_size = c.get("contractSize")
         if contract_size in (None, 0, "0", "", "null"):
-            # Project requirement: default to 1.0 if unknown
             contract_size = 1.0
         else:
             try:
@@ -60,39 +72,34 @@ def _load_symbols(force: bool = False) -> Dict[str, Dict[str, Any]]:
 
         price_precision = c.get("pricePrecision")
         if price_precision is None:
-            # Sometimes "priceIncrement" (tick size) is provided instead
             tick = c.get("priceIncrement") or c.get("tickSize")
             if tick:
                 try:
-                    # infer precision from increment like 0.001 -> 3
                     s = f"{float(tick):.12f}".rstrip("0").split(".")
                     price_precision = len(s[1]) if len(s) == 2 else 0
                 except Exception:
                     price_precision = 2
             else:
-                price_precision = 2  # safe default
+                price_precision = 2
 
         size_precision = (
             c.get("lotSize") or c.get("sizeIncrement") or c.get("baseIncrement")
         )
         if size_precision is not None:
             try:
-                # If provided as a float step (e.g., 0.001), keep it as step
                 step_size = float(size_precision)
-                size_precision = None  # step wins, precision becomes n/a
+                size_precision = None
             except Exception:
                 step_size = None
         else:
             step_size = None
 
-        # If we didn't get a step_size, infer it from a "volPrecision" or "sizePrecision"
         vol_precision = c.get("volPrecision") or c.get("sizePrecision")
         if step_size is None:
             step_size = _to_step_from_precision(vol_precision) or 0.001
 
         value_precision = c.get("valuePrecision")
         if value_precision is None:
-            # KuCoin often uses 0–2 for USDT notional rounding
             value_precision = 2
 
         min_qty = (
@@ -113,8 +120,8 @@ def _load_symbols(force: bool = False) -> Dict[str, Dict[str, Any]]:
         except Exception:
             max_leverage = 20
 
-        by_symbol[symbol] = {
-            "symbol": symbol,
+        by_symbol[symbol.upper()] = {
+            "symbol": symbol.upper(),
             "baseCurrency": c.get("baseCurrency") or c.get("baseAsset") or "",
             "quoteCurrency": c.get("quoteCurrency") or c.get("quoteAsset") or "USDT",
             "contractSize": contract_size,
@@ -124,7 +131,6 @@ def _load_symbols(force: bool = False) -> Dict[str, Dict[str, Any]]:
             "minQty": float(min_qty),
             "maxLeverage": int(max_leverage),
             "isActive": bool(c.get("enableTrading", True)),
-            # Keep raw in case callers need other vendor fields
             "_raw": c,
         }
 
@@ -134,14 +140,6 @@ def _load_symbols(force: bool = False) -> Dict[str, Dict[str, Any]]:
 
 
 def get_symbol_meta(symbol: str) -> Dict[str, Any]:
-    """
-    Returns normalized metadata for a KuCoin Futures symbol.
-
-    Keys:
-      symbol, baseCurrency, quoteCurrency, contractSize (float),
-      pricePrecision (int), stepSize (float), valuePrecision (int),
-      minQty (float), maxLeverage (int), isActive (bool)
-    """
     if not symbol:
         raise ValueError("symbol is required")
 
@@ -150,17 +148,15 @@ def get_symbol_meta(symbol: str) -> Dict[str, Any]:
     meta = table.get(symbol)
 
     if not meta:
-        # Cache miss? Try refresh once.
         table = _load_symbols(force=True)
         meta = table.get(symbol)
 
     if not meta:
-        # Final safe defaults so callers never crash
         return {
             "symbol": symbol,
             "baseCurrency": "",
             "quoteCurrency": "USDT",
-            "contractSize": 1.0,          # project default when missing
+            "contractSize": 1.0,
             "pricePrecision": 2,
             "stepSize": 0.001,
             "valuePrecision": 2,
@@ -173,10 +169,74 @@ def get_symbol_meta(symbol: str) -> Dict[str, Any]:
     return meta
 
 
-# ---------- Common helpers your trading code likely needs ----------
+# =============================
+# Order placement
+# =============================
+
+def _sign(req_time: int, method: str, endpoint: str, body: str = "") -> Dict[str, str]:
+    str_to_sign = f"{req_time}{method}{endpoint}{body}"
+    sig = base64.b64encode(
+        hmac.new(KC_API_SECRET.encode("utf-8"), str_to_sign.encode("utf-8"), hashlib.sha256).digest()
+    ).decode()
+    passphrase = base64.b64encode(
+        hmac.new(KC_API_SECRET.encode("utf-8"), KC_API_PASSPHRASE.encode("utf-8"), hashlib.sha256).digest()
+    ).decode()
+    return {
+        "KC-API-SIGN": sig,
+        "KC-API-TIMESTAMP": str(req_time),
+        "KC-API-KEY": KC_API_KEY,
+        "KC-API-PASSPHRASE": passphrase,
+        "KC-API-KEY-VERSION": "2",
+    }
+
+
+def place_limit_order(symbol: str, side: str, price: float, value_usdt: float,
+                      sl: Optional[float] = None, tp1: Optional[float] = None,
+                      tp2: Optional[float] = None, post_only: bool = True) -> Dict[str, Any]:
+    """
+    Place un ordre LIMIT Futures KuCoin avec marge fixe via valueQty (ex: 20 USDT).
+    """
+    endpoint = "/api/v1/orders"
+    url = KC_BASE + endpoint
+    now = int(time.time() * 1000)
+
+    client_oid = f"oid-{int(time.time()*1000)}"
+
+    body = {
+        "clientOid": client_oid,
+        "symbol": symbol,
+        "side": side.lower(),
+        "type": "limit",
+        "price": str(price),
+        "valueQty": str(value_usdt),
+        "postOnly": post_only,
+    }
+
+    body_json = json.dumps(body)
+    headers = _sign(now, "POST", endpoint, body_json)
+
+    try:
+        with httpx.Client() as client:
+            r = client.post(url, headers=headers, content=body_json, timeout=10)
+            data = r.json()
+            return {
+                "ok": r.status_code == 200,
+                "code": data.get("code"),
+                "msg": data.get("msg"),
+                "data": data.get("data"),
+                "orderId": (data.get("data") or {}).get("orderId"),
+                "clientOid": client_oid,
+                "raw": data,
+            }
+    except Exception as e:
+        return {"ok": False, "error": str(e), "clientOid": client_oid}
+
+
+# =============================
+# Helpers
+# =============================
 
 def round_price(price: float, price_precision: int) -> float:
-    """Round price to the given precision (e.g., 2 -> 0.01 tick)."""
     if price_precision < 0:
         return float(price)
     factor = 10 ** int(price_precision)
@@ -184,27 +244,20 @@ def round_price(price: float, price_precision: int) -> float:
 
 
 def round_qty(qty: float, step_size: float) -> float:
-    """Round quantity DOWN to the nearest step (lot size)."""
     return _round_down(float(qty), float(step_size))
 
 
 def build_value_qty_payload(margin_usdt: float) -> Dict[str, str]:
-    """
-    For KuCoin Futures LIMIT orders using fixed USDT margin.
-    Project requirement: always use valueQty to target fixed 20 USDT (or any value).
-    """
     return {"valueQty": f"{float(margin_usdt):.8f}"}
 
 
 def get_tick_size(symbol: str) -> float:
-    """Return tick size derived from pricePrecision."""
     meta = get_symbol_meta(symbol)
     pp = int(meta.get("pricePrecision", 2))
     return float(10 ** (-pp))
 
 
 def get_step_size(symbol: str) -> float:
-    """Return lot step size (quantity increment)."""
     meta = get_symbol_meta(symbol)
     return float(meta.get("stepSize", 0.001))
 
