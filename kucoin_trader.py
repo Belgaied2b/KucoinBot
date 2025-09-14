@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-kucoin_trader.py — LIMIT valueQty 20 USDT, iso, levier 10
-- Auto hedge/one-way: ajoute positionSide si hedge détecté
-- Retry 100001 (leverage), 330011 (flip positionSide)
+kucoin_trader.py — LIMIT simple (one-way), isolé, levier 10, valueQty (USDT)
+- Jamais de `positionSide`, pas de retry 330011
+- Envoie `crossMode=False`
 - Tick robuste
 """
 
@@ -17,7 +17,6 @@ log = get_logger("kucoin.trader")
 
 BASE = SETTINGS.kucoin_base_url.rstrip("/")
 DEFAULT_LEVERAGE = int(getattr(SETTINGS, "default_leverage", 10))
-VALUE_USDT       = float(getattr(SETTINGS, "margin_per_trade", 20.0))
 VALUE_DECIMALS   = int(getattr(SETTINGS, "value_decimals", 2))
 
 # -------- time sync --------
@@ -61,17 +60,25 @@ def _contract_meta(c: httpx.Client, symbol_api: str) -> Dict[str, Any]:
         path = f"/api/v1/contracts/{symbol_api}"
         r = c.get(BASE + path, headers=_headers("GET", path))
         if r.status_code == 200:
-            return (r.json() or {}).get("data", {}) or {}
+            d = (r.json() or {}).get("data", {}) or {}
+            if "priceIncrement" not in d:
+                tick = d.get("tickSize")
+                if tick and float(tick) > 0:
+                    d["priceIncrement"] = float(tick)
+                else:
+                    pp = int(d.get("pricePrecision", 8))
+                    d["priceIncrement"] = 10 ** (-pp) if pp >= 0 else 1e-8
+            return d
     except Exception:
         pass
-    return {}
+    return {"priceIncrement": 1e-8}
 
 def _safe_tick(meta: Dict[str, Any]) -> float:
-    def _f(x):
-        try: return float(x)
-        except Exception: return 0.0
-    t = _f(meta.get("tickSize") or meta.get("priceIncrement"))
-    if t > 0: return t
+    try:
+        t = float(meta.get("tickSize") or meta.get("priceIncrement") or 0.0)
+        if t > 0: return t
+    except Exception:
+        pass
     try:
         pp = int(meta.get("pricePrecision", 8))
         return 10 ** (-pp) if pp >= 0 else 1e-8
@@ -83,32 +90,6 @@ def _quantize(price: float, tick: float, side: str) -> float:
     steps = float(price) / float(tick)
     qsteps = math.floor(steps + 1e-12) if side.lower() == "buy" else math.ceil(steps - 1e-12)
     return float(qsteps) * float(tick)
-
-# -------- position mode --------
-def _get_position(c: httpx.Client, symbol_api: str) -> Dict[str, Any]:
-    try:
-        path = f"/api/v1/position?symbol={symbol_api}"
-        r = c.get(BASE + path, headers=_headers("GET", path))
-        if r.status_code == 200:
-            data = (r.json() or {}).get("data")
-            if isinstance(data, dict): return data
-            if isinstance(data, list) and data: return data[0]
-    except Exception:
-        pass
-    return {}
-
-def _infer_pos_mode(pos: Dict[str, Any]) -> str:
-    for k in ("positionMode","posMode","mode"):
-        v = pos.get(k)
-        if isinstance(v, str):
-            vl = v.lower()
-            if "hedge" in vl: return "hedge"
-            if "one" in vl or "single" in vl: return "oneway"
-    long_keys=("longQty","longSize","longOpen","longAvailable")
-    short_keys=("shortQty","shortSize","shortOpen","shortAvailable")
-    if any(k in pos for k in long_keys) and any(k in pos for k in short_keys):
-        return "hedge"
-    return "oneway"
 
 # -------- public API used by SFI --------
 def get_symbol_meta(symbol: str) -> Dict[str, Any]:
@@ -165,7 +146,7 @@ def place_limit_order(
     symbol: str,
     side: Literal["buy","sell"],
     price: float,
-    value_usdt: float = VALUE_USDT,
+    value_usdt: float = 20.0,
     sl: Optional[float] = None,
     tp1: Optional[float] = None,
     tp2: Optional[float] = None,
@@ -179,11 +160,6 @@ def place_limit_order(
         tick = _safe_tick(meta)
         qprice = _quantize(float(price), tick, side)
 
-        pos = _get_position(c, symbol)
-        mode = _infer_pos_mode(pos)
-        include_ps = (mode == "hedge")
-        log.info("[positionMode] %s -> %s (include positionSide=%s)", symbol, mode, include_ps)
-
         body = {
             "clientOid": str(client_order_id or _now_ms()),
             "symbol": symbol,
@@ -195,9 +171,9 @@ def place_limit_order(
             "timeInForce": "GTC",
             "postOnly": bool(post_only),
             "reduceOnly": False,
+            "crossMode": False,  # isolé
+            # ❌ jamais positionSide
         }
-        if include_ps:
-            body["positionSide"] = "long" if side.lower() == "buy" else "short"
 
         path = "/api/v1/orders"
         body_json = json.dumps(body, separators=(",", ":"))
@@ -210,7 +186,7 @@ def place_limit_order(
         msg  = (js or {}).get("msg")
         ok = (r.status_code == 200 and code == "200000")
 
-        # Retry leverage
+        # Retry levier uniquement
         if (not ok) and (code == "100001" or (msg and "Leverage parameter invalid" in str(msg))):
             body["leverage"] = "5" if str(body.get("leverage")) != "5" else "3"
             body_json = json.dumps(body, separators=(",", ":"))
@@ -222,22 +198,7 @@ def place_limit_order(
             code = (js or {}).get("code")
             ok = (r.status_code == 200 and code == "200000")
 
-        # Retry 330011 (flip positionSide inclusion)
-        if (not ok) and code == "330011":
-            alt_include_ps = not include_ps
-            log.info("[positionMode] retry %s with positionSide included=%s", symbol, alt_include_ps)
-            if alt_include_ps:
-                body["positionSide"] = "long" if side.lower() == "buy" else "short"
-            else:
-                body.pop("positionSide", None)
-            body_json = json.dumps(body, separators=(",", ":"))
-            r = c.post(BASE + path, headers=_headers("POST", path, body_json), content=body_json)
-            try:
-                js = r.json() if (r.content and r.text) else {}
-            except Exception:
-                js = {}
-            code = (js or {}).get("code")
-            ok = (r.status_code == 200 and code == "200000")
+        # ❌ Aucun retry 330011, jamais `positionSide`
 
         if "ok" not in js:
             js["ok"] = bool(ok)
@@ -254,3 +215,45 @@ def place_limit_valueqty(
     post_only: bool = True, client_order_id: Optional[str] = None, extra_kwargs: Optional[Dict[str, Any]] = None
 ) -> Dict[str, Any]:
     return place_limit_order(symbol, side, price, value_usdt, sl, tp1, tp2, post_only, client_order_id)
+
+def cancel_order(order_id: str) -> Dict[str, Any]:
+    with httpx.Client(timeout=10.0) as c:
+        path = f"/api/v1/orders/{order_id}/cancel"
+        r = c.post(BASE + path, headers=_headers("POST", path, ""))
+        try:
+            js = r.json() if (r.content and r.text) else {}
+        except Exception:
+            js = {}
+        js["ok"] = bool(r.status_code == 200 and (js or {}).get("code") == "200000")
+        return js
+
+def replace_order(order_id: str, new_price: float) -> Dict[str, Any]:
+    try:
+        c = cancel_order(order_id)
+        return {"ok": bool(c.get("ok")), "cancel": c}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+def place_market_by_value(symbol: str, side: Literal["buy","sell"], valueQty: float) -> Dict[str, Any]:
+    with httpx.Client(timeout=10.0) as c:
+        _sync_server_time(c)
+        body = {
+            "clientOid": str(_now_ms()),
+            "symbol": symbol,
+            "type": "market",
+            "side": side.lower(),
+            "valueQty": f"{float(valueQty):.{VALUE_DECIMALS}f}",
+            "reduceOnly": False,
+            "crossMode": False,
+        }
+        path = "/api/v1/orders"
+        body_json = json.dumps(body, separators=(",", ":"))
+        r = c.post(BASE + path, headers=_headers("POST", path, body_json), content=body_json)
+        try:
+            js = r.json() if (r.content and r.text) else {}
+        except Exception:
+            js = {}
+        js["ok"] = bool(r.status_code == 200 and (js or {}).get("code") == "200000")
+        if "orderId" not in js and isinstance(js.get("data"), dict):
+            js["orderId"] = js["data"].get("orderId")
+        return js
