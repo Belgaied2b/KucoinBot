@@ -1,5 +1,5 @@
 import time
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Union
 
 import httpx
 import pandas as pd
@@ -19,14 +19,16 @@ def _client(timeout: float = 10.0) -> httpx.Client:
 # ---------------------------------------------------------
 def _to_granularity(interval: Any) -> int:
     """
-    Accepte '1m','5m','15m','1h','4h','1d' etc., ou déjà un int (minutes).
+    Accepte '1m','2m','3m','5m','15m','30m','1h','2h','4h','6h','12h','1d'
+    ou déjà un int (minutes).
     """
     if isinstance(interval, (int, float)):
         return int(interval)
     s = str(interval).lower().strip()
     mapping = {
-        "1m": 1, "3m": 3, "5m": 5, "15m": 15, "30m": 30,
-        "1h": 60, "2h": 120, "4h": 240, "6h": 360, "12h": 720,
+        "1m": 1, "2m": 2, "3m": 3, "5m": 5, "10m": 10, "15m": 15, "30m": 30,
+        "45m": 45,
+        "1h": 60, "2h": 120, "3h": 180, "4h": 240, "6h": 360, "8h": 480, "12h": 720,
         "1d": 1440
     }
     return mapping.get(s, 60)
@@ -68,20 +70,21 @@ def fetch_symbol_meta() -> Dict[str, Dict[str, Any]]:
             display = sym_api.replace("USDTM", "USDT")
 
             # Certains champs peuvent être str -> cast float
-            tick_raw: Optional[Any] = it.get("tickSize", it.get("priceIncrement", 0.1))
-            tick = float(tick_raw) if tick_raw is not None else 0.1
+            tick_raw: Optional[Any] = it.get("tickSize", it.get("priceIncrement", None))
+            tick = float(tick_raw) if tick_raw not in (None, "", 0, "0", "0.0") else 0.0
+
             prec_raw: Optional[Any] = it.get("pricePrecision")
             if prec_raw is None:
-                prec = _infer_precision_from_tick(tick)
+                prec = _infer_precision_from_tick(tick if tick > 0 else 0.1)
             else:
                 try:
                     prec = int(prec_raw)
                 except Exception:
-                    prec = _infer_precision_from_tick(tick)
+                    prec = _infer_precision_from_tick(tick if tick > 0 else 0.1)
 
             meta[display] = {
                 "symbol_api": sym_api,
-                "tickSize": tick,
+                "tickSize": tick,  # peut être 0.0 si manquant; cf. price_tick_size pour fallback sûr
                 "pricePrecision": prec,
             }
         except Exception:
@@ -111,20 +114,68 @@ def symbol_to_api(symbol: str, meta: Optional[Dict[str, Dict[str, Any]]] = None)
     return symbol
 
 
+def price_tick_size(symbol: str, meta: Dict[str, Dict[str, Any]], default_tick: float = 1e-8) -> float:
+    """
+    Retourne un tickSize **garanti > 0** pour le symbole d'affichage (ex: BTCUSDT).
+    - utilise meta[symbol]['tickSize'] si > 0
+    - sinon derive via pricePrecision (10^-pp)
+    - sinon retourne default_tick (1e-8) pour éviter les 'multiple of 0'
+    """
+    m = meta.get(symbol, {})
+    # 1) tick direct
+    try:
+        t = float(m.get("tickSize", 0))
+        if t and t > 0:
+            return t
+    except Exception:
+        pass
+    # 2) derive de pricePrecision
+    try:
+        pp = int(m.get("pricePrecision", None))
+        if pp is not None and pp >= 0:
+            return 10 ** (-pp)
+    except Exception:
+        pass
+    # 3) fallback
+    return float(default_tick)
+
+
 def round_price(symbol: str, price: float, meta: Dict[str, Dict[str, Any]], default_tick: float = 0.1) -> float:
     """
     Arrondit le prix au multiple de tick du symbole affiché (ex: BTCUSDT),
-    en utilisant tickSize/pricePrecision de meta.
+    en utilisant tickSize/pricePrecision de meta. (arrondi standard)
     """
-    m = meta.get(symbol, {})
-    tick = float(m.get("tickSize", default_tick))
-    prec = int(m.get("pricePrecision", _infer_precision_from_tick(tick)))
-    # éviter division par zéro
-    if tick <= 0:
-        tick = default_tick
-        prec = _infer_precision_from_tick(tick)
+    tick = price_tick_size(symbol, meta, default_tick=default_tick)
+    prec = _infer_precision_from_tick(tick)
     stepped = round(price / tick) * tick
     return round(stepped, prec)
+
+
+def round_price_directional(
+    symbol: str,
+    price: float,
+    side: str,
+    meta: Dict[str, Dict[str, Any]],
+    default_tick: float = 0.1
+) -> float:
+    """
+    Arrondi directionnel pour rester passif en postOnly:
+      - BUY  -> floor (prix <= demandé, évite d'être exécuté immédiatement)
+      - SELL -> ceil
+    """
+    s = side.lower().strip()
+    tick = price_tick_size(symbol, meta, default_tick=default_tick)
+    prec = _infer_precision_from_tick(tick)
+    if tick <= 0:
+        # impossible normalement grâce à price_tick_size, mais on sécurise
+        return round(price, prec)
+    steps = price / tick
+    if s == "buy":
+        qsteps = int(steps // 1)  # floor
+    else:
+        # sell ou inconnu -> on privilégie la sécurité côté vendeur
+        qsteps = int(steps) if steps == int(steps) else int(steps) + 1  # ceil
+    return round(qsteps * tick, prec)
 
 
 # ---------------------------------------------------------
@@ -133,6 +184,10 @@ def round_price(symbol: str, price: float, meta: Dict[str, Dict[str, Any]], defa
 def _fetch_klines_minutes(symbol_api: str, granularity: int = 1, limit: int = 300) -> pd.DataFrame:
     """
     Implémentation minute-based. symbol_api doit être un contrat KuCoin (ex: BTCUSDTM).
+
+    ⚠️ KuCoin Futures /api/v1/kline/query renvoie:
+        [startAt, open, close, high, low, volume, turnover]
+    => Mapping correct: open=1, close=2, high=3, low=4
     """
     now_ms = int(time.time() * 1000)
     # fenêtre temps = limit * granularity minutes
@@ -141,7 +196,7 @@ def _fetch_klines_minutes(symbol_api: str, granularity: int = 1, limit: int = 30
 
     params = {
         "symbol": symbol_api,
-        "granularity": granularity,
+        "granularity": granularity,  # minutes
         "from": start_ms,
         "to": now_ms,
     }
@@ -155,17 +210,19 @@ def _fetch_klines_minutes(symbol_api: str, granularity: int = 1, limit: int = 30
     except Exception:
         arr = []
 
-    # KuCoin Futures renvoie: [time(ms|s), open, high, low, close, volume, ...]
+    # KuCoin Futures renvoie: [time(ms|s), open, close, high, low, volume, turnover]
     for it in arr:
         try:
             ts_raw = int(it[0])
             # tolérance: si <= 10^10, on considère que c'est en secondes -> converti en ms
             ts = ts_raw * 1000 if ts_raw < 10_000_000_000 else ts_raw
-            o = float(it[1])
-            h = float(it[2])
-            l = float(it[3])
-            c = float(it[4])
-            v = float(it[5])
+
+            o = float(it[1])  # open
+            c = float(it[2])  # close
+            h = float(it[3])  # high
+            l = float(it[4])  # low
+            v = float(it[5])  # volume
+
             rows.append({"time": ts, "open": o, "high": h, "low": l, "close": c, "volume": v})
         except Exception:
             continue
@@ -295,6 +352,8 @@ __all__ = [
     "fetch_symbol_meta",
     "symbol_to_api",
     "round_price",
+    "round_price_directional",
+    "price_tick_size",
     "kucoin_active_usdt_symbols",
     "binance_usdt_perp_symbols",
     "common_usdt_symbols",
