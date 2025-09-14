@@ -1,14 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-main.py — Boucle event-driven + fallback institutionnel structuré (OTE, liquidité, swings)
-- Direction H4, exécution H1 via OTE 62–79% et pools de liquidité
-- SL derrière la liquidité/swing + buffer ATR
-- TP1 swing/pool opposé, TP2 RR cible (2.0 par défaut)
-- Exécution SFI + fallback direct KuCoin avec vérif clientOid SEULEMENT si insertion acceptée
+main.py — Boucle event-driven optimisée + logs détaillés
+- Build des symboles via fetch_symbol_meta() (contrats USDTM)
+- Institutionnel + autotune si présents (soft import)
+- Logs clairs à chaque étape
 """
 
 import os, asyncio, logging, math, time
-from typing import Dict, Any, Tuple, List, Union
+from typing import Dict, Any, Tuple, List
 
 from ws_router import EventBus, PollingSource
 from execution_sfi import SFIEngine
@@ -17,18 +16,8 @@ from meta_policy import MetaPolicy
 from perf_metrics import register_signal_perf, update_perf_for_symbol
 from kucoin_utils import fetch_klines, fetch_symbol_meta
 from log_setup import init_logging, enable_httpx
-from kucoin_adapter import (
-    place_limit_order,
-    get_symbol_meta,
-)
 
-# get_order_by_client_oid est optionnel
-try:
-    from kucoin_adapter import get_order_by_client_oid  # type: ignore
-except Exception:
-    get_order_by_client_oid = None  # type: ignore
-
-# ---- Soft imports institutionnel / autotune
+# ---- Soft imports pour l'institutionnel / autotune (optionnels)
 HAS_INST = True
 try:
     from inst_enrich import get_institutional_snapshot  # type: ignore
@@ -41,7 +30,7 @@ try:
 except Exception:
     HAS_TUNER = False
 
-# ---- Analyse
+# ---- Analyse: bridge prioritaire, sinon fallback
 try:
     import analyze_bridge as analyze_signal  # type: ignore
 except Exception:
@@ -50,24 +39,12 @@ except Exception:
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID")
 
-H1_LIMIT                  = int(os.getenv("H1_LIMIT", "500"))
-H4_LIMIT                  = int(os.getenv("H4_LIMIT", "400"))
-H1_REFRESH_SEC            = int(os.getenv("H1_REFRESH_SEC", "60"))
-H4_REFRESH_SEC            = int(os.getenv("H4_REFRESH_SEC", "300"))
-ANALYSIS_MIN_INTERVAL_SEC = int(os.getenv("ANALYSIS_MIN_INTERVAL_SEC", "15"))
-WS_POLL_SEC               = int(os.getenv("WS_POLL_SEC", "5"))
-
-RR_TARGET_TP2             = float(os.getenv("INST_RR_TARGET_TP2", "2.0"))
-ATR_SL_MULT               = float(os.getenv("INST_ATR_SL_MULT", "1.0"))
-ATR_MIN_PCT               = float(os.getenv("INST_ATR_MIN_PCT", "0.003"))
-EQ_TOL_PCT                = float(os.getenv("INST_EQ_TOL_PCT", "0.0006"))
-OTE_LOW                   = float(os.getenv("INST_OTE_LOW", "0.62"))
-OTE_HIGH                  = float(os.getenv("INST_OTE_HIGH", "0.79"))
-OTE_MID                   = (OTE_LOW + OTE_HIGH) / 2.0
-
-KC_POST_ONLY_DEFAULT      = os.getenv("KC_POST_ONLY", "1") == "1"
-KC_VERIFY_MAX_TRIES       = int(os.getenv("KC_VERIFY_MAX_TRIES", "5"))
-KC_VERIFY_DELAY_SEC       = float(os.getenv("KC_VERIFY_DELAY_SEC", "0.35"))
+H1_LIMIT                 = int(os.getenv("H1_LIMIT", "500"))
+H4_LIMIT                 = int(os.getenv("H4_LIMIT", "400"))
+H1_REFRESH_SEC           = int(os.getenv("H1_REFRESH_SEC", "60"))
+H4_REFRESH_SEC           = int(os.getenv("H4_REFRESH_SEC", "300"))
+ANALYSIS_MIN_INTERVAL_SEC= int(os.getenv("ANALYSIS_MIN_INTERVAL_SEC", "15"))
+WS_POLL_SEC              = int(os.getenv("WS_POLL_SEC", "5"))
 
 _KLINE_CACHE: Dict[str, Dict[str, Any]] = {}
 _LAST_ANALYSIS_TS: Dict[str, float] = {}
@@ -91,11 +68,11 @@ def fmt_price(x):
 def send_telegram(text: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         log.info("[TG OFF] %s", text); return
-    import httpx
+    import requests
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode":"Markdown", "disable_web_page_preview": True}
     try:
-        httpx.post(url, json=payload, timeout=10)
+        requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": text,
+                                 "parse_mode":"Markdown", "disable_web_page_preview": True}, timeout=10)
     except Exception as e:
         log.error("Telegram KO: %s", e)
 
@@ -108,28 +85,36 @@ def _get_klines_cached(symbol: str) -> Tuple[Any, Any]:
     if need_h1:
         ent["h1"] = fetch_klines(symbol, interval="1h", limit=H1_LIMIT)
         ent["ts_h1"] = now
+        log.debug("H1 fetch", extra={"symbol": symbol})
+    else:
+        log.debug("H1 cache hit", extra={"symbol": symbol})
+
     if need_h4:
         ent["h4"] = fetch_klines(symbol, interval="4h", limit=H4_LIMIT)
         ent["ts_h4"] = now
+        log.debug("H4 fetch", extra={"symbol": symbol})
+    else:
+        log.debug("H4 cache hit", extra={"symbol": symbol})
 
     _KLINE_CACHE[symbol] = ent
     return ent.get("h1"), ent.get("h4")
 
 def _build_symbols() -> List[str]:
+    """
+    Construit la liste des contrats USDTM (ex: BTCUSDTM) à partir de fetch_symbol_meta().
+    - Respecte l'env SYMBOLS="BTCUSDTM,ETHUSDTM" si fourni.
+    """
     env_syms = os.getenv("SYMBOLS", "").strip()
     if env_syms:
-        return sorted(set(s.strip().upper() for s in env_syms.split(",") if s.strip()))
-
-    try:
-        meta = fetch_symbol_meta()
-    except Exception as e:
-        log.warning("fetch_symbol_meta KO: %s", e)
-        return []
-
+        # on fait confiance à l'utilisateur pour donner des contrats valides
+        lst = [s.strip().upper() for s in env_syms.split(",") if s.strip()]
+        return sorted(set(lst))
+    meta = fetch_symbol_meta()  # clés = "BTCUSDT", valeurs -> {"symbol_api":"BTCUSDTM", ...}
     syms = []
-    for display, v in meta.items():
-        if str(v.get("symbol_api", "")).endswith("USDTM"):
-            syms.append(display)
+    for v in meta.values():
+        sym_api = str(v.get("symbol_api", "")).strip().upper()
+        if sym_api.endswith("USDTM"):
+            syms.append(sym_api)
     return sorted(set(syms))
 
 
@@ -143,63 +128,125 @@ async def handle_symbol_event(ev: Dict[str, Any], rg: RiskGuard, policy: MetaPol
         return
     log.info("event: %s", etype, extra={"symbol": symbol})
 
+    # anti-spam analyse
     last = _LAST_ANALYSIS_TS.get(symbol, 0.0)
     if time.time() - last < ANALYSIS_MIN_INTERVAL_SEC:
+        log.debug("skip: analysis throttle", extra={"symbol": symbol})
         return
     _LAST_ANALYSIS_TS[symbol] = time.time()
 
+    # klines cache
     try:
         df_h1, df_h4 = _get_klines_cached(symbol)
     except Exception as e:
         log.warning("fetch_klines KO: %s", e, extra={"symbol": symbol})
         return
-    if df_h1 is None or df_h4 is None:
+    if df_h1 is None and df_h4 is None:
+        log.warning("klines vides", extra={"symbol": symbol})
         return
 
-    # simplifié : appel à analyze_signal
+    # --- Institutionnel + autotune (si dispo)
+    inst = {}
+    if HAS_INST:
+        try:
+            inst = get_institutional_snapshot(symbol)
+            log.info("inst: s=%.2f oi=%.2f d=%.2f f=%.2f liq=%.2f cvd=%d liq5m=%d",
+                     float(inst.get("score",0)), float(inst.get("oi_score",0)),
+                     float(inst.get("delta_score",0)), float(inst.get("funding_score",0)),
+                     float(inst.get("liq_score",0)), int(inst.get("delta_cvd_usd",0)),
+                     int(inst.get("liq_notional_5m",0)), extra={"symbol": symbol})
+        except Exception as e:
+            log.warning("inst snapshot KO: %s", e, extra={"symbol": symbol})
+            inst = {}
+
+    if HAS_INST and HAS_TUNER and TUNER is not None:
+        try:
+            thr = TUNER.update_and_get(symbol, df_h1, inst)  # seuils adaptatifs
+            comps_cnt, comps_detail = components_ok(inst, thr)
+            inst_ok = (float(inst.get("score",0)) >= thr["req_score"]) and (comps_cnt >= thr["components_min"])
+            log.info("inst-gate: pass=%s score=%.2f req=%.2f comps=%d/%d q=%.2f atr%%=%.2f",
+                     inst_ok, float(inst.get("score",0)), thr["req_score"], comps_cnt, thr["components_min"],
+                     float(thr.get("q_used", 0.0)), float(thr.get("atr_pct", 0.0)), extra={"symbol": symbol})
+            if not inst_ok:
+                log.info("inst-reject details: %s", comps_detail, extra={"symbol": symbol})
+                try: update_perf_for_symbol(symbol, df_h1=df_h1)
+                except Exception: pass
+                return
+        except Exception as e:
+            log.warning("autotune failed: %s", e, extra={"symbol": symbol})
+            # on continue sans gating si l'autotune a un souci
+
+    # --- Analyse (avec institutional si supporté)
     try:
-        res = analyze_signal.analyze_signal(symbol=symbol, df_h1=df_h1, df_h4=df_h4)
+        log.debug("analyze...", extra={"symbol": symbol})
+        try:
+            res = analyze_signal.analyze_signal(symbol=symbol, df_h1=df_h1, df_h4=df_h4, institutional=inst)
+        except TypeError:
+            # signature plus simple
+            res = analyze_signal.analyze_signal(symbol=symbol, df_h1=df_h1, df_h4=df_h4)
     except Exception as e:
         log.warning("analyze_signal KO: %s", e, extra={"symbol": symbol})
         return
 
-    if not isinstance(res, dict) or not res.get("valid"):
+    # ---- Logs d'analyse détaillés
+    if not isinstance(res, dict):
+        log.info("no-trade (bad result type)", extra={"symbol": symbol})
+        try: update_perf_for_symbol(symbol, df_h1=df_h1)
+        except Exception: pass
         return
 
-    side   = res.get("side")
-    entry  = res.get("entry", float(df_h1['close'].iloc[-1]))
-    sl     = res.get("sl")
-    tp1    = res.get("tp1")
-    tp2    = res.get("tp2")
-    rr     = res.get("rr", 0)
+    side = str(res.get("side", "none")).lower()
+    rr   = float(res.get("rr", 0) or 0)
+    # si l'analyse ne renvoie pas 'inst_score', on reprend celui du snapshot
+    score= float(res.get("inst_score", inst.get("score", 0) if isinstance(inst, dict) else 0) or 0)
+    comments_list = res.get("comments", []) or []
+    comments = ", ".join([str(c) for c in comments_list]) if comments_list else ""
+    log.info("analysis: side=%s rr=%.2f score=%.2f comment=%s",
+             side, rr, score, comments or "—", extra={"symbol": symbol})
 
-    log.info("analysis OK %s rr=%.2f", side, rr, extra={"symbol": symbol})
+    if not res.get("valid", False):
+        log.info("no-trade (invalid signal) — rr=%.2f score=%.2f reason=%s",
+                 rr, score, (comments or "no reason"), extra={"symbol": symbol})
+        try: update_perf_for_symbol(symbol, df_h1=df_h1)
+        except Exception: pass
+        return
 
     # --- Risk guard
-    rg_ok, _ = rg.can_enter(symbol)
-    if not rg_ok:
+    ok, reason = rg.can_enter(symbol, ws_latency_ms=50, last_data_age_s=5)
+    if not ok:
+        log.info("blocked by risk_guard: %s", reason, extra={"symbol": symbol})
         return
 
-    # --- Execution fallback KuCoin direct
-    try:
-        meta = get_symbol_meta(symbol) or {}
-        tick = float(meta.get("priceIncrement", 0.0)) or 0.0
-    except Exception:
-        tick = 0.0
+    # --- Policy
+    arm, weight, label = policy.choose({"atr_pct": res.get("atr_pct", 0), "adx_proxy": res.get("adx_proxy", 0)})
+    if weight < 0.25 and rr < 1.5:
+        log.info("policy reject — arm=%s w=%.2f rr=%.2f", arm, weight, rr, extra={"symbol": symbol})
+        try: update_perf_for_symbol(symbol, df_h1=df_h1)
+        except Exception: pass
+        return
 
-    price = entry
-    post_only = KC_POST_ONLY_DEFAULT
-    kc = place_limit_order(
-        symbol=symbol,
-        side=side,
-        price=float(price),
-        value_usdt=20,
-        sl=sl,
-        tp1=tp1,
-        tp2=tp2,
-        post_only=post_only
-    )
-    log.info("kc resp: %s", kc, extra={"symbol": symbol})
+    # --- Exécution
+    entry = res.get("entry"); sl, tp1, tp2 = res.get("sl"), res.get("tp1"), res.get("tp2")
+    value_usdt = float(os.environ.get("ORDER_VALUE_USDT", "20"))
+
+    log.info("EXEC %s entry=%s sl=%s tp1=%s tp2=%s val=%s",
+             side.upper(), fmt_price(entry), fmt_price(sl), fmt_price(tp1), fmt_price(tp2), value_usdt,
+             extra={"symbol": symbol})
+
+    eng = SFIEngine(symbol, side, value_usdt, sl, tp1, tp2)
+    orders = eng.place_initial(entry_hint=entry)
+    eng.maybe_requote()
+    log.info("orders=%s", orders, extra={"symbol": symbol})
+
+    msg = (f"🧠 *{symbol}* — *{side.upper()}* via *{label}*\n"
+           f"RR: *{res.get('rr','—')}*  |  Entrée: *{fmt_price(entry)}*  |  SL: *{fmt_price(sl)}*  |  TP1: *{fmt_price(tp1)}*  TP2: *{fmt_price(tp2)}*\n"
+           f"Ordres: {orders}")
+    send_telegram(msg)
+
+    key = f"{symbol}:{side}:{fmt_price(entry)}:{round(res.get('rr',0),2)}"
+    register_signal_perf(key, symbol, side, entry)
+    try: update_perf_for_symbol(symbol, df_h1=df_h1)
+    except Exception: pass
 
 
 # ------------------------
@@ -212,6 +259,7 @@ async def main():
 
     logging.getLogger("runner").info("start")
 
+    # Build des symboles contrats via meta (ou via env SYMBOLS)
     try:
         symbols = _build_symbols()
     except Exception as e:
