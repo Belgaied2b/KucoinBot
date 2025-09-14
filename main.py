@@ -4,7 +4,7 @@ main.py — Boucle event-driven + fallback institutionnel structuré (OTE, liqui
 - Direction H4, exécution H1 via OTE 62–79% et pools de liquidité
 - SL derrière la liquidité/swing + buffer ATR
 - TP1 swing/pool opposé, TP2 RR cible (2.0 par défaut)
-- Exécution SFI + fallback direct KuCoin avec vérif par clientOid (si disponible)
+- Exécution SFI + fallback direct KuCoin (sans poll inutile sur échec POST)
 """
 
 import os, asyncio, logging, math, time
@@ -688,17 +688,20 @@ async def handle_symbol_event(ev: Dict[str, Any], rg: RiskGuard, policy: MetaPol
 
         clientOid = None
         orderId   = None
+        ok_flag   = False
+        kc_code   = None
+
         if isinstance(kc, dict):
             orderId   = kc.get("orderId") or (kc.get("data") or {}).get("orderId")
             clientOid = kc.get("clientOid") or (kc.get("data") or {}).get("clientOid")
-            ok = bool(kc.get("ok", False))
-            code = kc.get("code")
-            msg  = kc.get("msg")
+            ok_flag   = bool(kc.get("ok", False))
+            kc_code   = kc.get("code")
+            msg       = kc.get("msg")
             log.info("[kc.place_limit_order] ok=%s code=%s msg=%s clientOid=%s orderId=%s",
-                     ok, code, msg, clientOid, orderId, extra={"symbol": symbol})
+                     ok_flag, kc_code, msg, clientOid, orderId, extra={"symbol": symbol})
 
-        # Si pas d'orderId mais on a un clientOid, on vérifie côté serveur (poll léger) — seulement si la fonction existe
-        if (not orderId) and clientOid and callable(get_order_by_client_oid or None):  # type: ignore
+        # Poll clientOid SEULEMENT si POST a réussi (code=200000) et qu'on n'a pas encore d'orderId
+        if (not orderId) and clientOid and ok_flag and (kc_code == "200000") and callable(get_order_by_client_oid or None):  # type: ignore
             for _ in range(KC_VERIFY_MAX_TRIES):
                 time.sleep(KC_VERIFY_DELAY_SEC)
                 try:
@@ -714,8 +717,11 @@ async def handle_symbol_event(ev: Dict[str, Any], rg: RiskGuard, policy: MetaPol
                         break
 
         # Met à jour 'orders' pour la suite/Telegram
-        if orderId or clientOid:
-            orders = [{"ok": True, "orderId": orderId, "clientOid": clientOid}]
+        if orderId:
+            orders = [{"ok": True, "orderId": orderId, "clientOid": clientOid, "code": kc_code or "200000"}]
+        elif ok_flag and kc_code == "200000" and clientOid:
+            # succès retourné par l'API mais pas d'orderId dans la réponse — on conserve le clientOid
+            orders = [{"ok": True, "orderId": None, "clientOid": clientOid, "code": "200000"}]
         else:
             orders = [{"ok": False, "raw": kc}]
 
