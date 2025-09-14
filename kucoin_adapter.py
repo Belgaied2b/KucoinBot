@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-kucoin_adapter.py — LIMIT simple (one-way), isolé, levier 10, valueQty (USDT)
-- Jamais de `positionSide`
-- Envoie `crossMode=False` (isolé)
+kucoin_adapter.py — LIMIT simple (one-way), levier 10, valueQty (USDT)
+- Jamais de `positionSide` (évite 330011 en one-way)
+- N'ENVOIE PAS `crossMode` (évite 330005) — on laisse l'exchange en isolé par défaut
 - `leverage` par défaut = 10 (fallback 5→3 si 100001)
 - `postOnly` True par défaut
 - Quantification prix au tick (tickSize/priceIncrement -> pricePrecision)
+- Auto-mapping symbole affichage ...USDT -> contrat API ...USDTM
 """
 
 from __future__ import annotations
@@ -45,6 +46,11 @@ def _sync_server_time() -> None:
 
 def _ts_ms() -> int:
     return int((time.time() + _SERVER_OFFSET) * 1000)
+
+# ------------ utils ------------
+def _to_api_symbol(symbol: str) -> str:
+    s = str(symbol).upper().replace("/", "").replace("-", "")
+    return s if s.endswith("USDTM") else (s + "M" if s.endswith("USDT") else s)
 
 # ------------ v2 sign ------------
 def _b64_hmac_sha256(secret: str, payload: str) -> str:
@@ -101,7 +107,8 @@ def _get(path: str) -> Tuple[bool, Dict[str, Any]]:
 
 # ------------ Meta / Tick ------------
 def get_symbol_meta(symbol: str) -> Dict[str, Any]:
-    ok, js = _get(f"{CNTR_PATH}/{symbol}")
+    sym = _to_api_symbol(symbol)
+    ok, js = _get(f"{CNTR_PATH}/{sym}")
     d = (js.get("data") or {}) if ok else {}
     # expose priceIncrement pour SFI
     if "priceIncrement" not in d:
@@ -109,7 +116,10 @@ def get_symbol_meta(symbol: str) -> Dict[str, Any]:
         if tick and float(tick) > 0:
             d["priceIncrement"] = float(tick)
         else:
-            pp = int(d.get("pricePrecision", 8))
+            try:
+                pp = int(d.get("pricePrecision", 8))
+            except Exception:
+                pp = 8
             d["priceIncrement"] = 10 ** (-pp) if pp >= 0 else 1e-8
     return d
 
@@ -137,7 +147,8 @@ def _quantize(price: float, tick: float, side: str) -> float:
 # ------------ Orderbook (optionnels) ------------
 def get_orderbook_top(symbol: str) -> Dict[str, Any] | None:
     try:
-        ok, js = _get(f"/api/v1/ticker?symbol={symbol}")
+        sym = _to_api_symbol(symbol)
+        ok, js = _get(f"/api/v1/ticker?symbol={sym}")
         if ok:
             d = js.get("data") or {}
             return {
@@ -152,8 +163,9 @@ def get_orderbook_top(symbol: str) -> Dict[str, Any] | None:
 
 def get_orderbook_levels(symbol: str, depth: int = 5) -> List[Dict[str, Any]]:
     try:
+        sym = _to_api_symbol(symbol)
         d = []
-        ok, js = _get(f"/api/v1/level2/depth{min(20, max(5, depth))}?symbol={symbol}")
+        ok, js = _get(f"/api/v1/level2/depth{min(20, max(5, depth))}?symbol={sym}")
         if ok:
             data = js.get("data") or {}
             for p, sz in (data.get("bids") or []):
@@ -189,7 +201,8 @@ def place_limit_order(
     if _SERVER_OFFSET == 0.0 or abs(_SERVER_OFFSET) > 30:
         _sync_server_time()
 
-    meta = get_symbol_meta(symbol) or {}
+    sym = _to_api_symbol(symbol)
+    meta = get_symbol_meta(sym) or {}
     tick = _safe_tick_from_meta(meta)
     qprice = _quantize(float(price), float(tick), side)
 
@@ -198,17 +211,17 @@ def place_limit_order(
 
     body = {
         "clientOid": coid,
-        "symbol": symbol,
+        "symbol": sym,
         "type": "limit",
         "side": str(side).lower(),              # "buy"/"sell"
         "price": f"{qprice:.12f}",
         "valueQty": f"{float(value_usdt):.{VALUE_DECIMALS}f}",
-        "leverage": str(lev),
+        "leverage": str(lev),                   # string
         "timeInForce": "GTC",
         "postOnly": bool(post_only),
         "reduceOnly": False,
-        "crossMode": False,                     # isolé
         # ❌ jamais positionSide
+        # ❌ pas de crossMode
     }
 
     ok, js = _post(ORDERS_PATH, body)
@@ -227,6 +240,7 @@ def place_limit_order(
     js.setdefault("clientOid", coid)
     js.setdefault("price_sent", qprice)
     js.setdefault("tick", tick)
+    js.setdefault("symbol_api", sym)
     return js
 
 # alias legacy
@@ -252,18 +266,20 @@ def replace_order(order_id: str, new_price: float) -> Dict[str, Any]:
 
 # ------------ Market-by-value (optionnel) ------------
 def place_market_by_value(symbol: str, side: str, valueQty: float) -> Dict[str, Any]:
+    sym = _to_api_symbol(symbol)
     body = {
         "clientOid": str(_ts_ms()),
-        "symbol": symbol,
+        "symbol": sym,
         "type": "market",
         "side": str(side).lower(),
         "valueQty": f"{float(valueQty):.{VALUE_DECIMALS}f}",
         "reduceOnly": False,
-        "crossMode": False,
+        # ❌ pas de crossMode / positionSide
     }
     ok, js = _post(ORDERS_PATH, body)
     js = js or {}
     js["ok"] = bool(ok and js.get("code") == "200000")
     if "orderId" not in js and isinstance(js.get("data"), dict):
         js["orderId"] = js["data"].get("orderId")
+    js.setdefault("symbol_api", sym)
     return js
