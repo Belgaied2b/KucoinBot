@@ -1,13 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-kucoin_trader.py — LIMIT simple (one-way), isolé, levier 10, valueQty (USDT)
-- Jamais de `positionSide`, pas de retry 330011
-- Envoie `crossMode=False`
-- Tick robuste
+kucoin_trader.py — LIMIT simple (one-way), levier 10, valueQty (USDT)
+- Jamais de `positionSide`
+- N'ENVOIE PAS `crossMode` (évite 330005) — on laisse l'exchange en isolé par défaut
+- `leverage` par défaut = 10 (fallback 5→3 si 100001)
+- `postOnly` True par défaut
+- Quantification prix au tick (tickSize/priceIncrement -> pricePrecision)
+- Auto-mapping symbole affichage ...USDT -> contrat API ...USDTM
 """
 
 import time, hmac, base64, hashlib, json, math
-from typing import Optional, Tuple, Dict, Any, Literal
+from typing import Optional, Dict, Any, Literal, List
 
 import httpx
 from config import SETTINGS
@@ -18,6 +21,11 @@ log = get_logger("kucoin.trader")
 BASE = SETTINGS.kucoin_base_url.rstrip("/")
 DEFAULT_LEVERAGE = int(getattr(SETTINGS, "default_leverage", 10))
 VALUE_DECIMALS   = int(getattr(SETTINGS, "value_decimals", 2))
+
+# -------- utils --------
+def _to_api_symbol(symbol: str) -> str:
+    s = str(symbol).upper().replace("/", "").replace("-", "")
+    return s if s.endswith("USDTM") else (s + "M" if s.endswith("USDT") else s)
 
 # -------- time sync --------
 _SERVER_OFFSET = 0.0
@@ -66,7 +74,10 @@ def _contract_meta(c: httpx.Client, symbol_api: str) -> Dict[str, Any]:
                 if tick and float(tick) > 0:
                     d["priceIncrement"] = float(tick)
                 else:
-                    pp = int(d.get("pricePrecision", 8))
+                    try:
+                        pp = int(d.get("pricePrecision", 8))
+                    except Exception:
+                        pp = 8
                     d["priceIncrement"] = 10 ** (-pp) if pp >= 0 else 1e-8
             return d
     except Exception:
@@ -93,13 +104,15 @@ def _quantize(price: float, tick: float, side: str) -> float:
 
 # -------- public API used by SFI --------
 def get_symbol_meta(symbol: str) -> Dict[str, Any]:
+    sym = _to_api_symbol(symbol)
     with httpx.Client(timeout=10.0) as c:
-        return _contract_meta(c, symbol)
+        return _contract_meta(c, sym)
 
 def get_orderbook_top(symbol: str) -> Dict[str, Any] | None:
     try:
+        sym = _to_api_symbol(symbol)
         with httpx.Client(timeout=10.0) as c:
-            path = f"/api/v1/ticker?symbol={symbol}"
+            path = f"/api/v1/ticker?symbol={sym}"
             r = c.get(BASE + path, headers=_headers("GET", path))
             if r.status_code != 200: return None
             d = (r.json() or {}).get("data") or {}
@@ -112,15 +125,16 @@ def get_orderbook_top(symbol: str) -> Dict[str, Any] | None:
     except Exception:
         return None
 
-def get_orderbook_levels(symbol: str, depth: int = 5) -> list[Dict[str, Any]]:
+def get_orderbook_levels(symbol: str, depth: int = 5) -> List[Dict[str, Any]]:
     try:
+        sym = _to_api_symbol(symbol)
         with httpx.Client(timeout=10.0) as c:
             depth = min(20, max(5, int(depth)))
-            path = f"/api/v1/level2/depth{depth}?symbol={symbol}"
+            path = f"/api/v1/level2/depth{depth}?symbol={sym}"
             r = c.get(BASE + path, headers=_headers("GET", path))
             if r.status_code != 200: return []
             data = (r.json() or {}).get("data") or {}
-            out = []
+            out: List[Dict[str, Any]] = []
             for p, sz in (data.get("bids") or []):
                 out.append({"side": "buy", "price": float(p), "size": float(sz)})
             for p, sz in (data.get("asks") or []):
@@ -154,15 +168,16 @@ def place_limit_order(
     client_order_id: Optional[str] = None,
     leverage: Optional[int] = None,
 ) -> Dict[str, Any]:
+    sym = _to_api_symbol(symbol)
     with httpx.Client(timeout=10.0) as c:
         _sync_server_time(c)
-        meta = _contract_meta(c, symbol)
+        meta = _contract_meta(c, sym)
         tick = _safe_tick(meta)
         qprice = _quantize(float(price), tick, side)
 
         body = {
             "clientOid": str(client_order_id or _now_ms()),
-            "symbol": symbol,
+            "symbol": sym,
             "type": "limit",
             "side": side.lower(),
             "price": f"{qprice:.12f}",
@@ -171,7 +186,7 @@ def place_limit_order(
             "timeInForce": "GTC",
             "postOnly": bool(post_only),
             "reduceOnly": False,
-            "crossMode": False,  # isolé
+            # ❌ pas de crossMode
             # ❌ jamais positionSide
         }
 
@@ -198,7 +213,7 @@ def place_limit_order(
             code = (js or {}).get("code")
             ok = (r.status_code == 200 and code == "200000")
 
-        # ❌ Aucun retry 330011, jamais `positionSide`
+        # ❌ Aucun retry 330011 — on reste strictement one-way sans positionSide
 
         if "ok" not in js:
             js["ok"] = bool(ok)
@@ -207,6 +222,7 @@ def place_limit_order(
         js.setdefault("clientOid", body.get("clientOid"))
         js.setdefault("price_sent", qprice)
         js.setdefault("tick", tick)
+        js.setdefault("symbol_api", sym)
         return js
 
 def place_limit_valueqty(
@@ -235,16 +251,17 @@ def replace_order(order_id: str, new_price: float) -> Dict[str, Any]:
         return {"ok": False, "error": str(e)}
 
 def place_market_by_value(symbol: str, side: Literal["buy","sell"], valueQty: float) -> Dict[str, Any]:
+    sym = _to_api_symbol(symbol)
     with httpx.Client(timeout=10.0) as c:
         _sync_server_time(c)
         body = {
             "clientOid": str(_now_ms()),
-            "symbol": symbol,
+            "symbol": sym,
             "type": "market",
             "side": side.lower(),
             "valueQty": f"{float(valueQty):.{VALUE_DECIMALS}f}",
             "reduceOnly": False,
-            "crossMode": False,
+            # ❌ pas de crossMode / positionSide
         }
         path = "/api/v1/orders"
         body_json = json.dumps(body, separators=(",", ":"))
@@ -256,4 +273,5 @@ def place_market_by_value(symbol: str, side: Literal["buy","sell"], valueQty: fl
         js["ok"] = bool(r.status_code == 200 and (js or {}).get("code") == "200000")
         if "orderId" not in js and isinstance(js.get("data"), dict):
             js["orderId"] = js["data"].get("orderId")
+        js.setdefault("symbol_api", sym)
         return js
