@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-kucoin_adapter.py — LIMIT par valueQty (20 USDT), iso, levier 10
-- Auto-détection position mode (one-way vs hedge) via /position
-- Ajoute positionSide si hedge, sinon jamais (one-way)
-- Pas de crossMode envoyé (évite 330005)
-- Retry: 100001 (leverage), 330011 (inverse presence positionSide)
-- Tick robuste: tickSize -> priceIncrement -> pricePrecision
+kucoin_adapter.py — LIMIT simple (one-way), isolé, levier 10, valueQty (USDT)
+- Jamais de `positionSide`
+- Envoie `crossMode=False` (isolé)
+- `leverage` par défaut = 10 (fallback 5→3 si 100001)
+- `postOnly` True par défaut
+- Quantification prix au tick (tickSize/priceIncrement -> pricePrecision)
 """
 
 from __future__ import annotations
@@ -25,10 +25,8 @@ TIME_PATH   = "/api/v1/timestamp"
 CNTR_PATH   = "/api/v1/contracts"
 ORDERS_PATH = "/api/v1/orders"
 GET_BY_COID = "/api/v1/order/client-order/{clientOid}"
-POS_PATH    = "/api/v1/position"
 
 DEFAULT_LEVERAGE = int(getattr(SETTINGS, "default_leverage", 10))
-VALUE_USDT       = float(getattr(SETTINGS, "margin_per_trade", 20.0))
 VALUE_DECIMALS   = int(getattr(SETTINGS, "value_decimals", 2))
 
 # ------------ time sync ------------
@@ -104,14 +102,23 @@ def _get(path: str) -> Tuple[bool, Dict[str, Any]]:
 # ------------ Meta / Tick ------------
 def get_symbol_meta(symbol: str) -> Dict[str, Any]:
     ok, js = _get(f"{CNTR_PATH}/{symbol}")
-    return (js.get("data") or {}) if ok else {}
+    d = (js.get("data") or {}) if ok else {}
+    # expose priceIncrement pour SFI
+    if "priceIncrement" not in d:
+        tick = d.get("tickSize")
+        if tick and float(tick) > 0:
+            d["priceIncrement"] = float(tick)
+        else:
+            pp = int(d.get("pricePrecision", 8))
+            d["priceIncrement"] = 10 ** (-pp) if pp >= 0 else 1e-8
+    return d
 
 def _safe_tick_from_meta(d: Dict[str, Any]) -> float:
-    def _f(x) -> float:
-        try: return float(x)
-        except Exception: return 0.0
-    t = _f(d.get("tickSize") or d.get("priceIncrement"))
-    if t > 0: return t
+    try:
+        t = float(d.get("tickSize") or d.get("priceIncrement") or 0.0)
+        if t > 0: return t
+    except Exception:
+        pass
     try:
         pp = int(d.get("pricePrecision", 8))
         return 10 ** (-pp) if pp >= 0 else 1e-8
@@ -121,33 +128,13 @@ def _safe_tick_from_meta(d: Dict[str, Any]) -> float:
 def _quantize(price: float, tick: float, side: str) -> float:
     if tick <= 0: return float(price)
     steps = float(price) / float(tick)
-    qsteps = math.floor(steps + 1e-12) if side.lower() == "buy" else math.ceil(steps - 1e-12)
+    if str(side).lower() == "buy":
+        qsteps = math.floor(steps + 1e-12)  # floor
+    else:
+        qsteps = math.ceil(steps - 1e-12)   # ceil
     return float(qsteps) * float(tick)
 
-# ------------ Position mode ------------
-def _get_position(symbol: str) -> Dict[str, Any]:
-    ok, js = _get(f"{POS_PATH}?symbol={symbol}")
-    if not ok: return {}
-    d = js.get("data")
-    if isinstance(d, dict): return d
-    if isinstance(d, list) and d: return d[0]
-    return {}
-
-def _infer_pos_mode(d: Dict[str, Any]) -> str:
-    # 'hedge' ou 'oneway'
-    for k in ("positionMode", "posMode", "mode"):
-        v = d.get(k)
-        if isinstance(v, str):
-            vl = v.lower()
-            if "hedge" in vl: return "hedge"
-            if "one" in vl or "single" in vl: return "oneway"
-    long_keys = ("longQty","longSize","longOpen","longAvailable")
-    short_keys= ("shortQty","shortSize","shortOpen","shortAvailable")
-    if any(k in d for k in long_keys) and any(k in d for k in short_keys):
-        return "hedge"
-    return "oneway"
-
-# ------------ Orderbook helpers (optionnels) ------------
+# ------------ Orderbook (optionnels) ------------
 def get_orderbook_top(symbol: str) -> Dict[str, Any] | None:
     try:
         ok, js = _get(f"/api/v1/ticker?symbol={symbol}")
@@ -186,30 +173,12 @@ def get_order_by_client_oid(client_oid: str) -> Optional[Dict[str, Any]]:
     ok, js = _get(GET_BY_COID.format(clientOid=client_oid))
     return (js.get("data") or None) if ok else None
 
-# ------------ PLACE LIMIT (auto hedge/oneway) ------------
-def _body_limit(symbol: str, side: str, qprice: float, value_usdt: float, lev: int, include_ps: bool) -> Dict[str, Any]:
-    b = {
-        "clientOid": str(_ts_ms()),
-        "symbol": symbol,
-        "type": "limit",
-        "side": side.lower(),
-        "price": f"{qprice:.12f}",
-        "valueQty": f"{float(value_usdt):.{VALUE_DECIMALS}f}",
-        "leverage": str(int(lev)),
-        "timeInForce": "GTC",
-        "postOnly": True,
-        "reduceOnly": False,
-        # pas de crossMode envoyé
-    }
-    if include_ps:
-        b["positionSide"] = "long" if side.lower() == "buy" else "short"
-    return b
-
+# ------------ PLACE LIMIT (one-way strict) ------------
 def place_limit_order(
     symbol: str,
     side: str,
     price: float,
-    value_usdt: float = VALUE_USDT,
+    value_usdt: float = 20.0,
     sl: Optional[float] = None,
     tp1: Optional[float] = None,
     tp2: Optional[float] = None,
@@ -220,49 +189,42 @@ def place_limit_order(
     if _SERVER_OFFSET == 0.0 or abs(_SERVER_OFFSET) > 30:
         _sync_server_time()
 
-    # tick & quantize
     meta = get_symbol_meta(symbol) or {}
     tick = _safe_tick_from_meta(meta)
     qprice = _quantize(float(price), float(tick), side)
 
-    # position mode
-    pos = _get_position(symbol)
-    mode = _infer_pos_mode(pos)
-    include_ps = (mode == "hedge")
-    log.info("[positionMode] %s -> %s (include positionSide=%s)", symbol, mode, include_ps)
-
     lev = int(leverage or DEFAULT_LEVERAGE)
-    body = _body_limit(symbol, side, qprice, value_usdt, lev, include_ps)
-    if client_order_id:
-        body["clientOid"] = str(client_order_id)
-    if post_only is False:
-        body["postOnly"] = False
+    coid = str(client_order_id or _ts_ms())
 
-    # send
+    body = {
+        "clientOid": coid,
+        "symbol": symbol,
+        "type": "limit",
+        "side": str(side).lower(),              # "buy"/"sell"
+        "price": f"{qprice:.12f}",
+        "valueQty": f"{float(value_usdt):.{VALUE_DECIMALS}f}",
+        "leverage": str(lev),
+        "timeInForce": "GTC",
+        "postOnly": bool(post_only),
+        "reduceOnly": False,
+        "crossMode": False,                     # isolé
+        # ❌ jamais positionSide
+    }
+
     ok, js = _post(ORDERS_PATH, body)
     code = (js or {}).get("code")
     msg  = (js or {}).get("msg")
 
-    # retry leverage
+    # retry levier uniquement
     if (not ok or code != "200000") and (code == "100001" or (msg and "Leverage parameter invalid" in str(msg))):
         body["leverage"] = "5" if str(body.get("leverage")) != "5" else "3"
-        ok, js = _post(ORDERS_PATH, body)
-        code = (js or {}).get("code")
-
-    # retry 330011 (inverse présence de positionSide)
-    if (not ok or code != "200000") and code == "330011":
-        alt_include_ps = not include_ps
-        log.info("[positionMode] retry %s with positionSide included=%s", symbol, alt_include_ps)
-        body = _body_limit(symbol, side, qprice, value_usdt, lev, alt_include_ps)
-        if client_order_id:
-            body["clientOid"] = str(client_order_id)
         ok, js = _post(ORDERS_PATH, body)
 
     js = js or {}
     js["ok"] = bool(ok and js.get("code") == "200000")
     if "orderId" not in js and isinstance(js.get("data"), dict):
         js["orderId"] = js["data"].get("orderId")
-    js.setdefault("clientOid", body.get("clientOid"))
+    js.setdefault("clientOid", coid)
     js.setdefault("price_sent", qprice)
     js.setdefault("tick", tick)
     return js
@@ -281,21 +243,23 @@ def cancel_order(order_id: str) -> Dict[str, Any]:
     return {"ok": ok and (js or {}).get("code") == "200000", **(js or {})}
 
 def replace_order(order_id: str, new_price: float) -> Dict[str, Any]:
+    # cancel-only; le caller re-postera au nouveau prix
     try:
         c = cancel_order(order_id)
         return {"ok": bool(c.get("ok")), "cancel": c}
     except Exception as e:
         return {"ok": False, "error": str(e)}
 
-# ------------ Market-by-value ------------
+# ------------ Market-by-value (optionnel) ------------
 def place_market_by_value(symbol: str, side: str, valueQty: float) -> Dict[str, Any]:
     body = {
         "clientOid": str(_ts_ms()),
         "symbol": symbol,
         "type": "market",
-        "side": side.lower(),
+        "side": str(side).lower(),
         "valueQty": f"{float(valueQty):.{VALUE_DECIMALS}f}",
         "reduceOnly": False,
+        "crossMode": False,
     }
     ok, js = _post(ORDERS_PATH, body)
     js = js or {}
