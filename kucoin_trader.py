@@ -1,12 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-kucoin_trader.py — LIMIT simple (one-way), levier 10, valueQty (USDT)
+kucoin_trader.py — LIMIT simple (one-way), valueQty USDT
 - Jamais de `positionSide`
-- N'ENVOIE PAS `crossMode` (évite 330005) — on laisse l'exchange en isolé par défaut
-- `leverage` par défaut = 10 (fallback 5→3 si 100001)
-- `postOnly` True par défaut
-- Quantification prix au tick (tickSize/priceIncrement -> pricePrecision)
-- Auto-mapping symbole affichage ...USDT -> contrat API ...USDTM
+- N'ENVOIE PAS `crossMode`
+- Pré-check du mode serveur (si Hedge -> refus local explicite)
+- Tick robuste + mapping ...USDT -> ...USDTM
 """
 
 import time, hmac, base64, hashlib, json, math
@@ -102,6 +100,39 @@ def _quantize(price: float, tick: float, side: str) -> float:
     qsteps = math.floor(steps + 1e-12) if side.lower() == "buy" else math.ceil(steps - 1e-12)
     return float(qsteps) * float(tick)
 
+# -------- server mode check --------
+def _infer_pos_mode(d: Dict[str, Any]) -> str:
+    for k in ("positionMode","posMode","mode"):
+        v = d.get(k)
+        if isinstance(v, str):
+            vl = v.lower()
+            if "hedge" in vl: return "hedge"
+            if "one" in vl or "single" in vl: return "oneway"
+    long_keys=("longQty","longSize","longOpen","longAvailable")
+    short_keys=("shortQty","shortSize","shortOpen","shortAvailable")
+    if any(k in d for k in long_keys) and any(k in d for k in short_keys):
+        return "hedge"
+    return "oneway"
+
+def _get_position_mode(c: httpx.Client, symbol_api: str) -> str:
+    path = f"/api/v1/position?symbol={symbol_api}"
+    try:
+        r = c.get(BASE + path, headers=_headers("GET", path))
+        if r.status_code == 200:
+            data = (r.json() or {}).get("data")
+            if isinstance(data, dict):
+                m = _infer_pos_mode(data)
+            elif isinstance(data, list) and data:
+                m = _infer_pos_mode(data[0])
+            else:
+                m = "oneway"
+        else:
+            m = "oneway"
+    except Exception:
+        m = "oneway"
+    log.info("[server positionMode] %s -> %s", symbol_api, m)
+    return m
+
 # -------- public API used by SFI --------
 def get_symbol_meta(symbol: str) -> Dict[str, Any]:
     sym = _to_api_symbol(symbol)
@@ -171,6 +202,14 @@ def place_limit_order(
     sym = _to_api_symbol(symbol)
     with httpx.Client(timeout=10.0) as c:
         _sync_server_time(c)
+
+        # ✅ Pré-check du mode serveur
+        mode = _get_position_mode(c, sym)
+        if mode == "hedge":
+            msg = "Server account is in HEDGE mode — switch to One-Way on this API/sub-account."
+            log.error("[precheck] %s", msg, extra={"symbol": sym})
+            return {"ok": False, "code": "330011_LOCAL", "msg": msg, "clientOid": str(client_order_id or _now_ms())}
+
         meta = _contract_meta(c, sym)
         tick = _safe_tick(meta)
         qprice = _quantize(float(price), tick, side)
@@ -213,8 +252,6 @@ def place_limit_order(
             code = (js or {}).get("code")
             ok = (r.status_code == 200 and code == "200000")
 
-        # ❌ Aucun retry 330011 — on reste strictement one-way sans positionSide
-
         if "ok" not in js:
             js["ok"] = bool(ok)
         if "orderId" not in js and isinstance(js.get("data"), dict):
@@ -254,6 +291,14 @@ def place_market_by_value(symbol: str, side: Literal["buy","sell"], valueQty: fl
     sym = _to_api_symbol(symbol)
     with httpx.Client(timeout=10.0) as c:
         _sync_server_time(c)
+
+        # Pré-check du mode
+        mode = _get_position_mode(c, sym)
+        if mode == "hedge":
+            msg = "Server account is in HEDGE mode — switch to One-Way on this API/sub-account."
+            log.error("[precheck] %s", msg, extra={"symbol": sym})
+            return {"ok": False, "code": "330011_LOCAL", "msg": msg, "clientOid": str(_now_ms())}
+
         body = {
             "clientOid": str(_now_ms()),
             "symbol": sym,
