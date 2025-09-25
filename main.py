@@ -20,6 +20,7 @@ from log_setup import init_logging, enable_httpx
 from kucoin_adapter import (
     place_limit_order,
     get_symbol_meta,
+    get_server_position_mode,  # ✅ pré-check du mode serveur
 )
 
 # get_order_by_client_oid est optionnel : pas d'ImportError si absent
@@ -59,9 +60,9 @@ WS_POLL_SEC               = int(os.getenv("WS_POLL_SEC", "5"))
 
 # Cibles / buffers institutionnels
 RR_TARGET_TP2             = float(os.getenv("INST_RR_TARGET_TP2", "2.0"))
-ATR_SL_MULT               = float(os.getenv("INST_ATR_SL_MULT", "1.0"))     # buffer ajouté derrière le swing/liquidité
-ATR_MIN_PCT               = float(os.getenv("INST_ATR_MIN_PCT", "0.003"))   # fallback ATR min = 0.3% prix
-EQ_TOL_PCT                = float(os.getenv("INST_EQ_TOL_PCT", "0.0006"))   # tolérance equal highs/lows (0.06%)
+ATR_SL_MULT               = float(os.getenv("INST_ATR_SL_MULT", "1.0"))
+ATR_MIN_PCT               = float(os.getenv("INST_ATR_MIN_PCT", "0.003"))
+EQ_TOL_PCT                = float(os.getenv("INST_EQ_TOL_PCT", "0.0006"))
 OTE_LOW                   = float(os.getenv("INST_OTE_LOW", "0.62"))
 OTE_HIGH                  = float(os.getenv("INST_OTE_HIGH", "0.79"))
 OTE_MID                   = (OTE_LOW + OTE_HIGH) / 2.0
@@ -145,7 +146,6 @@ def _build_symbols() -> List[str]:
 def _round_to_tick(px: float, tick: float) -> float:
     if not tick or tick <= 0:
         return float(px)
-    # floor vers le tick inférieur (évite rejet prix)
     return math.floor(float(px) / float(tick)) * float(tick)
 
 def _side_to_adapter(side: str) -> str:
@@ -155,12 +155,6 @@ def _side_to_adapter(side: str) -> str:
     return "buy" if s == "long" else "sell"
 
 def _has_real_order_id(orders: List[Dict[str, Any]]) -> bool:
-    """
-    VRAIE détection d'un ordre exchange:
-      - orderId présent (KuCoin)
-      - OU payload normalisé avec ok=True ET code 200000 (success) ET clientOid et/ou orderId
-    Un simple 'clientOid' isolé ou une string 'raw' ne compte pas.
-    """
     for o in orders or []:
         if not isinstance(o, dict):
             continue
@@ -177,10 +171,6 @@ def _has_real_order_id(orders: List[Dict[str, Any]]) -> bool:
 # Exécution robuste SFI
 # ------------------------
 def _normalize_orders(orders: Union[None, dict, list, tuple, str]) -> List[Dict[str, Any]]:
-    """
-    Uniformise la sortie en liste de dicts.
-    Extrait orderId/clientOid si possible même depuis 'raw' str.
-    """
     def _from_str(s: str) -> Dict[str, Any]:
         s = str(s).strip()
         if not s:
@@ -234,113 +224,75 @@ def _normalize_orders(orders: Union[None, dict, list, tuple, str]) -> List[Dict[
     return [{"raw": orders}]
 
 def _maybe_configure_tranches(engine: SFIEngine, tp1: float, tp2: float) -> None:
-    """
-    Configure 2 tranches en testant plusieurs formats pour compat SFI.
-    IMPORTANT: commencer par le format tuple (size, tp) pour éviter 'too many values to unpack'.
-    """
     try:
         if not hasattr(engine, "configure_tranches") or not callable(engine.configure_tranches):
             return
-
-        # 1) format tuple
         try:
             engine.configure_tranches([
                 (0.5, float(tp1)),
                 (0.5, float(tp2)),
             ])
             return
-        except Exception as e:
-            log.debug("configure_tranches(tuple) KO: %s", e)
-
-        # 2) format dict
+        except Exception:
+            pass
         try:
             engine.configure_tranches([
                 {"size": 0.5, "tp": float(tp1)},
                 {"size": 0.5, "tp": float(tp2)},
             ])
             return
-        except Exception as e:
-            log.debug("configure_tranches(dict) KO: %s", e)
-
-        # 3) simple list
+        except Exception:
+            pass
         try:
             engine.configure_tranches([float(tp1), float(tp2)])
             return
-        except Exception as e:
-            log.debug("configure_tranches(list-tp) KO: %s", e)
-
-    except Exception as e:
-        log.debug("configure_tranches (wrapper) KO: %s", e)
+        except Exception:
+            pass
+    except Exception:
+        pass
 
 def _safe_place_orders(engine: SFIEngine, entry: float, sl: float, tp1: float, tp2: float) -> List[Dict[str, Any]]:
-    """
-    Essaie différentes signatures usuelles et normalise la sortie.
-    Ordre :
-      1) open_limit (si dispo)
-      2) place_initial (kwargs → entry_hint → positional)
-      3) place_from_decision
-      4) place_market
-    """
     _maybe_configure_tranches(engine, tp1, tp2)
-
-    # 1) open_limit (preferred)
     try:
         if hasattr(engine, "open_limit") and callable(engine.open_limit):
-            log.info("try: open_limit(entry, sl, tp1, tp2)")
             orders = engine.open_limit(float(entry), float(sl), float(tp1), float(tp2))  # type: ignore
             return _normalize_orders(orders)
-    except Exception as e:
-        log.error("open_limit KO: %s", e)
-
-    # 2) place_initial kwargs
+    except Exception:
+        pass
     try:
-        log.info("try: place_initial(entry=, sl=, tp1=, tp2=)")
         orders = engine.place_initial(entry=float(entry), sl=float(sl), tp1=float(tp1), tp2=float(tp2))  # type: ignore
         return _normalize_orders(orders)
     except TypeError:
         pass
-    except Exception as e:
-        log.error("place_initial(kwargs) KO: %s", e)
-
-    # 2b) place_initial entry_hint
+    except Exception:
+        pass
     try:
-        log.info("try: place_initial(entry_hint=)")
         orders = engine.place_initial(entry_hint=float(entry))  # type: ignore
         return _normalize_orders(orders)
     except TypeError:
         pass
-    except Exception as e:
-        log.error("place_initial(entry_hint) KO: %s", e)
-
-    # 2c) place_initial positional
+    except Exception:
+        pass
     try:
-        log.info("try: place_initial(positional)")
         orders = engine.place_initial(float(entry), float(sl), float(tp1), float(tp2))  # type: ignore
         return _normalize_orders(orders)
     except TypeError:
         pass
-    except Exception as e:
-        log.error("place_initial(positional) KO: %s", e)
-
-    # 3) place_from_decision
+    except Exception:
+        pass
     try:
-        log.info("try: place_from_decision({entry,sl,tp1,tp2})")
-        dec = {"entry": float(entry), "sl": float(sl), "tp1": float(tp1), "tp2": float(tp2)}
         if hasattr(engine, "place_from_decision") and callable(engine.place_from_decision):
+            dec = {"entry": float(entry), "sl": float(sl), "tp1": float(tp1), "tp2": float(tp2)}
             orders = engine.place_from_decision(dec)  # type: ignore
             return _normalize_orders(orders)
-    except Exception as e:
-        log.error("place_from_decision KO: %s", e)
-
-    # 4) place_market
+    except Exception:
+        pass
     try:
         if hasattr(engine, "place_market") and callable(engine.place_market):
-            log.info("try: place_market()")
             orders = engine.place_market()  # type: ignore
             return _normalize_orders(orders)
-    except Exception as e:
-        log.error("place_market KO: %s", e)
-
+    except Exception:
+        pass
     return []
 
 
@@ -359,10 +311,6 @@ def _compute_atr(df, period: int = 14) -> float:
         return 0.0
 
 def _swing_highs_lows(df, lookback: int = 3) -> Tuple[List[int], List[int]]:
-    """
-    Détection simple: swing high si High[i] est le max sur i-lookback..i+lookback.
-    Retourne index des swing_highs et swing_lows.
-    """
     hs, ls = [], []
     h = df['high'].astype(float).values
     l = df['low'].astype(float).values
@@ -375,11 +323,6 @@ def _swing_highs_lows(df, lookback: int = 3) -> Tuple[List[int], List[int]]:
     return hs, ls
 
 def _last_impulse(df, side_hint: str) -> Tuple[float, float]:
-    """
-    Trouve une jambe impulsive récente:
-     - LONG: dernier swing low -> dernier swing high plus récent
-     - SHORT: dernier swing high -> dernier swing low plus récent
-    """
     hs, ls = _swing_highs_lows(df, lookback=3)
     if not hs or not ls:
         c = float(df['close'].astype(float).iloc[-1])
@@ -496,14 +439,12 @@ async def handle_symbol_event(ev: Dict[str, Any], rg: RiskGuard, policy: MetaPol
         return
     log.info("event: %s", etype, extra={"symbol": symbol})
 
-    # anti-spam
     last = _LAST_ANALYSIS_TS.get(symbol, 0.0)
     if time.time() - last < ANALYSIS_MIN_INTERVAL_SEC:
         log.debug("skip: analysis throttle", extra={"symbol": symbol})
         return
     _LAST_ANALYSIS_TS[symbol] = time.time()
 
-    # klines
     try:
         df_h1, df_h4 = _get_klines_cached(symbol)
     except Exception as e:
@@ -513,7 +454,6 @@ async def handle_symbol_event(ev: Dict[str, Any], rg: RiskGuard, policy: MetaPol
         log.warning("klines vides", extra={"symbol": symbol})
         return
 
-    # --- Institutionnel + autotune
     inst: Dict[str, Any] = {}
     inst_gate_pass = True
     inst_gate_reason = "n/a"
@@ -565,7 +505,6 @@ async def handle_symbol_event(ev: Dict[str, Any], rg: RiskGuard, policy: MetaPol
             inst_gate_pass = True
             inst_gate_reason = "autotune_fail_bypass"
 
-    # --- Analyse “classique”
     try:
         log.debug("analyze...", extra={"symbol": symbol})
         try:
@@ -599,7 +538,6 @@ async def handle_symbol_event(ev: Dict[str, Any], rg: RiskGuard, policy: MetaPol
     diag = (res.get("manage", {}) or {}).get("diagnostics", {})
     tolerated = diag.get("tolerated", res.get("tolerated", []))
 
-    # --- Fallback institutionnel STRUCTURÉ si signal invalide et gate OK
     force_exec = False
     if not res.get("valid", False) or side not in ("long", "short"):
         reason = res.get("reason") or "REJET — analyse classique invalide"
@@ -624,13 +562,11 @@ async def handle_symbol_event(ev: Dict[str, Any], rg: RiskGuard, policy: MetaPol
             except Exception: pass
             return
 
-    # --- Risk guard
     rg_ok, rg_reason = rg.can_enter(symbol, ws_latency_ms=50, last_data_age_s=5)
     if not rg_ok:
         log.info("blocked by risk_guard: %s", rg_reason, extra={"symbol": symbol})
         return
 
-    # --- Policy (bypass si fallback insti)
     label = "INST_STRUCT" if force_exec else None
     if not force_exec:
         arm, weight, label = policy.choose({"atr_pct": res.get("atr_pct", 0), "adx_proxy": res.get("adx_proxy", 0)})
@@ -640,7 +576,6 @@ async def handle_symbol_event(ev: Dict[str, Any], rg: RiskGuard, policy: MetaPol
             except Exception: pass
             return
 
-    # --- Exécution : SFI d'abord
     entry = float(res.get("entry") or df_h1["close"].astype(float).iloc[-1])
     sl    = float(res.get("sl", 0.0) or 0.0)
     tp1   = float(res.get("tp1", 0.0) or 0.0)
@@ -651,7 +586,6 @@ async def handle_symbol_event(ev: Dict[str, Any], rg: RiskGuard, policy: MetaPol
              side.upper(), fmt_price(entry), fmt_price(sl), fmt_price(tp1), fmt_price(tp2), value_usdt,
              extra={"symbol": symbol})
 
-    # ✅ Construction moteur dict-first (évite ambiguïtés de signatures)
     try:
         eng = SFIEngine(symbol, side, {"notional": value_usdt, "sl": sl, "tp1": tp1, "tp2": tp2})
     except TypeError:
@@ -660,7 +594,6 @@ async def handle_symbol_event(ev: Dict[str, Any], rg: RiskGuard, policy: MetaPol
     orders = _safe_place_orders(eng, entry, sl, tp1, tp2)
     orders = _normalize_orders(orders)
 
-    # --- Fallback direct KuCoin si pas d'ID exploitable
     if not _has_real_order_id(orders):
         try:
             meta = get_symbol_meta(symbol) or {}
@@ -700,7 +633,6 @@ async def handle_symbol_event(ev: Dict[str, Any], rg: RiskGuard, policy: MetaPol
             log.info("[kc.place_limit_order] ok=%s code=%s msg=%s clientOid=%s orderId=%s",
                      ok_flag, kc_code, msg, clientOid, orderId, extra={"symbol": symbol})
 
-        # Poll clientOid SEULEMENT si POST a réussi (code=200000) et qu'on n'a pas encore d'orderId
         if (not orderId) and clientOid and ok_flag and (kc_code == "200000") and callable(get_order_by_client_oid or None):  # type: ignore
             for _ in range(KC_VERIFY_MAX_TRIES):
                 time.sleep(KC_VERIFY_DELAY_SEC)
@@ -716,18 +648,15 @@ async def handle_symbol_event(ev: Dict[str, Any], rg: RiskGuard, policy: MetaPol
                     if orderId:
                         break
 
-        # Met à jour 'orders' pour la suite/Telegram
         if orderId:
             orders = [{"ok": True, "orderId": orderId, "clientOid": clientOid, "code": kc_code or "200000"}]
         elif ok_flag and kc_code == "200000" and clientOid:
-            # succès retourné par l'API mais pas d'orderId dans la réponse — on conserve le clientOid
             orders = [{"ok": True, "orderId": None, "clientOid": clientOid, "code": "200000"}]
         else:
             orders = [{"ok": False, "raw": kc}]
 
     log.info("orders=%s", orders, extra={"symbol": symbol})
 
-    # Telegram
     ids = []
     for o in orders or []:
         if isinstance(o, dict):
@@ -769,6 +698,20 @@ async def main():
     if not symbols:
         logging.getLogger("runner").warning("Aucun symbole.")
         return
+
+    # ✅ DEBUG: vérifie le mode serveur pour chaque symbole, stoppe si Hedge
+    try:
+        for s in symbols:
+            mode = get_server_position_mode(s)
+            logging.getLogger("runner").info("[DEBUG] %s positionMode=%s", s, mode)
+            if mode == "hedge":
+                logging.getLogger("runner").error(
+                    "Le serveur est en HEDGE pour %s. Passe le compte/sub-account en One-Way (Single-Side) puis relance.",
+                    s
+                )
+                return
+    except Exception as e:
+        logging.getLogger("runner").warning("check positionMode impossible: %s", e)
 
     bus = EventBus()
     src = PollingSource(symbols, interval_sec=WS_POLL_SEC)
