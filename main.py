@@ -5,6 +5,7 @@ main.py — Boucle event-driven + fallback institutionnel structuré (OTE, liqui
 - SL derrière la liquidité/swing + buffer ATR
 - TP1 swing/pool opposé, TP2 RR cible (2.0 par défaut)
 - Exécution SFI + fallback direct KuCoin (sans poll inutile sur échec POST)
+- 🔎 Logs enrichis: erreurs détaillées, raisons de blocage, score institutionnel + composants
 """
 
 import os, asyncio, logging, math, time
@@ -82,6 +83,16 @@ TUNER = InstAutoTune() if HAS_TUNER else None  # type: ignore
 # ------------------------
 # Utils
 # ------------------------
+def _log_block(stage: str, msg: str, symbol: str | None = None, **fields):
+    """Log standardisé avec stage + champs utiles."""
+    extra = {"stage": stage, "symbol": symbol} if symbol else {"stage": stage}
+    try:
+        # Ajoute champs dans le message pour faciliter la lecture de logs plats
+        kv = " ".join(f"{k}={v}" for k, v in fields.items())
+        log.info(f"[{stage}] {msg} {kv}".strip(), extra=extra)
+    except Exception:
+        log.info(f"[{stage}] {msg}", extra=extra)
+
 def fmt_price(x):
     if x is None: return "—"
     if x == 0: return "0"
@@ -233,66 +244,73 @@ def _maybe_configure_tranches(engine: SFIEngine, tp1: float, tp2: float) -> None
                 (0.5, float(tp2)),
             ])
             return
-        except Exception:
-            pass
+        except Exception as e:
+            _log_block("SFI", f"configure_tranches(tuple) KO: {e}")
         try:
             engine.configure_tranches([
                 {"size": 0.5, "tp": float(tp1)},
                 {"size": 0.5, "tp": float(tp2)},
             ])
             return
-        except Exception:
-            pass
+        except Exception as e:
+            _log_block("SFI", f"configure_tranches(dict) KO: {e}")
         try:
             engine.configure_tranches([float(tp1), float(tp2)])
             return
-        except Exception:
-            pass
-    except Exception:
-        pass
+        except Exception as e:
+            _log_block("SFI", f"configure_tranches(list) KO: {e}")
+    except Exception as e:
+        _log_block("SFI", f"configure_tranches wrapper KO: {e}")
 
 def _safe_place_orders(engine: SFIEngine, entry: float, sl: float, tp1: float, tp2: float) -> List[Dict[str, Any]]:
     _maybe_configure_tranches(engine, tp1, tp2)
     try:
         if hasattr(engine, "open_limit") and callable(engine.open_limit):
+            _log_block("SFI", "try open_limit(entry, sl, tp1, tp2)")
             orders = engine.open_limit(float(entry), float(sl), float(tp1), float(tp2))  # type: ignore
             return _normalize_orders(orders)
-    except Exception:
-        pass
+    except Exception as e:
+        _log_block("SFI", f"open_limit KO: {e}")
     try:
+        _log_block("SFI", "try place_initial kwargs")
         orders = engine.place_initial(entry=float(entry), sl=float(sl), tp1=float(tp1), tp2=float(tp2))  # type: ignore
         return _normalize_orders(orders)
     except TypeError:
         pass
-    except Exception:
-        pass
+    except Exception as e:
+        _log_block("SFI", f"place_initial(kwargs) KO: {e}")
     try:
+        _log_block("SFI", "try place_initial(entry_hint)")
         orders = engine.place_initial(entry_hint=float(entry))  # type: ignore
         return _normalize_orders(orders)
     except TypeError:
         pass
-    except Exception:
-        pass
+    except Exception as e:
+        _log_block("SFI", f"place_initial(entry_hint) KO: {e}")
     try:
+        _log_block("SFI", "try place_initial positional")
         orders = engine.place_initial(float(entry), float(sl), float(tp1), float(tp2))  # type: ignore
         return _normalize_orders(orders)
     except TypeError:
         pass
-    except Exception:
-        pass
+    except Exception as e:
+        _log_block("SFI", f"place_initial(positional) KO: {e}")
     try:
         if hasattr(engine, "place_from_decision") and callable(engine.place_from_decision):
+            _log_block("SFI", "try place_from_decision")
             dec = {"entry": float(entry), "sl": float(sl), "tp1": float(tp1), "tp2": float(tp2)}
             orders = engine.place_from_decision(dec)  # type: ignore
             return _normalize_orders(orders)
-    except Exception:
-        pass
+    except Exception as e:
+        _log_block("SFI", f"place_from_decision KO: {e}")
     try:
         if hasattr(engine, "place_market") and callable(engine.place_market):
+            _log_block("SFI", "try place_market")
             orders = engine.place_market()  # type: ignore
             return _normalize_orders(orders)
-    except Exception:
-        pass
+    except Exception as e:
+        _log_block("SFI", f"place_market KO: {e}")
+    _log_block("SFI", "Aucune méthode d'exécution n'a abouti (orders vides)")
     return []
 
 
@@ -437,76 +455,98 @@ async def handle_symbol_event(ev: Dict[str, Any], rg: RiskGuard, policy: MetaPol
     etype  = ev.get("type")
     if etype != "bar":
         return
-    log.info("event: %s", etype, extra={"symbol": symbol})
+    _log_block("EVENT", "bar reçu", symbol=symbol)
 
     last = _LAST_ANALYSIS_TS.get(symbol, 0.0)
     if time.time() - last < ANALYSIS_MIN_INTERVAL_SEC:
-        log.debug("skip: analysis throttle", extra={"symbol": symbol})
+        _log_block("THROTTLE", "skip (analysis cooldown)", symbol=symbol, dt=round(time.time()-last, 3))
         return
     _LAST_ANALYSIS_TS[symbol] = time.time()
 
+    # klines
     try:
         df_h1, df_h4 = _get_klines_cached(symbol)
     except Exception as e:
-        log.warning("fetch_klines KO: %s", e, extra={"symbol": symbol})
+        log.error("fetch_klines KO: %s", e, extra={"symbol": symbol}, exc_info=True)
         return
     if df_h1 is None and df_h4 is None:
-        log.warning("klines vides", extra={"symbol": symbol})
+        _log_block("DATA", "klines vides", symbol=symbol)
         return
 
+    # --- Institutionnel + autotune
     inst: Dict[str, Any] = {}
     inst_gate_pass = True
     inst_gate_reason = "n/a"
     comps_cnt = 0
     comps_min = 0
+    comps_detail = {}
     thr = {}
 
     if HAS_INST:
         try:
             inst = get_institutional_snapshot(symbol)
-            log.info("inst: s=%.2f oi=%.2f d=%.2f f=%.2f liq=%.2f cvd=%d liq5m=%d",
-                     float(inst.get("score",0)), float(inst.get("oi_score",0)),
-                     float(inst.get("delta_score",0)), float(inst.get("funding_score",0)),
-                     float(inst.get("liq_score",0)), int(inst.get("delta_cvd_usd",0)),
-                     int(inst.get("liq_notional_5m",0)), extra={"symbol": symbol})
+            _log_block(
+                "INST",
+                "snapshot",
+                symbol=symbol,
+                score=round(float(inst.get("score", 0) or 0.0), 3),
+                oi=round(float(inst.get("oi_score", 0) or 0.0), 3),
+                delta=round(float(inst.get("delta_score", 0) or 0.0), 3),
+                funding=round(float(inst.get("funding_score", 0) or 0.0), 3),
+                liq=round(float(inst.get("liq_score", 0) or 0.0), 3),
+                cvd=int(inst.get("delta_cvd_usd", 0) or 0),
+                liq5m=int(inst.get("liq_notional_5m", 0) or 0),
+            )
         except Exception as e:
-            log.warning("inst snapshot KO: %s", e, extra={"symbol": symbol})
+            log.warning("inst snapshot KO: %s", e, extra={"symbol": symbol}, exc_info=True)
             inst = {}
+    else:
+        _log_block("INST", "désactivé (HAS_INST=False)", symbol=symbol)
 
     if HAS_INST and HAS_TUNER and TUNER is not None:
         try:
             thr = TUNER.update_and_get(symbol, df_h1, inst)
             comps_cnt, comps_detail = components_ok(inst, thr)
-            comps_min = thr["components_min"]
+            comps_min = int(thr.get("components_min", 3))
 
             score_val = float(inst.get("score", 0) or 0.0)
             req_score = float(thr.get("req_score", 1.2) or 1.2)
 
             if comps_cnt >= 4:
                 inst_gate_pass = True;  inst_gate_reason = "force_pass_4of4"
-            elif comps_cnt >= 3:
-                inst_gate_pass = True;  inst_gate_reason = "tolerance_pass_3of4"
+            elif comps_cnt >= comps_min:
+                inst_gate_pass = True;  inst_gate_reason = f"tolerance_pass_{comps_cnt}of{comps_min}"
             elif score_val >= req_score:
                 inst_gate_pass = True;  inst_gate_reason = "score_gate"
             else:
                 inst_gate_pass = False; inst_gate_reason = "reject"
 
-            log.info("inst-gate: pass=%s reason=%s score=%.2f req=%.2f comps=%d/%d q=%.2f atr%%=%.2f",
-                     inst_gate_pass, inst_gate_reason, score_val, req_score, comps_cnt, comps_min,
-                     float(thr.get("q_used", 0.0)), float(thr.get("atr_pct", 0.0)), extra={"symbol": symbol})
+            _log_block(
+                "INST-GATE",
+                "résultat",
+                symbol=symbol,
+                pass_=inst_gate_pass,
+                reason=inst_gate_reason,
+                score=round(score_val, 3),
+                req_score=round(req_score, 3),
+                comps=f"{comps_cnt}/{comps_min}",
+                q_used=round(float(thr.get("q_used", 0.0)), 4),
+                atr_pct=round(float(thr.get("atr_pct", 0.0)), 4),
+                comps_detail=comps_detail,
+            )
 
             if not inst_gate_pass:
-                log.info("inst-reject details: %s", comps_detail, extra={"symbol": symbol})
                 try: update_perf_for_symbol(symbol, df_h1=df_h1)
                 except Exception: pass
                 return
         except Exception as e:
-            log.warning("autotune failed: %s", e, extra={"symbol": symbol})
+            log.warning("autotune failed: %s", e, extra={"symbol": symbol}, exc_info=True)
             inst_gate_pass = True
             inst_gate_reason = "autotune_fail_bypass"
 
+    # --- Analyse “classique”
     try:
-        log.debug("analyze...", extra={"symbol": symbol})
+        _log_block("ANALYZE", "lancement", symbol=symbol)
         try:
             res = analyze_signal.analyze_signal(
                 symbol=symbol,
@@ -518,73 +558,113 @@ async def handle_symbol_event(ev: Dict[str, Any], rg: RiskGuard, policy: MetaPol
         except TypeError:
             res = analyze_signal.analyze_signal(symbol=symbol, df_h1=df_h1, df_h4=df_h4)
     except Exception as e:
-        log.warning("analyze_signal KO: %s", e, extra={"symbol": symbol})
+        log.error("analyze_signal KO: %s", e, extra={"symbol": symbol}, exc_info=True)
         return
 
     if not isinstance(res, dict):
-        log.info("no-trade (bad result type)", extra={"symbol": symbol})
+        _log_block("ANALYZE", "no-trade (bad result type)", symbol=symbol, type=str(type(res)))
         try: update_perf_for_symbol(symbol, df_h1=df_h1)
         except Exception: pass
         return
 
     side   = str(res.get("side", "none")).lower()
     rr     = float(res.get("rr", 0) or 0)
-    score  = float(res.get("inst_score", 0) or 0)
+    score  = float(res.get("inst_score", inst.get("score", 0) or 0))
+    reason = res.get("reason") or ""
     c_list = res.get("comments", []) or []
-    comments = ", ".join([str(c) for c in c_list]) if c_list else ""
-    log.info("analysis: side=%s rr=%.2f score=%.2f comment=%s",
-             side, rr, score, comments or "—", extra={"symbol": symbol})
+    comments = ", ".join([str(c) for c in c_list]) if c_list else "—"
+    _log_block(
+        "ANALYZE",
+        "résultat",
+        symbol=symbol,
+        side=side,
+        rr=round(rr, 3),
+        inst_score=round(score, 3),
+        reason=reason or "—",
+        comments=comments,
+    )
 
     diag = (res.get("manage", {}) or {}).get("diagnostics", {})
     tolerated = diag.get("tolerated", res.get("tolerated", []))
 
+    # --- Fallback institutionnel STRUCTURÉ si signal invalide et gate OK
     force_exec = False
     if not res.get("valid", False) or side not in ("long", "short"):
-        reason = res.get("reason") or "REJET — analyse classique invalide"
-        log.info("no-trade (invalid signal) — rr=%.2f score=%.2f reason=%s tolerated=%s diag=%s",
-                 rr, score, reason, tolerated, diag, extra={"symbol": symbol})
+        _log_block(
+            "DECISION",
+            "signal classique invalide",
+            symbol=symbol,
+            rr=round(rr, 3),
+            inst_score=round(score, 3),
+            reason=reason or "—",
+            tolerated=tolerated,
+            diag=diag,
+        )
 
         if HAS_INST and inst_gate_pass:
             fb = _inst_structured_decision(symbol, inst, df_h1, df_h4)
             if fb:
                 res.update(fb)
                 side = fb["side"]; rr = float(fb["rr"])
-                log.info("INST_STRUCT_FALLBACK applied — side=%s rr=%.2f entry=%s sl=%s tp1=%s tp2=%s",
-                         side, rr, fmt_price(fb["entry"]), fmt_price(fb["sl"]),
-                         fmt_price(fb["tp1"]), fmt_price(fb["tp2"]), extra={"symbol": symbol})
+                _log_block(
+                    "DECISION",
+                    "INST_STRUCT_FALLBACK utilisé",
+                    symbol=symbol,
+                    side=side,
+                    rr=round(rr,3),
+                    entry=fmt_price(fb["entry"]),
+                    sl=fmt_price(fb["sl"]),
+                    tp1=fmt_price(fb["tp1"]),
+                    tp2=fmt_price(fb["tp2"]),
+                )
                 force_exec = True
             else:
+                _log_block("DECISION", "fallback institutionnel indisponible", symbol=symbol)
                 try: update_perf_for_symbol(symbol, df_h1=df_h1)
                 except Exception: pass
                 return
         else:
+            _log_block("DECISION", "rejete (inst gate fail ou HAS_INST=False)", symbol=symbol)
             try: update_perf_for_symbol(symbol, df_h1=df_h1)
             except Exception: pass
             return
 
+    # --- Risk guard
     rg_ok, rg_reason = rg.can_enter(symbol, ws_latency_ms=50, last_data_age_s=5)
     if not rg_ok:
-        log.info("blocked by risk_guard: %s", rg_reason, extra={"symbol": symbol})
+        _log_block("RISK", "blocked by risk_guard", symbol=symbol, reason=rg_reason)
         return
 
+    # --- Policy (bypass si fallback insti)
     label = "INST_STRUCT" if force_exec else None
     if not force_exec:
         arm, weight, label = policy.choose({"atr_pct": res.get("atr_pct", 0), "adx_proxy": res.get("adx_proxy", 0)})
+        _log_block("POLICY", "choix", symbol=symbol, arm=str(arm), weight=round(weight,3), label=str(label))
         if weight < 0.25 and rr < 1.5:
-            log.info("policy reject — arm=%s w=%.2f rr=%.2f", arm, weight, rr, extra={"symbol": symbol})
+            _log_block("POLICY", "rejete (poids/rr insuffisants)", symbol=symbol, weight=round(weight,3), rr=round(rr,3))
             try: update_perf_for_symbol(symbol, df_h1=df_h1)
             except Exception: pass
             return
 
+    # --- Exécution : SFI d'abord
     entry = float(res.get("entry") or df_h1["close"].astype(float).iloc[-1])
     sl    = float(res.get("sl", 0.0) or 0.0)
     tp1   = float(res.get("tp1", 0.0) or 0.0)
     tp2   = float(res.get("tp2", 0.0) or 0.0)
     value_usdt = float(os.environ.get("ORDER_VALUE_USDT", "20"))
 
-    log.info("EXEC %s entry=%s sl=%s tp1=%s tp2=%s val=%s",
-             side.upper(), fmt_price(entry), fmt_price(sl), fmt_price(tp1), fmt_price(tp2), value_usdt,
-             extra={"symbol": symbol})
+    _log_block(
+        "EXEC",
+        "préparation",
+        symbol=symbol,
+        side=side.upper(),
+        entry=fmt_price(entry),
+        sl=fmt_price(sl),
+        tp1=fmt_price(tp1),
+        tp2=fmt_price(tp2),
+        notional=value_usdt,
+        label=label or "META_POLICY",
+    )
 
     try:
         eng = SFIEngine(symbol, side, {"notional": value_usdt, "sl": sl, "tp1": tp1, "tp2": tp2})
@@ -594,6 +674,7 @@ async def handle_symbol_event(ev: Dict[str, Any], rg: RiskGuard, policy: MetaPol
     orders = _safe_place_orders(eng, entry, sl, tp1, tp2)
     orders = _normalize_orders(orders)
 
+    # --- Fallback direct KuCoin si pas d'ID exploitable
     if not _has_real_order_id(orders):
         try:
             meta = get_symbol_meta(symbol) or {}
@@ -605,8 +686,7 @@ async def handle_symbol_event(ev: Dict[str, Any], rg: RiskGuard, policy: MetaPol
         post_only = KC_POST_ONLY_DEFAULT
         side_for_adapter = _side_to_adapter(side)
 
-        log.info("fallback KuCoin LIMIT: px=%s (tick=%s) postOnly=%s",
-                 fmt_price(entry_px), tick, post_only, extra={"symbol": symbol})
+        _log_block("EXEC-KC", "fallback LIMIT", symbol=symbol, px=fmt_price(entry_px), tick=tick, postOnly=post_only)
 
         kc = place_limit_order(
             symbol=symbol,
@@ -630,9 +710,10 @@ async def handle_symbol_event(ev: Dict[str, Any], rg: RiskGuard, policy: MetaPol
             ok_flag   = bool(kc.get("ok", False))
             kc_code   = kc.get("code")
             msg       = kc.get("msg")
-            log.info("[kc.place_limit_order] ok=%s code=%s msg=%s clientOid=%s orderId=%s",
-                     ok_flag, kc_code, msg, clientOid, orderId, extra={"symbol": symbol})
+            _log_block("EXEC-KC", "place_limit_order retour", symbol=symbol,
+                       ok=ok_flag, code=kc_code, msg=msg, clientOid=clientOid, orderId=orderId)
 
+        # Poll clientOid SEULEMENT si POST = succès (code=200000) et pas encore d'orderId
         if (not orderId) and clientOid and ok_flag and (kc_code == "200000") and callable(get_order_by_client_oid or None):  # type: ignore
             for _ in range(KC_VERIFY_MAX_TRIES):
                 time.sleep(KC_VERIFY_DELAY_SEC)
@@ -644,7 +725,7 @@ async def handle_symbol_event(ev: Dict[str, Any], rg: RiskGuard, policy: MetaPol
                 if od and isinstance(od, dict):
                     orderId = od.get("orderId") or od.get("id")
                     status  = od.get("status") or od.get("state")
-                    log.info("[kc.verify] clientOid=%s status=%s orderId=%s", clientOid, status, orderId, extra={"symbol": symbol})
+                    _log_block("EXEC-KC", "verify clientOid", symbol=symbol, clientOid=clientOid, status=status, orderId=orderId)
                     if orderId:
                         break
 
@@ -654,9 +735,11 @@ async def handle_symbol_event(ev: Dict[str, Any], rg: RiskGuard, policy: MetaPol
             orders = [{"ok": True, "orderId": None, "clientOid": clientOid, "code": "200000"}]
         else:
             orders = [{"ok": False, "raw": kc}]
+            _log_block("EXEC", "aucun ordre confirmé (voir raw)", symbol=symbol, raw=str(kc)[:240])
 
-    log.info("orders=%s", orders, extra={"symbol": symbol})
+    _log_block("EXEC", f"orders={orders}", symbol=symbol)
 
+    # Telegram
     ids = []
     for o in orders or []:
         if isinstance(o, dict):
@@ -670,6 +753,7 @@ async def handle_symbol_event(ev: Dict[str, Any], rg: RiskGuard, policy: MetaPol
     lbl = label or "META_POLICY"
     msg = (f"🧠 *{symbol}* — *{side.upper()}* via *{lbl}*\n"
            f"RR: *{res.get('rr','—')}*  |  Entrée: *{fmt_price(entry)}*  |  SL: *{fmt_price(sl)}*  |  TP1: *{fmt_price(tp1)}*  TP2: *{fmt_price(tp2)}*\n"
+           f"Score inst.: *{round(float(inst.get('score', 0) or 0.0),3)}*  |  Gate: *{inst_gate_reason}*  |  Composants: *{comps_cnt}/{comps_min}*\n"
            f"Order IDs: {ids_str}")
     send_telegram(msg)
 
@@ -691,8 +775,9 @@ async def main():
 
     try:
         symbols = _build_symbols()
+        logging.getLogger("runner").info("[BOOT] symbols n=%d %s", len(symbols), symbols[:20])
     except Exception as e:
-        logging.getLogger("runner").error("Build symbols KO: %s", e)
+        logging.getLogger("runner").error("Build symbols KO: %s", e, exc_info=True)
         symbols = []
 
     if not symbols:
@@ -711,7 +796,7 @@ async def main():
                 )
                 return
     except Exception as e:
-        logging.getLogger("runner").warning("check positionMode impossible: %s", e)
+        logging.getLogger("runner").warning("check positionMode impossible: %s", e, exc_info=True)
 
     bus = EventBus()
     src = PollingSource(symbols, interval_sec=WS_POLL_SEC)
@@ -725,7 +810,7 @@ async def main():
         try:
             await handle_symbol_event(ev, rg, policy)
         except Exception as e:
-            logging.getLogger("runner").error("handle_symbol_event: %s", e)
+            logging.getLogger("runner").error("handle_symbol_event: %s", e, exc_info=True)
 
 if __name__ == "__main__":
     asyncio.run(main())
