@@ -1,12 +1,9 @@
 # -*- coding: utf-8 -*-
 """
 kucoin_adapter.py — LIMIT simple (one-way), levier 10, valueQty (USDT)
-- Jamais de `positionSide` (évite 330011 en one-way)
-- N'ENVOIE PAS `crossMode` (évite 330005) — on laisse l'exchange en isolé par défaut
-- `leverage` par défaut = 10 (fallback 5→3 si 100001)
-- `postOnly` True par défaut
-- Quantification prix au tick (tickSize/priceIncrement -> pricePrecision)
-- Auto-mapping symbole affichage ...USDT -> contrat API ...USDTM
+- Jamais de `positionSide`
+- N'ENVOIE PAS `crossMode`
+- Pré-check du mode serveur (oneway vs hedge) -> si hedge: on refuse localement avec message clair
 """
 
 from __future__ import annotations
@@ -26,6 +23,7 @@ TIME_PATH   = "/api/v1/timestamp"
 CNTR_PATH   = "/api/v1/contracts"
 ORDERS_PATH = "/api/v1/orders"
 GET_BY_COID = "/api/v1/order/client-order/{clientOid}"
+POS_PATH    = "/api/v1/position"
 
 DEFAULT_LEVERAGE = int(getattr(SETTINGS, "default_leverage", 10))
 VALUE_DECIMALS   = int(getattr(SETTINGS, "value_decimals", 2))
@@ -110,7 +108,6 @@ def get_symbol_meta(symbol: str) -> Dict[str, Any]:
     sym = _to_api_symbol(symbol)
     ok, js = _get(f"{CNTR_PATH}/{sym}")
     d = (js.get("data") or {}) if ok else {}
-    # expose priceIncrement pour SFI
     if "priceIncrement" not in d:
         tick = d.get("tickSize")
         if tick and float(tick) > 0:
@@ -138,11 +135,37 @@ def _safe_tick_from_meta(d: Dict[str, Any]) -> float:
 def _quantize(price: float, tick: float, side: str) -> float:
     if tick <= 0: return float(price)
     steps = float(price) / float(tick)
-    if str(side).lower() == "buy":
-        qsteps = math.floor(steps + 1e-12)  # floor
-    else:
-        qsteps = math.ceil(steps - 1e-12)   # ceil
+    qsteps = math.floor(steps + 1e-12) if str(side).lower() == "buy" else math.ceil(steps - 1e-12)
     return float(qsteps) * float(tick)
+
+# ------------ Position mode pré-check ------------
+def _infer_pos_mode(d: Dict[str, Any]) -> str:
+    for k in ("positionMode","posMode","mode"):
+        v = d.get(k)
+        if isinstance(v, str):
+            vl = v.lower()
+            if "hedge" in vl: return "hedge"
+            if "one" in vl or "single" in vl: return "oneway"
+    long_keys = ("longQty","longSize","longOpen","longAvailable")
+    short_keys= ("shortQty","shortSize","shortOpen","shortAvailable")
+    if any(k in d for k in long_keys) and any(k in d for k in short_keys):
+        return "hedge"
+    return "oneway"
+
+def _get_position_raw(symbol_api: str) -> Dict[str, Any]:
+    ok, js = _get(f"{POS_PATH}?symbol={symbol_api}")
+    if not ok: return {}
+    d = js.get("data")
+    if isinstance(d, dict): return d
+    if isinstance(d, list) and d: return d[0]
+    return {}
+
+def get_server_position_mode(symbol: str) -> str:
+    sym = _to_api_symbol(symbol)
+    raw = _get_position_raw(sym)
+    mode = _infer_pos_mode(raw)
+    log.info("[server positionMode] %s -> %s", sym, mode)
+    return mode
 
 # ------------ Orderbook (optionnels) ------------
 def get_orderbook_top(symbol: str) -> Dict[str, Any] | None:
@@ -185,7 +208,7 @@ def get_order_by_client_oid(client_oid: str) -> Optional[Dict[str, Any]]:
     ok, js = _get(GET_BY_COID.format(clientOid=client_oid))
     return (js.get("data") or None) if ok else None
 
-# ------------ PLACE LIMIT (one-way strict) ------------
+# ------------ PLACE LIMIT (one-way strict + pré-check) ------------
 def place_limit_order(
     symbol: str,
     side: str,
@@ -202,6 +225,14 @@ def place_limit_order(
         _sync_server_time()
 
     sym = _to_api_symbol(symbol)
+
+    # ✅ Pré-check: on refuse localement si le serveur est en hedge
+    mode = get_server_position_mode(sym)
+    if mode == "hedge":
+        msg = "Server account is in HEDGE mode — switch to One-Way on this API/sub-account."
+        log.error("[precheck] %s", msg, extra={"symbol": sym})
+        return {"ok": False, "code": "330011_LOCAL", "msg": msg, "clientOid": str(client_order_id or _ts_ms())}
+
     meta = get_symbol_meta(sym) or {}
     tick = _safe_tick_from_meta(meta)
     qprice = _quantize(float(price), float(tick), side)
@@ -213,10 +244,10 @@ def place_limit_order(
         "clientOid": coid,
         "symbol": sym,
         "type": "limit",
-        "side": str(side).lower(),              # "buy"/"sell"
+        "side": str(side).lower(),
         "price": f"{qprice:.12f}",
         "valueQty": f"{float(value_usdt):.{VALUE_DECIMALS}f}",
-        "leverage": str(lev),                   # string
+        "leverage": str(lev),
         "timeInForce": "GTC",
         "postOnly": bool(post_only),
         "reduceOnly": False,
@@ -257,7 +288,6 @@ def cancel_order(order_id: str) -> Dict[str, Any]:
     return {"ok": ok and (js or {}).get("code") == "200000", **(js or {})}
 
 def replace_order(order_id: str, new_price: float) -> Dict[str, Any]:
-    # cancel-only; le caller re-postera au nouveau prix
     try:
         c = cancel_order(order_id)
         return {"ok": bool(c.get("ok")), "cancel": c}
@@ -267,6 +297,12 @@ def replace_order(order_id: str, new_price: float) -> Dict[str, Any]:
 # ------------ Market-by-value (optionnel) ------------
 def place_market_by_value(symbol: str, side: str, valueQty: float) -> Dict[str, Any]:
     sym = _to_api_symbol(symbol)
+    mode = get_server_position_mode(sym)
+    if mode == "hedge":
+        msg = "Server account is in HEDGE mode — switch to One-Way on this API/sub-account."
+        log.error("[precheck] %s", msg, extra={"symbol": sym})
+        return {"ok": False, "code": "330011_LOCAL", "msg": msg, "clientOid": str(_ts_ms())}
+
     body = {
         "clientOid": str(_ts_ms()),
         "symbol": sym,
