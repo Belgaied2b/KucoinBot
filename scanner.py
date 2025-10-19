@@ -55,12 +55,28 @@ try:
 except Exception:
     import analyze_signal as analyze_mod  # type: ignore
 
-# Metrics CSV (optionnel)
+# Metrics CSV (optionnel) — patch: adaptateur de signature
 try:
-    from metrics import log_signal, log_order  # type: ignore
+    from metrics import log_signal as _log_signal_metrics, log_order  # type: ignore
 except Exception:
-    def log_signal(*args, **kwargs): pass
-    def log_order(*args, **kwargs): pass
+    def _log_signal_metrics(*a, **k): pass
+    def log_order(*a, **k): pass
+
+def _log_signal_safe(symbol: str, side: str, inst_score: float,
+                     rr_g: float | None, rr_n: float | None, fill_mode: str = "maker"):
+    """Adapte l'appel à metrics.log_signal(symbol, side, score, rr_gross, rr_net, fill_mode, note='')."""
+    try:
+        _log_signal_metrics(
+            symbol=symbol,
+            side=side,
+            score=float(inst_score or 0.0),
+            rr_gross=float(rr_g or 0.0),
+            rr_net=float(rr_n or 0.0),
+            fill_mode=fill_mode,
+            note=""
+        )
+    except Exception:
+        pass
 
 # Perf (MFE/MAE) optionnel
 try:
@@ -607,10 +623,21 @@ def scan_and_send_signals(symbols: Optional[List[str]] = None) -> Dict[str, Any]
         send_telegram(msg)
 
         # ----- Metrics / persistance anti-doublons / perf
-        try: log_signal(sym, res)
-        except Exception: pass
-        try: log_order(sym, side, float(entry), float(sl), float(tp1), float(tp2), float(notional), "SFI/KC", "sent")
-        except Exception: pass
+        try:
+            _log_signal_safe(
+                sym,
+                side,
+                float(res.get("inst_score", 0) or 0.0),
+                rr_b,  # rr_gross si calculé
+                rr_n,  # rr_net si calculé
+                "maker"
+            )
+        except Exception:
+            pass
+        try:
+            log_order(sym, side, float(entry), float(sl), float(tp1), float(tp2), float(notional), "SFI/KC", "sent")
+        except Exception:
+            pass
 
         store[key] = {"ts": time.time(), "side": side, "entry": entry, "rr": rr}
         save_json(SENT_SIGNALS_PATH, store)
