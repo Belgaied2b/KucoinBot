@@ -8,21 +8,108 @@ main.py — Boucle event-driven + fallback institutionnel structuré (OTE, liqui
 - 🔎 Logs enrichis: erreurs détaillées, raisons de blocage, score institutionnel + composants
 """
 
+# ===== UNIVERSAL IMPORT FIX (sans __init__.py, compatible Railway) =====
+import sys, os, pathlib
+HERE = pathlib.Path(__file__).resolve().parent
+CANDIDATES = [
+    HERE,
+    HERE.parent,
+    pathlib.Path("/app"),          # Railway
+    pathlib.Path("/workspace"),    # Replit / dev local
+]
+for base in CANDIDATES:
+    if (base / "core").exists() or (base / "ws_router.py").exists():
+        if str(base) not in sys.path:
+            sys.path.insert(0, str(base))
+        break
+# =====================================================================
+
 import os, asyncio, logging, math, time
 from typing import Dict, Any, Tuple, List, Union
 
-from ws_router import EventBus, PollingSource
-from execution_sfi import SFIEngine
-from risk_guard import RiskGuard
-from meta_policy import MetaPolicy
-from perf_metrics import register_signal_perf, update_perf_for_symbol
-from kucoin_utils import fetch_klines, fetch_symbol_meta
-from log_setup import init_logging, enable_httpx
-from kucoin_adapter import (
-    place_limit_order,
-    get_symbol_meta,
-    get_server_position_mode,  # ✅ pré-check du mode serveur
-)
+# --- ws_router (core ou racine)
+try:
+    from core.ws_router import EventBus, PollingSource
+except Exception:
+    from ws_router import EventBus, PollingSource  # type: ignore
+
+# --- SFI engine
+try:
+    from execution_sfi import SFIEngine  # racine
+except Exception:
+    try:
+        from core.execution_sfi import SFIEngine  # si déplacé
+    except Exception:
+        from execution.execution_sfi import SFIEngine  # autre structure
+
+# --- RiskGuard
+try:
+    from risk_guard import RiskGuard  # racine
+except Exception:
+    try:
+        from core.risk_guard import RiskGuard
+    except Exception:
+        from risk.risk_guard import RiskGuard
+
+# --- MetaPolicy
+try:
+    from meta_policy import MetaPolicy
+except Exception:
+    try:
+        from core.meta_policy import MetaPolicy
+    except Exception:
+        from policy.meta_policy import MetaPolicy
+
+# --- Metrics
+try:
+    from perf_metrics import register_signal_perf, update_perf_for_symbol
+except Exception:
+    def register_signal_perf(*a, **k): pass
+    def update_perf_for_symbol(*a, **k): pass
+
+# --- KuCoin utils/adapters (fetch klines + meta)
+# fetch_klines: tente d'abord kucoin_utils, sinon kucoin_adapter
+_fetch_klines = None
+try:
+    from kucoin_utils import fetch_klines as _fetch_klines  # type: ignore
+except Exception:
+    try:
+        from kucoin_adapter import fetch_klines as _fetch_klines  # type: ignore
+    except Exception:
+        _fetch_klines = None
+
+# symbol meta
+try:
+    from kucoin_utils import fetch_symbol_meta  # type: ignore
+except Exception:
+    def fetch_symbol_meta():
+        return {}
+
+# log setup (init_logging, enable_httpx)
+try:
+    from log_setup import init_logging, enable_httpx  # racine
+except Exception:
+    try:
+        from core.log_setup import init_logging, enable_httpx  # si packagé
+    except Exception:
+        # fallback no-op
+        def init_logging(): logging.basicConfig(level=logging.INFO)
+        def enable_httpx(_): pass
+
+# KuCoin adapter (place orders + meta + positionMode)
+try:
+    from kucoin_adapter import (
+        place_limit_order,
+        get_symbol_meta,
+        get_server_position_mode,  # ✅ pré-check du mode serveur
+    )
+except Exception:
+    # fallback strict si module renommé
+    from exchanges.kucoin_adapter import (
+        place_limit_order,
+        get_symbol_meta,
+        get_server_position_mode,
+    )
 
 # get_order_by_client_oid est optionnel : pas d'ImportError si absent
 try:
@@ -79,15 +166,13 @@ _LAST_ANALYSIS_TS: Dict[str, float] = {}
 log = logging.getLogger("runner")
 TUNER = InstAutoTune() if HAS_TUNER else None  # type: ignore
 
-
 # ------------------------
 # Utils
 # ------------------------
-def _log_block(stage: str, msg: str, symbol: str | None = None, **fields):
+def _log_block(stage: str, msg: str, symbol: Union[str, None] = None, **fields):
     """Log standardisé avec stage + champs utiles."""
     extra = {"stage": stage, "symbol": symbol} if symbol else {"stage": stage}
     try:
-        # Ajoute champs dans le message pour faciliter la lecture de logs plats
         kv = " ".join(f"{k}={v}" for k, v in fields.items())
         log.info(f"[{stage}] {msg} {kv}".strip(), extra=extra)
     except Exception:
@@ -118,6 +203,12 @@ def send_telegram(text: str):
         except Exception as e:
             log.error("Telegram KO: %s (attempt %s)", e, attempt)
 
+def _fetch_klines_safe(symbol: str, interval: str, limit: int):
+    """Wrapper qui cherche fetch_klines sur kucoin_utils puis kucoin_adapter; sinon erreur claire."""
+    if callable(_fetch_klines):
+        return _fetch_klines(symbol, interval=interval, limit=limit)  # type: ignore
+    raise RuntimeError("Aucun fetch_klines disponible (kucoin_utils/kucoin_adapter introuvables)")
+
 def _get_klines_cached(symbol: str) -> Tuple[Any, Any]:
     now = time.time()
     ent = _KLINE_CACHE.get(symbol, {})
@@ -125,14 +216,14 @@ def _get_klines_cached(symbol: str) -> Tuple[Any, Any]:
     need_h4 = ("h4" not in ent) or (now - ent.get("ts_h4", 0) > H4_REFRESH_SEC)
 
     if need_h1:
-        ent["h1"] = fetch_klines(symbol, interval="1h", limit=H1_LIMIT)
+        ent["h1"] = _fetch_klines_safe(symbol, interval="1h", limit=H1_LIMIT)
         ent["ts_h1"] = now
         log.debug("H1 fetch", extra={"symbol": symbol})
     else:
         log.debug("H1 cache hit", extra={"symbol": symbol})
 
     if need_h4:
-        ent["h4"] = fetch_klines(symbol, interval="4h", limit=H4_LIMIT)
+        ent["h4"] = _fetch_klines_safe(symbol, interval="4h", limit=H4_LIMIT)
         ent["ts_h4"] = now
         log.debug("H4 fetch", extra={"symbol": symbol})
     else:
@@ -148,10 +239,11 @@ def _build_symbols() -> List[str]:
         return sorted(set(lst))
     meta = fetch_symbol_meta()
     syms = []
-    for v in meta.values():
-        sym_api = str(v.get("symbol_api", "")).strip().upper()
-        if sym_api.endswith("USDTM"):
-            syms.append(sym_api)
+    if isinstance(meta, dict):
+        for v in meta.values():
+            sym_api = str(v.get("symbol_api", "")).strip().upper()
+            if sym_api.endswith("USDTM"):
+                syms.append(sym_api)
     return sorted(set(syms))
 
 def _round_to_tick(px: float, tick: float) -> float:
@@ -176,7 +268,6 @@ def _has_real_order_id(orders: List[Dict[str, Any]]) -> bool:
             if o.get("orderId") or o.get("clientOid"):
                 return True
     return False
-
 
 # ------------------------
 # Exécution robuste SFI
@@ -234,7 +325,7 @@ def _normalize_orders(orders: Union[None, dict, list, tuple, str]) -> List[Dict[
 
     return [{"raw": orders}]
 
-def _maybe_configure_tranches(engine: SFIEngine, tp1: float, tp2: float) -> None:
+def _maybe_configure_tranches(engine: "SFIEngine", tp1: float, tp2: float) -> None:
     try:
         if not hasattr(engine, "configure_tranches") or not callable(engine.configure_tranches):
             return
@@ -262,7 +353,7 @@ def _maybe_configure_tranches(engine: SFIEngine, tp1: float, tp2: float) -> None
     except Exception as e:
         _log_block("SFI", f"configure_tranches wrapper KO: {e}")
 
-def _safe_place_orders(engine: SFIEngine, entry: float, sl: float, tp1: float, tp2: float) -> List[Dict[str, Any]]:
+def _safe_place_orders(engine: "SFIEngine", entry: float, sl: float, tp1: float, tp2: float) -> List[Dict[str, Any]]:
     _maybe_configure_tranches(engine, tp1, tp2)
     try:
         if hasattr(engine, "open_limit") and callable(engine.open_limit):
@@ -312,7 +403,6 @@ def _safe_place_orders(engine: SFIEngine, entry: float, sl: float, tp1: float, t
         _log_block("SFI", f"place_market KO: {e}")
     _log_block("SFI", "Aucune méthode d'exécution n'a abouti (orders vides)")
     return []
-
 
 # ------------------------
 # Outils de structure "institutionnels"
@@ -446,11 +536,10 @@ def _inst_structured_decision(symbol: str, inst: Dict[str, Any], df_h1, df_h4) -
         log.warning("inst_structured_decision KO: %s", e, extra={"symbol": symbol})
         return None
 
-
 # ------------------------
 # Event handler
 # ------------------------
-async def handle_symbol_event(ev: Dict[str, Any], rg: RiskGuard, policy: MetaPolicy):
+async def handle_symbol_event(ev: Dict[str, Any], rg: "RiskGuard", policy: "MetaPolicy"):
     symbol = ev.get("symbol")
     etype  = ev.get("type")
     if etype != "bar":
@@ -505,8 +594,8 @@ async def handle_symbol_event(ev: Dict[str, Any], rg: RiskGuard, policy: MetaPol
 
     if HAS_INST and HAS_TUNER and TUNER is not None:
         try:
-            thr = TUNER.update_and_get(symbol, df_h1, inst)
-            comps_cnt, comps_detail = components_ok(inst, thr)
+            thr = TUNER.update_and_get(symbol, df_h1, inst)  # type: ignore
+            comps_cnt, comps_detail = components_ok(inst, thr)  # type: ignore
             comps_min = int(thr.get("components_min", 3))
 
             score_val = float(inst.get("score", 0) or 0.0)
@@ -761,7 +850,6 @@ async def handle_symbol_event(ev: Dict[str, Any], rg: RiskGuard, policy: MetaPol
     register_signal_perf(key, symbol, side, entry)
     try: update_perf_for_symbol(symbol, df_h1=df_h1)
     except Exception: pass
-
 
 # ------------------------
 # Main
