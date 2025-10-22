@@ -33,3 +33,7 @@ RR_MIN_TOLERATED_WITH_INST = float(os.getenv("RR_MIN_TOLERATED_WITH_INST","1.3")
 TOP_N_SYMBOLS = int(os.getenv("TOP_N_SYMBOLS","60"))   # scan réduit & qualitatif
 MIN_CONFLUENCE_SCORE = int(os.getenv("MIN_CONFLUENCE_SCORE","3"))
 SQUEEZE_REQUIRED = os.getenv("SQUEEZE_REQUIRED","false").lower() in ("1","true","yes")
+
+# Type de déclenchement des stops (SL/TP) : "TP" = last trade price, "MP" = mark price
+STOP_TRIGGER_TYPE_SL = os.getenv("STOP_TRIGGER_TYPE_SL", "TP")
+STOP_TRIGGER_TYPE_TP = os.getenv("STOP_TRIGGER_TYPE_TP", "TP")
