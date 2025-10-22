@@ -1,7 +1,7 @@
 """
-scanner.py — version avec logs détaillés et fallback
-- Log du nombre de paires
-- Si aucune paire, on réessaie le fetch une fois puis on scanne un fallback minimal
+scanner.py — scan performant + logs
+- Utilise top N symboles par turnover (par défaut 150) pour éviter les merdes illiquides
+- Granularité désormais correcte (minutes côté kucoin_utils)
 """
 import time
 import logging
@@ -11,7 +11,8 @@ from kucoin_trader import place_limit_order
 from telegram_client import send_telegram_message
 
 LOGGER = logging.getLogger(__name__)
-_FALLBACK = ["XBTUSDTM", "ETHUSDTM", "SOLUSDTM", "BNBUSDTM"]
+
+TOP_N = 150  # ajuste si tu veux scanner plus/moins
 
 def _fmt_signal_msg(sym, res):
     inst = res.get("institutional", {})
@@ -26,21 +27,10 @@ def _fmt_signal_msg(sym, res):
         f"Notes: {', '.join(reasons) if reasons else 'OK'}"
     )
 
-def _symbols_with_fallback() -> list[str]:
-    pairs = fetch_all_symbols()
-    if not pairs:
-        LOGGER.warning("Aucune paire récupérée, nouvelle tentative...")
-        time.sleep(1.0)
-        pairs = fetch_all_symbols()
-    if not pairs:
-        LOGGER.error("Toujours 0 paire — utilisation du fallback statique")
-        pairs = _FALLBACK
-    return pairs
-
 def scan_and_send_signals():
-    pairs = _symbols_with_fallback()
+    pairs = fetch_all_symbols(limit=TOP_N)
     LOGGER.info("Start scan %d pairs", len(pairs))
-    for sym in pairs:
+    for idx, sym in enumerate(pairs, start=1):
         try:
             df = fetch_klines(sym, "1h", 200)
             if df.empty:
@@ -64,11 +54,12 @@ def scan_and_send_signals():
                 price = float(df["close"].iloc[-1])
                 side = "buy" if signal["bias"] == "LONG" else "sell"
                 order = place_limit_order(sym, side, price)
-                LOGGER.info("Order %s %s @%.8f -> %s", sym, side, price, order)
+                LOGGER.info("[%d/%d] Order %s %s @%.8f -> %s", idx, len(pairs), sym, side, price, order)
             else:
                 send_telegram_message("❌ " + msg)
 
-            time.sleep(0.8)  # anti-429
+            # Anti-429 KuCoin/Binance/Telegram
+            time.sleep(0.6)
         except Exception as e:
             LOGGER.exception("Error on %s: %s", sym, e)
 
