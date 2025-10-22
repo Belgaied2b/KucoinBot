@@ -1,14 +1,20 @@
 """
-exits.py — stop-loss / take-profit avec fallback automatique
-1) Essaye /api/v1/stopOrders (Futures)
-2) Si 400007 (permissions) ou autre 4xx bloquant -> fallback /api/v1/orders avec champs stop*
-- Arrondit stopPrice/price au tickSize du contrat
-- reduceOnly=True
+exits.py — stop-loss / take-profit avec fallback robuste
+- 1) Tente /api/v1/stopOrders
+- 2) Si permissions/4xx -> fallback /api/v1/orders avec champs stop*
+- Ajouts:
+    * stopPriceType configurables (TP=last trade, MP=mark)
+    * SL fallback: envoie explicitement stopPriceType
+    * ok=True SEULEMENT si data.code == "200000"
+    * Arrondi au tick + reduceOnly
 """
 import time, uuid, logging, requests, base64, hmac, hashlib, json
-from typing import Literal, Dict, Any, Tuple
+from typing import Literal, Tuple
 
-from settings import KUCOIN_API_KEY, KUCOIN_API_SECRET, KUCOIN_API_PASSPHRASE, LEVERAGE
+from settings import (
+    KUCOIN_API_KEY, KUCOIN_API_SECRET, KUCOIN_API_PASSPHRASE, LEVERAGE,
+    STOP_TRIGGER_TYPE_SL, STOP_TRIGGER_TYPE_TP
+)
 from kucoin_utils import get_contract_info
 
 LOGGER = logging.getLogger(__name__)
@@ -17,7 +23,8 @@ BASE = "https://api-futures.kucoin.com"
 STOP_EP = "/api/v1/stopOrders"
 ORDERS_EP = "/api/v1/orders"
 
-# -------- auth helpers --------
+
+# ---------------- auth helpers ----------------
 def _sign(ts, method, ep, body):
     payload = str(ts) + method.upper() + ep + (json.dumps(body) if body else "")
     sig = base64.b64encode(hmac.new(KUCOIN_API_SECRET.encode(), payload.encode(), hashlib.sha256).digest())
@@ -35,9 +42,9 @@ def _headers(ts, sig, pph):
     }
 
 def _auth_post(ep: str, body: dict, timeout=12) -> requests.Response:
-    ts = int(time.time()*1000)
+    ts = int(time.time() * 1000)
     sig, pph = _sign(ts, "POST", ep, body)
-    return requests.post(BASE+ep, headers=_headers(ts, sig, pph), json=body, timeout=timeout)
+    return requests.post(BASE + ep, headers=_headers(ts, sig, pph), json=body, timeout=timeout)
 
 def _safe_json(resp: requests.Response) -> dict:
     try:
@@ -46,128 +53,132 @@ def _safe_json(resp: requests.Response) -> dict:
         return {"raw": resp.text}
 
 def _round_to_tick(x: float, tick: float) -> float:
-    if tick <= 0: return x
-    steps = int(x / tick)
+    if tick <= 0:
+        return x
+    steps = int(float(x) / tick)
     return round(steps * tick, 8)
 
 def _stop_direction(side: str) -> Tuple[str, str]:
-    """Retourne (stop, tp_stop) pour KuCoin Futures."""
     side = side.lower()
-    # Pour un LONG (entrée buy): SL doit se déclencher "down", TP se déclare via stopPriceType="TP" côté "up".
-    if side == "buy":
+    if side == "buy":      # position longue -> SL en "down", TP en "up"
         return "down", "up"
-    # Pour un SHORT (entrée sell): SL "up", TP "down".
-    return "up", "down"
+    return "up", "down"    # position courte
+
 
 def _is_permission_error(resp: requests.Response, data: dict) -> bool:
-    if resp is None: return False
-    if resp.status_code == 401 or resp.status_code == 403:
+    if resp is None:
+        return False
+    if resp.status_code in (401, 403):
         return True
-    code = str(data.get("code", ""))
-    # 400007 = Access denied, require more permission.
-    return code == "400007"
+    return str(data.get("code", "")) == "400007"
 
-# -------- public API --------
-def place_stop_loss(symbol: str, side: Literal["buy","sell"], size_lots: int, stop_price: float) -> dict:
+def _ok(data: dict) -> bool:
+    # KuCoin renvoie parfois HTTP 200 avec un code d'erreur applicatif
+    return isinstance(data, dict) and str(data.get("code")) == "200000"
+
+
+# ---------------- public API ----------------
+def place_stop_loss(symbol: str, side: Literal["buy", "sell"], size_lots: int, stop_price: float) -> dict:
     """
-    STOP au marché (reduce-only). Fallback auto si stopOrders refuse.
+    STOP-LOSS au marché (reduce-only). Fallback si stopOrders refusé.
     """
     meta = get_contract_info(symbol)
     tick = float(meta.get("tickSize", 0.01))
     stop_price = _round_to_tick(float(stop_price), tick)
     stop_dir, _tp_dir = _stop_direction(side)
 
-    # 1) Tentative /stopOrders
+    # 1) Endpoint recommandé: /stopOrders
     body = {
         "clientOid": str(uuid.uuid4()),
         "symbol": symbol,
-        "side": "sell" if side=="buy" else "buy",
+        "side": "sell" if side == "buy" else "buy",
         "type": "market",
         "size": str(int(size_lots)),
         "stop": stop_dir,
         "stopPrice": f"{stop_price:.8f}",
+        "stopPriceType": STOP_TRIGGER_TYPE_SL,  # <-- EXPLICITE: "TP" (last) ou "MP" (mark)
         "reduceOnly": True,
         "leverage": str(int(LEVERAGE)),
     }
     r = _auth_post(STOP_EP, body)
-    data = _safe_json(r)
+    d = _safe_json(r)
+    if r.status_code == 200 and _ok(d):
+        return {"ok": True, "endpoint": "stopOrders", "data": d}
 
-    if r.status_code == 200:
-        return {"ok": True, "endpoint": "stopOrders", "data": data}
-
-    # 4xx permission -> fallback
-    if _is_permission_error(r, data) or (400 <= r.status_code < 500):
-        LOGGER.warning("stopOrders refused (%s): %s -> fallback /orders stop*", r.status_code, data)
-        # 2) Fallback /orders avec champs stop*
+    # 2) Fallback: /orders avec champs stop*
+    if _is_permission_error(r, d) or (400 <= r.status_code < 500):
+        LOGGER.warning("stopOrders SL refused (%s): %s -> fallback /orders stop*", r.status_code, d)
         fb = {
             "clientOid": str(uuid.uuid4()),
             "symbol": symbol,
-            "side": "sell" if side=="buy" else "buy",
+            "side": "sell" if side == "buy" else "buy",
             "type": "market",
             "size": str(int(size_lots)),
             "reduceOnly": True,
             "stop": stop_dir,
             "stopPrice": f"{stop_price:.8f}",
+            "stopPriceType": STOP_TRIGGER_TYPE_SL,  # <-- OBLIGATOIRE en fallback aussi
             "leverage": str(int(LEVERAGE)),
         }
         rr = _auth_post(ORDERS_EP, fb)
         d2 = _safe_json(rr)
-        if rr.status_code == 200:
+        if rr.status_code == 200 and _ok(d2):
             return {"ok": True, "endpoint": "orders(stop*)", "data": d2}
         return {"ok": False, "endpoint": "orders(stop*)", "status": rr.status_code, "body": d2}
 
-    # autre erreur
-    return {"ok": False, "endpoint": "stopOrders", "status": r.status_code, "body": data}
+    return {"ok": False, "endpoint": "stopOrders", "status": r.status_code, "body": d}
 
-def place_take_profit(symbol: str, side: Literal["buy","sell"], size_lots: int, tp_price: float) -> dict:
+
+def place_take_profit(symbol: str, side: Literal["buy", "sell"], size_lots: int, tp_price: float) -> dict:
     """
-    TAKE-PROFIT limit (reduce-only). Fallback auto si stopOrders refuse.
+    TAKE-PROFIT limit (reduce-only). Fallback si stopOrders refusé.
     """
     meta = get_contract_info(symbol)
     tick = float(meta.get("tickSize", 0.01))
     tp_price = _round_to_tick(float(tp_price), tick)
     _sl_dir, tp_dir = _stop_direction(side)
 
-    # 1) Tentative /stopOrders
+    # 1) /stopOrders
     body = {
         "clientOid": str(uuid.uuid4()),
         "symbol": symbol,
-        "side": "sell" if side=="buy" else "buy",
+        "side": "sell" if side == "buy" else "buy",
         "type": "limit",
         "price": f"{tp_price:.8f}",
         "size": str(int(size_lots)),
         "stop": tp_dir,
-        "stopPriceType": "TP",
+        "stopPriceType": STOP_TRIGGER_TYPE_TP,  # "TP" ou "MP"
+        "stopPrice": f"{tp_price:.8f}",         # souvent requis pour TP aussi
         "reduceOnly": True,
         "leverage": str(int(LEVERAGE)),
         "timeInForce": "GTC",
     }
     r = _auth_post(STOP_EP, body)
-    data = _safe_json(r)
-    if r.status_code == 200:
-        return {"ok": True, "endpoint": "stopOrders", "data": data}
+    d = _safe_json(r)
+    if r.status_code == 200 and _ok(d):
+        return {"ok": True, "endpoint": "stopOrders", "data": d}
 
-    # 4xx permission -> fallback
-    if _is_permission_error(r, data) or (400 <= r.status_code < 500):
-        LOGGER.warning("stopOrders TP refused (%s): %s -> fallback /orders stop*", r.status_code, data)
+    # 2) Fallback: /orders stop*
+    if _is_permission_error(r, d) or (400 <= r.status_code < 500):
+        LOGGER.warning("stopOrders TP refused (%s): %s -> fallback /orders stop*", r.status_code, d)
         fb = {
             "clientOid": str(uuid.uuid4()),
             "symbol": symbol,
-            "side": "sell" if side=="buy" else "buy",
+            "side": "sell" if side == "buy" else "buy",
             "type": "limit",
             "price": f"{tp_price:.8f}",
             "size": str(int(size_lots)),
             "reduceOnly": True,
             "stop": tp_dir,
-            "stopPriceType": "TP",
-            "stopPrice": f"{tp_price:.8f}",  # KuCoin requiert parfois stopPrice même pour TP
+            "stopPriceType": STOP_TRIGGER_TYPE_TP,
+            "stopPrice": f"{tp_price:.8f}",
             "leverage": str(int(LEVERAGE)),
             "timeInForce": "GTC",
         }
         rr = _auth_post(ORDERS_EP, fb)
         d2 = _safe_json(rr)
-        if rr.status_code == 200:
+        if rr.status_code == 200 and _ok(d2):
             return {"ok": True, "endpoint": "orders(stop*)", "data": d2}
         return {"ok": False, "endpoint": "orders(stop*)", "status": rr.status_code, "body": d2}
 
-    return {"ok": False, "endpoint": "stopOrders", "status": r.status_code, "body": data}
+    return {"ok": False, "endpoint": "stopOrders", "status": r.status_code, "body": d}
