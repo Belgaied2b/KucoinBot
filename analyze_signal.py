@@ -1,3 +1,9 @@
+"""
+analyze_signal.py — intégration institutionnelle + garde-fou RR
+- Rejette immédiatement tout signal dont le RR n’est pas fini et > 0
+- Conserve la priorité institutionnelle (MIN_INST_SCORE) + tolérance RR si inst OK
+"""
+import math
 from indicators import compute_rsi, compute_macd, compute_ema, compute_atr, is_momentum_ok
 from structure_utils import structure_valid
 from institutional_data import compute_full_institutional_analysis
@@ -11,14 +17,14 @@ def evaluate_signal(signal: dict):
     signal attendu:
       {symbol, bias('LONG'/'SHORT'), rr_estimated: float, df: DataFrame, entry, sl, tp1, tp2, ote: bool}
 
-    Politique d'acceptation (top-1 desk):
+    Politique d'acceptation (desk pro):
       1) Institutionnel prioritaire:
            - inst_score >= MIN_INST_SCORE  ET  RR >= RR_MIN_TOLERATED_WITH_INST
            - + structure & momentum exigés si REQUIRE_* = True
-      2) Sinon logique stricte:
+      2) Sinon stricte:
            - RR >= RR_MIN_STRICT
            - structure & momentum exigés si REQUIRE_* = True
-      OTE manquant = toléré (mais on le note)
+      OTE manquant = toléré (signal noté, pas bloquant)
     """
     df = signal.get("df")
     close = df["close"]
@@ -26,6 +32,16 @@ def evaluate_signal(signal: dict):
     symbol = signal["symbol"]
     bias = signal.get("bias", "LONG").upper()
     rr = float(signal.get("rr_estimated", 0.0) or 0.0)
+
+    # --- Garde-fou RR ---
+    if rr is None or not math.isfinite(rr) or rr <= 0:
+        return {
+            "valid": False,
+            "score": 50,
+            "rr": None,
+            "reasons": ["RR invalide (entry/SL/TP incohérents)"],
+            "institutional": compute_full_institutional_analysis(symbol, bias)
+        }
 
     # Institutionnel
     inst = compute_full_institutional_analysis(symbol, bias)
