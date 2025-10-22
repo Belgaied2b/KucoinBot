@@ -1,8 +1,8 @@
 """
-scanner.py — version robuste avec construction de signal safe (RR>0) + affichage Telegram clampé
-- build_signal(): calcule entry/SL/TP cohérents selon le bias (LONG par défaut), RR > 0
-- _fmt_signal_msg(): affiche RR clampé [0..10] ou 'n/a' si invalide
-- Intégré au flux risk-first (sizing/guardrails/exits) si tu utilises déjà risk_manager/exits
+scanner.py — n'envoie sur Telegram que les trades VALIDES
+- AUCUN envoi pour les rejets/skip (silence radio)
+- En DRY_RUN=true : pas d'envoi Telegram (logs uniquement)
+- Intégré au flux risk-first (sizing/guardrails/exits)
 """
 import time
 import logging
@@ -78,7 +78,7 @@ def build_signal(df: pd.DataFrame, symbol: str, bias: str = "LONG"):
     return signal, None
 
 
-# ---------- Affichage Telegram safe ----------
+# ---------- Affichage Telegram (uniquement pour VALIDES) ----------
 def _fmt_signal_msg(sym, res):
     inst = res.get("institutional", {})
     inst_line = (
@@ -89,13 +89,13 @@ def _fmt_signal_msg(sym, res):
     if rr_val is None or not np.isfinite(rr_val) or rr_val <= 0:
         rr_txt = "n/a"
     else:
-        # clamp visuel pour éviter les valeurs absurdes
-        rr_txt = f"{max(min(rr_val, 10.0), 0.0):.2f}"
+        rr_txt = f"{max(min(rr_val, 10.0), 0.0):.2f}"  # clamp visuel
     reasons = res.get("reasons") or []
+    notes = (', '.join(reasons) if reasons else 'OK')
     return (
         f"🔎 *{sym}* — score {res.get('score', 0):.1f} | RR {rr_txt}\n"
         f"Inst: {inst_line}\n"
-        f"Notes: {', '.join(reasons) if reasons else 'OK'}"
+        f"Notes: {notes}"
     )
 
 
@@ -109,7 +109,7 @@ def scan_and_send_signals():
         try:
             df = fetch_klines(sym, "1h", 250)
             if df.empty:
-                LOGGER.warning("Skip %s (df empty)", sym)
+                LOGGER.info("Skip %s (df empty)", sym)
                 continue
 
             # Construit un signal RR-safe (LONG par défaut ici, adapte si tu as une logique de bias)
@@ -119,12 +119,10 @@ def scan_and_send_signals():
                 continue
 
             res = evaluate_signal(signal)
-            msg = _fmt_signal_msg(sym, res)
 
             if not res["valid"]:
-                # Rejet clair et propre
+                # PAS d'envoi Telegram pour les rejets
                 LOGGER.info("[%d/%d] Skip %s -> %s", idx, len(pairs), sym, "; ".join(res.get("reasons") or []))
-                send_telegram_message("❌ " + msg)
                 continue
 
             # ----- Risk-first sizing & guardrails -----
@@ -140,17 +138,20 @@ def scan_and_send_signals():
             ok, why = guardrails_ok(sym, sizing.notional)
             if not ok:
                 LOGGER.info("[%d/%d] Skip %s -> %s", idx, len(pairs), sym, why)
-                send_telegram_message(f"⏭️ {sym} — {why}")
+                # PAS d'envoi Telegram pour les gardes-fous
                 continue
 
+            # ----- Envois -----
+            msg = _fmt_signal_msg(sym, res)
+
             if DRY_RUN:
+                # Pas d'envoi Telegram en dry-run
                 LOGGER.info("[%d/%d] DRY-RUN %s lots=%s entry=%.6f sl=%.6f tp=%.6f",
                             idx, len(pairs), sym, sizing.size_lots, sizing.price_rounded, signal["sl"], signal["tp2"])
-                send_telegram_message("🧪 " + msg + f"\nLots: {sizing.size_lots} | Entry {sizing.price_rounded:.6f} | SL {signal['sl']:.6f} | TP {signal['tp2']:.6f}")
                 register_order(sym, sizing.notional)
                 continue
 
-            # ----- Envoi ordre + exits -----
+            # Envoi ordre + message Telegram (UNIQUEMENT ici)
             order = place_limit_order(sym, "buy", sizing.price_rounded)
             LOGGER.info("[%d/%d] Order %s -> %s", idx, len(pairs), sym, order)
             send_telegram_message("✅ " + msg + f"\nLots: {sizing.size_lots} | Entry {sizing.price_rounded:.6f} | SL {signal['sl']:.6f} | TP {signal['tp2']:.6f}")
