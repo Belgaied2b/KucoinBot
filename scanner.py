@@ -1,18 +1,14 @@
-"""
-scanner.py — scan performant + logs
-- Utilise top N symboles par turnover (par défaut 150) pour éviter les merdes illiquides
-- Granularité désormais correcte (minutes côté kucoin_utils)
-"""
 import time
 import logging
 from kucoin_utils import fetch_all_symbols, fetch_klines
 from analyze_signal import evaluate_signal
 from kucoin_trader import place_limit_order
 from telegram_client import send_telegram_message
+from settings import MAX_ORDERS_PER_SCAN, DRY_RUN
 
 LOGGER = logging.getLogger(__name__)
 
-TOP_N = 150  # ajuste si tu veux scanner plus/moins
+TOP_N = 150  # déjà en place
 
 def _fmt_signal_msg(sym, res):
     inst = res.get("institutional", {})
@@ -30,8 +26,14 @@ def _fmt_signal_msg(sym, res):
 def scan_and_send_signals():
     pairs = fetch_all_symbols(limit=TOP_N)
     LOGGER.info("Start scan %d pairs", len(pairs))
+
+    sent_orders = 0
     for idx, sym in enumerate(pairs, start=1):
         try:
+            if sent_orders >= MAX_ORDERS_PER_SCAN:
+                LOGGER.info("Order cap reached (%d). Remaining symbols will be skipped.", MAX_ORDERS_PER_SCAN)
+                break
+
             df = fetch_klines(sym, "1h", 200)
             if df.empty:
                 LOGGER.warning("Skip %s (df empty)", sym)
@@ -50,17 +52,24 @@ def scan_and_send_signals():
             msg = _fmt_signal_msg(sym, res)
 
             if res.get("valid"):
-                send_telegram_message("✅ " + msg)
-                price = float(df["close"].iloc[-1])
-                side = "buy" if signal["bias"] == "LONG" else "sell"
-                order = place_limit_order(sym, side, price)
-                LOGGER.info("[%d/%d] Order %s %s @%.8f -> %s", idx, len(pairs), sym, side, price, order)
+                if DRY_RUN:
+                    send_telegram_message("🧪 (DRY-RUN) " + msg)
+                    LOGGER.info("[%d/%d] DRY-RUN %s -> NO ORDER", idx, len(pairs), sym)
+                else:
+                    price = float(df["close"].iloc[-1])
+                    side = "buy" if signal["bias"] == "LONG" else "sell"
+                    order = place_limit_order(sym, side, price)
+                    sent_orders += 1
+                    LOGGER.info("[%d/%d] Order %s %s @%.8f -> %s", idx, len(pairs), sym, side, price, order)
+                    send_telegram_message("✅ " + msg)
             else:
+                LOGGER.info("[%d/%d] Skip %s -> %s", idx, len(pairs), sym, "; ".join(res.get("reasons") or []))
                 send_telegram_message("❌ " + msg)
 
             # Anti-429 KuCoin/Binance/Telegram
             time.sleep(0.6)
+
         except Exception as e:
             LOGGER.exception("Error on %s: %s", sym, e)
 
-    LOGGER.info("Scan done.")
+    LOGGER.info("Scan done. Orders sent this run: %d", sent_orders)
