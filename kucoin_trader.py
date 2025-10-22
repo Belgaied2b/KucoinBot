@@ -6,8 +6,9 @@ kucoin_trader.py — LIMIT orders en lots + modes auto
     * MarginMode (par symbole): ISOLATED par défaut (modifiable)
 - Arrondit le prix au tickSize du contrat.
 - Envoie clientOid (UUID v4).
+- ok=True UNIQUEMENT si data.code == "200000".
 """
-import os
+from __future__ import annotations
 import time
 import hmac
 import json
@@ -15,11 +16,14 @@ import uuid
 import base64
 import hashlib
 import logging
-from typing import Dict, Any
+from typing import Dict, Any, Tuple
 
 import requests
 
-from settings import KUCOIN_API_KEY, KUCOIN_API_SECRET, KUCOIN_API_PASSPHRASE, MARGIN_USDT, LEVERAGE
+from settings import (
+    KUCOIN_API_KEY, KUCOIN_API_SECRET, KUCOIN_API_PASSPHRASE,
+    MARGIN_USDT, LEVERAGE,
+)
 from retry_utils import backoff_retry, TransientHTTPError
 from kucoin_utils import get_contract_info
 
@@ -36,14 +40,12 @@ SWITCH_MARGIN_MODE_EP = "/api/v2/position/changeMarginMode"       # body: {"symb
 DEFAULT_POSITION_MODE = "0"       # "0"=one-way, "1"=hedge
 DEFAULT_MARGIN_MODE = "ISOLATED"  # ou "CROSS" si tu préfères
 
-
-# ------------- Sign / headers
-def _sign(ts_ms: int, method: str, endpoint: str, body: dict | None) -> tuple[bytes, bytes]:
+# --------- Helpers auth
+def _sign(ts_ms: int, method: str, endpoint: str, body: dict | None) -> Tuple[bytes, bytes]:
     payload = str(ts_ms) + method.upper() + endpoint + (json.dumps(body) if body else "")
     sig = base64.b64encode(hmac.new(KUCOIN_API_SECRET.encode(), payload.encode(), hashlib.sha256).digest())
     pph = base64.b64encode(hmac.new(KUCOIN_API_SECRET.encode(), KUCOIN_API_PASSPHRASE.encode(), hashlib.sha256).digest())
     return sig, pph
-
 
 def _headers(ts_ms: int, sig: bytes, pph: bytes) -> dict:
     return {
@@ -55,10 +57,15 @@ def _headers(ts_ms: int, sig: bytes, pph: bytes) -> dict:
         "Content-Type": "application/json",
     }
 
+def _safe_json(resp: requests.Response) -> dict:
+    try:
+        return resp.json()
+    except Exception:
+        return {"raw": resp.text}
 
 def _needs_retry(status_code: int) -> bool:
-    return status_code >= 500
-
+    # Retry sur 5xx et 429 (rate limit)
+    return status_code >= 500 or status_code == 429
 
 def _auth_post(endpoint: str, body: dict, timeout=12) -> requests.Response:
     ts = int(time.time() * 1000)
@@ -66,22 +73,13 @@ def _auth_post(endpoint: str, body: dict, timeout=12) -> requests.Response:
     headers = _headers(ts, sig, pph)
     return requests.post(BASE + endpoint, headers=headers, json=body, timeout=timeout)
 
-
 def _auth_get(endpoint: str, params=None, timeout=12) -> requests.Response:
     ts = int(time.time() * 1000)
     sig, pph = _sign(ts, "GET", endpoint, None)
     headers = _headers(ts, sig, pph)
     return requests.get(BASE + endpoint, headers=headers, params=params, timeout=timeout)
 
-
-def _safe_json(resp: requests.Response) -> dict:
-    try:
-        return resp.json()
-    except Exception:
-        return {"raw": resp.text}
-
-
-# ------------- Modes helpers
+# --------- Modes helpers
 def _ensure_position_mode(target_mode: str = DEFAULT_POSITION_MODE) -> None:
     try:
         r = _auth_get(GET_POSITION_MODE_EP)
@@ -97,7 +95,6 @@ def _ensure_position_mode(target_mode: str = DEFAULT_POSITION_MODE) -> None:
     except Exception as e:
         LOGGER.exception("ensure_position_mode error: %s", e)
 
-
 def _ensure_margin_mode(symbol: str, target_mode: str = DEFAULT_MARGIN_MODE) -> None:
     """
     Aligne le marginMode du symbole. Attention: KuCoin exige qu'il n'y ait pas
@@ -111,15 +108,13 @@ def _ensure_margin_mode(symbol: str, target_mode: str = DEFAULT_MARGIN_MODE) -> 
     except Exception as e:
         LOGGER.exception("ensure_margin_mode error: %s", e)
 
-
-# ------------- Sizing helpers
+# --------- Sizing helpers
 def _round_price(price: float, tick: float) -> float:
     if tick <= 0:
         return price
     # arrondi au multiple inférieur de tick
     steps = int(price / tick)
     return round(steps * tick, 8)
-
 
 def _compute_lots_for_value(price: float, multiplier: float, lot_size: int, budget_notional: float) -> int:
     """
@@ -134,17 +129,16 @@ def _compute_lots_for_value(price: float, multiplier: float, lot_size: int, budg
     # notional d'1 lot = price * multiplier
     notional_per_lot = price * multiplier
     est = int(budget_notional / max(notional_per_lot, 1e-12))
-    lots = max(lot_size, est)
-    return lots
+    return max(lot_size, est)
 
-
-# ------------- Place order
+# --------- Place order
 @backoff_retry(exceptions=(TransientHTTPError, requests.RequestException))
-def place_limit_order(symbol: str, side: str, price: float) -> dict:
+def place_limit_order(symbol: str, side: str, price: float, *, post_only: bool = True) -> dict:
     """
     Place un ordre LIMIT en 'size' (lots), conforme aux specs du contrat.
     - ajuste positionMode et marginMode avant l'ordre
     - arrondit price au tickSize
+    - ok=True UNIQUEMENT si data.code == "200000"
     """
     if not KUCOIN_API_KEY or not KUCOIN_API_SECRET or not KUCOIN_API_PASSPHRASE:
         LOGGER.error("KuCoin API credentials missing.")
@@ -155,7 +149,6 @@ def place_limit_order(symbol: str, side: str, price: float) -> dict:
     lot_size = int(meta.get("lotSize", 1))
     multiplier = float(meta.get("multiplier", 1.0))
     tick = float(meta.get("tickSize", 0.01))
-
     adj_price = _round_price(float(price), tick)
 
     # 2) Sizing en lots via budget notionnel = marge * levier
@@ -172,27 +165,41 @@ def place_limit_order(symbol: str, side: str, price: float) -> dict:
     body = {
         "clientOid": client_oid,
         "symbol": symbol,
-        "side": side.lower(),          # buy / sell
+        "side": side.lower(),          # "buy" (long) ou "sell" (short)
         "type": "limit",
         "price": f"{adj_price:.8f}",
-        "size": str(int(size_lots)),   # <-- taille en L0TS (entier, multiple de lotSize)
+        "size": str(int(size_lots)),   # taille en LOTS (entier, multiple de lotSize)
         "leverage": str(int(LEVERAGE)),
         "timeInForce": "GTC",
-        "postOnly": True,
-        # "reduceOnly": False,
+        "postOnly": bool(post_only),
+        # "reduceOnly": False,  # uniquement pour les exits
     }
 
-    sig, pph = _sign(ts, "POST", ORDERS_EP, body)
-    headers = _headers(ts, sig, pph)
-    resp = requests.post(BASE + ORDERS_EP, headers=headers, json=body, timeout=12)
+    resp = _auth_post(ORDERS_EP, body)
 
     if _needs_retry(resp.status_code):
-        raise TransientHTTPError(f"KuCoin 5xx {resp.status_code}: {resp.text}")
+        raise TransientHTTPError(f"KuCoin transient {resp.status_code}: {resp.text}")
 
     data = _safe_json(resp)
-    if resp.status_code != 200:
-        # Log explicite des messages 330005/330011/100001
-        LOGGER.error("KuCoin order error %s %s -> %s", resp.status_code, symbol, data)
-        return {"ok": False, "status": resp.status_code, "body": data, "clientOid": client_oid}
 
-    return {"ok": True, "data": data, "clientOid": client_oid, "price": adj_price, "size_lots": size_lots}
+    # succès KuCoin = HTTP 200 + code applicatif "200000"
+    ok = (resp.status_code == 200 and str(data.get("code")) == "200000")
+    if not ok:
+        # Log explicite des messages 330005/330011/100001 etc.
+        LOGGER.error("KuCoin order error %s %s -> %s", resp.status_code, symbol, data)
+        return {
+            "ok": False,
+            "status": resp.status_code,
+            "body": data,
+            "clientOid": client_oid,
+            "price": adj_price,
+            "size_lots": size_lots,
+        }
+
+    return {
+        "ok": True,
+        "data": data,
+        "clientOid": client_oid,
+        "price": adj_price,
+        "size_lots": size_lots,
+    }
