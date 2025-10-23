@@ -1,6 +1,6 @@
 """
-kucoin_trader.py — LIMIT orders en lots + modes auto
-- Calcule 'size' (lots) à partir de MARGIN_USDT * LEVERAGE et des specs contrat (multiplier, lotSize).
+kucoin_trader.py — LIMIT orders en lots + modes auto (compatible 4 arguments)
+- Calcule 'size' (lots) si size_lots n'est pas fourni, à partir de MARGIN_USDT * LEVERAGE et des specs contrat.
 - Aligne les modes avant l'ordre :
     * PositionMode: One-Way (0) par défaut (modifiable)
     * MarginMode (par symbole): ISOLATED par défaut (modifiable)
@@ -9,15 +9,8 @@ kucoin_trader.py — LIMIT orders en lots + modes auto
 - ok=True UNIQUEMENT si data.code == "200000".
 """
 from __future__ import annotations
-import time
-import hmac
-import json
-import uuid
-import base64
-import hashlib
-import logging
-from typing import Dict, Any, Tuple
-
+import time, hmac, json, uuid, base64, hashlib, logging
+from typing import Dict, Any, Tuple, Optional
 import requests
 
 from settings import (
@@ -38,7 +31,7 @@ SWITCH_POSITION_MODE_EP = "/api/v2/position/switchPositionMode"   # body: {"posi
 SWITCH_MARGIN_MODE_EP = "/api/v2/position/changeMarginMode"       # body: {"symbol":"XBTUSDTM","marginMode":"ISOLATED|CROSS"}
 
 DEFAULT_POSITION_MODE = "0"       # "0"=one-way, "1"=hedge
-DEFAULT_MARGIN_MODE = "ISOLATED"  # ou "CROSS" si tu préfères
+DEFAULT_MARGIN_MODE = "ISOLATED"  # "CROSS" si tu préfères
 
 # --------- Helpers auth
 def _sign(ts_ms: int, method: str, endpoint: str, body: dict | None) -> Tuple[bytes, bytes]:
@@ -97,13 +90,11 @@ def _ensure_position_mode(target_mode: str = DEFAULT_POSITION_MODE) -> None:
 
 def _ensure_margin_mode(symbol: str, target_mode: str = DEFAULT_MARGIN_MODE) -> None:
     """
-    Aligne le marginMode du symbole. Attention: KuCoin exige qu'il n'y ait pas
-    d'ordres/positions ouverts pour changer — ici on tente en best-effort.
+    Aligne le marginMode du symbole. KuCoin refuse si ordres/positions ouverts : best-effort.
     """
     try:
         rr = _auth_post(SWITCH_MARGIN_MODE_EP, {"symbol": symbol, "marginMode": target_mode})
         if rr.status_code != 200:
-            # Beaucoup de cas renvoient 400 avec message explicite, on log seulement.
             LOGGER.warning("SwitchMarginMode %s => %s failed %s: %s", symbol, target_mode, rr.status_code, rr.text)
     except Exception as e:
         LOGGER.exception("ensure_margin_mode error: %s", e)
@@ -112,33 +103,30 @@ def _ensure_margin_mode(symbol: str, target_mode: str = DEFAULT_MARGIN_MODE) -> 
 def _round_price(price: float, tick: float) -> float:
     if tick <= 0:
         return price
-    # arrondi au multiple inférieur de tick
-    steps = int(price / tick)
+    steps = int(price / tick)  # arrondi au multiple inférieur
     return round(steps * tick, 8)
 
 def _compute_lots_for_value(price: float, multiplier: float, lot_size: int, budget_notional: float) -> int:
     """
-    price: prix du contrat (USDT)
-    multiplier: base-coin par lot (ex: 0.001 BTC)
-    lot_size: lot minimal (entier, souvent 1)
-    budget_notional: budget notionnel = MARGIN_USDT * LEVERAGE
-    Retourne un entier de lots >= lot_size.
+    notional d'1 lot = price * multiplier
     """
     if price <= 0 or multiplier <= 0:
         return lot_size
-    # notional d'1 lot = price * multiplier
     notional_per_lot = price * multiplier
     est = int(budget_notional / max(notional_per_lot, 1e-12))
     return max(lot_size, est)
 
-# --------- Place order
+# --------- Place order (compat 3 ou 4 arguments)
 @backoff_retry(exceptions=(TransientHTTPError, requests.RequestException))
-def place_limit_order(symbol: str, side: str, price: float, *, post_only: bool = True) -> dict:
+def place_limit_order(symbol: str, side: str, price: float,
+                      size_lots: Optional[int] = None, *, post_only: bool = True) -> dict:
     """
-    Place un ordre LIMIT en 'size' (lots), conforme aux specs du contrat.
-    - ajuste positionMode et marginMode avant l'ordre
-    - arrondit price au tickSize
-    - ok=True UNIQUEMENT si data.code == "200000"
+    Place un ordre LIMIT en 'size' (lots).
+    - Si size_lots est fourni par l'appelant, on l'utilise.
+    - Sinon, on calcule à partir de MARGIN_USDT * LEVERAGE et des specs contrat.
+    - Ajuste positionMode et marginMode avant l'ordre.
+    - Arrondit le price au tickSize.
+    - ok=True UNIQUEMENT si data.code == "200000".
     """
     if not KUCOIN_API_KEY or not KUCOIN_API_SECRET or not KUCOIN_API_PASSPHRASE:
         LOGGER.error("KuCoin API credentials missing.")
@@ -151,9 +139,12 @@ def place_limit_order(symbol: str, side: str, price: float, *, post_only: bool =
     tick = float(meta.get("tickSize", 0.01))
     adj_price = _round_price(float(price), tick)
 
-    # 2) Sizing en lots via budget notionnel = marge * levier
-    budget = float(MARGIN_USDT) * float(LEVERAGE)
-    size_lots = _compute_lots_for_value(adj_price, multiplier, lot_size, budget)
+    # 2) Sizing en lots via budget notionnel si non fourni
+    if size_lots is None or int(size_lots) <= 0:
+        budget = float(MARGIN_USDT) * float(LEVERAGE)
+        size_lots = _compute_lots_for_value(adj_price, multiplier, lot_size, budget)
+    else:
+        size_lots = max(lot_size, int(size_lots))
 
     # 3) Modes (best effort)
     _ensure_position_mode(DEFAULT_POSITION_MODE)
@@ -172,7 +163,6 @@ def place_limit_order(symbol: str, side: str, price: float, *, post_only: bool =
         "leverage": str(int(LEVERAGE)),
         "timeInForce": "GTC",
         "postOnly": bool(post_only),
-        # "reduceOnly": False,  # uniquement pour les exits
     }
 
     resp = _auth_post(ORDERS_EP, body)
@@ -181,11 +171,8 @@ def place_limit_order(symbol: str, side: str, price: float, *, post_only: bool =
         raise TransientHTTPError(f"KuCoin transient {resp.status_code}: {resp.text}")
 
     data = _safe_json(resp)
-
-    # succès KuCoin = HTTP 200 + code applicatif "200000"
     ok = (resp.status_code == 200 and str(data.get("code")) == "200000")
     if not ok:
-        # Log explicite des messages 330005/330011/100001 etc.
         LOGGER.error("KuCoin order error %s %s -> %s", resp.status_code, symbol, data)
         return {
             "ok": False,
