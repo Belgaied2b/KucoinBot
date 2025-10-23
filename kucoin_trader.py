@@ -27,8 +27,8 @@ BASE = "https://api-futures.kucoin.com"
 # Endpoints
 ORDERS_EP = "/api/v1/orders"
 GET_POSITION_MODE_EP = "/api/v2/position/getPositionMode"
-SWITCH_POSITION_MODE_EP = "/api/v2/position/switchPositionMode"   # body: {"positionMode":"0|1"}
-SWITCH_MARGIN_MODE_EP = "/api/v2/position/changeMarginMode"       # body: {"symbol":"XBTUSDTM","marginMode":"ISOLATED|CROSS"}
+SWITCH_POSITION_MODE_EP = "/api/v2/position/switchPositionMode"
+SWITCH_MARGIN_MODE_EP = "/api/v2/position/changeMarginMode"
 
 DEFAULT_POSITION_MODE = "0"       # "0"=one-way, "1"=hedge
 DEFAULT_MARGIN_MODE = "ISOLATED"  # "CROSS" si tu préfères
@@ -57,7 +57,6 @@ def _safe_json(resp: requests.Response) -> dict:
         return {"raw": resp.text}
 
 def _needs_retry(status_code: int) -> bool:
-    # Retry sur 5xx et 429 (rate limit)
     return status_code >= 500 or status_code == 429
 
 def _auth_post(endpoint: str, body: dict, timeout=12) -> requests.Response:
@@ -89,9 +88,6 @@ def _ensure_position_mode(target_mode: str = DEFAULT_POSITION_MODE) -> None:
         LOGGER.exception("ensure_position_mode error: %s", e)
 
 def _ensure_margin_mode(symbol: str, target_mode: str = DEFAULT_MARGIN_MODE) -> None:
-    """
-    Aligne le marginMode du symbole. KuCoin refuse si ordres/positions ouverts : best-effort.
-    """
     try:
         rr = _auth_post(SWITCH_MARGIN_MODE_EP, {"symbol": symbol, "marginMode": target_mode})
         if rr.status_code != 200:
@@ -103,13 +99,10 @@ def _ensure_margin_mode(symbol: str, target_mode: str = DEFAULT_MARGIN_MODE) -> 
 def _round_price(price: float, tick: float) -> float:
     if tick <= 0:
         return price
-    steps = int(price / tick)  # arrondi au multiple inférieur
+    steps = int(price / tick)
     return round(steps * tick, 8)
 
 def _compute_lots_for_value(price: float, multiplier: float, lot_size: int, budget_notional: float) -> int:
-    """
-    notional d'1 lot = price * multiplier
-    """
     if price <= 0 or multiplier <= 0:
         return lot_size
     notional_per_lot = price * multiplier
@@ -120,53 +113,40 @@ def _compute_lots_for_value(price: float, multiplier: float, lot_size: int, budg
 @backoff_retry(exceptions=(TransientHTTPError, requests.RequestException))
 def place_limit_order(symbol: str, side: str, price: float,
                       size_lots: Optional[int] = None, *, post_only: bool = True) -> dict:
-    """
-    Place un ordre LIMIT en 'size' (lots).
-    - Si size_lots est fourni par l'appelant, on l'utilise.
-    - Sinon, on calcule à partir de MARGIN_USDT * LEVERAGE et des specs contrat.
-    - Ajuste positionMode et marginMode avant l'ordre.
-    - Arrondit le price au tickSize.
-    - ok=True UNIQUEMENT si data.code == "200000".
-    """
     if not KUCOIN_API_KEY or not KUCOIN_API_SECRET or not KUCOIN_API_PASSPHRASE:
         LOGGER.error("KuCoin API credentials missing.")
         return {"ok": False, "error": "missing_api_credentials"}
 
-    # 1) Contrat & arrondis
     meta = get_contract_info(symbol)
     lot_size = int(meta.get("lotSize", 1))
     multiplier = float(meta.get("multiplier", 1.0))
     tick = float(meta.get("tickSize", 0.01))
     adj_price = _round_price(float(price), tick)
 
-    # 2) Sizing en lots via budget notionnel si non fourni
     if size_lots is None or int(size_lots) <= 0:
         budget = float(MARGIN_USDT) * float(LEVERAGE)
         size_lots = _compute_lots_for_value(adj_price, multiplier, lot_size, budget)
     else:
         size_lots = max(lot_size, int(size_lots))
 
-    # 3) Modes (best effort)
     _ensure_position_mode(DEFAULT_POSITION_MODE)
     _ensure_margin_mode(symbol, DEFAULT_MARGIN_MODE)
 
-    # 4) Envoi ordre LIMIT
     ts = int(time.time() * 1000)
     client_oid = str(uuid.uuid4())
     body = {
         "clientOid": client_oid,
         "symbol": symbol,
-        "side": side.lower(),          # "buy" (long) ou "sell" (short)
+        "side": side.lower(),
         "type": "limit",
         "price": f"{adj_price:.8f}",
-        "size": str(int(size_lots)),   # taille en LOTS (entier, multiple de lotSize)
+        "size": str(int(size_lots)),
         "leverage": str(int(LEVERAGE)),
         "timeInForce": "GTC",
         "postOnly": bool(post_only),
     }
 
     resp = _auth_post(ORDERS_EP, body)
-
     if _needs_retry(resp.status_code):
         raise TransientHTTPError(f"KuCoin transient {resp.status_code}: {resp.text}")
 
@@ -190,3 +170,82 @@ def place_limit_order(symbol: str, side: str, price: float,
         "price": adj_price,
         "size_lots": size_lots,
     }
+
+# ----------------------------------------------------------------------
+# === PATCH : Helpers BE / Positions / Reduce-only orders ===
+# ----------------------------------------------------------------------
+import uuid
+
+def get_open_position(symbol: str) -> Dict[str, Any]:
+    """
+    Retourne les infos de position futures KuCoin pour un symbol (ou {} si rien).
+    Champs utiles: currentQty, entryPrice, markPrice, liquidationPrice.
+    """
+    try:
+        r = _auth_get("/api/v1/position", params={"symbol": symbol})
+        if r.status_code != 200:
+            return {}
+        d = r.json().get("data") or {}
+        return d
+    except Exception:
+        return {}
+
+def place_reduce_only_stop(symbol: str, side: str, new_stop: float, size_lots: int,
+                           stop_price_type: str = "MP") -> Dict[str, Any]:
+    """
+    Place un stop-loss reduce-only au prix 'new_stop'.
+    - side: sens d'entrée (buy/sell) -> le stop sera du côté opposé.
+    """
+    try:
+        stop_side = "sell" if side.lower() == "buy" else "buy"
+        body = {
+            "clientOid": str(uuid.uuid4()),
+            "symbol": symbol,
+            "side": stop_side,
+            "type": "market",
+            "reduceOnly": True,
+            "stop": "loss",
+            "stopPriceType": stop_price_type,
+            "stopPrice": f"{float(new_stop):.8f}",
+            "size": str(int(size_lots)),
+        }
+        ts = int(time.time() * 1000)
+        sig, pph = _sign(ts, "POST", "/api/v1/orders", body)
+        resp = requests.post(BASE + "/api/v1/orders", headers=_headers(ts, sig, pph), json=body, timeout=12)
+        try:
+            data = resp.json()
+        except Exception:
+            data = {"raw": resp.text}
+        return {"ok": resp.status_code == 200, "status": resp.status_code, "data": data}
+    except Exception as e:
+        LOGGER.exception("place_reduce_only_stop error: %s", e)
+        return {"ok": False, "error": str(e)}
+
+def place_reduce_only_tp_limit(symbol: str, side: str, take_profit: float, size_lots: int) -> Dict[str, Any]:
+    """
+    Place un take-profit reduce-only 'limit' à 'take_profit'.
+    """
+    try:
+        tp_side = "sell" if side.lower() == "buy" else "buy"
+        body = {
+            "clientOid": str(uuid.uuid4()),
+            "symbol": symbol,
+            "side": tp_side,
+            "type": "limit",
+            "reduceOnly": True,
+            "price": f"{float(take_profit):.8f}",
+            "size": str(int(size_lots)),
+            "timeInForce": "GTC",
+            "postOnly": True
+        }
+        ts = int(time.time() * 1000)
+        sig, pph = _sign(ts, "POST", "/api/v1/orders", body)
+        resp = requests.post(BASE + "/api/v1/orders", headers=_headers(ts, sig, pph), json=body, timeout=12)
+        try:
+            data = resp.json()
+        except Exception:
+            data = {"raw": resp.text}
+        return {"ok": resp.status_code == 200, "status": resp.status_code, "data": data}
+    except Exception as e:
+        LOGGER.exception("place_reduce_only_tp_limit error: %s", e)
+        return {"ok": False, "error": str(e)}
