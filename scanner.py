@@ -4,6 +4,8 @@ scanner.py — orchestration avec exits APRES fill + stops robustes + sizing par
 - Taille: par risque ($) puis cap par marge (MARGIN_USDT & LEVERAGE).
 - Entrée: LIMIT sécurisée (tick) + retry si 300011.
 - Exits: posés APRES fill, purge des anciens reduce-only.
+- TP1/TP2 (nouveau): 1.5R / 2.5R avec alignement structurel (swing).
+- Break-Even (nouveau): déplacement automatique du SL à l'entrée lorsque TP1 est atteint.
 """
 from __future__ import annotations
 import time, logging, numpy as np, pandas as pd
@@ -78,6 +80,28 @@ def _cap_by_margin(entry: float, lot_mult: float, lot_step: int, size_lots: int)
     max_lots_margin -= (max_lots_margin % max(1, lot_step))
     return max(lot_step, min(size_lots, max_lots_margin))
 
+# ----------- TP engine : 1.5R / 2.5R + alignement swing (institutionnel) -----------
+def _swing_levels(df: pd.DataFrame, lookback: int = 20) -> tuple[float, float]:
+    swing_high = float(df["high"].rolling(lookback).max().iloc[-2])
+    swing_low  = float(df["low"].rolling(lookback).min().iloc[-2])
+    return swing_high, swing_low
+
+def _compute_tp_levels(df: pd.DataFrame, entry: float, sl: float, bias: str,
+                       rr1: float = 1.5, rr2: float = 2.5,
+                       tick: float = 0.01, lookback: int = 20) -> tuple[float, float]:
+    swing_high, swing_low = _swing_levels(df, lookback)
+    if bias == "LONG":
+        risk = max(1e-8, entry - sl)
+        tp1 = entry + rr1 * risk
+        tp2_rr = entry + rr2 * risk
+        tp2 = swing_high if (swing_high > entry and swing_high < tp2_rr) else tp2_rr
+    else:
+        risk = max(1e-8, sl - entry)
+        tp1 = entry - rr1 * risk
+        tp2_rr = entry - rr2 * risk
+        tp2 = swing_low if (swing_low < entry and swing_low > tp2_rr) else tp2_rr
+    return _round_to_tick(tp1, tick), _round_to_tick(tp2, tick)
+
 # ------------------------------- Core fallbacks -------------------------------
 def _build_core(df, sym):
     entry = float(df["close"].iloc[-1])
@@ -131,14 +155,12 @@ def scan_and_send_signals():
 
             if bias == "LONG":
                 sl_raw = protective_stop_long(df, entry, tick)
-                dist = max(1e-8, entry - sl_raw)
-                tp_raw = entry + RR_TARGET * dist
             else:
                 sl_raw = protective_stop_short(df, entry, tick)
-                dist = max(1e-8, sl_raw - entry)
-                tp_raw = entry - RR_TARGET * dist
 
-            ok_rr, entry, sl, tp, rr = _validate_rr_and_fix(bias, entry, sl_raw, tp_raw, tick)
+            tp1_raw, tp2_raw = _compute_tp_levels(df, entry, sl_raw, bias, rr1=1.5, rr2=2.5, tick=tick, lookback=20)
+
+            ok_rr, entry, sl, tp2, rr = _validate_rr_and_fix(bias, entry, sl_raw, tp2_raw, tick)
             if not ok_rr:
                 LOGGER.info("[%d/%d] Skip %s -> RR invalide (entry/SL/TP incohérents)", idx, len(pairs), sym)
                 continue
@@ -153,7 +175,15 @@ def scan_and_send_signals():
             notional = entry * lot_mult * size_lots
 
             # Evaluation (garde tes règles)
-            signal.update({"entry": entry, "sl": sl, "tp2": tp, "size_lots": size_lots, "bias": bias, "rr_estimated": rr})
+            signal.update({
+                "entry": entry,
+                "sl": sl,
+                "tp1": tp1_raw,   # pour monitoring BE
+                "tp2": tp2,       # utilisé pour l’exit réel
+                "size_lots": size_lots,
+                "bias": bias,
+                "rr_estimated": rr
+            })
             res = evaluate_signal(signal)
             if not res.get("valid"):
                 LOGGER.info("[%d/%d] Skip %s -> %s", idx, len(pairs), sym, ", ".join(res.get("reasons") or []))
@@ -167,8 +197,8 @@ def scan_and_send_signals():
             msg = _fmt(sym, res, extra)
 
             if DRY_RUN:
-                LOGGER.info("[%d/%d] DRY-RUN %s lots=%s entry=%.6f sl=%.6f tp=%.6f rr=%.2f",
-                            idx, len(pairs), sym, size_lots, entry, sl, tp, rr)
+                LOGGER.info("[%d/%d] DRY-RUN %s lots=%s entry=%.6f sl=%.6f tp1=%.6f tp2=%.6f rr=%.2f",
+                            idx, len(pairs), sym, size_lots, entry, sl, tp1_raw, tp2, rr)
                 register_order(sym, notional)
             else:
                 side = "buy" if bias == "LONG" else "sell"
@@ -179,15 +209,13 @@ def scan_and_send_signals():
                     body = (order.get("body") or {})
                     code = str((body or {}).get("code"))
                     if code == "300011":
-                        # price out of range -> ajuste le prix et retente UNE fois
                         adj = 0.995 if side == "buy" else 1.005
                         entry_retry = _round_to_tick(entry * adj, tick)
                         LOGGER.warning("Retry %s price adjust for code 300011: %.8f -> %.8f", sym, entry, entry_retry)
                         order = place_limit_order(sym, side, entry_retry, size_lots, post_only=False)
-                        entry = entry_retry  # garde trace du prix d'entrée visé
+                        entry = entry_retry
                     elif code == "300003":
                         LOGGER.error("Balance insuffisante pour %s (marge requise). Skip.", sym)
-                        # pas d'exits, on passe au suivant
                         time.sleep(0.2)
                         continue
 
@@ -206,16 +234,28 @@ def scan_and_send_signals():
                 # 3) purge des anciens exits reduce-only
                 purge_reduce_only(sym)
 
-                # 4) pose des exits maintenant que la position existe
-                sl_resp, tp_resp = attach_exits_after_fill(sym, side, df, entry, sl, tp, size_lots)
+                # 4) pose des exits maintenant que la position existe (SL initial + TP2)
+                sl_resp, tp_resp = attach_exits_after_fill(sym, side, df, entry, sl, tp2, size_lots)
                 LOGGER.info("Exits %s -> SL %s | TP %s", sym, sl_resp, tp_resp)
 
-                # 5) Telegram (succès)
+                # 5) Lancer le moniteur Break-Even (déplacement SL à BE à TP1)
+                try:
+                    from breakeven_manager import monitor_breakeven
+                    import threading
+                    threading.Thread(
+                        target=monitor_breakeven,
+                        args=(sym, side, entry, signal["tp1"], tp2, size_lots),
+                        daemon=True
+                    ).start()
+                except Exception as e:
+                    LOGGER.warning("BE monitor failed for %s: %s", sym, e)
+
+                # 6) Telegram (succès)
                 try:
                     from telegram_client import send_telegram_message
                     send_telegram_message(
                         "✅ " + msg +
-                        f"\nSide: {side.upper()} | Lots: {size_lots} | Entry {entry:.6f} | SL {sl:.6f} | TP {tp:.6f} | RR {rr:.2f}"
+                        f"\nSide: {side.upper()} | Lots: {size_lots} | Entry {entry:.6f} | SL {sl:.6f} | TP1 {signal['tp1']:.6f} | TP2 {tp2:.6f} | RR {rr:.2f}"
                     )
                 except Exception:
                     pass
