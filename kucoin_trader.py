@@ -174,13 +174,7 @@ def place_limit_order(symbol: str, side: str, price: float,
 # ----------------------------------------------------------------------
 # === PATCH : Helpers BE / Positions / Reduce-only orders ===
 # ----------------------------------------------------------------------
-import uuid
-
 def get_open_position(symbol: str) -> Dict[str, Any]:
-    """
-    Retourne les infos de position futures KuCoin pour un symbol (ou {} si rien).
-    Champs utiles: currentQty, entryPrice, markPrice, liquidationPrice.
-    """
     try:
         r = _auth_get("/api/v1/position", params={"symbol": symbol})
         if r.status_code != 200:
@@ -192,10 +186,6 @@ def get_open_position(symbol: str) -> Dict[str, Any]:
 
 def place_reduce_only_stop(symbol: str, side: str, new_stop: float, size_lots: int,
                            stop_price_type: str = "MP") -> Dict[str, Any]:
-    """
-    Place un stop-loss reduce-only au prix 'new_stop'.
-    - side: sens d'entrée (buy/sell) -> le stop sera du côté opposé.
-    """
     try:
         stop_side = "sell" if side.lower() == "buy" else "buy"
         body = {
@@ -222,9 +212,6 @@ def place_reduce_only_stop(symbol: str, side: str, new_stop: float, size_lots: i
         return {"ok": False, "error": str(e)}
 
 def place_reduce_only_tp_limit(symbol: str, side: str, take_profit: float, size_lots: int) -> Dict[str, Any]:
-    """
-    Place un take-profit reduce-only 'limit' à 'take_profit'.
-    """
     try:
         tp_side = "sell" if side.lower() == "buy" else "buy"
         body = {
@@ -249,3 +236,20 @@ def place_reduce_only_tp_limit(symbol: str, side: str, take_profit: float, size_
     except Exception as e:
         LOGGER.exception("place_reduce_only_tp_limit error: %s", e)
         return {"ok": False, "error": str(e)}
+
+def list_open_orders(symbol: str):
+    """
+    Retourne la liste des ordres ouverts (KuCoin Futures) pour un symbole.
+    Utilisé pour vérifier que TP/SL ont bien été créés.
+    """
+    try:
+        r = _auth_get("/api/v1/openOrders", params={"symbol": symbol})
+        if r.status_code != 200:
+            LOGGER.warning("openOrders %s -> %s %s", symbol, r.status_code, r.text)
+            return []
+        data = r.json().get("data") or {}
+        items = data.get("items") or data.get("orderList") or []
+        return items
+    except Exception as e:
+        LOGGER.exception("list_open_orders error for %s: %s", symbol, e)
+        return []
