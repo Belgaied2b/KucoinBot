@@ -45,3 +45,14 @@ MAX_SYMBOL_EXPOSURE = float(os.getenv("MAX_SYMBOL_EXPOSURE", "0.25"))   # 25% eq
 CORR_GROUP_CAP = float(os.getenv("CORR_GROUP_CAP", "0.5"))               # 50% equity par groupe corrélé
 CORR_BTC_THRESHOLD = float(os.getenv("CORR_BTC_THRESHOLD", "0.7"))       # corrélation forte à BTC
 DOM_TREND_STRONG = float(os.getenv("DOM_TREND_STRONG", "0.002"))         # dominance BTC très forte (≈0.2%/h)
+
+# --- Risk par trade (nouveau) ---
+RISK_USDT = float(os.getenv("RISK_USDT", "20"))          # perte max si SL touche
+RR_TARGET = float(os.getenv("RR_TARGET", "1.6"))         # RR pour TP par défaut
+
+# --- Stops robustes ---
+ATR_LEN = int(os.getenv("ATR_LEN", "14"))
+ATR_MULT_SL = float(os.getenv("ATR_MULT_SL", "2.2"))     # SL = max(swing, entry - ATR*mult)
+STRUCT_LOOKBACK = int(os.getenv("STRUCT_LOOKBACK", "20"))# swing lookback pour low/high
+SL_BUFFER_PCT = float(os.getenv("SL_BUFFER_PCT", "0.0015"))  # 0.15% de buffer
+SL_BUFFER_TICKS = int(os.getenv("SL_BUFFER_TICKS", "2"))     # buffer ticks en plus
