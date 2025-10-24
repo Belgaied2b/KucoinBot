@@ -122,6 +122,19 @@ def _release_file_lock(key: str):
     except Exception:
         pass
 
+# --- Coalescing de logs "skip" pour éviter les doublons visuels ---
+_SKIP_LOG_GUARD: Dict[str, float] = {}
+_SKIP_LOG_TTL = 10.0  # secondes
+
+def _log_skip_once(key: str, msg: str):
+    now = time.time()
+    last = _SKIP_LOG_GUARD.get(key, 0.0)
+    if (now - last) >= _SKIP_LOG_TTL:
+        LOGGER.info(msg)
+        _SKIP_LOG_GUARD[key] = now
+    else:
+        LOGGER.debug(msg)
+
 # =====================================================================
 # 🔎 Aides ordres ouverts
 # =====================================================================
@@ -215,14 +228,13 @@ def monitor_breakeven(
         return
 
     # --- Obtenir une clé robuste AVANT tout (pour lock inter-processus) ---
-    # On récupère positionId (si dispo) pour la clé ; l'entrée arrondie viendra plus bas.
     _, pos_id_for_key, _ = _get_pos_snapshot(symbol)
     key_for_lock = _make_monitor_key(symbol, entry, pos_id_for_key)
 
     # --- File-lock à l'entrée (bloque les doubles, même si appel direct) ---
     lock_held = _try_acquire_file_lock(key_for_lock, _MONITOR_TTL)
     if not lock_held:
-        LOGGER.info("[BE] file-lock present -> skip monitor start (key=%s)", key_for_lock)
+        _log_skip_once(key_for_lock, f"[BE] file-lock present -> skip monitor start (key={key_for_lock})")
         return
 
     try:
@@ -244,9 +256,9 @@ def monitor_breakeven(
                     tick = tick2
             except Exception:
                 pass
-            if tick <= 0 or tick > max(0.01 * ref, 0.01):
-                LOGGER.warning("[BE] %s tick aberrant (%.6f) — aborting this monitor to avoid duplicates.", symbol, tick)
-                return  # on n'exécute pas ce monitor “mauvais” — l'autre (avec bon tick) reste actif
+        if tick <= 0 or tick > max(0.01 * ref, 0.01):
+            LOGGER.warning("[BE] %s tick aberrant (%.6f) — aborting this monitor to avoid duplicates.", symbol, tick)
+            return  # on n'exécute pas ce monitor “mauvais” — l'autre (avec bon tick) reste actif
 
         entry_r = _round_to_tick(float(entry), tick)
         tp1_r   = _round_to_tick(float(tp1), tick)
@@ -429,21 +441,21 @@ def launch_breakeven_thread(
 
     # Verrou inter-processus (évite doubles monitors cross-workers)
     if not _try_acquire_file_lock(key, _MONITOR_TTL):
-        LOGGER.info("[BE] file-lock present -> skip launch (key=%s)", key)
+        _log_skip_once(key, f"[BE] file-lock present -> skip launch (key={key})")
         return
 
     with _ACTIVE_LOCK:
         # déjà actif ?
         th = _ACTIVE_MONITORS.get(key)
         if th and th.is_alive():
-            LOGGER.info("[BE] monitor déjà actif pour %s -> skip (key=%s)", symbol, key)
+            _log_skip_once(key, f"[BE] monitor déjà actif -> skip (key={key})")
             _release_file_lock(key)
             return
 
         # TTL contre relance immédiate
         last_ts = _ACTIVE_LAST_TS.get(key, 0.0)
         if (time.time() - last_ts) < _MONITOR_TTL:
-            LOGGER.info("[BE] monitor récemment terminé pour %s -> skip (key=%s, TTL)", symbol, key)
+            _log_skip_once(key, f"[BE] monitor récemment terminé -> skip (key={key}, TTL)")
             _release_file_lock(key)
             return
 
