@@ -192,53 +192,67 @@ def get_open_position(symbol: str) -> Dict[str, Any]:
 
 def list_open_orders(symbol: str) -> List[Dict[str, Any]]:
     """
-    Retourne les ordres actifs Futures pour `symbol`.
-    Stratégie:
-      1) /api/v1/orders?status=open&symbol=...
-      2) Fallback: /api/v1/openOrders (peut 404 selon région/compte)
+    Retourne les ordres ouverts pour `symbol`.
+    1) /api/v1/orders?status=open&symbol=...
+    2) Fallback /api/v1/openOrders (peut 404 selon région/compte)
     """
-    items_all: List[Dict[str, Any]] = []
+    out: List[Dict[str, Any]] = []
 
-    # --- 1) Route principale: /orders?status=open ---
+    # Route principale + pagination
     try:
         page = 1
-        for _ in range(3):  # limite de sécurité pagination
+        for _ in range(3):
             params = {"status": "open", "symbol": symbol, "pageSize": 50, "currentPage": page}
             r = _auth_get(LIST_ORDERS_EP, params=params)
             if r.status_code != 200:
                 LOGGER.warning("orders(open) %s -> %s %s", symbol, r.status_code, r.text)
                 break
-
             data = r.json().get("data") or {}
             items = data.get("items") or data.get("orderList") or []
             if isinstance(items, list):
-                items_all.extend(items)
-
-            # pagination: s'il n'y a pas d'items ou qu'on est à la dernière page, on sort
+                out.extend(items)
             total_page = int(data.get("totalPage", 1) or 1)
             if page >= total_page or not items:
                 break
             page += 1
-
-        if items_all:
-            return items_all
+        if out:
+            return out
     except Exception as e:
         LOGGER.warning("orders(open) error %s: %s", symbol, e)
 
-    # --- 2) Fallback: /openOrders (certains comptes renvoient 404) ---
+    # Fallback openOrders
     try:
         r2 = _auth_get(GET_OPEN_ORDERS_EP, params={"symbol": symbol})
         if r2.status_code == 200:
             d2 = r2.json().get("data") or {}
             items2 = d2.get("items") or d2.get("orderList") or []
             return items2 if isinstance(items2, list) else []
-        else:
-            LOGGER.warning("openOrders %s -> %s %s", symbol, r2.status_code, r2.text)
+        LOGGER.warning("openOrders %s -> %s %s", symbol, r2.status_code, r2.text)
     except Exception as e:
         LOGGER.warning("openOrders error %s: %s", symbol, e)
 
     return []
+    
+# --- kucoin_trader.py : add this helper ---
+def get_mark_price(symbol: str) -> float:
+    """
+    Mark price via endpoint public Futures.
+    Fallback sur mid du carnet si nécessaire.
+    """
+    url = f"{BASE}/api/v1/mark-price/{symbol}/current"
+    r = requests.get(url, timeout=3)
+    r.raise_for_status()
+    data = r.json().get("data") or {}
+    v = data.get("value")
+    if v is not None:
+        return float(v)
 
+    # Fallback: carnet depth20
+    ob = requests.get(f"{BASE}/api/v1/level2/depth20", params={"symbol": symbol}, timeout=3).json().get("data") or {}
+    bids, asks = ob.get("bids") or [], ob.get("asks") or []
+    if bids and asks:
+        return (float(bids[0][0]) + float(asks[0][0])) / 2.0
+    raise RuntimeError("markPrice unavailable")
 
 # ----------------------------------------------------------------------
 # === Reduce-only SL / TP (robustes) ===
@@ -274,30 +288,38 @@ def place_reduce_only_stop(symbol: str, side: str, new_stop: float, size_lots: i
     if r1.status_code == 200 and str(data1.get("code")) == "200000":
         return {"ok": True, "status": 200, "data": data1}
 
-    # essai #2 : stop-limit
-    body2 = {
-        "clientOid": str(uuid.uuid4()),
-        "symbol": symbol,
-        "side": stop_side,
-        "type": "limit",
-        "reduceOnly": True,
-        "stop": stop_flag,
-        "stopPriceType": stop_price_type,
-        "stopPrice": f"{float(new_stop):.8f}",
-        "price": f"{float(new_stop):.8f}",
-        "size": str(int(size_lots)),
-        "timeInForce": "GTC",
-        "postOnly": False
-    }
-    r2 = _auth_post(ORDERS_EP, body2)
-    data2 = _safe_json(r2)
-    return {"ok": (r2.status_code == 200 and str(data2.get("code")) == "200000"),
-            "status": r2.status_code, "data": data2}
+# essai #2 : stop-limit (aligné au tickSize)
+meta = get_contract_info(symbol)
+tick = float(meta.get("tickSize", 0.01))
+p = _round_price(float(new_stop), tick)
+
+body2 = {
+    "clientOid": str(uuid.uuid4()),
+    "symbol": symbol,
+    "side": stop_side,
+    "type": "limit",
+    "reduceOnly": True,
+    "stop": stop_flag,                 # "down" si long, "up" si short
+    "stopPriceType": stop_price_type,  # ex: "MP"
+    "stopPrice": f"{p:.8f}",
+    "price": f"{p:.8f}",
+    "size": str(int(size_lots)),
+    "timeInForce": "GTC",
+    "postOnly": False
+}
+r2 = _auth_post(ORDERS_EP, body2)
+data2 = _safe_json(r2)
+return {
+    "ok": (r2.status_code == 200 and str(data2.get("code")) == "200000"),
+    "status": r2.status_code,
+    "data": data2
+}
 
 def place_reduce_only_tp_limit(symbol: str, side: str, take_profit: float, size_lots: int) -> Dict[str, Any]:
-    """
-    TP simple: limit reduce-only (sans 'stop' pour éviter les rejets).
-    """
+    meta = get_contract_info(symbol)
+    tick = float(meta.get("tickSize", 0.01))
+    price = _round_price(float(take_profit), tick)
+
     tp_side = "sell" if side.lower() == "buy" else "buy"
     body = {
         "clientOid": str(uuid.uuid4()),
@@ -305,7 +327,7 @@ def place_reduce_only_tp_limit(symbol: str, side: str, take_profit: float, size_
         "side": tp_side,
         "type": "limit",
         "reduceOnly": True,
-        "price": f"{float(take_profit):.8f}",
+        "price": f"{price:.8f}",
         "size": str(int(size_lots)),
         "timeInForce": "GTC",
         "postOnly": True
