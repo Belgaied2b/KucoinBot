@@ -146,7 +146,7 @@ def attach_exits_after_fill(
             entry=float(entry),
             tp1=float(tp1_r),
             tp2=float(tp2_r) if tp2_r is not None else None,
-            price_tick=float(tick),
+            price_tick=None,                 # ⚠️ Laisser le monitor lire le tick du contrat (évite les incohérences)
             notifier=notifier,
         )
         LOGGER.info("[EXITS] BE monitor launched for %s", symbol)
