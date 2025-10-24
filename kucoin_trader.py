@@ -191,30 +191,53 @@ def get_open_position(symbol: str) -> Dict[str, Any]:
         return {}
 
 def list_open_orders(symbol: str) -> List[Dict[str, Any]]:
-    """Essaye /openOrders, puis fallback /orders?status=active&symbol=..."""
-    # tentative 1
+    """
+    Retourne les ordres actifs Futures pour `symbol`.
+    Stratégie:
+      1) /api/v1/orders?status=open&symbol=...
+      2) Fallback: /api/v1/openOrders (peut 404 selon région/compte)
+    """
+    items_all: List[Dict[str, Any]] = []
+
+    # --- 1) Route principale: /orders?status=open ---
     try:
-        r1 = _auth_get(GET_OPEN_ORDERS_EP, params={"symbol": symbol})
-        if r1.status_code == 200:
-            d = r1.json().get("data") or {}
-            items = d.get("items") or d.get("orderList") or []
-            return items if isinstance(items, list) else []
+        page = 1
+        for _ in range(3):  # limite de sécurité pagination
+            params = {"status": "open", "symbol": symbol, "pageSize": 50, "currentPage": page}
+            r = _auth_get(LIST_ORDERS_EP, params=params)
+            if r.status_code != 200:
+                LOGGER.warning("orders(open) %s -> %s %s", symbol, r.status_code, r.text)
+                break
+
+            data = r.json().get("data") or {}
+            items = data.get("items") or data.get("orderList") or []
+            if isinstance(items, list):
+                items_all.extend(items)
+
+            # pagination: s'il n'y a pas d'items ou qu'on est à la dernière page, on sort
+            total_page = int(data.get("totalPage", 1) or 1)
+            if page >= total_page or not items:
+                break
+            page += 1
+
+        if items_all:
+            return items_all
+    except Exception as e:
+        LOGGER.warning("orders(open) error %s: %s", symbol, e)
+
+    # --- 2) Fallback: /openOrders (certains comptes renvoient 404) ---
+    try:
+        r2 = _auth_get(GET_OPEN_ORDERS_EP, params={"symbol": symbol})
+        if r2.status_code == 200:
+            d2 = r2.json().get("data") or {}
+            items2 = d2.get("items") or d2.get("orderList") or []
+            return items2 if isinstance(items2, list) else []
         else:
-            LOGGER.warning("openOrders %s -> %s %s", symbol, r1.status_code, r1.text)
+            LOGGER.warning("openOrders %s -> %s %s", symbol, r2.status_code, r2.text)
     except Exception as e:
         LOGGER.warning("openOrders error %s: %s", symbol, e)
-    # fallback
-    try:
-        r2 = _auth_get(LIST_ORDERS_EP, params={"status": "active", "symbol": symbol})
-        if r2.status_code != 200:
-            LOGGER.warning("orders(active) %s -> %s %s", symbol, r2.status_code, r2.text)
-            return []
-        d = r2.json().get("data") or {}
-        items = d.get("items") or d.get("orderList") or []
-        return items if isinstance(items, list) else []
-    except Exception as e:
-        LOGGER.warning("orders(active) error %s: %s", symbol, e)
-        return []
+
+    return []
 
 
 # ----------------------------------------------------------------------
