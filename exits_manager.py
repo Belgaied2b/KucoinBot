@@ -1,7 +1,8 @@
 """
 exits_manager.py — SL + TP1/TP2 reduce-only institutionnels, avec vérification, retry et lancement du BE monitor.
+Compatibilité : attach_exits_after_fill(symbol, side, df, entry, sl, tp, size_lots, tp2=None, ...)
 - SL : posé sur 100% de la taille
-- TP1 : posé sur ~50% (ou 1 lot si impossible)
+- TP1 : posé sur ~50% (ou 1 lot si impossible) au prix 'tp'
 - TP2 : (optionnel) posé maintenant sur le reste, ou laissé au BE monitor
 """
 from __future__ import annotations
@@ -85,15 +86,15 @@ def purge_reduce_only(symbol: str) -> None:
 def attach_exits_after_fill(
     symbol: str,
     side: str,
-    df,                    # <-- conservé pour compatibilité (ignoré)
+    df,                    # <-- conservé pour compat (ignoré)
     entry: float,
     sl: float,
-    tp1: float,            # prix TP1
-    tp2: Optional[float],  # prix TP2 (optionnel)
+    tp: float,             # <-- prix TP1 (compat historique)
     size_lots: int,
+    tp2: Optional[float] = None,             # <-- prix TP2 (optionnel, après size_lots pour compat)
     *,
-    place_tp2_now: bool = False,              # True = poser TP2 maintenant ; False = laisser le monitor le poser
-    price_tick: Optional[float] = None,       # override tick si besoin
+    place_tp2_now: bool = False,             # True = poser TP2 maintenant ; False = laisser le monitor le poser
+    price_tick: Optional[float] = None,      # override tick si besoin
     notifier: Optional[Callable[[str], None]] = None,  # callback (ex: Telegram)
 ) -> Tuple[dict, dict]:
     """
@@ -104,7 +105,7 @@ def attach_exits_after_fill(
     tick = float(price_tick) if price_tick else float(meta.get("tickSize", 0.01))
 
     sl_r  = _round_to_tick(float(sl),  tick)
-    tp1_r = _round_to_tick(float(tp1), tick)
+    tp1_r = _round_to_tick(float(tp),  tick)   # 'tp' = TP1 historique
     tp2_r = _round_to_tick(float(tp2), tick) if tp2 is not None else None
 
     lots_full = int(size_lots)
@@ -120,7 +121,10 @@ def attach_exits_after_fill(
     sl_resp = place_reduce_only_stop(symbol, side, new_stop=sl_r, size_lots=lots_full)
 
     # 2) TP1 sur ~50% (ou 1 lot si impossible)
-    tp1_resp = place_reduce_only_tp_limit(symbol, side, take_profit=tp1_r, size_lots=tp1_lots) if tp1_lots > 0 else {"ok": False, "skipped": True, "reason": "no_tp1_lots"}
+    if tp1_lots > 0:
+        tp1_resp = place_reduce_only_tp_limit(symbol, side, take_profit=tp1_r, size_lots=tp1_lots)
+    else:
+        tp1_resp = {"ok": False, "skipped": True, "reason": "no_tp1_lots"}
 
     # 3) TP2 maintenant ? (ou laisser le monitor le poser à TP1)
     if place_tp2_now and (tp2_r is not None) and tp2_lots > 0:
@@ -134,7 +138,7 @@ def attach_exits_after_fill(
         sl_resp=sl_resp, tp_resp=tp1_resp
     )
 
-    # 5) Lancer le monitor BE (déplacement SL->BE quand TP1 est rempli, et pose TP2 si on ne l'a pas posé ici)
+    # 5) Lancer le monitor BE (déplacement SL->BE quand TP1 est rempli, et pose TP2 si non posé)
     try:
         launch_breakeven_thread(
             symbol=symbol,
