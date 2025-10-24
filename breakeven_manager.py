@@ -5,6 +5,7 @@ import threading
 import os
 import requests
 import errno
+import inspect
 from typing import Optional, Callable, Dict, Tuple
 
 from kucoin_utils import get_contract_info
@@ -323,6 +324,19 @@ def monitor_breakeven(
 # =====================================================================
 # 🚀 Lancement thread (anti-doublon + notifier par défaut via Telegram)
 # =====================================================================
+# Garde: par défaut, on n'autorise que exits_manager.py à lancer le BE
+BE_ONLY_FROM_EXITS = os.getenv("BE_ONLY_FROM_EXITS", "1")  # "0" pour désactiver
+
+def _caller_hint() -> str:
+    try:
+        st = inspect.stack()
+        if len(st) >= 3:
+            f = st[2]
+            return f"{f.filename}:{f.lineno} in {f.function}"
+    except Exception:
+        pass
+    return "unknown"
+
 def launch_breakeven_thread(
     symbol: str,
     side: str,
@@ -337,8 +351,14 @@ def launch_breakeven_thread(
     - Un seul monitor par **position** (positionId si dispo, sinon symbol+entry).
     - Anti-spam via TTL 30s (si un monitor vient de se terminer, on évite de relancer immédiatement).
     - Verrou inter-processus (file-lock) pour empêcher les doubles monitors cross-workers.
-    - Si notifier n'est pas fourni mais TG_TOKEN/TG_CHAT_ID sont définis, on utilise telegram_notifier.
+    - Garde optionnelle : seul exits_manager.py peut lancer (BE_ONLY_FROM_EXITS="1" par défaut).
     """
+    caller = _caller_hint()
+    LOGGER.info("[BE] launch_breakeven_thread called by %s", caller)
+    if BE_ONLY_FROM_EXITS == "1" and "exits_manager.py" not in caller.replace("\\", "/"):
+        LOGGER.warning("[BE] launch blocked: not called from exits_manager (%s)", caller)
+        return
+
     if notifier is None and TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
         notifier = telegram_notifier
 
