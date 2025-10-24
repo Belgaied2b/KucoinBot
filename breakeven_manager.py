@@ -1,5 +1,5 @@
 # breakeven_manager.py
-import time, logging, threading
+import time, logging, threading, os, requests
 from typing import Optional, Callable
 
 from kucoin_utils import get_contract_info
@@ -8,11 +8,35 @@ from kucoin_trader import (
     get_open_position,
     get_mark_price,                      # fallback markPrice public (pour logs/info)
     place_reduce_only_tp_limit,          # pour poser TP2 si absent
-    list_open_orders,                    # pour détecter TP2 existant
+    list_open_orders,                    # pour détecter TP2 existant / debug
 )
 
 LOGGER = logging.getLogger(__name__)
 
+# =====================================================================
+# 🔔 Alerte Telegram (optionnelle, utilisée via notifier)
+# =====================================================================
+TELEGRAM_TOKEN = os.getenv("TG_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TG_CHAT_ID")
+
+def telegram_notifier(msg: str):
+    """Envoie un message Telegram (si les variables TG_TOKEN et TG_CHAT_ID sont définies)."""
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        LOGGER.warning("[TG] Token ou Chat ID manquant, message ignoré.")
+        return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            data={"chat_id": TELEGRAM_CHAT_ID, "text": msg},
+            timeout=5
+        )
+        LOGGER.info("[TG] Message envoyé: %s", msg)
+    except Exception as e:
+        LOGGER.warning("[TG] Erreur envoi Telegram: %s", e)
+
+# =====================================================================
+# 🔍 Helper interne pour notifier + logs
+# =====================================================================
 def _notify_wrap(notifier: Optional[Callable[[str], None]], msg: str):
     if notifier:
         try:
@@ -21,6 +45,9 @@ def _notify_wrap(notifier: Optional[Callable[[str], None]], msg: str):
             pass
     LOGGER.info(msg)
 
+# =====================================================================
+# 🔎 Vérifie la présence d’un TP LIMIT reduce-only à un prix proche
+# =====================================================================
 def _has_open_tp_at_price(symbol: str, side: str, price: float, tick: float) -> bool:
     """Vérifie s'il existe déjà un TP LIMIT reduce-only à ~ce prix (±0.5 tick)."""
     try:
@@ -47,10 +74,12 @@ def _has_open_tp_at_price(symbol: str, side: str, price: float, tick: float) -> 
         return False
     return False
 
-
+# =====================================================================
+# 🧠 Fonction principale : monitoring du BE / TP2
+# =====================================================================
 def monitor_breakeven(
     symbol: str,
-    side: str,                               # 2e arg
+    side: str,
     entry: float,
     tp1: float,
     tp2: Optional[float] = None,             # ← prix TP2 (optionnel)
@@ -60,7 +89,7 @@ def monitor_breakeven(
     """
     Surveille la position :
       - Cas >=2 lots : détecte TP1 par réduction de taille (~50% exécutés), déplace SL -> BE et s'assure de TP2.
-      - Cas 1 lot    : pas de split possible → on déplace SL -> BE quand le prix atteint TP1. (Pas de TP2 ici)
+      - Cas 1 lot    : pas de split possible → déplace SL -> BE quand le prix atteint TP1. (Pas de TP2 ici)
     IMPORTANT : on ne ferme rien au marché ici (les TP sont des LIMIT reduce-only).
     """
     # --- Normalisation côté ---
@@ -76,7 +105,7 @@ def monitor_breakeven(
         LOGGER.warning("[BE] %s -> side invalide '%s', fallback 'buy'", symbol, side)
         side = "buy"
 
-    # --- Tick / tolérance (utile pour logs et détection TP2) ---
+    # --- Tick / tolérance ---
     tick_from_arg = float(price_tick) if (price_tick is not None) else 0.0
     try:
         meta = get_contract_info(symbol) or {}
@@ -95,12 +124,12 @@ def monitor_breakeven(
     cap = gap * 0.25
     tol = min(raw_tol, cap) if cap > 0 else raw_tol
 
-    _notify_wrap(notifier, f"[BE] Monitoring {symbol} | side {side} | entry {entry:.10f} | TP1 {tp1:.10f} | TP2 {tp2 if tp2 is not None else '-'} | tick {tick:.10f} | tol {tol:.10f}")
+    _notify_wrap(notifier, f"[BE] Monitoring {symbol} | side {side} | entry {entry:.10f} | TP1 {tp1:.10f} | TP2 {tp2 if tp2 else '-'} | tick {tick:.10f} | tol {tol:.10f}")
 
-    # --- Boucle : suit la TAILLE de la position pour détecter TP1 rempli (si possible) ---
+    # --- Boucle principale ---
     initial_lots: Optional[int] = None
-    target_lots_after_tp1: Optional[int] = None   # taille attendue après ~50% d'exécution
-    seen_reduction = False                        # on n'agit qu'après avoir vu une baisse réelle
+    target_lots_after_tp1: Optional[int] = None
+    seen_reduction = False
 
     while True:
         try:
@@ -110,7 +139,6 @@ def monitor_breakeven(
             if initial_lots is None:
                 initial_lots = max(0, cur_lots)
                 if initial_lots >= 2:
-                    # Après TP1 (≈50%), il doit rester ceil(init/2)
                     target_lots_after_tp1 = (initial_lots + 1) // 2  # ceil
                     _notify_wrap(notifier, f"[BE] {symbol} initLots={initial_lots} → targetAfterTP1={target_lots_after_tp1}")
                 else:
@@ -120,14 +148,10 @@ def monitor_breakeven(
                 LOGGER.info("[BE] %s -> position fermée ou inexistante", symbol)
                 break
 
-            # -------------- CAS 1 LOT : fallback sur PRIX --------------
+            # -------------- CAS 1 LOT --------------
             if initial_lots == 1:
-                # progression obligatoire
-                # (pas de BE si le prix n'a pas au moins rejoint l'entrée)
                 try:
-                    mark = pos.get("markPrice")
-                    if mark is None:
-                        mark = get_mark_price(symbol)
+                    mark = pos.get("markPrice") or get_mark_price(symbol)
                     mark_price = float(mark)
                 except Exception:
                     time.sleep(1.2)
@@ -140,7 +164,6 @@ def monitor_breakeven(
                     tp_hit = progress_ok and (mark_price <= (tp1 + tol))
 
                 if tp_hit:
-                    # Déplacer SL -> BE pour la taille entière (1 lot)
                     try:
                         modify_stop_order(
                             symbol=symbol, side=side,
@@ -152,31 +175,26 @@ def monitor_breakeven(
                     except Exception as e:
                         LOGGER.exception("[BE] %s modify_stop_order (1-lot) a échoué: %s", symbol, e)
                     break
-
                 time.sleep(1.2)
                 continue
-            # -----------------------------------------------------------
 
-            # -------------- CAS >= 2 LOTS : détection par réduction --------------
-            # On attend d'abord d'observer une BAISSE réelle de la taille
+            # -------------- CAS >= 2 LOTS --------------
             if not seen_reduction:
                 if cur_lots < initial_lots:
                     seen_reduction = True
                 else:
-                    # Pas encore de réduction, on ne fait rien
                     time.sleep(1.2)
                     continue
 
-            # Maintenant on peut comparer à la cible "après TP1"
-            if target_lots_after_tp1 is not None and cur_lots <= target_lots_after_tp1:
+            if target_lots_after_tp1 and cur_lots <= target_lots_after_tp1:
                 _notify_wrap(notifier, f"[BE] {symbol} -> TP1 détecté par réduction: lots {initial_lots} ➜ {cur_lots}")
 
-                # 1) Déplacer le SL → BE pour la taille restante
+                # 1️⃣ Déplace SL → BE
                 try:
                     modify_stop_order(
                         symbol=symbol,
                         side=side,
-                        existing_order_id=None,      # annule/recrée côté trader si besoin
+                        existing_order_id=None,
                         new_stop=float(entry),
                         size_lots=cur_lots,
                     )
@@ -184,8 +202,8 @@ def monitor_breakeven(
                 except Exception as e:
                     LOGGER.exception("[BE] %s modify_stop_order a échoué: %s", symbol, e)
 
-                # 2) S'assurer que TP2 est présent (si demandé)
-                if tp2 is not None and cur_lots > 0:
+                # 2️⃣ Pose TP2 si manquant
+                if tp2 and cur_lots > 0:
                     try:
                         if not _has_open_tp_at_price(symbol, side, float(tp2), tick):
                             r = place_reduce_only_tp_limit(symbol, side, take_profit=float(tp2), size_lots=cur_lots)
@@ -198,33 +216,53 @@ def monitor_breakeven(
                     except Exception as e:
                         LOGGER.exception("[BE] %s place_reduce_only_tp_limit a échoué: %s", symbol, e)
 
-                break  # monitor terminé après action BE
-
+                break
             time.sleep(1.2)
-            # ----------------------------------------------------------------------
         except Exception as e:
             LOGGER.exception("[BE] erreur sur %s: %s", symbol, e)
             time.sleep(2.0)
 
-
+# =====================================================================
+# 🚀 Lancement thread
+# =====================================================================
 def launch_breakeven_thread(
     symbol: str,
-    side: str,                              # 2e arg ici aussi
+    side: str,
     entry: float,
     tp1: float,
     tp2: Optional[float] = None,
     price_tick: Optional[float] = None,
     notifier: Optional[Callable[[str], None]] = None,
 ):
-    """
-    Lance un thread indépendant pour surveiller le TP1 :
-    - n'utilise PAS de market close (c'est le TP LIMIT reduce-only qui fait la sortie partielle)
-    - >=2 lots : déplace SL -> BE quand ~50% exécutés + (re)pose TP2 si absent
-    - 1 lot : déplace SL -> BE quand le PRIX atteint TP1 (pas de TP2)
-    """
+    """Lance un thread indépendant pour surveiller le TP1."""
     threading.Thread(
         target=monitor_breakeven,
         args=(symbol, side, entry, tp1, tp2, price_tick, notifier),
         daemon=True,
         name=f"BE_{symbol}",
     ).start()
+
+# =====================================================================
+# 🧾 Debug des ordres ouverts
+# =====================================================================
+def debug_open_orders(symbol: str):
+    """Affiche les ordres ouverts (évite le faux 404 du /openOrders direct)."""
+    try:
+        time.sleep(0.25)
+        items = list_open_orders(symbol)
+        LOGGER.info("[DBG] %s open orders: %d", symbol, len(items))
+        for o in items[:6]:
+            LOGGER.info(
+                "  - id=%s side=%s type=%s price=%s stopPrice=%s size=%s reduceOnly=%s postOnly=%s status=%s",
+                o.get("id") or o.get("orderId"),
+                o.get("side"),
+                o.get("type") or o.get("orderType"),
+                o.get("price"),
+                o.get("stopPrice"),
+                o.get("size"),
+                o.get("reduceOnly"),
+                o.get("postOnly"),
+                o.get("status"),
+            )
+    except Exception as e:
+        LOGGER.warning("[DBG] list_open_orders failed for %s: %s", symbol, e)
