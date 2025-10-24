@@ -1,12 +1,12 @@
 """
 exits_manager.py — SL + TP1/TP2 reduce-only institutionnels, avec vérification, retry et lancement du BE monitor.
 - SL : posé sur 100% de la taille
-- TP1 : posé sur ~50% au prix tp1
+- TP1 : posé sur ~50% (ou 1 lot si impossible)
 - TP2 : (optionnel) posé maintenant sur le reste, ou laissé au BE monitor
 """
 from __future__ import annotations
 import logging, time
-from typing import Tuple, Optional, Callable, Dict, Any
+from typing import Tuple, Optional, Callable
 
 from kucoin_utils import get_contract_info
 from kucoin_trader import (
@@ -49,7 +49,7 @@ def _retry_if_needed(symbol: str, side: str,
         sl_resp = place_reduce_only_stop(symbol, side, new_stop=sl, size_lots=int(sl_lots))
 
     if not tp_resp.get("ok") and tp_lots > 0:
-        LOGGER.warning("Retry TP for %s at %.12f (lots=%d)", symbol, tp_price, tp_lots)
+        LOGGER.warning("Retry TP1 for %s at %.12f (lots=%d)", symbol, tp_price, tp_lots)
         tp_resp = place_reduce_only_tp_limit(symbol, side, take_profit=tp_price, size_lots=int(tp_lots))
 
     # vérification légère
@@ -85,19 +85,20 @@ def purge_reduce_only(symbol: str) -> None:
 def attach_exits_after_fill(
     symbol: str,
     side: str,
+    df,                    # <-- conservé pour compatibilité (ignoré)
     entry: float,
     sl: float,
-    tp1: float,                 # <-- prix TP1
-    tp2: Optional[float],       # <-- prix TP2 (optionnel)
+    tp1: float,            # prix TP1
+    tp2: Optional[float],  # prix TP2 (optionnel)
     size_lots: int,
     *,
     place_tp2_now: bool = False,              # True = poser TP2 maintenant ; False = laisser le monitor le poser
     price_tick: Optional[float] = None,       # override tick si besoin
     notifier: Optional[Callable[[str], None]] = None,  # callback (ex: Telegram)
-) -> Dict[str, Any]:
+) -> Tuple[dict, dict]:
     """
     Pose SL + TP1 (+ éventuellement TP2) et lance le monitor BE (qui déplacera SL->BE quand TP1 est rempli).
-    Retourne un dict {"sl":..., "tp1":..., "tp2":...}
+    Retourne (sl_resp, tp1_resp) pour compatibilité avec l’appelant.
     """
     meta = get_contract_info(symbol)
     tick = float(price_tick) if price_tick else float(meta.get("tickSize", 0.01))
@@ -123,9 +124,7 @@ def attach_exits_after_fill(
 
     # 3) TP2 maintenant ? (ou laisser le monitor le poser à TP1)
     if place_tp2_now and (tp2_r is not None) and tp2_lots > 0:
-        tp2_resp = place_reduce_only_tp_limit(symbol, side, take_profit=tp2_r, size_lots=tp2_lots)
-    else:
-        tp2_resp = {"ok": False, "skipped": True, "reason": "deferred_to_BE_monitor" if tp2_r else "no_tp2_price_or_lots"}
+        _ = place_reduce_only_tp_limit(symbol, side, take_profit=tp2_r, size_lots=tp2_lots)
 
     # 4) retry + contrôle basique pour TP1 uniquement (TP2 est optionnel ici)
     sl_resp, tp1_resp = _retry_if_needed(
@@ -150,4 +149,5 @@ def attach_exits_after_fill(
     except Exception as e:
         LOGGER.exception("[EXITS] Failed to launch BE monitor for %s: %s", symbol, e)
 
-    return {"sl": sl_resp, "tp1": tp1_resp, "tp2": tp2_resp}
+    # ⬅️ Compat: on retourne exactement 2 valeurs (SL, TP1)
+    return sl_resp, tp1_resp
