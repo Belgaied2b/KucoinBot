@@ -4,7 +4,6 @@ import logging
 import threading
 import os
 import requests
-import errno
 from typing import Optional, Callable, Dict, Tuple
 
 from kucoin_utils import get_contract_info
@@ -53,6 +52,7 @@ def _approx_price_equal(a: float, b: float, tick: float, tol_ticks: float = 0.5)
     """Compare deux prix avec une tolérance (par défaut ±0.5 tick)."""
     if tick and tick > 0:
         return abs(float(a) - float(b)) <= (float(tick) * float(tol_ticks))
+    # sans tick, tolérance très faible
     return abs(float(a) - float(b)) <= max(abs(a), abs(b), 1.0) * 1e-9
 
 def _make_monitor_key(symbol: str, entry: float, pos_id: Optional[str]) -> str:
@@ -70,48 +70,12 @@ def _notify_wrap(notifier: Optional[Callable[[str], None]], msg: str):
     LOGGER.info(msg)
 
 # =====================================================================
-# 🧵 Registry (anti-doublon monitor par position) + TTL + File-lock inter-processus
+# 🧵 Registry (anti-doublon monitor par position) + TTL
 # =====================================================================
 _ACTIVE_MONITORS: Dict[str, threading.Thread] = {}
 _ACTIVE_LAST_TS: Dict[str, float] = {}
 _ACTIVE_LOCK = threading.Lock()
 _MONITOR_TTL = 30.0  # secondes
-
-_LOCK_DIR = "/tmp/kucoin_be_locks"
-os.makedirs(_LOCK_DIR, exist_ok=True)
-
-def _lock_path(key: str) -> str:
-    safe_key = key.replace("/", "_").replace(" ", "_")
-    return os.path.join(_LOCK_DIR, f"{safe_key}.lock")
-
-def _try_acquire_file_lock(key: str, ttl: float) -> bool:
-    """
-    Crée un lockfile par key. Si le lock existe et est récent (< ttl), on refuse.
-    Sinon on (ré)écrit le lockfile avec l'heure courante.
-    """
-    path = _lock_path(key)
-    now = time.time()
-    try:
-        if os.path.exists(path):
-            try:
-                mtime = os.path.getmtime(path)
-                if (now - mtime) < max(1.0, ttl):
-                    return False
-            except Exception:
-                pass
-        with open(path, "w") as f:
-            f.write(str(now))
-        return True
-    except OSError as e:
-        if e.errno not in (errno.EACCES, errno.EPERM):
-            LOGGER.debug("[BE] lock create error for %s: %s", key, e)
-        return False
-
-def _release_file_lock(key: str):
-    try:
-        os.remove(_lock_path(key))
-    except Exception:
-        pass
 
 # =====================================================================
 # 🔎 Aides ordres ouverts
@@ -148,6 +112,7 @@ def _get_pos_snapshot(symbol: str) -> Tuple[int, Optional[str], float]:
         pos = get_open_position(symbol) or {}
         lots = int(float(pos.get("currentQty", 0) or 0))
         pos_id = None
+        # champs possibles: "positionId", "id" ou autres selon wrapper
         for k in ("positionId", "id", "positionID"):
             if k in pos and pos.get(k):
                 pos_id = str(pos.get(k))
@@ -186,15 +151,6 @@ def monitor_breakeven(
     except Exception:
         tick_meta = 0.0
     tick = float(price_tick) if (price_tick and price_tick > 0) else tick_meta
-    # Corrige un tick aberrant (ex: 1.0 passé par erreur)
-    if tick <= 0 or tick > max(0.01 * abs(entry or 1.0), 0.01):
-        try:
-            meta = get_contract_info(symbol) or {}
-            tick_meta = float(meta.get("tickSize", 0.0) or 0.0)
-            if tick_meta > 0:
-                tick = tick_meta
-        except Exception:
-            pass
     entry_r = _round_to_tick(float(entry), tick)
     tp1_r   = _round_to_tick(float(tp1), tick)
     tp2_r   = _round_to_tick(float(tp2), tick) if tp2 is not None else None
@@ -220,6 +176,7 @@ def monitor_breakeven(
     initial_lots: Optional[int] = None
     target_lots_after_tp1: Optional[int] = None
     moved_to_be = False  # idempotence
+    started_ts = time.time()
 
     try:
         while True:
@@ -234,6 +191,7 @@ def monitor_breakeven(
             if initial_lots is None:
                 initial_lots = lots
                 if initial_lots >= 2:
+                    # target -> ceil(initial / 2)
                     target_lots_after_tp1 = (initial_lots + 1) // 2
                     _notify_wrap(notifier, f"[BE] {symbol} initLots={initial_lots} → targetAfterTP1={target_lots_after_tp1}")
                 else:
@@ -304,14 +262,13 @@ def monitor_breakeven(
                 continue
 
     finally:
-        # Nettoyage du registry si ce thread est celui enregistré + release file-lock
+        # Nettoyage du registry si ce thread est celui enregistré
         with _ACTIVE_LOCK:
             th = _ACTIVE_MONITORS.get(key)
             if th is threading.current_thread():
                 _ACTIVE_MONITORS.pop(key, None)
                 _ACTIVE_LAST_TS[key] = time.time()
                 LOGGER.debug("[BE] monitor %s libéré", key)
-        _release_file_lock(key)
 
 # =====================================================================
 # 🚀 Lancement thread (anti-doublon + notifier par défaut via Telegram)
@@ -329,7 +286,6 @@ def launch_breakeven_thread(
     Lance un thread indépendant pour surveiller le TP1.
     - Un seul monitor par **position** (positionId si dispo, sinon symbol+entry).
     - Anti-spam via TTL 30s (si un monitor vient de se terminer, on évite de relancer immédiatement).
-    - Verrou inter-processus (file-lock) pour empêcher les doubles monitors cross-workers.
     - Si notifier n'est pas fourni mais TG_TOKEN/TG_CHAT_ID sont définis, on utilise telegram_notifier.
     """
     if notifier is None and TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
@@ -355,24 +311,17 @@ def launch_breakeven_thread(
 
     key = _make_monitor_key(symbol, entry_r, pos_id)
 
-    # Verrou inter-processus (évite doubles monitors cross-workers)
-    if not _try_acquire_file_lock(key, _MONITOR_TTL):
-        LOGGER.info("[BE] file-lock present -> skip launch (key=%s)", key)
-        return
-
     with _ACTIVE_LOCK:
         # déjà actif ?
         th = _ACTIVE_MONITORS.get(key)
         if th and th.is_alive():
             LOGGER.info("[BE] monitor déjà actif pour %s -> skip (key=%s)", symbol, key)
-            _release_file_lock(key)
             return
 
         # TTL contre relance immédiate
         last_ts = _ACTIVE_LAST_TS.get(key, 0.0)
         if (time.time() - last_ts) < _MONITOR_TTL:
             LOGGER.info("[BE] monitor récemment terminé pour %s -> skip (key=%s, TTL)", symbol, key)
-            _release_file_lock(key)
             return
 
         t = threading.Thread(
