@@ -108,6 +108,14 @@ def _try_acquire_file_lock(key: str, ttl: float) -> bool:
             LOGGER.debug("[BE] lock create error for %s: %s", key, e)
         return False
 
+def _refresh_file_lock_ts(key: str):
+    """Met à jour le mtime du lock (keep-alive)."""
+    try:
+        with open(_lock_path(key), "w") as f:
+            f.write(str(time.time()))
+    except Exception:
+        pass
+
 def _release_file_lock(key: str):
     try:
         os.remove(_lock_path(key))
@@ -163,6 +171,27 @@ def _get_pos_snapshot(symbol: str) -> Tuple[int, Optional[str], float]:
         return 0, None, 0.0
 
 # =====================================================================
+# ⚠️ Garde d’appelant (optionnelle)
+# =====================================================================
+BE_ONLY_FROM_EXITS = os.getenv("BE_ONLY_FROM_EXITS", "1")  # "0" pour désactiver
+
+def _caller_hint() -> str:
+    try:
+        st = inspect.stack()
+        if len(st) >= 3:
+            f = st[2]
+            return f"{f.filename}:{f.lineno} in {f.function}"
+    except Exception:
+        pass
+    return "unknown"
+
+def _caller_allowed() -> bool:
+    if BE_ONLY_FROM_EXITS != "1":
+        return True
+    c = _caller_hint().replace("\\", "/")
+    return ("exits_manager.py" in c) or ("breakeven_manager.py" in c)
+
+# =====================================================================
 # 🧠 Fonction principale : monitoring du BE / TP2
 # =====================================================================
 def monitor_breakeven(
@@ -180,57 +209,74 @@ def monitor_breakeven(
       - Cas 1 lot    : pas de split → déplace SL -> BE quand le prix atteint TP1. (Pas de TP2 ici)
     IMPORTANT : pas de close market ici (TP = LIMIT reduce-only).
     """
-    # -- Tick --
-    try:
-        meta = get_contract_info(symbol) or {}
-        tick_meta = float(meta.get("tickSize", 0.0) or 0.0)
-    except Exception:
-        tick_meta = 0.0
-    tick = float(price_tick) if (price_tick and price_tick > 0) else tick_meta
+    # --- Garde d'appelant (bloque les appels directs non autorisés) ---
+    if not _caller_allowed():
+        LOGGER.warning("[BE] monitor launch blocked: not called from exits_manager (%s)", _caller_hint())
+        return
 
-    # Corrige un tick aberrant (ex: 1.0 passé par erreur) : si tick > 1% d'un prix de référence, on recharge depuis le contrat,
-    # et si toujours aberrant on ABANDONNE ce monitor (pour éviter le double monitor “pollué”).
-    ref = max(abs(entry), abs(tp1), abs(tp2 or 0.0), 1.0)
-    if tick <= 0 or tick > max(0.01 * ref, 0.01):
+    # --- Obtenir une clé robuste AVANT tout (pour lock inter-processus) ---
+    # On récupère positionId (si dispo) pour la clé ; l'entrée arrondie viendra plus bas.
+    _, pos_id_for_key, _ = _get_pos_snapshot(symbol)
+    key_for_lock = _make_monitor_key(symbol, entry, pos_id_for_key)
+
+    # --- File-lock à l'entrée (bloque les doubles, même si appel direct) ---
+    lock_held = _try_acquire_file_lock(key_for_lock, _MONITOR_TTL)
+    if not lock_held:
+        LOGGER.info("[BE] file-lock present -> skip monitor start (key=%s)", key_for_lock)
+        return
+
+    try:
+        # -- Tick --
         try:
-            meta2 = get_contract_info(symbol) or {}
-            tick2 = float(meta2.get("tickSize", 0.0) or 0.0)
-            if tick2 > 0:
-                tick = tick2
+            meta = get_contract_info(symbol) or {}
+            tick_meta = float(meta.get("tickSize", 0.0) or 0.0)
         except Exception:
-            pass
+            tick_meta = 0.0
+        tick = float(price_tick) if (price_tick and price_tick > 0) else tick_meta
+
+        # Corrige un tick aberrant
+        ref = max(abs(entry), abs(tp1), abs(tp2 or 0.0), 1.0)
         if tick <= 0 or tick > max(0.01 * ref, 0.01):
-            LOGGER.warning("[BE] %s tick aberrant (%.6f) — aborting this monitor to avoid duplicates.", symbol, tick)
-            return  # on n'exécute pas ce monitor “mauvais” — l'autre (avec bon tick) reste actif
+            try:
+                meta2 = get_contract_info(symbol) or {}
+                tick2 = float(meta2.get("tickSize", 0.0) or 0.0)
+                if tick2 > 0:
+                    tick = tick2
+            except Exception:
+                pass
+            if tick <= 0 or tick > max(0.01 * ref, 0.01):
+                LOGGER.warning("[BE] %s tick aberrant (%.6f) — aborting this monitor to avoid duplicates.", symbol, tick)
+                return  # on n'exécute pas ce monitor “mauvais” — l'autre (avec bon tick) reste actif
 
-    entry_r = _round_to_tick(float(entry), tick)
-    tp1_r   = _round_to_tick(float(tp1), tick)
-    tp2_r   = _round_to_tick(float(tp2), tick) if tp2 is not None else None
+        entry_r = _round_to_tick(float(entry), tick)
+        tp1_r   = _round_to_tick(float(tp1), tick)
+        tp2_r   = _round_to_tick(float(tp2), tick) if tp2 is not None else None
 
-    # -- Side normalisé --
-    side = (str(side) if side is not None else "").lower()
-    if side not in ("buy", "sell"):
-        try:
-            pos_side = ((get_open_position(symbol) or {}).get("side") or "").lower()
-            if pos_side in ("buy", "sell"):
-                side = pos_side
-        except Exception:
-            pass
-    if side not in ("buy", "sell"):
-        LOGGER.warning("[BE] %s -> side invalide '%s', fallback 'buy'", symbol, side)
-        side = "buy"
+        # -- Side normalisé --
+        side = (str(side) if side is not None else "").lower()
+        if side not in ("buy", "sell"):
+            try:
+                pos_side = ((get_open_position(symbol) or {}).get("side") or "").lower()
+                if pos_side in ("buy", "sell"):
+                    side = pos_side
+            except Exception:
+                pass
+        if side not in ("buy", "sell"):
+            LOGGER.warning("[BE] %s -> side invalide '%s', fallback 'buy'", symbol, side)
+            side = "buy"
 
-    # -- Clé monitor (par position) & enregistrement anti-doublon --
-    cur_lots, pos_id, _ = _get_pos_snapshot(symbol)
-    key = _make_monitor_key(symbol, entry_r, pos_id)
+        # -- Clé finale pour logs / registry --
+        cur_lots, pos_id, _ = _get_pos_snapshot(symbol)
+        key = _make_monitor_key(symbol, entry_r, pos_id)
 
-    _notify_wrap(notifier, f"[BE] Monitoring {symbol} | key={key} | side {side} | entry {entry_r:.10f} | TP1 {tp1_r:.10f} | TP2 {tp2_r if tp2_r is not None else '-'} | tick {tick:.10f}")
-    initial_lots: Optional[int] = None
-    target_lots_after_tp1: Optional[int] = None
-    moved_to_be = False  # idempotence
+        _notify_wrap(notifier, f"[BE] Monitoring {symbol} | key={key} | side {side} | entry {entry_r:.10f} | TP1 {tp1_r:.10f} | TP2 {tp2_r if tp2_r is not None else '-'} | tick {tick:.10f}")
+        initial_lots: Optional[int] = None
+        target_lots_after_tp1: Optional[int] = None
+        moved_to_be = False  # idempotence
 
-    try:
+        # Boucle principale
         while True:
+            _refresh_file_lock_ts(key_for_lock)  # keep-alive du lock
             lots, pos_id_now, mark_price = _get_pos_snapshot(symbol)
 
             # si position fermée → fin
@@ -312,31 +358,25 @@ def monitor_breakeven(
                 continue
 
     finally:
-        # Nettoyage du registry si ce thread est celui enregistré + release file-lock
+        # Nettoyage registry (si thread enregistré) + release lock si acquis ici
         with _ACTIVE_LOCK:
-            th = _ACTIVE_MONITORS.get(key)
+            # key basé sur entry arrondi si dispo, sinon celui du lock
+            try:
+                cur_lots, pos_id, _ = _get_pos_snapshot(symbol)
+                tick_meta = (get_contract_info(symbol) or {}).get("tickSize", 0.0) or 0.0
+                key_final = _make_monitor_key(symbol, _round_to_tick(float(entry), float(tick_meta)), pos_id)
+            except Exception:
+                key_final = key_for_lock
+            th = _ACTIVE_MONITORS.get(key_final)
             if th is threading.current_thread():
-                _ACTIVE_MONITORS.pop(key, None)
-                _ACTIVE_LAST_TS[key] = time.time()
-                LOGGER.debug("[BE] monitor %s libéré", key)
-        _release_file_lock(key)
+                _ACTIVE_MONITORS.pop(key_final, None)
+                _ACTIVE_LAST_TS[key_final] = time.time()
+                LOGGER.debug("[BE] monitor %s libéré", key_final)
+        _release_file_lock(key_for_lock)
 
 # =====================================================================
 # 🚀 Lancement thread (anti-doublon + notifier par défaut via Telegram)
 # =====================================================================
-# Garde: par défaut, on n'autorise que exits_manager.py à lancer le BE
-BE_ONLY_FROM_EXITS = os.getenv("BE_ONLY_FROM_EXITS", "1")  # "0" pour désactiver
-
-def _caller_hint() -> str:
-    try:
-        st = inspect.stack()
-        if len(st) >= 3:
-            f = st[2]
-            return f"{f.filename}:{f.lineno} in {f.function}"
-    except Exception:
-        pass
-    return "unknown"
-
 def launch_breakeven_thread(
     symbol: str,
     side: str,
