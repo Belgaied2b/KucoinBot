@@ -186,8 +186,11 @@ def monitor_breakeven(
     except Exception:
         tick_meta = 0.0
     tick = float(price_tick) if (price_tick and price_tick > 0) else tick_meta
-    # Corrige un tick aberrant (ex: 1.0 passé par erreur)
-    if tick <= 0 or tick > max(0.01 * abs(entry or 1.0), 0.01):
+
+    # Corrige un tick aberrant (ex: 1.0 passé par erreur) : si tick > 1% d'un prix de référence, on recharge depuis le contrat,
+    # et si toujours aberrant on ABANDONNE ce monitor (pour éviter le double monitor “pollué”).
+    ref = max(abs(entry), abs(tp1), abs(tp2 or 0.0), 1.0)
+    if tick <= 0 or tick > max(0.01 * ref, 0.01):
         try:
             meta2 = get_contract_info(symbol) or {}
             tick2 = float(meta2.get("tickSize", 0.0) or 0.0)
@@ -195,6 +198,9 @@ def monitor_breakeven(
                 tick = tick2
         except Exception:
             pass
+        if tick <= 0 or tick > max(0.01 * ref, 0.01):
+            LOGGER.warning("[BE] %s tick aberrant (%.6f) — aborting this monitor to avoid duplicates.", symbol, tick)
+            return  # on n'exécute pas ce monitor “mauvais” — l'autre (avec bon tick) reste actif
 
     entry_r = _round_to_tick(float(entry), tick)
     tp1_r   = _round_to_tick(float(tp1), tick)
@@ -336,7 +342,7 @@ def launch_breakeven_thread(
     if notifier is None and TELEGRAM_TOKEN and TELEGRAM_CHAT_ID:
         notifier = telegram_notifier
 
-    # Construire la clé (on essaie de lire la position pour capter positionId)
+    # Clé (tente de lire positionId)
     try:
         pos = get_open_position(symbol) or {}
         pos_id = None
@@ -346,14 +352,19 @@ def launch_breakeven_thread(
                 break
     except Exception:
         pos_id = None
+
+    # Normalise/assainit le tick pour la clé (même logique que monitor)
     try:
         meta = get_contract_info(symbol) or {}
         tick_meta = float(meta.get("tickSize", 0.0) or 0.0)
     except Exception:
         tick_meta = 0.0
     tick = float(price_tick) if (price_tick and price_tick > 0) else tick_meta
-    entry_r = _round_to_tick(float(entry), tick)
+    ref = max(abs(entry), abs(tp1), abs(tp2 or 0.0), 1.0)
+    if tick <= 0 or tick > max(0.01 * ref, 0.01):
+        tick = tick_meta  # on ne fige pas ici un mauvais tick dans la clé
 
+    entry_r = _round_to_tick(float(entry), tick)
     key = _make_monitor_key(symbol, entry_r, pos_id)
 
     # Verrou inter-processus (évite doubles monitors cross-workers)
@@ -378,7 +389,7 @@ def launch_breakeven_thread(
 
         t = threading.Thread(
             target=monitor_breakeven,
-            args=(symbol, side, entry_r, tp1, tp2, price_tick, notifier),
+            args=(symbol, side, entry, tp1, tp2, price_tick, notifier),
             daemon=True,
             name=f"BE_{key}",
         )
