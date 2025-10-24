@@ -52,7 +52,7 @@ def _retry_if_needed(symbol: str, side: str,
                      sl_resp: dict, tp_resp: dict) -> Tuple[dict, dict]:
     """
     Si SL/TP non 'ok', on retente une fois. Ensuite on vérifie la présence
-    d'au moins un des ordres en 'open orders' et on log l'état.
+    d'au moins un des ordres via open orders, avec backoff tolérant (anti-404/latence d'indexation).
     """
     if not sl_resp.get("ok"):
         LOGGER.warning("Retry SL for %s at %.12f (lots=%d)", symbol, sl, sl_lots)
@@ -62,14 +62,23 @@ def _retry_if_needed(symbol: str, side: str,
         LOGGER.warning("Retry TP1 for %s at %.12f (lots=%d)", symbol, tp_price, tp_lots)
         tp_resp = place_reduce_only_tp_limit(symbol, side, take_profit=tp_price, size_lots=int(tp_lots))
 
-    # vérification légère
-    time.sleep(0.6)
+    # Backoff progressif pour laisser KuCoin indexer les ordres
+    attempts, oo = 0, []
+    while attempts < 3:
+        attempts += 1
+        time.sleep(0.6 * attempts)  # 0.6s, 1.2s, 1.8s
+        try:
+            oo = list_open_orders(symbol)
+            if isinstance(oo, list):
+                break
+        except Exception as e:
+            LOGGER.debug("list_open_orders try #%d failed for %s: %s", attempts, symbol, e)
+
     try:
-        oo = list_open_orders(symbol)
-        n_open = len(oo)
-        LOGGER.info("Open orders on %s after exits: %s", symbol, n_open)
+        n_open = len(oo) if isinstance(oo, list) else 0
+        LOGGER.info("Open orders on %s after exits: %s (after %d tries)", symbol, n_open, attempts)
         # Log de quelques ordres pour diagnostic
-        for o in oo[:8]:
+        for o in (oo[:8] if isinstance(oo, list) else []):
             LOGGER.info("  - id=%s side=%s type=%s price=%s stopPrice=%s size=%s reduceOnly=%s postOnly=%s status=%s",
                         o.get("id") or o.get("orderId"),
                         o.get("side"),
@@ -80,22 +89,26 @@ def _retry_if_needed(symbol: str, side: str,
                         o.get("reduceOnly"),
                         o.get("postOnly"),
                         o.get("status"))
-        # Détection explicite d'un TP1 reduce-only au bon prix
+        # Détection explicite d'un TP1 reduce-only LIMIT au bon prix (compare string normalisée)
         tp1_present = False
-        price_str = f"{tp_price:.12f}".rstrip("0").rstrip(".")
-        for o in oo:
-            if str(o.get("reduceOnly")).lower() == "true":
+        if tp_lots > 0 and isinstance(oo, list):
+            price_str = f"{tp_price:.12f}".rstrip("0").rstrip(".")
+            for o in oo:
+                if str(o.get("reduceOnly")).lower() != "true":
+                    continue
                 otype = (o.get("type") or o.get("orderType") or "").lower()
-                if "limit" in otype:
-                    # price peut être str; on compare en string normalisée pour éviter float issues
-                    if str(o.get("price")) == price_str:
-                        tp1_present = True
-                        break
+                if "limit" not in otype:
+                    continue
+                if str(o.get("price")) == price_str:
+                    tp1_present = True
+                    break
         if not tp1_present and tp_lots > 0:
-            LOGGER.warning("TP1 not visible in open orders for %s at %s — will rely on BE monitor to reassert if needed.",
-                           symbol, price_str)
+            LOGGER.warning(
+                "TP1 not visible yet in open orders for %s at %s — likely indexing delay; BE monitor will reassert if needed.",
+                symbol, f"{tp_price:.12f}".rstrip("0").rstrip(".")
+            )
     except Exception as e:
-        LOGGER.warning("list_open_orders failed for %s: %s", symbol, e)
+        LOGGER.warning("open-orders verification failed for %s: %s", symbol, e)
 
     return sl_resp, tp_resp
 
