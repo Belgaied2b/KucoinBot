@@ -29,8 +29,7 @@ GET_POSITION_MODE_EP = "/api/v2/position/getPositionMode"
 SWITCH_POSITION_MODE_EP = "/api/v2/position/switchPositionMode"
 SWITCH_MARGIN_MODE_EP = "/api/v2/position/changeMarginMode"
 GET_POSITION_EP = "/api/v1/position"
-GET_OPEN_ORDERS_EP = "/api/v1/openOrders"      # peut renvoyer 404 selon comptes/régions
-LIST_ORDERS_EP = "/api/v1/orders"              # utiliser ?status=open&symbol=...
+LIST_ORDERS_EP = "/api/v1/orders"  # utiliser ?status=open&symbol=...
 
 DEFAULT_POSITION_MODE = "0"       # "0"=one-way, "1"=hedge
 DEFAULT_MARGIN_MODE = "ISOLATED"  # ou "CROSS"
@@ -192,46 +191,50 @@ def get_open_position(symbol: str) -> Dict[str, Any]:
 
 def list_open_orders(symbol: str) -> List[Dict[str, Any]]:
     """
-    Retourne les ordres ouverts pour `symbol`.
-    1) /api/v1/orders?status=open&symbol=...
-    2) Fallback /api/v1/openOrders (peut 404 selon région/compte)
+    Retourne les ordres OUVERTS pour `symbol` via /api/v1/orders?status=open&symbol=...
+    - Pagination jusqu'à 5 pages
+    - Retry doux si statut non-200
+    - N'utilise PAS /openOrders (souvent 404 selon région/compte)
     """
     out: List[Dict[str, Any]] = []
-
-    # Route principale + pagination
-    try:
-        page = 1
-        for _ in range(5):  # jusqu'à 5 pages par sécurité
-            params = {"status": "open", "symbol": symbol, "pageSize": 50, "currentPage": page}
+    max_pages = 5
+    for page in range(1, max_pages + 1):
+        params = {"status": "open", "symbol": symbol, "pageSize": 50, "currentPage": page}
+        try:
             r = _auth_get(LIST_ORDERS_EP, params=params)
             if r.status_code != 200:
-                LOGGER.warning("orders(open) %s -> %s %s", symbol, r.status_code, r.text)
-                break
+                LOGGER.warning("orders(open) %s p#%d -> %s %s", symbol, page, r.status_code, r.text)
+                time.sleep(0.2 * page)  # petit backoff
+                continue
             data = r.json().get("data") or {}
             items = data.get("items") or data.get("orderList") or []
-            if isinstance(items, list):
-                out.extend(items)
-            total_page = int(data.get("totalPage", 1) or 1)
-            if page >= total_page or not items:
+            if not isinstance(items, list):
                 break
-            page += 1
-        if out:
-            return out
-    except Exception as e:
-        LOGGER.warning("orders(open) error %s: %s", symbol, e)
+            out.extend(items)
+            # si moins que la page complète, on peut s'arrêter
+            if len(items) < 50:
+                break
+        except Exception as e:
+            LOGGER.warning("orders(open) error %s p#%d: %s", symbol, page, e)
+            time.sleep(0.2 * page)
+            continue
+    return out
 
-    # Fallback openOrders
+def get_order(order_id: str) -> Dict[str, Any]:
+    """
+    Récupère un ordre par son orderId via /api/v1/orders/{orderId}.
+    Retourne {} si non trouvé/erreur.
+    """
     try:
-        r2 = _auth_get(GET_OPEN_ORDERS_EP, params={"symbol": symbol})
-        if r2.status_code == 200:
-            d2 = r2.json().get("data") or {}
-            items2 = d2.get("items") or d2.get("orderList") or []
-            return items2 if isinstance(items2, list) else []
-        LOGGER.warning("openOrders %s -> %s %s", symbol, r2.status_code, r2.text)
+        ep = f"/api/v1/orders/{order_id}"
+        r = _auth_get(ep)
+        if r.status_code != 200:
+            LOGGER.debug("get_order %s -> %s %s", order_id, r.status_code, r.text)
+            return {}
+        return r.json().get("data") or {}
     except Exception as e:
-        LOGGER.warning("openOrders error %s: %s", symbol, e)
-
-    return []
+        LOGGER.debug("get_order error %s: %s", order_id, e)
+        return {}
 
 # --- Public helper: mark price ---
 def get_mark_price(symbol: str) -> float:
