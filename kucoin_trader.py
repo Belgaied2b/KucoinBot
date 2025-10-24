@@ -30,7 +30,7 @@ SWITCH_POSITION_MODE_EP = "/api/v2/position/switchPositionMode"
 SWITCH_MARGIN_MODE_EP = "/api/v2/position/changeMarginMode"
 GET_POSITION_EP = "/api/v1/position"
 GET_OPEN_ORDERS_EP = "/api/v1/openOrders"      # peut renvoyer 404 selon comptes/régions
-LIST_ORDERS_EP = "/api/v1/orders"              # fallback: ?status=active&symbol=...
+LIST_ORDERS_EP = "/api/v1/orders"              # utiliser ?status=open&symbol=...
 
 DEFAULT_POSITION_MODE = "0"       # "0"=one-way, "1"=hedge
 DEFAULT_MARGIN_MODE = "ISOLATED"  # ou "CROSS"
@@ -201,7 +201,7 @@ def list_open_orders(symbol: str) -> List[Dict[str, Any]]:
     # Route principale + pagination
     try:
         page = 1
-        for _ in range(3):
+        for _ in range(5):  # jusqu'à 5 pages par sécurité
             params = {"status": "open", "symbol": symbol, "pageSize": 50, "currentPage": page}
             r = _auth_get(LIST_ORDERS_EP, params=params)
             if r.status_code != 200:
@@ -232,8 +232,8 @@ def list_open_orders(symbol: str) -> List[Dict[str, Any]]:
         LOGGER.warning("openOrders error %s: %s", symbol, e)
 
     return []
-    
-# --- kucoin_trader.py : add this helper ---
+
+# --- Public helper: mark price ---
 def get_mark_price(symbol: str) -> float:
     """
     Mark price via endpoint public Futures.
@@ -294,25 +294,25 @@ def place_reduce_only_stop(symbol: str, side: str, new_stop: float, size_lots: i
     p = _round_price(float(new_stop), tick)
 
     body2 = {
-    "clientOid": str(uuid.uuid4()),
-    "symbol": symbol,
-    "side": stop_side,
-    "type": "limit",
-    "reduceOnly": True,
-    "stop": stop_flag,                 # "down" si long, "up" si short
-    "stopPriceType": stop_price_type,  # ex: "MP"
-    "stopPrice": f"{p:.8f}",
-    "price": f"{p:.8f}",
-    "size": str(int(size_lots)),
-    "timeInForce": "GTC",
-    "postOnly": False
+        "clientOid": str(uuid.uuid4()),
+        "symbol": symbol,
+        "side": stop_side,
+        "type": "limit",
+        "reduceOnly": True,
+        "stop": stop_flag,                 # "down" si long, "up" si short
+        "stopPriceType": stop_price_type,  # ex: "MP"
+        "stopPrice": f"{p:.8f}",
+        "price": f"{p:.8f}",
+        "size": str(int(size_lots)),
+        "timeInForce": "GTC",
+        "postOnly": False
     }
     r2 = _auth_post(ORDERS_EP, body2)
     data2 = _safe_json(r2)
     return {
-    "ok": (r2.status_code == 200 and str(data2.get("code")) == "200000"),
-    "status": r2.status_code,
-    "data": data2
+        "ok": (r2.status_code == 200 and str(data2.get("code")) == "200000"),
+        "status": r2.status_code,
+        "data": data2
     }
 
 def place_reduce_only_tp_limit(symbol: str, side: str, take_profit: float, size_lots: int) -> Dict[str, Any]:
