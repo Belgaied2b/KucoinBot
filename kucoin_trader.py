@@ -1,17 +1,16 @@
 """
 kucoin_trader.py — LIMIT orders en lots + modes auto (compatible 4 arguments)
 - Calcule 'size' (lots) si size_lots n'est pas fourni, à partir de MARGIN_USDT * LEVERAGE et des specs contrat.
-- Aligne les modes avant l'ordre :
-    * PositionMode: One-Way (0) par défaut (modifiable)
-    * MarginMode (par symbole): ISOLATED par défaut (modifiable)
-- Arrondit le prix au tickSize du contrat.
-- Envoie clientOid (UUID v4).
+- Aligne positionMode/marginMode avant l'ordre.
+- Prix arrondi au tickSize.
+- clientOid (UUID v4).
 - ok=True UNIQUEMENT si data.code == "200000".
 """
 from __future__ import annotations
 import time, hmac, json, uuid, base64, hashlib, logging
 from typing import Dict, Any, Tuple, Optional, List
 import requests
+from urllib.parse import urlencode
 
 from settings import (
     KUCOIN_API_KEY, KUCOIN_API_SECRET, KUCOIN_API_PASSPHRASE,
@@ -30,16 +29,16 @@ GET_POSITION_MODE_EP = "/api/v2/position/getPositionMode"
 SWITCH_POSITION_MODE_EP = "/api/v2/position/switchPositionMode"
 SWITCH_MARGIN_MODE_EP = "/api/v2/position/changeMarginMode"
 GET_POSITION_EP = "/api/v1/position"
-GET_OPEN_ORDERS_EP = "/api/v1/openOrders"  # peut renvoyer 404 selon comptes/régions
-LIST_ORDERS_EP = "/api/v1/orders"          # fallback: ?status=active&symbol=...
+GET_OPEN_ORDERS_EP = "/api/v1/openOrders"      # peut renvoyer 404 selon comptes/régions
+LIST_ORDERS_EP = "/api/v1/orders"              # fallback: ?status=active&symbol=...
 
 DEFAULT_POSITION_MODE = "0"       # "0"=one-way, "1"=hedge
-DEFAULT_MARGIN_MODE = "ISOLATED"  # "CROSS" si tu préfères
-
+DEFAULT_MARGIN_MODE = "ISOLATED"  # ou "CROSS"
 
 # ---------- Auth helpers ----------
-def _sign(ts_ms: int, method: str, endpoint: str, body: dict | None) -> Tuple[bytes, bytes]:
-    payload = str(ts_ms) + method.upper() + endpoint + (json.dumps(body) if body else "")
+def _sign(ts_ms: int, method: str, path_to_sign: str, body: dict | None) -> Tuple[bytes, bytes]:
+    # IMPORTANT: pour GET, path_to_sign DOIT inclure la query string
+    payload = str(ts_ms) + method.upper() + path_to_sign + (json.dumps(body) if body else "")
     sig = base64.b64encode(hmac.new(KUCOIN_API_SECRET.encode(), payload.encode(), hashlib.sha256).digest())
     pph = base64.b64encode(hmac.new(KUCOIN_API_SECRET.encode(), KUCOIN_API_PASSPHRASE.encode(), hashlib.sha256).digest())
     return sig, pph
@@ -69,9 +68,13 @@ def _auth_post(endpoint: str, body: dict, timeout=12) -> requests.Response:
     headers = _headers(ts, sig, pph)
     return requests.post(BASE + endpoint, headers=headers, json=body, timeout=timeout)
 
-def _auth_get(endpoint: str, params=None, timeout=12) -> requests.Response:
+def _auth_get(endpoint: str, params: dict | None = None, timeout=12) -> requests.Response:
+    # Signature DOIT inclure la query string
+    qs = ""
+    if params:
+        qs = "?" + urlencode(params, doseq=True)
     ts = int(time.time() * 1000)
-    sig, pph = _sign(ts, "GET", endpoint, None)
+    sig, pph = _sign(ts, "GET", endpoint + qs, None)
     headers = _headers(ts, sig, pph)
     return requests.get(BASE + endpoint, headers=headers, params=params, timeout=timeout)
 
@@ -131,9 +134,9 @@ def place_limit_order(symbol: str, side: str, price: float,
         return {"ok": False, "error": "missing_api_credentials"}
 
     meta = get_contract_info(symbol)
-    lot_size = int(meta.get("lotSize", 1))
+    lot_size  = int(meta.get("lotSize", 1))
     multiplier = float(meta.get("multiplier", 1.0))
-    tick = float(meta.get("tickSize", 0.01))
+    tick      = float(meta.get("tickSize", 0.01))
     adj_price = _round_price(float(price), tick)
 
     if size_lots is None or int(size_lots) <= 0:
@@ -150,7 +153,7 @@ def place_limit_order(symbol: str, side: str, price: float,
     body = {
         "clientOid": client_oid,
         "symbol": symbol,
-        "side": side.lower(),
+        "side": side.lower(),          # buy / sell
         "type": "limit",
         "price": f"{adj_price:.8f}",
         "size": str(int(size_lots)),
@@ -188,11 +191,8 @@ def get_open_position(symbol: str) -> Dict[str, Any]:
         return {}
 
 def list_open_orders(symbol: str) -> List[Dict[str, Any]]:
-    """
-    Essaye d’abord /openOrders (peut renvoyer 404), sinon fallback sur /orders?status=active.
-    Retourne une liste homogène d’ordres ouverts.
-    """
-    # tentative 1 : /openOrders
+    """Essaye /openOrders, puis fallback /orders?status=active&symbol=..."""
+    # tentative 1
     try:
         r1 = _auth_get(GET_OPEN_ORDERS_EP, params={"symbol": symbol})
         if r1.status_code == 200:
@@ -203,8 +203,7 @@ def list_open_orders(symbol: str) -> List[Dict[str, Any]]:
             LOGGER.warning("openOrders %s -> %s %s", symbol, r1.status_code, r1.text)
     except Exception as e:
         LOGGER.warning("openOrders error %s: %s", symbol, e)
-
-    # fallback : /orders?status=active
+    # fallback
     try:
         r2 = _auth_get(LIST_ORDERS_EP, params={"status": "active", "symbol": symbol})
         if r2.status_code != 200:
@@ -221,14 +220,19 @@ def list_open_orders(symbol: str) -> List[Dict[str, Any]]:
 # ----------------------------------------------------------------------
 # === Reduce-only SL / TP (robustes) ===
 # ----------------------------------------------------------------------
+def _stop_flag_for_sl(entry_side: str) -> str:
+    # SL long déclenche vers le BAS -> "down", SL short vers le HAUT -> "up"
+    return "down" if entry_side.lower() == "buy" else "up"
+
 def place_reduce_only_stop(symbol: str, side: str, new_stop: float, size_lots: int,
                            stop_price_type: str = "MP") -> Dict[str, Any]:
     """
     Place un stop-loss reduce-only.
-    - 1er essai : stop-market.
-    - Si 'stopInvalid' / 400100 -> 2e essai en stop-limit (price = stopPrice, postOnly False).
+    - 1er essai : stop-market avec stop="down"/"up".
+    - Si stopInvalid -> 2e essai en stop-limit (price = stopPrice, postOnly False).
     """
     stop_side = "sell" if side.lower() == "buy" else "buy"
+    stop_flag = _stop_flag_for_sl(side)
 
     # essai #1 : stop-market
     body1 = {
@@ -237,27 +241,24 @@ def place_reduce_only_stop(symbol: str, side: str, new_stop: float, size_lots: i
         "side": stop_side,
         "type": "market",
         "reduceOnly": True,
-        "stop": "loss",
-        "stopPriceType": stop_price_type,   # MP = mark price (par défaut)
+        "stop": stop_flag,                  # <<< IMPORTANT: "down" / "up"
+        "stopPriceType": stop_price_type,   # MP = mark price
         "stopPrice": f"{float(new_stop):.8f}",
         "size": str(int(size_lots)),
     }
-    ts = int(time.time() * 1000)
-    sig, pph = _sign(ts, "POST", ORDERS_EP, body1)
-    r1 = requests.post(BASE + ORDERS_EP, headers=_headers(ts, sig, pph), json=body1, timeout=12)
+    r1 = _auth_post(ORDERS_EP, body1)
     data1 = _safe_json(r1)
-
     if r1.status_code == 200 and str(data1.get("code")) == "200000":
         return {"ok": True, "status": 200, "data": data1}
 
-    # si rejet -> essai #2 : stop-limit (souvent accepté quand stop-market est invalidé)
+    # essai #2 : stop-limit
     body2 = {
         "clientOid": str(uuid.uuid4()),
         "symbol": symbol,
         "side": stop_side,
         "type": "limit",
         "reduceOnly": True,
-        "stop": "loss",
+        "stop": stop_flag,
         "stopPriceType": stop_price_type,
         "stopPrice": f"{float(new_stop):.8f}",
         "price": f"{float(new_stop):.8f}",
@@ -265,15 +266,15 @@ def place_reduce_only_stop(symbol: str, side: str, new_stop: float, size_lots: i
         "timeInForce": "GTC",
         "postOnly": False
     }
-    ts2 = int(time.time() * 1000)
-    sig2, pph2 = _sign(ts2, "POST", ORDERS_EP, body2)
-    r2 = requests.post(BASE + ORDERS_EP, headers=_headers(ts2, sig2, pph2), json=body2, timeout=12)
+    r2 = _auth_post(ORDERS_EP, body2)
     data2 = _safe_json(r2)
-
     return {"ok": (r2.status_code == 200 and str(data2.get("code")) == "200000"),
             "status": r2.status_code, "data": data2}
 
 def place_reduce_only_tp_limit(symbol: str, side: str, take_profit: float, size_lots: int) -> Dict[str, Any]:
+    """
+    TP simple: limit reduce-only (sans 'stop' pour éviter les rejets).
+    """
     tp_side = "sell" if side.lower() == "buy" else "buy"
     body = {
         "clientOid": str(uuid.uuid4()),
@@ -286,27 +287,21 @@ def place_reduce_only_tp_limit(symbol: str, side: str, take_profit: float, size_
         "timeInForce": "GTC",
         "postOnly": True
     }
-    ts = int(time.time() * 1000)
-    sig, pph = _sign(ts, "POST", ORDERS_EP, body)
-    r = requests.post(BASE + ORDERS_EP, headers=_headers(ts, sig, pph), json=body, timeout=12)
+    r = _auth_post(ORDERS_EP, body)
     data = _safe_json(r)
-
-    # si refus (ex. postOnly traverse), on retente sans postOnly
     if not (r.status_code == 200 and str(data.get("code")) == "200000"):
+        # 2e essai sans postOnly (si traverse)
         body["clientOid"] = str(uuid.uuid4())
         body["postOnly"] = False
-        ts2 = int(time.time() * 1000)
-        sig2, pph2 = _sign(ts2, "POST", ORDERS_EP, body)
-        r2 = requests.post(BASE + ORDERS_EP, headers=_headers(ts2, sig2, pph2), json=body, timeout=12)
+        r2 = _auth_post(ORDERS_EP, body)
         data2 = _safe_json(r2)
         return {"ok": (r2.status_code == 200 and str(data2.get("code")) == "200000"),
                 "status": r2.status_code, "data": data2}
-
     return {"ok": True, "status": 200, "data": data}
 
 
 # ----------------------------------------------------------------------
-# === Cancel / Modify (pour BE & trailing) ===
+# === Cancel / Modify / Close-partial (pour BE & trailing) ===
 # ----------------------------------------------------------------------
 def cancel_order(order_id: str) -> Dict[str, Any]:
     try:
@@ -318,10 +313,7 @@ def cancel_order(order_id: str) -> Dict[str, Any]:
 
 def modify_stop_order(symbol: str, side: str, existing_order_id: Optional[str],
                       new_stop: float, size_lots: int, stop_price_type: str = "MP") -> Dict[str, Any]:
-    """
-    Modifie un stop en le *remplaçant* (cancel + nouvelle création).
-    Si existing_order_id est fourni, on tente de le cancel d'abord.
-    """
+    """Remplace un stop (cancel + recreate)."""
     try:
         if existing_order_id:
             _ = cancel_order(existing_order_id)
@@ -329,3 +321,20 @@ def modify_stop_order(symbol: str, side: str, existing_order_id: Optional[str],
     except Exception:
         pass
     return place_reduce_only_stop(symbol, side, new_stop=new_stop, size_lots=size_lots, stop_price_type=stop_price_type)
+
+def close_partial_position(symbol: str, side: str, size_lots: int) -> Dict[str, Any]:
+    """
+    Ferme partiellement via market reduce-only (utile pour TP1/BE).
+    """
+    exit_side = "sell" if side.lower() == "buy" else "buy"
+    body = {
+        "clientOid": str(uuid.uuid4()),
+        "symbol": symbol,
+        "side": exit_side,
+        "type": "market",
+        "reduceOnly": True,
+        "size": str(int(size_lots)),
+    }
+    r = _auth_post(ORDERS_EP, body)
+    return {"ok": (r.status_code == 200 and str((_safe_json(r)).get("code")) == "200000"),
+            "status": r.status_code, "data": _safe_json(r)}
