@@ -53,6 +53,7 @@ def _retry_if_needed(symbol: str, side: str,
     """
     Si SL/TP non 'ok', on retente une fois. Ensuite on vérifie la présence
     d'au moins un des ordres via open orders, avec backoff tolérant (anti-404/latence d'indexation).
+    IMPORTANT: on ne s'arrête pas sur une liste vide — on tente jusqu'à max_tries.
     """
     if not sl_resp.get("ok"):
         LOGGER.warning("Retry SL for %s at %.12f (lots=%d)", symbol, sl, sl_lots)
@@ -62,21 +63,28 @@ def _retry_if_needed(symbol: str, side: str,
         LOGGER.warning("Retry TP1 for %s at %.12f (lots=%d)", symbol, tp_price, tp_lots)
         tp_resp = place_reduce_only_tp_limit(symbol, side, take_profit=tp_price, size_lots=int(tp_lots))
 
-    # Backoff progressif pour laisser KuCoin indexer les ordres
-    attempts, oo = 0, []
-    while attempts < 3:
-        attempts += 1
-        time.sleep(0.6 * attempts)  # 0.6s, 1.2s, 1.8s
+    # Backoff progressif pour laisser KuCoin indexer les ordres LIMIT/STOP
+    max_tries = 5
+    oo = []
+    for attempt in range(1, max_tries + 1):
+        # Delais 0.6s, 1.2s, 1.8s, 2.4s, 3.0s
+        time.sleep(0.6 * attempt)
         try:
-            oo = list_open_orders(symbol)
-            if isinstance(oo, list):
-                break
+            res = list_open_orders(symbol)
+            if isinstance(res, list):
+                oo = res
+                # on ne sort du loop que si on VOIT quelque chose (len > 0)
+                if len(oo) > 0 or attempt == max_tries:
+                    break
+            else:
+                LOGGER.debug("list_open_orders returned non-list on %s (attempt %d)", symbol, attempt)
         except Exception as e:
-            LOGGER.debug("list_open_orders try #%d failed for %s: %s", attempts, symbol, e)
+            LOGGER.debug("list_open_orders try #%d failed for %s: %s", attempt, symbol, e)
+            # on continue quand même jusqu'au max_tries
 
     try:
         n_open = len(oo) if isinstance(oo, list) else 0
-        LOGGER.info("Open orders on %s after exits: %s (after %d tries)", symbol, n_open, attempts)
+        LOGGER.info("Open orders on %s after exits: %s (after %d tries)", symbol, n_open, attempt)
         # Log de quelques ordres pour diagnostic
         for o in (oo[:8] if isinstance(oo, list) else []):
             LOGGER.info("  - id=%s side=%s type=%s price=%s stopPrice=%s size=%s reduceOnly=%s postOnly=%s status=%s",
@@ -91,7 +99,7 @@ def _retry_if_needed(symbol: str, side: str,
                         o.get("status"))
         # Détection explicite d'un TP1 reduce-only LIMIT au bon prix (compare string normalisée)
         tp1_present = False
-        if tp_lots > 0 and isinstance(oo, list):
+        if tp_lots > 0 and isinstance(oo, list) and len(oo) > 0:
             price_str = f"{tp_price:.12f}".rstrip("0").rstrip(".")
             for o in oo:
                 if str(o.get("reduceOnly")).lower() != "true":
