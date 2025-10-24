@@ -288,12 +288,12 @@ def place_reduce_only_stop(symbol: str, side: str, new_stop: float, size_lots: i
     if r1.status_code == 200 and str(data1.get("code")) == "200000":
         return {"ok": True, "status": 200, "data": data1}
 
-# essai #2 : stop-limit (aligné au tickSize)
-meta = get_contract_info(symbol)
-tick = float(meta.get("tickSize", 0.01))
-p = _round_price(float(new_stop), tick)
+    # essai #2 : stop-limit (aligné au tickSize)
+    meta = get_contract_info(symbol)
+    tick = float(meta.get("tickSize", 0.01))
+    p = _round_price(float(new_stop), tick)
 
-body2 = {
+    body2 = {
     "clientOid": str(uuid.uuid4()),
     "symbol": symbol,
     "side": stop_side,
@@ -306,14 +306,14 @@ body2 = {
     "size": str(int(size_lots)),
     "timeInForce": "GTC",
     "postOnly": False
-}
-r2 = _auth_post(ORDERS_EP, body2)
-data2 = _safe_json(r2)
-return {
+    }
+    r2 = _auth_post(ORDERS_EP, body2)
+    data2 = _safe_json(r2)
+    return {
     "ok": (r2.status_code == 200 and str(data2.get("code")) == "200000"),
     "status": r2.status_code,
     "data": data2
-}
+    }
 
 def place_reduce_only_tp_limit(symbol: str, side: str, take_profit: float, size_lots: int) -> Dict[str, Any]:
     meta = get_contract_info(symbol)
