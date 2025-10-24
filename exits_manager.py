@@ -6,35 +6,44 @@ Compatibilité : attach_exits_after_fill(symbol, side, df, entry, sl, tp, size_l
 - TP2 : (optionnel) posé maintenant sur le reste, ou laissé au BE monitor
 """
 from __future__ import annotations
-import logging, time
+import logging
+import time
 from typing import Tuple, Optional, Callable
 
 from kucoin_utils import get_contract_info
 from kucoin_trader import (
     place_reduce_only_stop,
     place_reduce_only_tp_limit,
-    list_open_orders,         # helper fiable (status=open)
+    list_open_orders,  # helper fiable (status=open)
 )
 from breakeven_manager import launch_breakeven_thread
 
 LOGGER = logging.getLogger(__name__)
 
+# Anti-doublon local pour le lancement du BE monitor (30s par symbole)
+_BE_LAUNCH_GUARD: dict[str, float] = {}
+_BE_GUARD_TTL = 30.0  # secondes
+
 # ------------------------------- Utils -------------------------------
 def _round_to_tick(x: float, tick: float) -> float:
+    """
+    Normalise un prix au tick le plus proche (compliant exchange).
+    On évite les erreurs binaires en travaillant en nombres entiers de ticks.
+    """
     if tick <= 0:
         return float(x)
-    steps = int(float(x) / float(tick))
+    steps = round(float(x) / float(tick))
     return round(steps * float(tick), 12)
 
 def _split_half(lots: int) -> Tuple[int, int]:
-    """Retourne (tp1_lots, tp2_lots) ~50/50, en garantissant min 1 lot pour TP1 si possible."""
+    """Retourne (tp1_lots, tp2_lots) ~50/50 ; garantit min 1 lot pour TP1 si lots>=1."""
     lots = int(max(0, lots))
     if lots <= 1:
         return (max(0, lots), 0)
     a = lots // 2
     b = lots - a
-    if a == 0 and lots > 0:
-        a, b = 1, lots - 1
+    if a == 0:
+        a, b = 1, max(0, lots - 1)
     return a, b
 
 def _retry_if_needed(symbol: str, side: str,
@@ -54,12 +63,13 @@ def _retry_if_needed(symbol: str, side: str,
         tp_resp = place_reduce_only_tp_limit(symbol, side, take_profit=tp_price, size_lots=int(tp_lots))
 
     # vérification légère
-    time.sleep(0.5)
+    time.sleep(0.6)
     try:
         oo = list_open_orders(symbol)
         n_open = len(oo)
         LOGGER.info("Open orders on %s after exits: %s", symbol, n_open)
-        for o in oo[:6]:
+        # Log de quelques ordres pour diagnostic
+        for o in oo[:8]:
             LOGGER.info("  - id=%s side=%s type=%s price=%s stopPrice=%s size=%s reduceOnly=%s postOnly=%s status=%s",
                         o.get("id") or o.get("orderId"),
                         o.get("side"),
@@ -70,10 +80,34 @@ def _retry_if_needed(symbol: str, side: str,
                         o.get("reduceOnly"),
                         o.get("postOnly"),
                         o.get("status"))
+        # Détection explicite d'un TP1 reduce-only au bon prix
+        tp1_present = False
+        price_str = f"{tp_price:.12f}".rstrip("0").rstrip(".")
+        for o in oo:
+            if str(o.get("reduceOnly")).lower() == "true":
+                otype = (o.get("type") or o.get("orderType") or "").lower()
+                if "limit" in otype:
+                    # price peut être str; on compare en string normalisée pour éviter float issues
+                    if str(o.get("price")) == price_str:
+                        tp1_present = True
+                        break
+        if not tp1_present and tp_lots > 0:
+            LOGGER.warning("TP1 not visible in open orders for %s at %s — will rely on BE monitor to reassert if needed.",
+                           symbol, price_str)
     except Exception as e:
         LOGGER.warning("list_open_orders failed for %s: %s", symbol, e)
 
     return sl_resp, tp_resp
+
+def _should_launch_be(symbol: str) -> bool:
+    now = time.time()
+    last = _BE_LAUNCH_GUARD.get(symbol, 0.0)
+    if (now - last) < _BE_GUARD_TTL:
+        LOGGER.info("[EXITS] BE monitor launch guarded for %s (%.1fs remaining)",
+                    symbol, _BE_GUARD_TTL - (now - last))
+        return False
+    _BE_LAUNCH_GUARD[symbol] = now
+    return True
 
 def purge_reduce_only(symbol: str) -> None:
     """Optionnel : annule d’anciens exits si tu as un cancel. Laisser vide sinon."""
@@ -86,12 +120,12 @@ def purge_reduce_only(symbol: str) -> None:
 def attach_exits_after_fill(
     symbol: str,
     side: str,
-    df,                    # <-- conservé pour compat (ignoré)
+    df,                    # conservé pour compat (ignoré)
     entry: float,
     sl: float,
-    tp: float,             # <-- prix TP1 (compat historique)
+    tp: float,             # prix TP1 (compat historique)
     size_lots: int,
-    tp2: Optional[float] = None,             # <-- prix TP2 (optionnel, après size_lots pour compat)
+    tp2: Optional[float] = None,             # prix TP2 (optionnel)
     *,
     place_tp2_now: bool = False,             # True = poser TP2 maintenant ; False = laisser le monitor le poser
     price_tick: Optional[float] = None,      # override tick si besoin
@@ -110,6 +144,10 @@ def attach_exits_after_fill(
 
     lots_full = int(size_lots)
     tp1_lots, tp2_lots = _split_half(lots_full)
+
+    # Safety: si, pour une raison quelconque, TP1 tombe à 0 lot alors qu'on a une position, forcer 1 lot sur TP1.
+    if lots_full >= 1 and tp1_lots == 0:
+        tp1_lots, tp2_lots = 1, max(0, lots_full - 1)
 
     LOGGER.info(
         "[EXITS] %s side=%s lots=%d -> SL@%.12f | TP1: %d @ %.12f | TP2: %s",
@@ -140,18 +178,21 @@ def attach_exits_after_fill(
 
     # 5) Lancer le monitor BE (déplacement SL->BE quand TP1 est rempli, et pose TP2 si non posé)
     try:
-        launch_breakeven_thread(
-            symbol=symbol,
-            side=side,
-            entry=float(entry),
-            tp1=float(tp1_r),
-            tp2=float(tp2_r) if tp2_r is not None else None,
-            price_tick=None,                 # ⚠️ Laisser le monitor lire le tick du contrat (évite les incohérences)
-            notifier=notifier,
-        )
-        LOGGER.info("[EXITS] BE monitor launched for %s", symbol)
+        if _should_launch_be(symbol):
+            launch_breakeven_thread(
+                symbol=symbol,
+                side=side,
+                entry=float(entry),
+                tp1=float(tp1_r),
+                tp2=float(tp2_r) if tp2_r is not None else None,
+                price_tick=None,  # laisser le monitor lire le tick du contrat (évite les incohérences)
+                notifier=notifier,
+            )
+            LOGGER.info("[EXITS] BE monitor launched for %s", symbol)
+        else:
+            LOGGER.info("[EXITS] Skipped launching BE monitor for %s (guarded)", symbol)
     except Exception as e:
         LOGGER.exception("[EXITS] Failed to launch BE monitor for %s: %s", symbol, e)
 
-    # ⬅️ Compat: on retourne exactement 2 valeurs (SL, TP1)
+    # Compat: on retourne exactement 2 valeurs (SL, TP1)
     return sl_resp, tp1_resp
