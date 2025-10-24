@@ -14,7 +14,8 @@ from kucoin_utils import get_contract_info
 from kucoin_trader import (
     place_reduce_only_stop,
     place_reduce_only_tp_limit,
-    list_open_orders,  # helper fiable (status=open)
+    list_open_orders,  # /api/v1/orders?status=open&symbol=...
+    get_order,         # vérification directe par orderId
 )
 from breakeven_manager import launch_breakeven_thread
 
@@ -53,7 +54,8 @@ def _retry_if_needed(symbol: str, side: str,
     """
     Si SL/TP non 'ok', on retente une fois. Ensuite on vérifie la présence
     d'au moins un des ordres via open orders, avec backoff tolérant (anti-404/latence d'indexation).
-    IMPORTANT: on ne s'arrête pas sur une liste vide — on tente jusqu'à max_tries.
+    IMPORTANT: on ne s'arrête pas sur une liste vide — on tente jusqu'à max_tries,
+    puis on confirme le TP1 par get_order(orderId) si nécessaire.
     """
     if not sl_resp.get("ok"):
         LOGGER.warning("Retry SL for %s at %.12f (lots=%d)", symbol, sl, sl_lots)
@@ -66,25 +68,26 @@ def _retry_if_needed(symbol: str, side: str,
     # Backoff progressif pour laisser KuCoin indexer les ordres LIMIT/STOP
     max_tries = 5
     oo = []
+    last_attempt = 0
     for attempt in range(1, max_tries + 1):
-        # Delais 0.6s, 1.2s, 1.8s, 2.4s, 3.0s
-        time.sleep(0.6 * attempt)
+        last_attempt = attempt
+        time.sleep(0.6 * attempt)  # 0.6s, 1.2s, 1.8s, 2.4s, 3.0s
         try:
             res = list_open_orders(symbol)
             if isinstance(res, list):
                 oo = res
-                # on ne sort du loop que si on VOIT quelque chose (len > 0)
+                # on ne sort du loop que si on VOIT quelque chose (len > 0) ou à la dernière tentative
                 if len(oo) > 0 or attempt == max_tries:
                     break
             else:
                 LOGGER.debug("list_open_orders returned non-list on %s (attempt %d)", symbol, attempt)
         except Exception as e:
             LOGGER.debug("list_open_orders try #%d failed for %s: %s", attempt, symbol, e)
-            # on continue quand même jusqu'au max_tries
+            # on continue jusqu'au max_tries
 
     try:
         n_open = len(oo) if isinstance(oo, list) else 0
-        LOGGER.info("Open orders on %s after exits: %s (after %d tries)", symbol, n_open, attempt)
+        LOGGER.info("Open orders on %s after exits: %s (after %d tries)", symbol, n_open, last_attempt)
         # Log de quelques ordres pour diagnostic
         for o in (oo[:8] if isinstance(oo, list) else []):
             LOGGER.info("  - id=%s side=%s type=%s price=%s stopPrice=%s size=%s reduceOnly=%s postOnly=%s status=%s",
@@ -97,7 +100,8 @@ def _retry_if_needed(symbol: str, side: str,
                         o.get("reduceOnly"),
                         o.get("postOnly"),
                         o.get("status"))
-        # Détection explicite d'un TP1 reduce-only LIMIT au bon prix (compare string normalisée)
+
+        # 1) Matching explicite du TP1 dans le carnet, si on a des ordres
         tp1_present = False
         if tp_lots > 0 and isinstance(oo, list) and len(oo) > 0:
             price_str = f"{tp_price:.12f}".rstrip("0").rstrip(".")
@@ -110,6 +114,26 @@ def _retry_if_needed(symbol: str, side: str,
                 if str(o.get("price")) == price_str:
                     tp1_present = True
                     break
+
+        # 2) Si carnet vide ou pas trouvé, confirmer via get_order(orderId)
+        if not tp1_present and tp_lots > 0:
+            tp_oid = None
+            try:
+                tp_oid = (tp_resp.get("data") or {}).get("data", {}).get("orderId") or tp_resp.get("orderId")
+            except Exception:
+                tp_oid = None
+
+            if tp_oid:
+                od = get_order(str(tp_oid))
+                status = (od.get("status") or od.get("currentStatus") or "").lower()
+                # Accepte les états "ouverts" (les libellés varient selon versions d'API)
+                openish = {"open", "new", "active", "partially_filled", "partiallyfilled", "match", "matched"}
+                if status in openish or (status and "open" in status):
+                    LOGGER.info("TP1 confirmed by get_order(%s): status=%s — treated as visible.", tp_oid, status)
+                    tp1_present = True
+                else:
+                    LOGGER.warning("get_order(%s) status=%s (not open) — TP1 may not be active yet.", tp_oid, status)
+
         if not tp1_present and tp_lots > 0:
             LOGGER.warning(
                 "TP1 not visible yet in open orders for %s at %s — likely indexing delay; BE monitor will reassert if needed.",
