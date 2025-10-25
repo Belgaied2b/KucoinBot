@@ -8,6 +8,7 @@ import math
 from typing import Optional
 import pandas as pd
 
+from institutional_data import detect_liquidity_clusters
 from indicators import compute_rsi, compute_macd, compute_ema, compute_atr, is_momentum_ok
 from structure_utils import structure_valid
 from institutional_data import compute_full_institutional_analysis
