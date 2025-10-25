@@ -6,6 +6,7 @@ scanner.py — orchestration avec exits APRES fill + stops robustes + sizing par
 - Exits: posés APRES fill, purge des anciens reduce-only.
 - TP1/TP2 (nouveau): 1.5R / 2.5R avec alignement structurel (swing).
 - Break-Even (nouveau): déplacement automatique du SL à l'entrée lorsque TP1 est atteint.
+- Anti-doublons: empreinte persistante + garde position/ordres ouverts (même côté).
 """
 from __future__ import annotations
 import time, logging, numpy as np, pandas as pd
@@ -17,13 +18,16 @@ from settings import (
     RISK_USDT, RR_TARGET, LEVERAGE, MARGIN_USDT,
 )
 from risk_manager import reset_scan_counters, guardrails_ok, register_order
-from kucoin_trader import place_limit_order
+from kucoin_trader import place_limit_order, get_open_position, list_open_orders
 from exits_manager import purge_reduce_only, attach_exits_after_fill
 from fills import wait_for_fill
 
 # nouveaux helpers (fichiers ajoutés)
 from stops import protective_stop_long, protective_stop_short
 from sizing import lots_by_risk
+
+# anti-doublons (nouveau fichier duplicate_guard.py requis)
+from duplicate_guard import signal_fingerprint, is_duplicate_and_mark, unmark
 
 LOGGER = logging.getLogger(__name__)
 
@@ -194,14 +198,91 @@ def scan_and_send_signals():
                 LOGGER.info("[%d/%d] Skip %s -> %s", idx, len(pairs), sym, why)
                 continue
 
+            # ===========================
+            #     ANTI-DOUBLONS (NEW)
+            # ===========================
+            side = "buy" if bias == "LONG" else "sell"
+            tf = "1h"  # cohérent avec fetch_klines
+
+            # 1) Garde position existante (même côté)
+            try:
+                pos = get_open_position(sym) or {}
+                qty = float(pos.get("currentQty") or 0.0)
+                pos_side = str(pos.get("side") or "").lower()
+                if qty > 0 and pos_side == side:
+                    LOGGER.info("[DUP] %s %s déjà en position (qty=%s) → skip signal", sym, side, qty)
+                    time.sleep(0.2)
+                    continue
+            except Exception:
+                pass
+
+            # 2) Garde ordre LIMIT ouvert (non reduce-only) même côté
+            try:
+                open_o = list_open_orders(sym) or []
+                has_same_side_limit = False
+                for o in open_o:
+                    o_side = (o.get("side") or "").lower()
+                    otype = (o.get("type") or o.get("orderType") or "").lower()
+                    ro = str(o.get("reduceOnly")).lower() == "true"
+                    if (o_side == side) and ("limit" in otype) and not ro:
+                        has_same_side_limit = True
+                        break
+                if has_same_side_limit:
+                    LOGGER.info("[DUP] %s %s a déjà un LIMIT ouvert → skip signal", sym, side)
+                    time.sleep(0.2)
+                    continue
+            except Exception:
+                pass
+
+            # 3) Empreinte persistante (structure + zone d'entrée bucketisée)
+            structure = {
+                "bos_direction": res.get("bos_direction") or signal.get("bos_direction"),
+                "choch_direction": res.get("choch_direction") or signal.get("choch_direction"),
+                "has_liquidity_zone": res.get("has_liquidity_zone") or signal.get("has_liquidity_zone"),
+                "trend": res.get("trend") or signal.get("trend"),
+                "ema_state": res.get("ema_state") or signal.get("ema_state"),
+                "tf": tf,
+                "tf_confirm": res.get("tf_confirm") or signal.get("tf_confirm"),
+                "mode": res.get("mode") or signal.get("mode"),
+                "engulfing": res.get("engulfing") or signal.get("engulfing"),
+                "fvg": res.get("fvg") or signal.get("fvg"),
+                "cos": res.get("cos") or signal.get("cos"),
+            }
+
+            fp = signal_fingerprint(
+                symbol=sym,
+                side=side,
+                timeframe=tf,
+                entry_price=float(entry),
+                tick_size=tick,
+                entry_bucket_ticks=10,  # considérés identiques si même zone ±10 ticks
+                structure=structure,
+            )
+
+            # 3.a Lecture sans marquage : si présent → skip
+            if is_duplicate_and_mark(fp, ttl_seconds=6*3600, mark=False):
+                LOGGER.info("[DUP] %s %s empreinte déjà présente → skip signal", sym, side)
+                time.sleep(0.2)
+                continue
+
             msg = _fmt(sym, res, extra)
 
             if DRY_RUN:
+                # marquage pour éviter re-spam même en dry-run (optionnel)
+                is_duplicate_and_mark(fp, ttl_seconds=6*3600, mark=True)
+
                 LOGGER.info("[%d/%d] DRY-RUN %s lots=%s entry=%.6f sl=%.6f tp1=%.6f tp2=%.6f rr=%.2f",
-                            idx, len(pairs), sym, size_lots, entry, sl, tp1_raw, tp2, rr)
+                            idx, len(pairs), sym, size_lots, entry, sl, signal["tp1"], signal["tp2"], rr)
                 register_order(sym, notional)
             else:
-                side = "buy" if bias == "LONG" else "sell"
+                # 3.b Marquer juste avant d'agir (évite courses)
+                race = is_duplicate_and_mark(fp, ttl_seconds=6*3600, mark=True)
+                # Note: la fonction retourne False en cas de marquage réussi dans notre implémentation
+                # mais on gère défensivement : si elle renvoie True, on traite comme doublon.
+                if race is True:
+                    LOGGER.info("[DUP] %s %s condition de course (déjà marqué) → skip", sym, side)
+                    time.sleep(0.2)
+                    continue
 
                 # 1) envoyer l'entrée (LIMIT) + retry si 300011
                 order = place_limit_order(sym, side, entry, size_lots, post_only=False)
@@ -213,9 +294,21 @@ def scan_and_send_signals():
                         entry_retry = _round_to_tick(entry * adj, tick)
                         LOGGER.warning("Retry %s price adjust for code 300011: %.8f -> %.8f", sym, entry, entry_retry)
                         order = place_limit_order(sym, side, entry_retry, size_lots, post_only=False)
-                        entry = entry_retry
+                        if order.get("ok"):
+                            entry = entry_retry
+                        else:
+                            # échec => on libère le fingerprint pour laisser une chance ultérieure
+                            unmark(fp)
+                            time.sleep(0.2)
+                            continue
                     elif code == "300003":
                         LOGGER.error("Balance insuffisante pour %s (marge requise). Skip.", sym)
+                        unmark(fp)
+                        time.sleep(0.2)
+                        continue
+                    else:
+                        LOGGER.error("place_limit_order failed for %s: %s", sym, body)
+                        unmark(fp)
                         time.sleep(0.2)
                         continue
 
@@ -223,19 +316,22 @@ def scan_and_send_signals():
                 order_id = ((order.get("data") or {}).get("data") or {}).get("orderId")
                 if not order_id:
                     LOGGER.error("No orderId returned for %s, skip exits.", sym)
+                    # ordre non confirmé → on dé-marque pour ne pas bloquer indéfiniment
+                    unmark(fp)
                     continue
 
                 # 2) attendre un (début de) fill
                 fill = wait_for_fill(order_id, timeout_s=20)
                 if not fill["filled"]:
                     LOGGER.info("No fill yet on %s — exits delayed", sym)
+                    # Ici on garde la marque pour éviter les re-ordres en boucle pendant le TTL
                     continue
 
                 # 3) purge des anciens exits reduce-only
                 purge_reduce_only(sym)
 
                 # 4) pose des exits maintenant que la position existe (SL initial + TP2)
-                sl_resp, tp_resp = attach_exits_after_fill(sym, side, df, entry, sl, tp2, size_lots)
+                sl_resp, tp_resp = attach_exits_after_fill(sym, side, df, entry, sl, signal["tp2"], size_lots)
                 LOGGER.info("Exits %s -> SL %s | TP %s", sym, sl_resp, tp_resp)
 
                 # 5) Lancer le moniteur Break-Even (déplacement SL à BE à TP1)
@@ -244,7 +340,7 @@ def scan_and_send_signals():
                     import threading
                     threading.Thread(
                         target=monitor_breakeven,
-                        args=(sym, side, entry, signal["tp1"], tp2, size_lots),
+                        args=(sym, side, entry, signal["tp1"], signal["tp2"], size_lots),
                         daemon=True
                     ).start()
                 except Exception as e:
@@ -255,7 +351,7 @@ def scan_and_send_signals():
                     from telegram_client import send_telegram_message
                     send_telegram_message(
                         "✅ " + msg +
-                        f"\nSide: {side.upper()} | Lots: {size_lots} | Entry {entry:.6f} | SL {sl:.6f} | TP1 {signal['tp1']:.6f} | TP2 {tp2:.6f} | RR {rr:.2f}"
+                        f"\nSide: {side.upper()} | Lots: {size_lots} | Entry {entry:.6f} | SL {sl:.6f} | TP1 {signal['tp1']:.6f} | TP2 {signal['tp2']:.6f} | RR {rr:.2f}"
                     )
                 except Exception:
                     pass
