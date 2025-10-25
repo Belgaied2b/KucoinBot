@@ -29,7 +29,7 @@ except Exception:
 
 LOGGER = logging.getLogger(__name__)
 
-# Anti-doublon local pour le lancement du BE monitor (30s par symbole)
+# Anti-doublon local pour le lancement du BE monitor (clé par position)
 _BE_LAUNCH_GUARD: dict[str, float] = {}
 _BE_GUARD_TTL = 30.0  # secondes
 
@@ -137,14 +137,19 @@ def _retry_if_needed(symbol: str, side: str,
 
     return sl_resp, tp_resp
 
-def _should_launch_be(symbol: str) -> bool:
+# --------- Guard BE par position (clé = symbol + entry arrondi au tick) ---------
+def _be_guard_key(symbol: str, entry: float, tick: float) -> str:
+    return f"{symbol}#{_round_to_tick(float(entry), float(tick))}"
+
+def _should_launch_be(symbol: str, entry: float, tick: float) -> bool:
+    key = _be_guard_key(symbol, entry, tick)
     now = time.time()
-    last = _BE_LAUNCH_GUARD.get(symbol, 0.0)
+    last = _BE_LAUNCH_GUARD.get(key, 0.0)
     if (now - last) < _BE_GUARD_TTL:
         LOGGER.info("[EXITS] BE monitor launch guarded for %s (%.1fs remaining)",
-                    symbol, _BE_GUARD_TTL - (now - last))
+                    key, _BE_GUARD_TTL - (now - last))
         return False
-    _BE_LAUNCH_GUARD[symbol] = now
+    _BE_LAUNCH_GUARD[key] = now
     return True
 
 def purge_reduce_only(symbol: str) -> None:
@@ -239,15 +244,15 @@ def attach_exits_after_fill(
 
     # 5) Lancer le monitor BE (déplacement SL->BE quand TP1 est rempli, et pose TP2 si non posé)
     try:
-        now_ok = _should_launch_be(symbol)
+        now_ok = _should_launch_be(symbol, float(entry), float(tick))   # <<< guard par position (symbol+entry~tick)
         if now_ok:
             launch_breakeven_thread(
                 symbol=symbol,
                 side=side,
                 entry=float(entry),
-                tp1=float(tp1_r),                              # <<< on passe le TP1 NORMALISÉ
+                tp1=float(tp1_r),                                    # on passe le TP1 NORMALISÉ
                 tp2=float(tp2_r) if tp2_r is not None else None,
-                price_tick=None,                               # laisser le monitor lire le tick du contrat
+                price_tick=float(tick),                               # <<< on passe le tick au monitor
                 notifier=notifier,
             )
             LOGGER.info("[EXITS] BE monitor launched for %s", symbol)
