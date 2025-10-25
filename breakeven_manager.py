@@ -20,6 +20,14 @@ from kucoin_trader import (
 LOGGER = logging.getLogger(__name__)
 
 # =====================================================================
+# 🔧 Paramètres BE
+# =====================================================================
+# Nombre de ticks ajoutés au prix d'entrée pour couvrir frais/slippage quand on déplace le SL -> BE.
+# Long  : new_sl = entry +  FEE_BUFFER_TICKS * tick
+# Short : new_sl = entry + (-FEE_BUFFER_TICKS) * tick
+FEE_BUFFER_TICKS = int(os.getenv("BE_FEE_BUFFER_TICKS", "1"))
+
+# =====================================================================
 # 🔔 Alerte Telegram (optionnelle, utilisée via notifier)
 # =====================================================================
 TELEGRAM_TOKEN = os.getenv("TG_TOKEN")
@@ -218,8 +226,8 @@ def monitor_breakeven(
 ):
     """
     Surveille la position :
-      - Cas >=2 lots : détecte TP1 par réduction de taille (~50% exécutés), déplace SL -> BE et s'assure de TP2.
-      - Cas 1 lot    : pas de split → déplace SL -> BE quand le prix atteint TP1. (Pas de TP2 ici)
+      - Cas >=2 lots : détecte TP1 par réduction de taille (~50% exécutés), déplace SL -> BE (avec buffer) et s'assure de TP2.
+      - Cas 1 lot    : pas de split → déplace SL -> BE (avec buffer) quand le prix atteint TP1. (Pas de TP2 ici)
     IMPORTANT : pas de close market ici (TP = LIMIT reduce-only).
     """
     # --- Garde d'appelant (bloque les appels directs non autorisés) ---
@@ -318,14 +326,19 @@ def monitor_breakeven(
 
                 if tp_hit and not moved_to_be:
                     try:
+                        # BE "net" : entry + buffer tick (couverture frais/slippage)
+                        sign = +1 if side == "buy" else -1
+                        fee_buf = max(0, int(FEE_BUFFER_TICKS))
+                        new_sl = entry_r + sign * fee_buf * tick
+                        new_sl = _round_to_tick(new_sl, tick)
                         modify_stop_order(
                             symbol=symbol, side=side,
                             existing_order_id=None,
-                            new_stop=float(entry_r),
+                            new_stop=float(new_sl),
                             size_lots=lots,  # tout
                         )
                         moved_to_be = True
-                        _notify_wrap(notifier, f"[BE] {symbol} ✅ TP1 atteint (1 lot) — SL → BE ({entry_r:.10f})")
+                        _notify_wrap(notifier, f"[BE] {symbol} ✅ TP1 atteint (1 lot) — SL → BE net ({new_sl:.10f})")
                     except Exception as e:
                         LOGGER.exception("[BE] %s modify_stop_order (1-lot) a échoué: %s", symbol, e)
                     break  # rien d'autre à faire en 1 lot
@@ -337,15 +350,20 @@ def monitor_breakeven(
                 # TP1 exécuté → SL -> BE (une seule fois)
                 if not moved_to_be:
                     try:
+                        # BE "net" : entry + buffer tick (couverture frais/slippage)
+                        sign = +1 if side == "buy" else -1
+                        fee_buf = max(0, int(FEE_BUFFER_TICKS))
+                        new_sl = entry_r + sign * fee_buf * tick
+                        new_sl = _round_to_tick(new_sl, tick)
                         modify_stop_order(
                             symbol=symbol,
                             side=side,
                             existing_order_id=None,
-                            new_stop=float(entry_r),
+                            new_stop=float(new_sl),
                             size_lots=lots,  # sur le restant
                         )
                         moved_to_be = True
-                        _notify_wrap(notifier, f"[BE] {symbol} ✅ TP1 détecté : lots {initial_lots} ➜ {lots} — SL → BE ({entry_r:.10f})")
+                        _notify_wrap(notifier, f"[BE] {symbol} ✅ TP1 détecté : lots {initial_lots} ➜ {lots} — SL → BE net ({new_sl:.10f})")
                     except Exception as e:
                         LOGGER.exception("[BE] %s modify_stop_order a échoué: %s", symbol, e)
 
@@ -467,6 +485,8 @@ def launch_breakeven_thread(
         )
         _ACTIVE_MONITORS[key] = t
         t.start()
+        # ✅ IMPORTANT : libérer le lock pris au lancement pour éviter un lock orphelin
+        _release_file_lock(key)
 
 # =====================================================================
 # 🧾 Debug des ordres ouverts
