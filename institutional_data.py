@@ -2,7 +2,7 @@
 institutional_data.py — Analyse institutionnelle avancée (robuste)
 - Mapping KuCoin → Binance (XBTUSDTM → BTCUSDT, etc.)
 - Cache des symboles Binance pour valider le mapping
-- Fetch tolérant (JSON vide, rate-limit, réponses non-list)
+- Fetch tolérant (JSON vide, rate-limit, réponses non-JSON)
 - Profil "large traders", divergence CVD, liquidity map
 - Couche d’orchestration (pondération + commentaire)
 """
@@ -17,7 +17,9 @@ from typing import Optional, Dict, Any
 
 LOGGER = logging.getLogger(__name__)
 
+# Endpoints Binance
 BINANCE_FUTURES_API = "https://fapi.binance.com/fapi/v1"
+BINANCE_FUTURES_DATA = "https://fapi.binance.com/futures/data"  # ← correct pour topLongShortAccountRatio
 
 # ==========
 #  CACHES
@@ -25,14 +27,44 @@ BINANCE_FUTURES_API = "https://fapi.binance.com/fapi/v1"
 _BINANCE_SYMS_CACHE: Dict[str, Any] = {"ts": 0.0, "set": set()}
 _BINANCE_SYMS_TTL = 15 * 60  # 15 minutes
 
+# --- Compteurs santé / anti-spam logs ---
+_ERR_COUNTS: Dict[str, int] = {"large_ratio": 0, "cvd_div": 0, "map": 0, "net": 0}
+_ERR_WARN_EVERY = 10  # WARNING toutes les 10 occurrences
+
+
+def _bump_and_maybe_warn(key: str, msg: str, detail: str = ""):
+    _ERR_COUNTS[key] = _ERR_COUNTS.get(key, 0) + 1
+    c = _ERR_COUNTS[key]
+    line = f"[INST] {msg}" + (f" | {detail}" if detail else "")
+    if c % _ERR_WARN_EVERY == 0:
+        LOGGER.warning("%s (x%s)", line, c)
+    else:
+        LOGGER.debug("%s", line)
+
 
 def _safe_json_get(url: str, params: Optional[dict] = None, timeout: float = 7.0):
     try:
-        r = requests.get(url, params=params or {}, timeout=timeout)
-        r.raise_for_status()
-        return r.json()
+        r = requests.get(
+            url,
+            params=params or {},
+            timeout=timeout,
+            headers={"User-Agent": "insto-bot/1.0 (+binance)"},
+        )
+        if r.status_code != 200:
+            _bump_and_maybe_warn("net", f"HTTP {r.status_code} on {url.split('/')[-1]}")
+            return None
+        try:
+            data = r.json()
+        except Exception:
+            _bump_and_maybe_warn("net", "Non-JSON response", r.text[:120])
+            return None
+        # Certaines erreurs Binance renvoient {"code": -xxxx, "msg": "..."}
+        if isinstance(data, dict) and "code" in data and data.get("code") != 0:
+            _bump_and_maybe_warn("net", "Binance error", f"{data}")
+            return None
+        return data
     except Exception as e:
-        LOGGER.debug("GET %s failed: %s", url, e)
+        _bump_and_maybe_warn("net", "Request exception", str(e))
         return None
 
 
@@ -43,7 +75,7 @@ def _refresh_binance_symbols():
         return
     data = _safe_json_get(f"{BINANCE_FUTURES_API}/exchangeInfo")
     syms = set()
-    # Structure attendue: {"symbols": [{"symbol":"BTCUSDT", "contractType":"PERPETUAL", ...}, ...]}
+    # Attendu: {"symbols": [{"symbol":"BTCUSDT","contractType":"PERPETUAL",...}, ...]}
     try:
         for s in (data or {}).get("symbols", []):
             if s.get("contractType") in ("PERPETUAL", "CURRENT_QUARTER", "NEXT_QUARTER"):
@@ -58,10 +90,10 @@ def _refresh_binance_symbols():
         LOGGER.info("Loaded %d Binance futures symbols", len(syms))
 
 
-# Aliases courants KuCoin → Binance sur la base
+# Aliases courants KuCoin → Binance
 _ALIAS_BASE = {
     "XBT": "BTC",   # KuCoin XBT → Binance BTC
-    "APR": "APE",   # certains tickers "APR" sur KuCoin correspondent à APE sur Binance
+    "APR": "APE",   # Exemple d’alias
 }
 
 
@@ -80,16 +112,13 @@ def _map_to_binance_symbol(kucoin_symbol: str) -> Optional[str]:
             s = s[: -len(suf)]
             break
 
-    # 2) S'assure qu'on est en base+USDT
+    # 2) Base
     if s.endswith("USDT"):
         base = s[:-4]
+    elif s.endswith("USDTM"):
+        base = s[:-5]
     else:
-        # beaucoup de flux chez toi sont de type BASEUSDTM → force USDT
-        if s.endswith("USDTM"):
-            base = s[:-5]
-        else:
-            # parfois s est seulement le base
-            base = s
+        base = s
 
     # 3) Alias base
     base_alias = _ALIAS_BASE.get(base, base)
@@ -102,12 +131,12 @@ def _map_to_binance_symbol(kucoin_symbol: str) -> Optional[str]:
     if b_symbol in syms:
         return b_symbol
 
-    # 5) Dernier essai : si la base telle quelle existe déjà
+    # 5) Essai alternatif
     alt = f"{base}USDT"
     if alt in syms:
         return alt
 
-    LOGGER.debug("Binance symbol mapping failed for %s → tried %s / %s", kucoin_symbol, b_symbol, alt)
+    _bump_and_maybe_warn("map", f"Binance symbol mapping failed for {kucoin_symbol}")
     return None
 
 
@@ -123,16 +152,18 @@ def get_large_trader_ratio(symbol: str) -> float:
     """
     b_sym = _map_to_binance_symbol(symbol)
     if not b_sym:
+        _bump_and_maybe_warn("map", f"Mapping Binance introuvable pour {symbol}")
         return 0.5
+
     data = _safe_json_get(
-        f"{BINANCE_FUTURES_API}/topLongShortAccountRatio",
+        f"{BINANCE_FUTURES_DATA}/topLongShortAccountRatio",  # ← endpoint correct
         params={"symbol": b_sym, "period": "1h", "limit": 1},
         timeout=6.0,
     )
     try:
         if isinstance(data, list) and data:
             row = data[0]
-            # Champs typiques: longAccount, shortAccount, longShortRatio
+            # Champs: longAccount, shortAccount, longShortRatio, timestamp
             long_acc = float(row.get("longAccount", 0.0))
             short_acc = float(row.get("shortAccount", 0.0))
             if long_acc <= 0 and short_acc <= 0:
@@ -141,7 +172,7 @@ def get_large_trader_ratio(symbol: str) -> float:
             score = np.tanh(ratio)  # 0..1
             return float(np.clip(score, 0.0, 1.0))
     except Exception as e:
-        LOGGER.debug("Large trader ratio parse failed for %s: %s", b_sym, e)
+        _bump_and_maybe_warn("large_ratio", f"Parse failed for {b_sym}", str(e))
     return 0.5
 
 
@@ -156,6 +187,7 @@ def get_cvd_divergence(symbol: str, limit: int = 500) -> float:
     """
     b_sym = _map_to_binance_symbol(symbol)
     if not b_sym:
+        _bump_and_maybe_warn("map", f"Mapping Binance introuvable pour {symbol}")
         return 0.0
 
     data = _safe_json_get(
@@ -185,11 +217,10 @@ def get_cvd_divergence(symbol: str, limit: int = 500) -> float:
         price_change = float(df["p"].iloc[-1] - df["p"].iloc[0])
         if abs(price_change) < 1e-10:
             return 0.0
-        # signe cohérent ?
         corr = np.sign(price_change) * np.sign(cvd)
         return float(np.clip(corr, -1.0, 1.0))
     except Exception as e:
-        LOGGER.debug("CVD divergence parse failed for %s: %s", b_sym, e)
+        _bump_and_maybe_warn("cvd_div", f"CVD divergence parse failed for {b_sym}", str(e))
         return 0.0
 
 
