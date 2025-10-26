@@ -331,7 +331,17 @@ def scan_and_send_signals():
                 purge_reduce_only(sym)
 
                 # 4) pose des exits maintenant que la position existe (SL initial + TP2)
-                sl_resp, tp_resp = attach_exits_after_fill(sym, side, df, entry, sl, signal["tp2"], size_lots)
+                # ✅ FIX wiring: on passe bien TP1 en paramètre principal, et TP2 séparément
+                sl_resp, tp_resp = attach_exits_after_fill(
+                    symbol=sym,
+                    side=side,
+                    df=df,
+                    entry=entry,
+                    sl=sl,
+                    tp=signal["tp1"],     # <<< TP1 correct
+                    size_lots=size_lots,
+                    tp2=signal["tp2"]     # <<< TP2 séparé
+                )
                 LOGGER.info("Exits %s -> SL %s | TP %s", sym, sl_resp, tp_resp)
 
                 # 5) Lancer le moniteur Break-Even (déplacement SL à BE à TP1)
