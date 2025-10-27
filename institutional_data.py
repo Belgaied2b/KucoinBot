@@ -1,11 +1,9 @@
-"""
-institutional_data.py — Analyse institutionnelle avancée (robuste)
-- Mapping KuCoin → Binance (XBTUSDTM → BTCUSDT, etc.)
-- Cache des symboles Binance pour valider le mapping
-- Fetch tolérant (JSON vide, rate-limit, réponses non-JSON)
-- Profil "large traders", divergence CVD, liquidity map
-- Couche d’orchestration (pondération + commentaire)
-"""
+# institutional_data.py — Analyse institutionnelle avancée (robuste)
+# - Mapping KuCoin → Binance (XBTUSDTM → BTCUSDT, etc.)
+# - Cache des symboles Binance pour valider le mapping
+# - Fetch tolérant (JSON vide, rate-limit 429, réponses non-JSON) + retries + jitter
+# - Profil "large traders", divergence CVD, liquidity map
+# - Couche d’orchestration (pondération + commentaire)
 from __future__ import annotations
 
 import time
@@ -13,8 +11,14 @@ import logging
 import requests
 import numpy as np
 import pandas as pd
+import random
 from typing import Optional, Dict, Any
-from functools import lru_cache
+
+from settings import (
+    BINANCE_HTTP_TIMEOUT_S,
+    BINANCE_HTTP_RETRIES,
+    BINANCE_MIN_INTERVAL_S,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -22,24 +26,13 @@ LOGGER = logging.getLogger(__name__)
 BINANCE_FUTURES_API = "https://fapi.binance.com/fapi/v1"
 BINANCE_FUTURES_DATA = "https://fapi.binance.com/futures/data"  # ← correct pour topLongShortAccountRatio
 
-# =======================
-#   CACHES & THROTTLING
-# =======================
+# ========== CACHES ==========
 _BINANCE_SYMS_CACHE: Dict[str, Any] = {"ts": 0.0, "set": set()}
 _BINANCE_SYMS_TTL = 15 * 60  # 15 minutes
 
-# Compteurs santé / anti-spam logs
+# ========== Compteurs santé / anti-spam logs ==========
 _ERR_COUNTS: Dict[str, int] = {"large_ratio": 0, "cvd_div": 0, "map": 0, "net": 0}
 _ERR_WARN_EVERY = 10  # WARNING toutes les 10 occurrences
-
-# Throttle par endpoint (rps raisonnable pour éviter 429)
-_MIN_INTERVAL_S = 0.25  # ~4 req/s par endpoint
-_LAST_CALL_TS: Dict[str, float] = {}
-
-# Session HTTP réutilisée
-_SESSION = requests.Session()
-_SESSION.headers.update({"User-Agent": "insto-bot/1.0 (+binance)"})
-
 
 def _bump_and_maybe_warn(key: str, msg: str, detail: str = ""):
     _ERR_COUNTS[key] = _ERR_COUNTS.get(key, 0) + 1
@@ -50,67 +43,90 @@ def _bump_and_maybe_warn(key: str, msg: str, detail: str = ""):
     else:
         LOGGER.debug("%s", line)
 
+# ========== Rate-limit local par endpoint + jitter ==========
+# Clé = nom court d'endpoint (ex: "exchangeInfo", "aggTrades", "topLongShortAccountRatio")
+_RATE_LIMIT_NEXT: Dict[str, float] = {}
 
-def _throttle(endpoint_key: str):
-    """Respecte un délai minimal entre deux appels du même endpoint."""
-    last = _LAST_CALL_TS.get(endpoint_key, 0.0)
+def _rl_sleep(endpoint_key: str):
     now = time.time()
-    wait = _MIN_INTERVAL_S - (now - last)
-    if wait > 0:
-        time.sleep(wait)
-    _LAST_CALL_TS[endpoint_key] = time.time()
+    next_ok = _RATE_LIMIT_NEXT.get(endpoint_key, 0.0)
+    if now < next_ok:
+        time.sleep(max(0.0, next_ok - now))
+    # prochaine fenêtre avec jitter
+    _RATE_LIMIT_NEXT[endpoint_key] = time.time() + BINANCE_MIN_INTERVAL_S * (1.0 + 0.25 * random.random())
 
+# ========== HTTP helpers robustes ==========
+def _safe_json_get(url: str, params: Optional[dict] = None, timeout: float = None, endpoint_key: str = ""):
+    """
+    GET JSON robuste : RL local, retries, backoff sur 429, détection erreurs Binance.
+    """
+    if timeout is None:
+        timeout = float(BINANCE_HTTP_TIMEOUT_S)
+    retries = int(max(0, BINANCE_HTTP_RETRIES))
 
-def _safe_json_get(url: str, params: Optional[dict] = None, timeout: float = 7.0, retries: int = 2):
-    """
-    GET tolérant:
-    - throttle local par endpoint
-    - retry simple (incl. 429 via Retry-After)
-    - parse JSON sûr (retourne None sinon)
-    - ignore codes d'erreur Binance {"code":..., "msg":...} non 0
-    """
-    endpoint_key = url.split("/fapi/")[-1].split("?")[0]
     for attempt in range(retries + 1):
+        if endpoint_key:
+            _rl_sleep(endpoint_key)
+
         try:
-            _throttle(endpoint_key)
-            r = _SESSION.get(url, params=params or {}, timeout=timeout)
-            if r.status_code == 200:
-                try:
-                    data = r.json()
-                except Exception:
-                    _bump_and_maybe_warn("net", "Non-JSON response", r.text[:120])
-                    data = None
-                # Certaines erreurs Binance renvoient {"code": -xxxx, "msg": "..."}
-                if isinstance(data, dict) and "code" in data and data.get("code") not in (0, None):
-                    _bump_and_maybe_warn("net", "Binance error", f"{data}")
-                    data = None
-                return data
-            elif r.status_code == 429:
-                # Respecte Retry-After si fourni
-                ra = r.headers.get("Retry-After")
-                try:
-                    sleep_s = float(ra) if ra else 1.2
-                except Exception:
-                    sleep_s = 1.2
-                time.sleep(sleep_s)
-                continue
-            else:
-                _bump_and_maybe_warn("net", f"HTTP {r.status_code} on {endpoint_key}")
+            r = requests.get(
+                url,
+                params=params or {},
+                timeout=timeout,
+                headers={"User-Agent": "insto-bot/1.0 (+binance)"},
+            )
         except Exception as e:
             _bump_and_maybe_warn("net", "Request exception", str(e))
-        # Backoff léger entre tentatives
-        time.sleep(0.4 * (attempt + 1))
+            # petit backoff avant retry
+            if attempt < retries:
+                time.sleep(0.25 + 0.25 * random.random())
+                continue
+            return None
+
+        if r.status_code == 429:
+            # backoff adaptatif
+            delay = 0.5 + attempt * (0.6 + 0.4 * random.random())
+            _bump_and_maybe_warn("net", "HTTP 429 backoff", f"{delay:.2f}s")
+            time.sleep(delay)
+            continue
+
+        if r.status_code != 200:
+            _bump_and_maybe_warn("net", f"HTTP {r.status_code} on {url.split('/')[-1]}")
+            if attempt < retries:
+                time.sleep(0.25 + 0.25 * random.random())
+                continue
+            return None
+
+        # JSON parse
+        try:
+            data = r.json()
+        except Exception:
+            _bump_and_maybe_warn("net", "Non-JSON response", r.text[:120])
+            if attempt < retries:
+                time.sleep(0.25 + 0.25 * random.random())
+                continue
+            return None
+
+        # Erreurs Binance au format {"code": -xxxx, "msg": "..."}
+        if isinstance(data, dict) and "code" in data and data.get("code") not in (0, "0", None):
+            _bump_and_maybe_warn("net", "Binance error", f"{data}")
+            if attempt < retries:
+                time.sleep(0.25 + 0.25 * random.random())
+                continue
+            return None
+
+        return data
+
     return None
 
-
+# ========== Symbols Binance (cache) ==========
 def _refresh_binance_symbols():
     """Charge et met en cache la liste des symboles USDT futures (ex: BTCUSDT)."""
     now = time.time()
     if (now - _BINANCE_SYMS_CACHE["ts"]) < _BINANCE_SYMS_TTL and _BINANCE_SYMS_CACHE["set"]:
         return
-    data = _safe_json_get(f"{BINANCE_FUTURES_API}/exchangeInfo", params=None, timeout=6.0, retries=2)
+    data = _safe_json_get(f"{BINANCE_FUTURES_API}/exchangeInfo", endpoint_key="exchangeInfo")
     syms = set()
-    # Attendu: {"symbols": [{"symbol":"BTCUSDT","contractType":"PERPETUAL",...}, ...]}
     try:
         for s in (data or {}).get("symbols", []):
             if s.get("contractType") in ("PERPETUAL", "CURRENT_QUARTER", "NEXT_QUARTER"):
@@ -124,16 +140,12 @@ def _refresh_binance_symbols():
     if syms:
         LOGGER.info("Loaded %d Binance futures symbols", len(syms))
 
-
 # Aliases courants KuCoin → Binance
 _ALIAS_BASE = {
     "XBT": "BTC",   # KuCoin XBT → Binance BTC
     "APR": "APE",   # Exemple d’alias
-    # Ajoute ici si tu croises d’autres alias (ex: "BCH"->"BCH" inchangé)
 }
 
-
-@lru_cache(maxsize=2048)
 def _map_to_binance_symbol(kucoin_symbol: str) -> Optional[str]:
     """
     Convertit un symbole KuCoin (ex: XBTUSDTM, ETHUSDTM) en symbole Binance (ex: BTCUSDT, ETHUSDT).
@@ -149,31 +161,31 @@ def _map_to_binance_symbol(kucoin_symbol: str) -> Optional[str]:
             s = s[: -len(suf)]
             break
 
-    # 2) Base + alias éventuel
+    # 2) Base
     if s.endswith("USDT"):
         base = s[:-4]
     elif s.endswith("USDTM"):
         base = s[:-5]
     else:
         base = s
-    base_alias = _ALIAS_BASE.get(base, base)
 
-    # 3) Construit le symbole Binance et valide
+    # 3) Alias base
+    base_alias = _ALIAS_BASE.get(base, base)
     b_symbol = f"{base_alias}USDT"
+
+    # 4) Valide contre la liste Binance
     _refresh_binance_symbols()
     syms = _BINANCE_SYMS_CACHE["set"]
-
     if b_symbol in syms:
         return b_symbol
 
-    # 4) Essai alternatif sans alias ou cas borderline
+    # 5) Essai alternatif strict
     alt = f"{base}USDT"
     if alt in syms:
         return alt
 
     _bump_and_maybe_warn("map", f"Binance symbol mapping failed for {kucoin_symbol}")
     return None
-
 
 # --------------------------------------------------------------------
 # 🔹 1. PROFIL VOLUME INSTITUTIONNEL (grands comptes vs. retail)
@@ -191,30 +203,28 @@ def get_large_trader_ratio(symbol: str) -> float:
         return 0.5
 
     data = _safe_json_get(
-        f"{BINANCE_FUTURES_DATA}/topLongShortAccountRatio",
+        f"{BINANCE_FUTURES_DATA}/topLongShortAccountRatio",  # ← endpoint correct
         params={"symbol": b_sym, "period": "1h", "limit": 1},
-        timeout=6.0,
-        retries=2,
+        endpoint_key="topLongShortAccountRatio",
     )
     try:
         if isinstance(data, list) and data:
             row = data[0]
-            # Champs: longAccount, shortAccount, longShortRatio, timestamp (strings)
+            # Champs: longAccount, shortAccount, longShortRatio, timestamp
             long_acc = float(row.get("longAccount", 0.0))
             short_acc = float(row.get("shortAccount", 0.0))
             if long_acc <= 0 and short_acc <= 0:
                 return 0.5
             ratio = long_acc / max(1e-9, short_acc)
-            # Écrase dans 0..1 via tanh-like
+            # bornage doux 0..1 via tanh (sans être trop aggressive)
             score = np.tanh(ratio)
             return float(np.clip(score, 0.0, 1.0))
     except Exception as e:
         _bump_and_maybe_warn("large_ratio", f"Parse failed for {b_sym}", str(e))
     return 0.5
 
-
 # --------------------------------------------------------------------
-# 🔹 2. DELTA CUMULÉ PAR CANDLE (divergence CVD vs prix)
+# 🔹 2. DELTA CUMULÉ (CVD) & DIVERGENCE vs PRIX
 # --------------------------------------------------------------------
 def get_cvd_divergence(symbol: str, limit: int = 500) -> float:
     """
@@ -229,16 +239,15 @@ def get_cvd_divergence(symbol: str, limit: int = 500) -> float:
 
     data = _safe_json_get(
         f"{BINANCE_FUTURES_API}/aggTrades",
-        params={"symbol": b_sym, "limit": max(100, min(1000, int(limit)))},
-        timeout=6.0,
-        retries=2,
+        params={"symbol": b_sym, "limit": int(max(100, min(1000, limit)))},
+        endpoint_key="aggTrades",
     )
     if not isinstance(data, list) or len(data) < 10:
         return 0.0
 
     try:
         df = pd.DataFrame(data)
-        # Attendus: p (price), q (qty), m (isBuyerMaker)
+        # attendus: p (price), q (qty), m (isBuyerMaker)
         if not {"p", "q", "m"}.issubset(df.columns):
             return 0.0
         df["p"] = pd.to_numeric(df["p"], errors="coerce")
@@ -247,7 +256,7 @@ def get_cvd_divergence(symbol: str, limit: int = 500) -> float:
         if df.empty:
             return 0.0
 
-        # maker côté vendeur => taker acheteur (m=False) ; code +1 pour taker acheteur
+        # maker côté vendeur => taker acheteur (m=False) ; +1 pour taker acheteur
         df["side"] = df["m"].apply(lambda x: -1 if bool(x) else 1)
         df["delta"] = df["q"] * df["side"]
 
@@ -255,12 +264,11 @@ def get_cvd_divergence(symbol: str, limit: int = 500) -> float:
         price_change = float(df["p"].iloc[-1] - df["p"].iloc[0])
         if abs(price_change) < 1e-10:
             return 0.0
-        corr = np.sign(price_change) * np.sign(cvd)  # +1 cohérent, -1 divergence
+        corr = np.sign(price_change) * np.sign(cvd)
         return float(np.clip(corr, -1.0, 1.0))
     except Exception as e:
         _bump_and_maybe_warn("cvd_div", f"CVD divergence parse failed for {b_sym}", str(e))
         return 0.0
-
 
 # --------------------------------------------------------------------
 # 🔹 3. LIQUIDITY MAP (equal highs/lows)
@@ -291,11 +299,10 @@ def detect_liquidity_clusters(df: pd.DataFrame, lookback: int = 50, tolerance: f
         "eq_lows": sorted({round(float(x), 6) for x in eq_lows}),
     }
 
-
 # --------------------------------------------------------------------
 # 🔸 SCORE INSTITUTIONNEL GLOBAL (pondéré)
 # --------------------------------------------------------------------
-def compute_institutional_score(symbol: str, bias: str, prev_oi: float = None) -> Dict[str, Any]:
+def compute_institutional_score(symbol: str, bias: str, prev_oi: float = None):
     """
     Retourne:
     {
@@ -303,7 +310,7 @@ def compute_institutional_score(symbol: str, bias: str, prev_oi: float = None) -
       "score_total": int,
       "details": {...}
     }
-    - 'fund' est un placeholder (1) tant que le funding live n'est pas intégré.
+    - 'fund' est un placeholder (1) tant que tu n'intègres pas un vrai funding live.
     """
     large_ratio = get_large_trader_ratio(symbol)
     cvd_div = get_cvd_divergence(symbol)
@@ -311,10 +318,10 @@ def compute_institutional_score(symbol: str, bias: str, prev_oi: float = None) -
     # Pondération simple (failsafe: neutres possibles)
     oi_score = 1 if large_ratio > 0.55 else 0
     cvd_score = 1 if cvd_div > 0 else 0
-    fund_score = 1  # TODO: remplacer par un vrai funding si dispo
-    liq_score = 0   # calcul côté structure si nécessaire
+    fund_score = 1  # à remplacer si tu wires un vrai funding
+    liq_score = 0   # calcul côté structure si besoin (évite double comptage)
 
-    score_total = oi_score + cvd_score + fund_score  # 0..3
+    score_total = oi_score + cvd_score + fund_score
 
     return {
         "scores": {
@@ -331,42 +338,20 @@ def compute_institutional_score(symbol: str, bias: str, prev_oi: float = None) -
         }
     }
 
-
 # --------------------------------------------------------------------
 # 🔹 4. COUCHE D’ORCHESTRATION (pondération + commentaire)
 # --------------------------------------------------------------------
-def compute_full_institutional_analysis(symbol: str, bias: str, prev_oi: float = None) -> Dict[str, Any]:
-    """
-    Orchestration robuste:
-    - Si mapping Binance indisponible → neutre (pas d'appel réseau)
-    - Sinon calcule un score global et génère un commentaire
-    """
-    # Vérifie d'abord si le mapping est possible sans déclencher d'appels inutiles
-    b_sym = _map_to_binance_symbol(symbol)
-    if not b_sym:
-        return {
-            "institutional_score": 0,
-            "institutional_strength": "Faible",
-            "institutional_comment": "Pas de flux dominants",
-            "neutral": True,
-            "reason": "no_binance_mapping",
-            "details": {}
-        }
-
+def compute_full_institutional_analysis(symbol: str, bias: str, prev_oi: float = None):
     inst = compute_institutional_score(symbol, bias, prev_oi)
-    d = inst["scores"]
-    total = int(inst["score_total"])
-
+    d = inst["scores"]; total = inst["score_total"]
     comment = []
     if d.get("oi"):   comment.append("OI↑")
     if d.get("fund"): comment.append("Funding cohérent")
     if d.get("cvd"):  comment.append("CVD cohérent")
     strength = "Fort" if total == 3 else ("Moyen" if total == 2 else "Faible")
-
     return {
-        "institutional_score": total,                 # utilisé par analyze_signal.py
+        "institutional_score": total,
         "institutional_strength": strength,
         "institutional_comment": ", ".join(comment) if comment else "Pas de flux dominants",
-        "neutral": False,
         "details": inst
     }
