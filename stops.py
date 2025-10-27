@@ -1,4 +1,4 @@
-# stops.py — SL "desk pro": Liquidité (prioritaire) + Structure H1 (limite) > ATR (dernier recours) + logs
+# stops.py — SL "desk pro": Liquidité (prioritaire) + Structure H1 (limite) > ATR (fallback) + clamps + logs + export source
 from __future__ import annotations
 from typing import Optional, List, Tuple
 import numpy as np
@@ -10,55 +10,66 @@ from institutional_data import detect_liquidity_clusters
 from settings import (
     ATR_LEN, ATR_MULT_SL, STRUCT_LOOKBACK,
     SL_BUFFER_PCT, SL_BUFFER_TICKS,
+    # les suivants peuvent être absents de settings (defaults ci-dessous)
 )
 
 LOGGER = logging.getLogger(__name__)
 
-# --- Options supplémentaires (fallback si absentes dans settings.py) ---
+# =================== Defaults robustes si absents dans settings ===================
 try:
     from settings import MAX_SL_PCT
 except Exception:
-    MAX_SL_PCT = 0.06  # 6% par défaut
+    MAX_SL_PCT = 0.06  # 6% max entre entry et SL
 
 try:
     from settings import MIN_SL_TICKS
 except Exception:
-    MIN_SL_TICKS = 2   # au moins 2 ticks
+    MIN_SL_TICKS = 2   # min 2 ticks
 
 try:
     from settings import ATR_MULT_SL_CAP
 except Exception:
-    ATR_MULT_SL_CAP = 2.0  # SL ne dépasse pas 2x l'ATR
+    ATR_MULT_SL_CAP = 2.0  # |entry-SL| ≤ ATR*2
 
-# Buffers & lookback spécifiques "liquidité"
+# Buffers & lookback spécifiques liquidité
 try:
     from settings import LIQ_LOOKBACK
 except Exception:
-    LIQ_LOOKBACK = max(80, int(STRUCT_LOOKBACK))  # plus large pour mieux capter
+    LIQ_LOOKBACK = max(80, int(STRUCT_LOOKBACK))  # un peu plus large que structure
 
 try:
     from settings import LIQ_BUFFER_PCT
 except Exception:
-    LIQ_BUFFER_PCT = max(0.0, float(SL_BUFFER_PCT))  # par défaut = buffer SL
+    LIQ_BUFFER_PCT = max(0.0, float(SL_BUFFER_PCT))  # par défaut ≈ buffer SL
 
 try:
     from settings import LIQ_BUFFER_TICKS
 except Exception:
-    LIQ_BUFFER_TICKS = max(3, int(SL_BUFFER_TICKS + 1))  # un peu plus que SL buffer
+    LIQ_BUFFER_TICKS = max(3, int(SL_BUFFER_TICKS + 1))  # plus que SL buffer
 
 # Tolérance liquidité adaptative
 try:
     from settings import LIQ_TOL_BPS_MIN
 except Exception:
-    LIQ_TOL_BPS_MIN = 5  # 0.05% mini
+    LIQ_TOL_BPS_MIN = 5  # 0.05%
 
 try:
     from settings import LIQ_TOL_TICKS
 except Exception:
-    LIQ_TOL_TICKS = 3  # égalité si écart <= 3 ticks
+    LIQ_TOL_TICKS = 3  # égalité si écart ≤ 3 ticks
 
+# =================== Export de la source du SL pour exits_manager ===================
+_LAST_SL_SOURCE: str = "unknown"
 
-# ------------------------- Utils génériques -------------------------
+def _set_last_sl_source(src: str) -> None:
+    global _LAST_SL_SOURCE
+    _LAST_SL_SOURCE = str(src)
+
+def get_last_sl_source() -> str:
+    """Permet à exits_manager d'afficher la source du SL (liquidity / structure / atr / hybrid)."""
+    return _LAST_SL_SOURCE
+
+# =================== Utils génériques ===================
 
 def _round_to_tick(x: float, tick: float) -> float:
     if tick <= 0:
@@ -87,7 +98,7 @@ def _fallback_atr(df: pd.DataFrame, period: int) -> float:
 def _swing_low(df: pd.DataFrame, lookback: int) -> Optional[float]:
     try:
         s = df["low"].rolling(int(max(2, lookback))).min()
-        v = float(s.iloc[-2])
+        v = float(s.iloc[-2])  # exclut la bougie en formation
         return None if np.isnan(v) or np.isinf(v) else v
     except Exception:
         return None
@@ -110,8 +121,7 @@ def _compute_atr(df: pd.DataFrame) -> float:
         atr_val = _fallback_atr(df, int(ATR_LEN))
     return float(max(0.0, atr_val or 0.0))
 
-
-# ------------------------- Liquidité (détection) -------------------------
+# =================== Liquidité (détection) ===================
 
 def _adaptive_tol(price: float, tick: float) -> float:
     """
@@ -125,8 +135,7 @@ def _adaptive_tol(price: float, tick: float) -> float:
 
 def _detect_eq_local(df: pd.DataFrame, lookback: int, tol_rel: float) -> Tuple[List[float], List[float]]:
     """
-    Détection locale 'equal highs/lows' si institutional_data.detect_liquidity_clusters
-    ne retourne rien. On compare bougies successives (ou patterns triples) avec tolérance relative.
+    Détection locale d'equal highs/lows au cas où detect_liquidity_clusters ne renvoie rien.
     """
     try:
         highs = df["high"].astype(float).tail(lookback).to_numpy()
@@ -135,6 +144,8 @@ def _detect_eq_local(df: pd.DataFrame, lookback: int, tol_rel: float) -> Tuple[L
         return [], []
 
     eq_highs, eq_lows = set(), set()
+
+    # 2 points consécutifs quasi égaux
     for i in range(1, len(highs)):
         try:
             if abs(highs[i] - highs[i - 1]) / max(1e-12, highs[i]) <= tol_rel:
@@ -144,7 +155,7 @@ def _detect_eq_local(df: pd.DataFrame, lookback: int, tol_rel: float) -> Tuple[L
         except Exception:
             continue
 
-    # petit pattern 3-point (H==H==H / L==L==L)
+    # petit pattern 3 points
     for i in range(2, len(highs)):
         try:
             h1, h2, h3 = highs[i-2], highs[i-1], highs[i]
@@ -166,8 +177,7 @@ def _nearest_above(levels: List[float], entry: float) -> Optional[float]:
     above = [float(x) for x in levels if float(x) > float(entry)]
     return min(above) if above else None
 
-
-# ------------------------ Garde-fous communs ------------------------
+# =================== Clamps communs (sécurité & conformité) ===================
 
 def _apply_common_clamps(entry: float,
                          sl_raw: float,
@@ -201,18 +211,17 @@ def _apply_common_clamps(entry: float,
 
     # Bon côté après alignement
     if side == "buy":
-        sl = min(sl, _round_to_tick(entry - tick, tick))
+        sl = min(sl, _round_to_tick(entry - tick, tick))  # strictement sous l'entrée
     else:
-        sl = max(sl, _round_to_tick(entry + tick, tick))
+        sl = max(sl, _round_to_tick(entry + tick, tick))  # strictement au-dessus de l'entrée
 
     return max(1e-8, float(sl))
 
-
-# ---------------------- Calculs SL par scénario ----------------------
+# =================== SL depuis liquidité ===================
 
 def _sl_long_from_liquidity(df_liq: pd.DataFrame, entry: float, tick: float) -> Tuple[Optional[float], Optional[float], str]:
-    """Renvoie (sl, lvl, source) pour un long basé sur liquidité; source in {'liquidity','liquidity_local','none'}"""
-    # 1) Liquidité via module institutionnel
+    """(sl, lvl, source) pour LONG via liquidité; source in {'liquidity','liquidity_local','none'}."""
+    # 1) Liquidité via module insto
     try:
         liq = detect_liquidity_clusters(df_liq, lookback=int(LIQ_LOOKBACK), tolerance=0.0005)
         eq_lows = list(liq.get("eq_lows", []))
@@ -224,7 +233,7 @@ def _sl_long_from_liquidity(df_liq: pd.DataFrame, entry: float, tick: float) -> 
         sl = _round_to_tick(base, float(tick)) - float(LIQ_BUFFER_TICKS) * float(tick)
         return float(sl), float(lvl), "liquidity"
 
-    # 2) Détection locale (encore liquidité, pas structure)
+    # 2) Détection locale (fallback liquidité)
     tol_rel = _adaptive_tol(float(entry), float(tick))
     eqh, eql = _detect_eq_local(df_liq, lookback=int(LIQ_LOOKBACK), tol_rel=tol_rel)
     lvl = _nearest_below(eql, float(entry)) if eql else None
@@ -236,7 +245,7 @@ def _sl_long_from_liquidity(df_liq: pd.DataFrame, entry: float, tick: float) -> 
     return None, None, "none"
 
 def _sl_short_from_liquidity(df_liq: pd.DataFrame, entry: float, tick: float) -> Tuple[Optional[float], Optional[float], str]:
-    """Renvoie (sl, lvl, source) pour un short basé sur liquidité."""
+    """(sl, lvl, source) pour SHORT via liquidité."""
     try:
         liq = detect_liquidity_clusters(df_liq, lookback=int(LIQ_LOOKBACK), tolerance=0.0005)
         eq_highs = list(liq.get("eq_highs", []))
@@ -258,6 +267,7 @@ def _sl_short_from_liquidity(df_liq: pd.DataFrame, entry: float, tick: float) ->
 
     return None, None, "none"
 
+# =================== Swing (bufferisé) ===================
 
 def _swing_buffered_long(df_h1: pd.DataFrame, tick: float) -> Optional[float]:
     swing = _swing_low(df_h1, int(STRUCT_LOOKBACK))
@@ -279,39 +289,42 @@ def _swing_buffered_short(df_h1: pd.DataFrame, tick: float) -> Optional[float]:
     base = float(swing) * (1.0 + float(SL_BUFFER_PCT))
     return _round_to_tick(base, float(tick)) + float(SL_BUFFER_TICKS) * float(tick)
 
-
-# ----------------------------- API publique -----------------------------
-# NOTE: df_liq = timeframe dédiée (ex: M15). Si None, on utilise df (H1).
+# =================== API publique ===================
+# NOTE: df_liq = timeframe dédiée (ex: M15). Si None, la liquidité est détectée sur df (H1).
 
 def protective_stop_long(df: pd.DataFrame, entry: float, tick: float, df_liq: Optional[pd.DataFrame] = None) -> float:
     """
     LONG — priorité stricte (hybride):
-      1) Liquidité (M15 conseillé via df_liq) la plus proche sous l'entrée (+ buffers liq)
+      1) Liquidité (M15 conseillé via df_liq) sous l'entrée (+ buffers liq)
       2) Structure H1: swing low (buffer SL)
-      => Fusion: sl_raw = max(sl_liquidity, sl_swing)  # jamais sous le swing H1
+      Fusion: sl_raw = max(sl_liquidity, sl_swing)  # jamais sous le swing H1
       3) ATR: entry - ATR_MULT_SL * ATR   (ultime recours)
       + Garde-fous (cap %, cap ATR, min ticks, alignement, bon côté)
     """
     atr_val = _compute_atr(df)
-
     base_df_for_liq = df_liq if df_liq is not None else df
+
     sl_liq, lvl, src = _sl_long_from_liquidity(base_df_for_liq, float(entry), float(tick))
     sl_swing = _swing_buffered_long(df, float(tick))
 
     if sl_liq is not None and sl_swing is not None:
-        raw = max(float(sl_liq), float(sl_swing))  # protège le RR : on ne va pas sous le swing H1
+        raw = max(float(sl_liq), float(sl_swing))  # protège le RR : jamais sous le swing H1
+        _set_last_sl_source("hybrid:"+src)
         LOGGER.info("[SL] long via hybrid (%s + swing) lvl=%.12f swing_buf=%.12f entry=%.12f -> raw=%.12f",
                     src, float(lvl), float(sl_swing), float(entry), float(raw))
     elif sl_liq is not None:
         raw = float(sl_liq)
+        _set_last_sl_source(src)
         LOGGER.info("[SL] long via %s lvl=%.12f entry=%.12f -> raw=%.12f", src, float(lvl), float(entry), float(raw))
     elif sl_swing is not None:
         raw = float(sl_swing)
+        _set_last_sl_source("structure")
         LOGGER.info("[SL] long via structure swing_buf=%.12f entry=%.12f -> raw=%.12f", float(sl_swing), float(entry), float(raw))
     else:
         sl_atr = float(entry) - float(ATR_MULT_SL) * float(atr_val)
         base = sl_atr * (1.0 - float(SL_BUFFER_PCT))
         raw = _round_to_tick(base, float(tick)) - float(SL_BUFFER_TICKS) * float(tick)
+        _set_last_sl_source("atr_fallback")
         LOGGER.info("[SL] long via atr_fallback atr=%.12f entry=%.12f -> raw=%.12f", float(atr_val), float(entry), float(raw))
 
     sl = _apply_common_clamps(entry=float(entry), sl_raw=float(raw), side="buy",
@@ -319,36 +332,39 @@ def protective_stop_long(df: pd.DataFrame, entry: float, tick: float, df_liq: Op
     LOGGER.info("[SL] long final=%.12f (tick=%.12f)", float(sl), float(tick))
     return float(sl)
 
-
 def protective_stop_short(df: pd.DataFrame, entry: float, tick: float, df_liq: Optional[pd.DataFrame] = None) -> float:
     """
     SHORT — priorité stricte (hybride):
-      1) Liquidité (M15 conseillé via df_liq) la plus proche au-dessus de l'entrée (+ buffers liq)
+      1) Liquidité (M15 conseillé via df_liq) au-dessus de l'entrée (+ buffers liq)
       2) Structure H1: swing high (buffer SL)
-      => Fusion: sl_raw = min(sl_liquidity, sl_swing)  # jamais au-dessus du swing H1
+      Fusion: sl_raw = min(sl_liquidity, sl_swing)  # jamais au-dessus du swing H1
       3) ATR: entry + ATR_MULT_SL * ATR   (ultime recours)
       + Garde-fous (cap %, cap ATR, min ticks, alignement, bon côté)
     """
     atr_val = _compute_atr(df)
-
     base_df_for_liq = df_liq if df_liq is not None else df
+
     sl_liq, lvl, src = _sl_short_from_liquidity(base_df_for_liq, float(entry), float(tick))
     sl_swing = _swing_buffered_short(df, float(tick))
 
     if sl_liq is not None and sl_swing is not None:
-        raw = min(float(sl_liq), float(sl_swing))  # protège le RR : on ne dépasse pas le swing H1
+        raw = min(float(sl_liq), float(sl_swing))  # protège le RR : pas au-dessus du swing H1
+        _set_last_sl_source("hybrid:"+src)
         LOGGER.info("[SL] short via hybrid (%s + swing) lvl=%.12f swing_buf=%.12f entry=%.12f -> raw=%.12f",
                     src, float(lvl), float(sl_swing), float(entry), float(raw))
     elif sl_liq is not None:
         raw = float(sl_liq)
+        _set_last_sl_source(src)
         LOGGER.info("[SL] short via %s lvl=%.12f entry=%.12f -> raw=%.12f", src, float(lvl), float(entry), float(raw))
     elif sl_swing is not None:
         raw = float(sl_swing)
+        _set_last_sl_source("structure")
         LOGGER.info("[SL] short via structure swing_buf=%.12f entry=%.12f -> raw=%.12f", float(sl_swing), float(entry), float(raw))
     else:
         sl_atr = float(entry) + float(ATR_MULT_SL) * float(atr_val)
         base = sl_atr * (1.0 + float(SL_BUFFER_PCT))
         raw = _round_to_tick(base, float(tick)) + float(SL_BUFFER_TICKS) * float(tick)
+        _set_last_sl_source("atr_fallback")
         LOGGER.info("[SL] short via atr_fallback atr=%.12f entry=%.12f -> raw=%.12f", float(atr_val), float(entry), float(raw))
 
     sl = _apply_common_clamps(entry=float(entry), sl_raw=float(raw), side="sell",
