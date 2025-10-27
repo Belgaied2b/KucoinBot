@@ -17,6 +17,7 @@ from kucoin_trader import (
     list_open_orders,  # helper fiable (status=open)
 )
 from breakeven_manager import launch_breakeven_thread
+from stops import get_last_sl_source  # <<< nouvelle import pour tracer la source du SL
 
 # (optionnel) si tu utilises le module exits.py (stopOrders natif)
 try:
@@ -32,12 +33,6 @@ LOGGER = logging.getLogger(__name__)
 # Anti-doublon local pour le lancement du BE monitor (clé par position)
 _BE_LAUNCH_GUARD: dict[str, float] = {}
 _BE_GUARD_TTL = 30.0  # secondes
-
-# ---- Petites bornes (fallbacks si pas dans settings.py) ----
-try:
-    from settings import MIN_TP_TICKS  # écart minimal TP1/TP2 et par rapport à l'entry
-except Exception:
-    MIN_TP_TICKS = 1
 
 # ------------------------------- Utils -------------------------------
 def _round_to_tick(x: float, tick: float) -> float:
@@ -58,101 +53,39 @@ def _split_half(lots: int) -> Tuple[int, int]:
         a, b = 1, max(0, lots - 1)
     return a, b
 
-def _ensure_demi_espace(side: str, entry: float, price: float, tick: float) -> float:
-    """Force le TP du bon côté de l'entrée (au moins 1 tick dans le bon demi-espace)."""
-    s = (side or "").lower()
-    e = float(entry); p = float(price); t = float(tick)
-    if s == "buy":
-        if p <= e:
-            p = e + max(t, 0.0)
-    else:
-        if p >= e:
-            p = e - max(t, 0.0)
-    return _round_to_tick(p, t)
-
-def _normalize_targets(
-    side: str,
-    entry: float,
-    tp1: float,
-    tp2: Optional[float],
-    tick: float,
-    min_tp_ticks: int = 1
-) -> Tuple[float, Optional[float], bool, bool]:
+def _normalize_targets(side: str, entry: float, tp1: float, tp2: Optional[float]) -> Tuple[float, Optional[float], bool]:
     """
     Garantit : TP1 = target la plus proche de l'entry dans le bon sens ; TP2 = plus lointaine.
-    Impose un écart minimal en ticks et évite TP1==TP2 après arrondi.
-    Retourne (tp1_norm, tp2_norm, swapped, adjusted)
-    - swapped=True si inversion TP1/TP2
-    - adjusted=True si correction demi-espace/écart min effectuée
+    Retourne (tp1_norm, tp2_norm, swapped) ; swapped=True si on a inversé les valeurs fournies.
     """
     s = (side or "").lower()
-    e = float(entry); t = float(tick)
+    e = float(entry)
     t1 = float(tp1)
     t2 = float(tp2) if tp2 is not None else None
-    swapped = False
-    adjusted = False
 
-    # 1) Demi-espace minimum (≥ 1 tick dans le bon sens)
-    t1 = _ensure_demi_espace(s, e, t1, t)
-    if tp2 is not None:
-        t2 = _ensure_demi_espace(s, e, t2, t)
-
-    # 2) Si TP2 absent → normalisation simple
+    # Si pas de TP2 → rien à normaliser
     if t2 is None:
-        # s'assurer qu'au moins min_tp_ticks par rapport à entry
-        min_d = max(int(min_tp_ticks) * t, t if t > 0 else 0.0)
-        if s == "buy" and (t1 - e) < min_d:
-            t1 = _round_to_tick(e + min_d, t); adjusted = True
-        elif s == "sell" and (e - t1) < min_d:
-            t1 = _round_to_tick(e - min_d, t); adjusted = True
-        return t1, None, swapped, adjusted
+        return t1, None, False
 
-    # 3) Choisir proche/loin dans le bon demi-espace
     if s == "buy":
+        # On veut t1 > e et t2 > e ; le plus proche de e = TP1
         candidates = [x for x in (t1, t2) if x > e]
         if len(candidates) == 2:
             near = min(candidates, key=lambda x: x - e)
             far  = max(candidates, key=lambda x: x - e)
             swapped = not (near == t1 and far == t2)
-            t1, t2 = near, far
-        # sinon on laisse tel quel mais on fera les garde-fous ci-dessous
+            return near, far, swapped
+        # Si l’un est du mauvais côté, on garde l’ordre relatif mais on loggue
+        return t1, t2, False
     else:
+        # sell : on veut t1 < e et t2 < e ; le plus proche (en valeur absolue) = TP1
         candidates = [x for x in (t1, t2) if x < e]
         if len(candidates) == 2:
-            # le plus proche de e est la valeur la plus grande (côté inférieur)
-            near = max(candidates)
-            far  = min(candidates)
+            near = max(candidates, key=lambda x: x)  # plus proche de e par le haut
+            far  = min(candidates, key=lambda x: x)  # plus lointain
             swapped = not (near == t1 and far == t2)
-            t1, t2 = near, far
-
-    # 4) Ecart minimal en ticks entre entry/TP1 et TP1/TP2
-    min_d = max(int(min_tp_ticks) * t, t if t > 0 else 0.0)
-
-    # entry -> TP1
-    if s == "buy":
-        if (t1 - e) < min_d:
-            t1 = _round_to_tick(e + min_d, t); adjusted = True
-    else:
-        if (e - t1) < min_d:
-            t1 = _round_to_tick(e - min_d, t); adjusted = True
-
-    # TP1 -> TP2
-    if s == "buy":
-        if (t2 - t1) < min_d:
-            t2 = _round_to_tick(t1 + min_d, t); adjusted = True
-    else:
-        if (t1 - t2) < min_d:
-            t2 = _round_to_tick(t1 - min_d, t); adjusted = True
-
-    # 5) Eviter collision TP1==TP2 après réalignement
-    if t2 == t1:
-        t2 = _round_to_tick(t1 + (t if s == "buy" else -t), t); adjusted = True
-
-    # 6) Sécurité finale : toujours dans le bon demi-espace après tous ajustements
-    t1 = _ensure_demi_espace(s, e, t1, t)
-    t2 = _ensure_demi_espace(s, e, t2, t)
-
-    return t1, t2, swapped, adjusted
+            return near, far, swapped
+        return t1, t2, False
 
 def _retry_if_needed(symbol: str, side: str,
                      sl: float, tp_price: float,
@@ -161,7 +94,6 @@ def _retry_if_needed(symbol: str, side: str,
     """
     Si SL/TP non 'ok', on retente une fois. Ensuite on vérifie la présence
     d'au moins un des ordres via open orders, avec backoff tolérant (anti-404/latence d'indexation).
-    IMPORTANT: on ne s'arrête pas sur une liste vide — on tente jusqu'à max_tries.
     """
     if not sl_resp.get("ok"):
         LOGGER.warning("Retry SL for %s at %.12f (lots=%d)", symbol, sl, sl_lots)
@@ -210,8 +142,8 @@ def _be_guard_key(symbol: str, entry: float, tick: float) -> str:
     return f"{symbol}#{_round_to_tick(float(entry), float(tick))}"
 
 def _should_launch_be(symbol: str, entry: float, tick: float) -> bool:
-    now = time.time()
     key = _be_guard_key(symbol, entry, tick)
+    now = time.time()
     last = _BE_LAUNCH_GUARD.get(key, 0.0)
     if (now - last) < _BE_GUARD_TTL:
         LOGGER.info("[EXITS] BE monitor launch guarded for %s (%.1fs remaining)",
@@ -249,22 +181,15 @@ def attach_exits_after_fill(
     meta = get_contract_info(symbol)
     tick = float(price_tick) if price_tick else float(meta.get("tickSize", 0.01))
 
-    # --- 0) Normalisation des targets (clé pour éviter TP1/TP2 inversés + écart min/tick) ---
-    tp1_norm, tp2_norm, swapped, adjusted = _normalize_targets(
-        side=side, entry=float(entry), tp1=float(tp), tp2=tp2 if tp2 is not None else None,
-        tick=tick, min_tp_ticks=int(MIN_TP_TICKS)
-    )
-    if swapped or adjusted:
-        LOGGER.warning(
-            "[EXITS] %s side=%s — Targets normalisées (swapped=%s adjusted=%s): "
-            "tp1_in=%.12f tp2_in=%s -> tp1=%.12f tp2=%s",
-            symbol, side, swapped, adjusted,
-            float(tp), f"{tp2:.12f}" if tp2 is not None else "None",
-            tp1_norm, f"{tp2_norm:.12f}" if tp2_norm is not None else "None"
-        )
+    # --- 0) Normalisation des targets (clé pour éviter TP1/TP2 inversés) ---
+    tp_norm, tp2_norm, swapped = _normalize_targets(side, float(entry), float(tp), tp2 if tp2 is not None else None)
+    if swapped:
+        LOGGER.warning("[EXITS] %s side=%s — TP1/TP2 reçus inversés. Normalisation: tp1=%s -> %.12f | tp2=%s -> %.12f",
+                       symbol, side, f"{tp:.12f}", tp_norm, f"{tp2:.12f}" if tp2 is not None else "None",
+                       tp2_norm if tp2_norm is not None else float("nan"))
 
     sl_r  = _round_to_tick(float(sl),      tick)
-    tp1_r = _round_to_tick(float(tp1_norm), tick)
+    tp1_r = _round_to_tick(float(tp_norm), tick)     # TP1 = plus proche de l'entry
     tp2_r = _round_to_tick(float(tp2_norm), tick) if tp2_norm is not None else None
 
     lots_full = int(size_lots)
@@ -272,9 +197,15 @@ def attach_exits_after_fill(
     if lots_full >= 1 and tp1_lots == 0:
         tp1_lots, tp2_lots = 1, max(0, lots_full - 1)
 
+    # --- LOG preview + source du SL (nouveau) ---
+    try:
+        sl_src = get_last_sl_source()
+    except Exception:
+        sl_src = "unknown"
+
     LOGGER.info(
-        "[EXITS] %s side=%s lots=%d -> SL@%.12f | TP1: %d @ %.12f | TP2: %s",
-        symbol, side, lots_full, sl_r, tp1_lots, tp1_r,
+        "[EXITS] %s side=%s lots=%d -> SL@%.12f (src=%s) | TP1: %d @ %.12f | TP2: %s",
+        symbol, side, lots_full, sl_r, sl_src, tp1_lots, tp1_r,
         f"{tp2_lots} @ {tp2_r:.12f}" if (tp2_r is not None and tp2_lots > 0) else "none"
     )
 
@@ -287,7 +218,7 @@ def attach_exits_after_fill(
     else:
         sl_resp = place_reduce_only_stop(symbol, side, new_stop=sl_r, size_lots=lots_full)
 
-    # 2) TP1 sur ~50% (ou 1 lot si impossible) — LIMIT reduce-only, GTC (pas post-only)
+    # 2) TP1 sur ~50% (ou 1 lot si impossible)
     if tp1_lots > 0:
         if USE_FIXED_TPSL and place_tp_fixed:
             tp1_resp = place_tp_fixed(symbol, side, size_lots=tp1_lots, tp_price=tp1_r)
@@ -325,9 +256,9 @@ def attach_exits_after_fill(
                 symbol=symbol,
                 side=side,
                 entry=float(entry),
-                tp1=float(tp1_r),                                   # TP1 NORMALISÉ
+                tp1=float(tp1_r),                                    # on passe le TP1 NORMALISÉ
                 tp2=float(tp2_r) if tp2_r is not None else None,
-                price_tick=float(tick),                             # tick au monitor
+                price_tick=float(tick),                               # tick au monitor
                 notifier=notifier,
             )
             LOGGER.info("[EXITS] BE monitor launched for %s", symbol)
