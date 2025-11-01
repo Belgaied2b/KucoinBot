@@ -262,7 +262,7 @@ def _apply_common_clamps(entry: float,
                          tick: float,
                          atr_value: float,
                          regime: str,
-                         meta: Dict[str, float]) -> float:
+                         meta: Dict[str, Union[float, str]]) -> float:
     """
     Applique: cap % max, cap ATR (cap dynamique selon régime), distance min ticks, alignement tick, bon côté.
     """
@@ -276,30 +276,31 @@ def _apply_common_clamps(entry: float,
         max_dist_abs = entry * float(MAX_SL_PCT)
         if abs(entry - sl) > max_dist_abs:
             sl = entry - max_dist_abs if side == "buy" else entry + max_dist_abs
-            meta["clamp_max_pct"] = max_dist_abs
+            meta["clamp_max_pct"] = float(max_dist_abs)
 
     # Cap ATR absolu (avec multiplicateur de régime)
-    atr_cap_mult = meta.get("atr_cap_mult", 1.0)
+    atr_cap_mult = float(meta.get("atr_cap_mult", 1.0))  # renseigné par l'appelant
     if ATR_MULT_SL_CAP and ATR_MULT_SL_CAP > 0 and atr_value and atr_value > 0:
         atr_cap = float(atr_value) * float(ATR_MULT_SL_CAP) * float(atr_cap_mult)
         if abs(entry - sl) > atr_cap:
             sl = entry - atr_cap if side == "buy" else entry + atr_cap
-            meta["clamp_atr_cap"] = atr_cap
+            meta["clamp_atr_cap"] = float(atr_cap)
 
     # Distance minimale en ticks
     min_dist = max(float(MIN_SL_TICKS) * tick, tick if tick > 0 else 0.0)
     if abs(entry - sl) < min_dist:
         sl = entry - min_dist if side == "buy" else entry + min_dist
-        meta["clamp_min_ticks"] = min_dist
+        meta["clamp_min_ticks"] = float(min_dist)
 
     # Alignement tick
     sl = _round_to_tick(sl, tick)
 
     # Bon côté après alignement
-    if side == "buy":
-        sl = min(sl, _round_to_tick(entry - tick, tick))
-    else:
-        sl = max(sl, _round_to_tick(entry + tick, tick))
+    if tick > 0:
+        if side == "buy":
+            sl = min(sl, _round_to_tick(entry - tick, tick))
+        else:
+            sl = max(sl, _round_to_tick(entry + tick, tick))
 
     return max(1e-8, float(sl))
 
@@ -383,7 +384,7 @@ def protective_stop_long(
     tick: float,
     df_liq: Optional[pd.DataFrame] = None,
     return_meta: bool = False
-) -> Union[float, Tuple[float, Dict[str, float]]]:
+) -> Union[float, Tuple[float, Dict[str, Union[float, str]]]]:
     """
     LONG — priorité stricte (hybride):
       1) Liquidité (M15 conseillé via df_liq) la plus proche sous l'entrée (+ buffers liq)
@@ -399,7 +400,7 @@ def protective_stop_long(
     regime = _infer_regime(df, atr_val)
     adj = _regime_adjustments(regime)
 
-    meta: Dict[str, float] = {
+    meta: Dict[str, Union[float, str]] = {
         "side": "long",
         "regime": regime,
         "atr": float(atr_val),
@@ -419,12 +420,15 @@ def protective_stop_long(
 
     if sl_liq is not None and sl_swing is not None:
         raw = max(float(sl_liq), float(sl_swing))  # protège le RR : on ne va pas sous le swing H1
-        meta.update({"source": "hybrid", "liquidity_level": float(lvl or 0.0), "swing_level": float(sl_swing)})
+        meta.update({"source": "hybrid"})
+        if lvl is not None: meta["liquidity_level"] = float(lvl)
+        meta["swing_level"] = float(sl_swing)
         LOGGER.info("[SL] long via hybrid (%s + swing) lvl=%.12f swing_buf=%.12f entry=%.12f -> raw=%.12f | regime=%s",
                     src, float(lvl or 0.0), float(sl_swing), float(entry), float(raw), regime)
     elif sl_liq is not None:
         raw = float(sl_liq)
-        meta.update({"source": src, "liquidity_level": float(lvl or 0.0)})
+        meta.update({"source": src})
+        if lvl is not None: meta["liquidity_level"] = float(lvl)
         LOGGER.info("[SL] long via %s lvl=%.12f entry=%.12f -> raw=%.12f | regime=%s",
                     src, float(lvl or 0.0), float(entry), float(raw), regime)
     elif sl_swing is not None:
@@ -461,7 +465,7 @@ def protective_stop_short(
     tick: float,
     df_liq: Optional[pd.DataFrame] = None,
     return_meta: bool = False
-) -> Union[float, Tuple[float, Dict[str, float]]]:
+) -> Union[float, Tuple[float, Dict[str, Union[float, str]]]]:
     """
     SHORT — priorité stricte (hybride):
       1) Liquidité (M15 conseillé via df_liq) la plus proche au-dessus de l'entrée (+ buffers liq)
@@ -477,7 +481,7 @@ def protective_stop_short(
     regime = _infer_regime(df, atr_val)
     adj = _regime_adjustments(regime)
 
-    meta: Dict[str, float] = {
+    meta: Dict[str, Union[float, str]] = {
         "side": "short",
         "regime": regime,
         "atr": float(atr_val),
@@ -497,12 +501,15 @@ def protective_stop_short(
 
     if sl_liq is not None and sl_swing is not None:
         raw = min(float(sl_liq), float(sl_swing))  # protège le RR : on ne dépasse pas le swing H1
-        meta.update({"source": "hybrid", "liquidity_level": float(lvl or 0.0), "swing_level": float(sl_swing)})
+        meta.update({"source": "hybrid"})
+        if lvl is not None: meta["liquidity_level"] = float(lvl)
+        meta["swing_level"] = float(sl_swing)
         LOGGER.info("[SL] short via hybrid (%s + swing) lvl=%.12f swing_buf=%.12f entry=%.12f -> raw=%.12f | regime=%s",
                     src, float(lvl or 0.0), float(sl_swing), float(entry), float(raw), regime)
     elif sl_liq is not None:
         raw = float(sl_liq)
-        meta.update({"source": src, "liquidity_level": float(lvl or 0.0)})
+        meta.update({"source": src})
+        if lvl is not None: meta["liquidity_level"] = float(lvl)
         LOGGER.info("[SL] short via %s lvl=%.12f entry=%.12f -> raw=%.12f | regime=%s",
                     src, float(lvl or 0.0), float(entry), float(raw), regime)
     elif sl_swing is not None:
@@ -532,3 +539,40 @@ def protective_stop_short(
         meta["sl_final"] = float(sl)
         return float(sl), meta
     return float(sl)
+
+# ----------------------------- Helper logs ------------------------------
+def format_sl_meta_for_log(meta: Dict[str, Union[float, str]]) -> str:
+    """
+    Fabrique une ligne compacte pour tes logs [EXITS].
+    Champs possibles:
+      - source in {'liquidity','liquidity_local','structure','atr','hybrid'}
+      - regime in {'low','normal','high'}
+      - liquidity_level, swing_level (si dispo)
+      - atr, atr_mult_sl, atr_cap_mult
+      - clamp_max_pct, clamp_atr_cap, clamp_min_ticks
+      - sl_final
+    """
+    parts = []
+    src = str(meta.get("source", "n/a"))
+    reg = str(meta.get("regime", "normal"))
+    parts.append(f"source={src}")
+    parts.append(f"regime={reg}")
+    if "liquidity_level" in meta:
+        parts.append(f"liq_lvl={float(meta['liquidity_level']):.6f}")
+    if "swing_level" in meta:
+        parts.append(f"swing={float(meta['swing_level']):.6f}")
+    if "atr" in meta:
+        parts.append(f"atr={float(meta['atr']):.6f}")
+    if "atr_mult_sl" in meta:
+        parts.append(f"atr_mult={float(meta['atr_mult_sl']):.2f}")
+    if "atr_cap_mult" in meta:
+        parts.append(f"atr_cap_mult={float(meta['atr_cap_mult']):.2f}")
+    if "clamp_max_pct" in meta:
+        parts.append(f"cap_pct={float(meta['clamp_max_pct']):.6f}")
+    if "clamp_atr_cap" in meta:
+        parts.append(f"cap_atr={float(meta['clamp_atr_cap']):.6f}")
+    if "clamp_min_ticks" in meta:
+        parts.append(f"min_ticks={float(meta['clamp_min_ticks']):.6f}")
+    if "sl_final" in meta:
+        parts.append(f"sl_final={float(meta['sl_final']):.6f}")
+    return " | ".join(parts)
