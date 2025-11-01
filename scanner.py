@@ -23,7 +23,7 @@ from exits_manager import purge_reduce_only, attach_exits_after_fill
 from fills import wait_for_fill
 
 # nouveaux helpers (fichiers ajoutés)
-from stops import protective_stop_long, protective_stop_short
+from stops import protective_stop_long, protective_stop_short, format_sl_meta_for_log
 from sizing import lots_by_risk
 
 # anti-doublons (nouveau fichier duplicate_guard.py requis)
@@ -157,11 +157,16 @@ def scan_and_send_signals():
             if bias not in ("LONG", "SHORT"):
                 bias = "LONG"
 
+            # --- SL avec meta + log [EXITS] ---
             if bias == "LONG":
-                sl_raw = protective_stop_long(df, entry, tick)
+                sl_val, sl_meta = protective_stop_long(df, entry, tick, return_meta=True)
             else:
-                sl_raw = protective_stop_short(df, entry, tick)
+                sl_val, sl_meta = protective_stop_short(df, entry, tick, return_meta=True)
+            sl_raw = float(sl_val)
+            sl_log = format_sl_meta_for_log(sl_meta)
+            LOGGER.info("[EXITS][SL] %s | entry=%.12f | sl=%.12f", sl_log, entry, sl_raw)
 
+            # --- TP1/TP2 (1.5R/2.5R + alignement swing) ---
             tp1_raw, tp2_raw = _compute_tp_levels(df, entry, sl_raw, bias, rr1=1.5, rr2=2.5, tick=tick, lookback=20)
 
             ok_rr, entry, sl, tp2, rr = _validate_rr_and_fix(bias, entry, sl_raw, tp2_raw, tick)
@@ -178,7 +183,7 @@ def scan_and_send_signals():
 
             notional = entry * lot_mult * size_lots
 
-            # Evaluation (garde tes règles)
+            # Evaluation (règles desk pro)
             signal.update({
                 "entry": entry,
                 "sl": sl,
@@ -186,7 +191,9 @@ def scan_and_send_signals():
                 "tp2": tp2,       # utilisé pour l’exit réel
                 "size_lots": size_lots,
                 "bias": bias,
-                "rr_estimated": rr
+                "rr_estimated": rr,
+                # passage éventuel au moteur d'évaluation
+                "sl_log": sl_log
             })
             res = evaluate_signal(signal)
             if not res.get("valid"):
@@ -271,14 +278,12 @@ def scan_and_send_signals():
                 # marquage pour éviter re-spam même en dry-run (optionnel)
                 is_duplicate_and_mark(fp, ttl_seconds=6*3600, mark=True)
 
-                LOGGER.info("[%d/%d] DRY-RUN %s lots=%s entry=%.6f sl=%.6f tp1=%.6f tp2=%.6f rr=%.2f",
-                            idx, len(pairs), sym, size_lots, entry, sl, signal["tp1"], signal["tp2"], rr)
+                LOGGER.info("[%d/%d] DRY-RUN %s lots=%s entry=%.6f sl=%.6f tp1=%.6f tp2=%.6f rr=%.2f | [EXITS] %s",
+                            idx, len(pairs), sym, size_lots, entry, sl, signal["tp1"], signal["tp2"], rr, sl_log)
                 register_order(sym, notional)
             else:
                 # 3.b Marquer juste avant d'agir (évite courses)
                 race = is_duplicate_and_mark(fp, ttl_seconds=6*3600, mark=True)
-                # Note: la fonction retourne False en cas de marquage réussi dans notre implémentation
-                # mais on gère défensivement : si elle renvoie True, on traite comme doublon.
                 if race is True:
                     LOGGER.info("[DUP] %s %s condition de course (déjà marqué) → skip", sym, side)
                     time.sleep(0.2)
@@ -297,8 +302,7 @@ def scan_and_send_signals():
                         if order.get("ok"):
                             entry = entry_retry
                         else:
-                            # échec => on libère le fingerprint pour laisser une chance ultérieure
-                            unmark(fp)
+                            unmark(fp)  # libère pour retenter plus tard
                             time.sleep(0.2)
                             continue
                     elif code == "300003":
@@ -316,33 +320,31 @@ def scan_and_send_signals():
                 order_id = ((order.get("data") or {}).get("data") or {}).get("orderId")
                 if not order_id:
                     LOGGER.error("No orderId returned for %s, skip exits.", sym)
-                    # ordre non confirmé → on dé-marque pour ne pas bloquer indéfiniment
-                    unmark(fp)
+                    unmark(fp)  # évite blocage
                     continue
 
                 # 2) attendre un (début de) fill
                 fill = wait_for_fill(order_id, timeout_s=20)
                 if not fill["filled"]:
-                    LOGGER.info("No fill yet on %s — exits delayed", sym)
-                    # Ici on garde la marque pour éviter les re-ordres en boucle pendant le TTL
+                    LOGGER.info("No fill yet on %s — exits delayed | [EXITS] %s", sym, sl_log)
+                    # On garde la marque pour éviter des re-ordres en boucle pendant le TTL
                     continue
 
                 # 3) purge des anciens exits reduce-only
                 purge_reduce_only(sym)
 
                 # 4) pose des exits maintenant que la position existe (SL initial + TP2)
-                # ✅ FIX wiring: on passe bien TP1 en paramètre principal, et TP2 séparément
                 sl_resp, tp_resp = attach_exits_after_fill(
                     symbol=sym,
                     side=side,
                     df=df,
                     entry=entry,
                     sl=sl,
-                    tp=signal["tp1"],     # <<< TP1 correct
+                    tp=signal["tp1"],     # TP1 principal
                     size_lots=size_lots,
-                    tp2=signal["tp2"]     # <<< TP2 séparé
+                    tp2=signal["tp2"]     # TP2 secondaire
                 )
-                LOGGER.info("Exits %s -> SL %s | TP %s", sym, sl_resp, tp_resp)
+                LOGGER.info("Exits %s -> SL %s | TP %s | [EXITS] %s", sym, sl_resp, tp_resp, sl_log)
 
                 # 5) Lancer le moniteur Break-Even (déplacement SL à BE à TP1)
                 try:
@@ -362,6 +364,7 @@ def scan_and_send_signals():
                     send_telegram_message(
                         "✅ " + msg +
                         f"\nSide: {side.upper()} | Lots: {size_lots} | Entry {entry:.6f} | SL {sl:.6f} | TP1 {signal['tp1']:.6f} | TP2 {signal['tp2']:.6f} | RR {rr:.2f}"
+                        f"\n[EXITS] {sl_log}"
                     )
                 except Exception:
                     pass
