@@ -2,8 +2,8 @@
 institutional_data.py — Analyse institutionnelle avancée (robuste)
 - Mapping KuCoin → Binance (XBTUSDTM → BTCUSDT, etc.)
 - Cache des symboles Binance pour valider le mapping
-- Fetch tolérant (JSON vide, rate-limit, réponses non-JSON) + rate-limit adaptatif par endpoint (backoff + jitter)
-- Profil "large traders", divergence CVD, liquidity map
+- Fetch tolérant (JSON vide, rate-limit, réponses non-JSON) + rate-limit adaptatif par endpoint (token bucket + backoff + jitter)
+- Funding Rate live (premiumIndex), profil "large traders", divergence CVD, liquidity map
 - Couche d’orchestration (pondération + commentaire)
 """
 from __future__ import annotations
@@ -30,14 +30,14 @@ _BINANCE_SYMS_CACHE: Dict[str, Any] = {"ts": 0.0, "set": set()}
 _BINANCE_SYMS_TTL = 15 * 60  # 15 minutes
 
 # Compteurs santé / anti-spam logs
-_ERR_COUNTS: Dict[str, int] = {"large_ratio": 0, "cvd_div": 0, "map": 0, "net": 0}
+_ERR_COUNTS: Dict[str, int] = {"large_ratio": 0, "cvd_div": 0, "map": 0, "net": 0, "fund": 0}
 _ERR_WARN_EVERY = 10  # WARNING toutes les 10 occurrences
 
 # ---------- Rate-limit adaptatif par endpoint ----------
 # Modèle: token bucket simple + intervalle adaptatif (ok => decay, 429/5xx => backoff) + jitter
 _RATE_STATE: Dict[str, Dict[str, float]] = {}
-_BASE_INTERVAL = 0.15    # 6-7 req/s par endpoint en régime nominal (token bucket max autorise des rafales)
-_MAX_INTERVAL = 2.5      # clamp de backoff (fort 429)
+_BASE_INTERVAL = 0.15    # ~6-7 req/s par endpoint en nominal
+_MAX_INTERVAL = 2.5      # clamp de backoff max
 _BURST_TOKENS = 3.0      # petite rafale initiale par endpoint
 
 def _rate_state(ep: str) -> Dict[str, float]:
@@ -273,7 +273,42 @@ def get_large_trader_ratio(symbol: str) -> float:
 
 
 # --------------------------------------------------------------------
-# 🔹 2. DELTA CUMULÉ PAR CANDLE (divergence CVD vs prix)
+# 🔹 2. FUNDING RATE live (premiumIndex)
+# --------------------------------------------------------------------
+# Fallbacks réglables via settings.py (optionnels)
+try:
+    from settings import FUNDING_DEADBAND
+except Exception:
+    FUNDING_DEADBAND = 0.00005  # 0.005% (deadband autour de 0 => neutre)
+
+def get_funding_rate(symbol: str) -> Optional[float]:
+    """
+    Récupère le funding rate live Binance (lastFundingRate) pour le symbole mappé.
+    Retourne None si indisponible/erreur.
+    """
+    b_sym = _map_to_binance_symbol(symbol)
+    if not b_sym:
+        _bump_and_maybe_warn("map", f"Mapping Binance introuvable pour {symbol}")
+        return None
+
+    data = _safe_json_get(
+        f"{BINANCE_FUTURES_API}/premiumIndex",
+        params={"symbol": b_sym},
+        timeout=6.0,
+        retries=2
+    )
+    try:
+        if isinstance(data, dict) and "lastFundingRate" in data:
+            fr = float(data.get("lastFundingRate"))
+            # NOTE: Binance renvoie le funding toutes les 8h ; on utilise le dernier connu.
+            return fr
+    except Exception as e:
+        _bump_and_maybe_warn("fund", f"Parse funding failed for {b_sym}", str(e))
+    return None
+
+
+# --------------------------------------------------------------------
+# 🔹 3. DELTA CUMULÉ PAR CANDLE (divergence CVD vs prix)
 # --------------------------------------------------------------------
 def get_cvd_divergence(symbol: str, limit: int = 500) -> float:
     """
@@ -322,7 +357,7 @@ def get_cvd_divergence(symbol: str, limit: int = 500) -> float:
 
 
 # --------------------------------------------------------------------
-# 🔹 3. LIQUIDITY MAP (equal highs/lows)
+# 🔹 4. LIQUIDITY MAP (equal highs/lows)
 # --------------------------------------------------------------------
 def detect_liquidity_clusters(df: pd.DataFrame, lookback: int = 50, tolerance: float = 0.0005):
     """
@@ -362,16 +397,31 @@ def compute_institutional_score(symbol: str, bias: str, prev_oi: float = None) -
       "score_total": int,
       "details": {...}
     }
-    - 'fund' est un placeholder (1) tant que le funding live n'est pas intégré.
+    Règles:
+    - OI proxy (large traders): +1 si ratio>0.55
+    - CVD divergence: +1 si corrélation prix/CVD >= 0
+    - Funding: +1 si signe du funding cohérent avec le biais (LONG: funding >= +deadband ; SHORT: funding <= -deadband)
+      (deadband évite de donner un point pour un funding ~0)
+    - Liquidity (placeholder ici à 0; tu peux injecter un proxy externe)
     """
     large_ratio = get_large_trader_ratio(symbol)
     cvd_div = get_cvd_divergence(symbol)
+    fund = get_funding_rate(symbol)  # peut être None
 
     # Pondération simple (failsafe: neutres possibles)
     oi_score = 1 if large_ratio > 0.55 else 0
-    cvd_score = 1 if cvd_div > 0 else 0
-    fund_score = 1  # TODO: remplacer par un vrai funding si dispo
-    liq_score = 0   # calcul côté structure si nécessaire
+    cvd_score = 1 if cvd_div >= 0 else 0
+
+    fund_score = 0
+    if fund is not None:
+        if str(bias).upper() == "LONG" and fund >= float(FUNDING_DEADBAND):
+            fund_score = 1
+        elif str(bias).upper() == "SHORT" and fund <= -float(FUNDING_DEADBAND):
+            fund_score = 1
+        else:
+            fund_score = 0  # funding faible ou contraire au biais
+
+    liq_score = 0   # à compléter si tu ajoutes un proxy liquidations
 
     score_total = oi_score + cvd_score + fund_score  # 0..3
 
@@ -386,13 +436,15 @@ def compute_institutional_score(symbol: str, bias: str, prev_oi: float = None) -
         "details": {
             "large_ratio": round(float(large_ratio), 3),
             "cvd_divergence": float(cvd_div),
+            "funding_rate": (None if fund is None else float(fund)),
+            "funding_deadband": float(FUNDING_DEADBAND),
             "bias": str(bias).upper()
         }
     }
 
 
 # --------------------------------------------------------------------
-# 🔹 4. COUCHE D’ORCHESTRATION (pondération + commentaire)
+# 🔹 5. COUCHE D’ORCHESTRATION (pondération + commentaire)
 # --------------------------------------------------------------------
 def compute_full_institutional_analysis(symbol: str, bias: str, prev_oi: float = None) -> Dict[str, Any]:
     """
