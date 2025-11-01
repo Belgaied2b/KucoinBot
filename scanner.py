@@ -1,12 +1,13 @@
 """
 scanner.py — orchestration avec exits APRES fill + stops robustes + sizing par risque + garde-fous KuCoin
-- Stops: True ATR + swing + buffer, RR validé.
+- Stops: True ATR + swing + buffer, RR validé (+ meta [EXITS]).
 - Taille: par risque ($) puis cap par marge (MARGIN_USDT & LEVERAGE).
-- Entrée: LIMIT sécurisée (tick) + retry si 300011.
+- Entrée: OTE gate + LIMIT maker (ladder) sécurisé (tick) + retry si 300011 (anti “market déguisé”).
 - Exits: posés APRES fill, purge des anciens reduce-only.
 - TP1/TP2 (nouveau): 1.5R / 2.5R avec alignement structurel (swing).
 - Break-Even (nouveau): déplacement automatique du SL à l'entrée lorsque TP1 est atteint.
 - Anti-doublons: empreinte persistante + garde position/ordres ouverts (même côté).
+- Day stop & exposure guard (si modules présents).
 """
 from __future__ import annotations
 import time, logging, numpy as np, pandas as pd
@@ -17,17 +18,37 @@ from settings import (
     DRY_RUN, TOP_N_SYMBOLS, ENABLE_SQUEEZE_ENGINE, FAIL_OPEN_TO_CORE,
     RISK_USDT, RR_TARGET, LEVERAGE, MARGIN_USDT,
 )
+
 from risk_manager import reset_scan_counters, guardrails_ok, register_order
 from kucoin_trader import place_limit_order, get_open_position, list_open_orders
 from exits_manager import purge_reduce_only, attach_exits_after_fill
 from fills import wait_for_fill
 
-# nouveaux helpers (fichiers ajoutés)
+# nouveaux helpers
 from stops import protective_stop_long, protective_stop_short, format_sl_meta_for_log
 from sizing import lots_by_risk
-
-# anti-doublons (nouveau fichier duplicate_guard.py requis)
 from duplicate_guard import signal_fingerprint, is_duplicate_and_mark, unmark
+
+# quick wins
+from ote_utils import compute_ote_zone  # OTE gate auto
+from ladder import build_ladder_prices  # ladder maker
+
+# optionnels (fail-safe si absents)
+try:
+    from day_guard import day_guard_ok
+except Exception:
+    def day_guard_ok(): return True, "no_day_guard"
+
+try:
+    from exposure_guard import exposure_ok
+    # on suppose qu’un inventaire des expositions est disponible côté risk_manager (optionnel)
+    try:
+        from risk_manager import get_open_notional_by_symbol
+    except Exception:
+        def get_open_notional_by_symbol(): return {}
+except Exception:
+    exposure_ok = None
+    def get_open_notional_by_symbol(): return {}
 
 LOGGER = logging.getLogger(__name__)
 
@@ -157,6 +178,29 @@ def scan_and_send_signals():
             if bias not in ("LONG", "SHORT"):
                 bias = "LONG"
 
+            # --- Gate OTE (H1 swing propre) + ladder maker ---
+            ote_zone = None
+            try:
+                ote_zone = compute_ote_zone(df, bias, lb=60)  # (low, high)
+            except Exception:
+                ote_zone = None
+
+            in_ote = True
+            if ote_zone:
+                low, high = float(ote_zone[0]), float(ote_zone[1])
+                last = float(df["close"].iloc[-1])
+                # tolérance 1 tick
+                in_ote = (low - tick) <= last <= (high + tick)
+                # construit une petite ladder dans la zone OTE (3 niveaux)
+                side = "buy" if bias == "LONG" else "sell"
+                ladder_prices = build_ladder_prices(side, low, high, tick, n=3) or [entry]
+                # choisit le niveau “cheap” (premier côté cheap de la ladder)
+                entry = float(ladder_prices[0])
+            else:
+                side = "buy" if bias == "LONG" else "sell"
+
+            signal["ote"] = bool(in_ote)
+
             # --- SL avec meta + log [EXITS] ---
             if bias == "LONG":
                 sl_val, sl_meta = protective_stop_long(df, entry, tick, return_meta=True)
@@ -183,6 +227,23 @@ def scan_and_send_signals():
 
             notional = entry * lot_mult * size_lots
 
+            # Day guard
+            ok_day, why_day = day_guard_ok()
+            if not ok_day:
+                LOGGER.info("[%d/%d] Skip %s -> day guard: %s", idx, len(pairs), sym, why_day)
+                continue
+
+            # Exposure guard (si dispo)
+            if exposure_ok is not None:
+                try:
+                    open_notional_by_symbol = get_open_notional_by_symbol() or {}
+                    ok_exp, why_exp = exposure_ok(open_notional_by_symbol, sym, notional, float(RISK_USDT))
+                    if not ok_exp:
+                        LOGGER.info("[%d/%d] Skip %s -> exposure guard: %s", idx, len(pairs), sym, why_exp)
+                        continue
+                except Exception as e:
+                    LOGGER.debug("Exposure guard unavailable: %s", e)
+
             # Evaluation (règles desk pro)
             signal.update({
                 "entry": entry,
@@ -192,7 +253,6 @@ def scan_and_send_signals():
                 "size_lots": size_lots,
                 "bias": bias,
                 "rr_estimated": rr,
-                # passage éventuel au moteur d'évaluation
                 "sl_log": sl_log
             })
             res = evaluate_signal(signal)
@@ -208,7 +268,6 @@ def scan_and_send_signals():
             # ===========================
             #     ANTI-DOUBLONS (NEW)
             # ===========================
-            side = "buy" if bias == "LONG" else "sell"
             tf = "1h"  # cohérent avec fetch_klines
 
             # 1) Garde position existante (même côté)
@@ -289,16 +348,17 @@ def scan_and_send_signals():
                     time.sleep(0.2)
                     continue
 
-                # 1) envoyer l'entrée (LIMIT) + retry si 300011
-                order = place_limit_order(sym, side, entry, size_lots, post_only=False)
+                # 1) envoyer l'entrée (LIMIT maker) + retry si 300011
+                #    NB: on force post_only=True pour éviter le market déguisé.
+                order = place_limit_order(sym, side, entry, size_lots, post_only=True)
                 if not order.get("ok"):
                     body = (order.get("body") or {})
                     code = str((body or {}).get("code"))
                     if code == "300011":
-                        adj = 0.995 if side == "buy" else 1.005
-                        entry_retry = _round_to_tick(entry * adj, tick)
-                        LOGGER.warning("Retry %s price adjust for code 300011: %.8f -> %.8f", sym, entry, entry_retry)
-                        order = place_limit_order(sym, side, entry_retry, size_lots, post_only=False)
+                        # prix non maker → on se décale d’1 tick “cheap”
+                        entry_retry = _round_to_tick(entry - tick, tick) if side == "buy" else _round_to_tick(entry + tick, tick)
+                        LOGGER.warning("Retry %s maker adjust for code 300011: %.8f -> %.8f", sym, entry, entry_retry)
+                        order = place_limit_order(sym, side, entry_retry, size_lots, post_only=True)
                         if order.get("ok"):
                             entry = entry_retry
                         else:
