@@ -2,7 +2,7 @@
 institutional_data.py — Analyse institutionnelle avancée (robuste)
 - Mapping KuCoin → Binance (XBTUSDTM → BTCUSDT, etc.)
 - Cache des symboles Binance pour valider le mapping
-- Fetch tolérant (JSON vide, rate-limit, réponses non-JSON)
+- Fetch tolérant (JSON vide, rate-limit, réponses non-JSON) + rate-limit adaptatif par endpoint (backoff + jitter)
 - Profil "large traders", divergence CVD, liquidity map
 - Couche d’orchestration (pondération + commentaire)
 """
@@ -13,6 +13,7 @@ import logging
 import requests
 import numpy as np
 import pandas as pd
+import random
 from typing import Optional, Dict, Any
 from functools import lru_cache
 
@@ -20,7 +21,7 @@ LOGGER = logging.getLogger(__name__)
 
 # Endpoints Binance
 BINANCE_FUTURES_API = "https://fapi.binance.com/fapi/v1"
-BINANCE_FUTURES_DATA = "https://fapi.binance.com/futures/data"  # ← correct pour topLongShortAccountRatio
+BINANCE_FUTURES_DATA = "https://fapi.binance.com/futures/data"  # topLongShortAccountRatio
 
 # =======================
 #   CACHES & THROTTLING
@@ -32,13 +33,64 @@ _BINANCE_SYMS_TTL = 15 * 60  # 15 minutes
 _ERR_COUNTS: Dict[str, int] = {"large_ratio": 0, "cvd_div": 0, "map": 0, "net": 0}
 _ERR_WARN_EVERY = 10  # WARNING toutes les 10 occurrences
 
-# Throttle par endpoint (rps raisonnable pour éviter 429)
-_MIN_INTERVAL_S = 0.25  # ~4 req/s par endpoint
-_LAST_CALL_TS: Dict[str, float] = {}
+# ---------- Rate-limit adaptatif par endpoint ----------
+# Modèle: token bucket simple + intervalle adaptatif (ok => decay, 429/5xx => backoff) + jitter
+_RATE_STATE: Dict[str, Dict[str, float]] = {}
+_BASE_INTERVAL = 0.15    # 6-7 req/s par endpoint en régime nominal (token bucket max autorise des rafales)
+_MAX_INTERVAL = 2.5      # clamp de backoff (fort 429)
+_BURST_TOKENS = 3.0      # petite rafale initiale par endpoint
+
+def _rate_state(ep: str) -> Dict[str, float]:
+    st = _RATE_STATE.get(ep)
+    if st is None:
+        st = {
+            "interval": _BASE_INTERVAL,  # intervalle courant entre 2 « jetons »
+            "tokens": _BURST_TOKENS,     # jetons disponibles
+            "last_ts": time.time(),      # pour recharger les jetons
+        }
+        _RATE_STATE[ep] = st
+    return st
+
+def _adaptive_wait(ep: str):
+    """Attend selon le token bucket pour l'endpoint `ep`."""
+    st = _rate_state(ep)
+    now = time.time()
+    # recharge des jetons en fonction du temps écoulé
+    if st["interval"] > 0:
+        added = (now - st["last_ts"]) / max(1e-12, st["interval"])
+    else:
+        added = 1.0
+    st["tokens"] = min(_BURST_TOKENS, st["tokens"] + added)
+    st["last_ts"] = now
+    if st["tokens"] >= 1.0:
+        st["tokens"] -= 1.0
+        return
+    # sinon, calcule le temps d'attente pour accumuler 1 jeton
+    need = 1.0 - st["tokens"]
+    wait_s = need * max(st["interval"], _BASE_INTERVAL)
+    if wait_s > 0:
+        time.sleep(wait_s)
+    st["tokens"] = max(0.0, st["tokens"] - 1.0 + wait_s / max(st["interval"], _BASE_INTERVAL))
+
+def _feedback_ok(ep: str):
+    """Succès: on réduit légèrement l'intervalle (vers base)."""
+    st = _rate_state(ep)
+    st["interval"] = max(_BASE_INTERVAL, st["interval"] * 0.9)
+
+def _feedback_backoff(ep: str, retry_after: Optional[float] = None):
+    """Erreur 429/5xx: on augmente l'intervalle, on ajoute un jitter."""
+    st = _rate_state(ep)
+    new_int = st["interval"] * 1.6
+    if retry_after and retry_after > 0:
+        new_int = max(new_int, float(retry_after))
+    st["interval"] = min(_MAX_INTERVAL, new_int)
+    # petit jitter pour désynchroniser
+    jitter = random.uniform(0.05, 0.25) * st["interval"]
+    time.sleep(jitter)
 
 # Session HTTP réutilisée
 _SESSION = requests.Session()
-_SESSION.headers.update({"User-Agent": "insto-bot/1.0 (+binance)"})
+_SESSION.headers.update({"User-Agent": "insto-bot/1.1 (+binance)"})
 
 
 def _bump_and_maybe_warn(key: str, msg: str, detail: str = ""):
@@ -51,28 +103,29 @@ def _bump_and_maybe_warn(key: str, msg: str, detail: str = ""):
         LOGGER.debug("%s", line)
 
 
-def _throttle(endpoint_key: str):
-    """Respecte un délai minimal entre deux appels du même endpoint."""
-    last = _LAST_CALL_TS.get(endpoint_key, 0.0)
-    now = time.time()
-    wait = _MIN_INTERVAL_S - (now - last)
-    if wait > 0:
-        time.sleep(wait)
-    _LAST_CALL_TS[endpoint_key] = time.time()
+def _endpoint_key_from_url(url: str) -> str:
+    # Ex: https://fapi.binance.com/fapi/v1/aggTrades -> 'aggTrades'
+    try:
+        tail = url.split("/fapi/")[-1]
+        key = tail.split("?")[0].strip("/").split("/")[1] if "/" in tail else tail
+        return key or "unknown"
+    except Exception:
+        return "unknown"
 
 
 def _safe_json_get(url: str, params: Optional[dict] = None, timeout: float = 7.0, retries: int = 2):
     """
-    GET tolérant:
-    - throttle local par endpoint
-    - retry simple (incl. 429 via Retry-After)
-    - parse JSON sûr (retourne None sinon)
-    - ignore codes d'erreur Binance {"code":..., "msg":...} non 0
+    GET tolérant + rate-limit adaptatif:
+    - Token bucket par endpoint (rafales limitées)
+    - Backoff + jitter sur 429/5xx (respect Retry-After si fourni)
+    - Retry simple
+    - Parse JSON sûr (retourne None sinon)
+    - Ignore erreurs Binance {"code":..., "msg":...} != 0
     """
-    endpoint_key = url.split("/fapi/")[-1].split("?")[0]
+    ep = _endpoint_key_from_url(url)
     for attempt in range(retries + 1):
         try:
-            _throttle(endpoint_key)
+            _adaptive_wait(ep)
             r = _SESSION.get(url, params=params or {}, timeout=timeout)
             if r.status_code == 200:
                 try:
@@ -84,22 +137,28 @@ def _safe_json_get(url: str, params: Optional[dict] = None, timeout: float = 7.0
                 if isinstance(data, dict) and "code" in data and data.get("code") not in (0, None):
                     _bump_and_maybe_warn("net", "Binance error", f"{data}")
                     data = None
+                _feedback_ok(ep)
                 return data
             elif r.status_code == 429:
-                # Respecte Retry-After si fourni
                 ra = r.headers.get("Retry-After")
                 try:
-                    sleep_s = float(ra) if ra else 1.2
+                    sleep_s = float(ra) if ra else None
                 except Exception:
-                    sleep_s = 1.2
-                time.sleep(sleep_s)
+                    sleep_s = None
+                _bump_and_maybe_warn("net", f"HTTP 429 on {ep}", f"Retry-After={ra}")
+                _feedback_backoff(ep, retry_after=sleep_s)
+                # on retente
                 continue
+            elif 500 <= r.status_code < 600:
+                _bump_and_maybe_warn("net", f"HTTP {r.status_code} on {ep}")
+                _feedback_backoff(ep)
             else:
-                _bump_and_maybe_warn("net", f"HTTP {r.status_code} on {endpoint_key}")
+                _bump_and_maybe_warn("net", f"HTTP {r.status_code} on {ep}")
         except Exception as e:
             _bump_and_maybe_warn("net", "Request exception", str(e))
+            _feedback_backoff(ep)
         # Backoff léger entre tentatives
-        time.sleep(0.4 * (attempt + 1))
+        time.sleep(0.35 * (attempt + 1))
     return None
 
 
@@ -129,7 +188,7 @@ def _refresh_binance_symbols():
 _ALIAS_BASE = {
     "XBT": "BTC",   # KuCoin XBT → Binance BTC
     "APR": "APE",   # Exemple d’alias
-    # Ajoute ici si tu croises d’autres alias (ex: "BCH"->"BCH" inchangé)
+    # ajoute d'autres alias si nécessaire
 }
 
 
@@ -166,7 +225,7 @@ def _map_to_binance_symbol(kucoin_symbol: str) -> Optional[str]:
     if b_symbol in syms:
         return b_symbol
 
-    # 4) Essai alternatif sans alias ou cas borderline
+    # 4) Essai alternatif sans alias
     alt = f"{base}USDT"
     if alt in syms:
         return alt
@@ -205,7 +264,7 @@ def get_large_trader_ratio(symbol: str) -> float:
             if long_acc <= 0 and short_acc <= 0:
                 return 0.5
             ratio = long_acc / max(1e-9, short_acc)
-            # Écrase dans 0..1 via tanh-like
+            # Écrase dans 0..1 via tanh-like (doucement croissant)
             score = np.tanh(ratio)
             return float(np.clip(score, 0.0, 1.0))
     except Exception as e:
