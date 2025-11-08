@@ -225,7 +225,9 @@ def scan_and_send_signals():
                 LOGGER.info("[%d/%d] Skip %s -> taille insuffisante après cap marge", idx, len(pairs), sym)
                 continue
 
+            # === Notionnel & Marge estimée (DEBUG lisible avec exposure_guard en "marge") ===
             notional = entry * lot_mult * size_lots
+            est_margin = notional / max(float(LEVERAGE), 1.0)
 
             # Day guard
             ok_day, why_day = day_guard_ok()
@@ -233,14 +235,17 @@ def scan_and_send_signals():
                 LOGGER.info("[%d/%d] Skip %s -> day guard: %s", idx, len(pairs), sym, why_day)
                 continue
 
-            # Exposure guard (si dispo)
+            # Exposure guard (si dispo) — compare côté guard en MARGE (conversion interne)
             if exposure_ok is not None:
                 try:
                     open_notional_by_symbol = get_open_notional_by_symbol() or {}
                     ok_exp, why_exp = exposure_ok(open_notional_by_symbol, sym, notional, float(RISK_USDT))
                     if not ok_exp:
-                        LOGGER.info("[%d/%d] Skip %s -> exposure guard: %s", idx, len(pairs), sym, why_exp)
+                        LOGGER.info("[%d/%d] Skip %s -> exposure guard: %s | est_margin=%.0f | notional=%.0f",
+                                    idx, len(pairs), sym, why_exp, est_margin, notional)
                         continue
+                    else:
+                        LOGGER.info("[EXPO] %s OK | est_margin=%.0f | notional=%.0f", sym, est_margin, notional)
                 except Exception as e:
                     LOGGER.debug("Exposure guard unavailable: %s", e)
 
@@ -338,7 +343,7 @@ def scan_and_send_signals():
                 is_duplicate_and_mark(fp, ttl_seconds=6*3600, mark=True)
 
                 LOGGER.info("[%d/%d] DRY-RUN %s lots=%s entry=%.6f sl=%.6f tp1=%.6f tp2=%.6f rr=%.2f | [EXITS] %s",
-                            idx, len(pairs), sym, size_lots, entry, sl, signal["tp1"], signal["tp2"], rr, sl_log)
+                            idx, len(pairs), sym, size_lots, entry, sl, tp1_raw, tp2, rr, sl_log)
                 register_order(sym, notional)
             else:
                 # 3.b Marquer juste avant d'agir (évite courses)
@@ -400,9 +405,9 @@ def scan_and_send_signals():
                     df=df,
                     entry=entry,
                     sl=sl,
-                    tp=signal["tp1"],     # TP1 principal
+                    tp=tp1_raw,       # TP1 principal
                     size_lots=size_lots,
-                    tp2=signal["tp2"]     # TP2 secondaire
+                    tp2=tp2           # TP2 secondaire
                 )
                 LOGGER.info("Exits %s -> SL %s | TP %s | [EXITS] %s", sym, sl_resp, tp_resp, sl_log)
 
@@ -412,7 +417,7 @@ def scan_and_send_signals():
                     import threading
                     threading.Thread(
                         target=monitor_breakeven,
-                        args=(sym, side, entry, signal["tp1"], signal["tp2"], size_lots),
+                        args=(sym, side, entry, tp1_raw, tp2, size_lots),
                         daemon=True
                     ).start()
                 except Exception as e:
@@ -423,7 +428,7 @@ def scan_and_send_signals():
                     from telegram_client import send_telegram_message
                     send_telegram_message(
                         "✅ " + msg +
-                        f"\nSide: {side.upper()} | Lots: {size_lots} | Entry {entry:.6f} | SL {sl:.6f} | TP1 {signal['tp1']:.6f} | TP2 {signal['tp2']:.6f} | RR {rr:.2f}"
+                        f"\nSide: {side.upper()} | Lots: {size_lots} | Entry {entry:.6f} | SL {sl:.6f} | TP1 {tp1_raw:.6f} | TP2 {tp2:.6f} | RR {rr:.2f}"
                         f"\n[EXITS] {sl_log}"
                     )
                 except Exception:
