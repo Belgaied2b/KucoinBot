@@ -355,6 +355,27 @@ def scan_and_send_signals():
 
                 # 1) envoyer l'entrée (LIMIT maker) + retry si 300011
                 #    NB: on force post_only=True pour éviter le market déguisé.
+                def _extract_order_id(resp: dict) -> str | None:
+                    if not resp:
+                        return None
+                    for path in [
+                        ["data", "data", "orderId"],
+                        ["data", "orderId"],
+                        ["orderId"],
+                        ["data", "order_id"],
+                    ]:
+                        cur = resp
+                        ok = True
+                        for k in path:
+                            if isinstance(cur, dict) and k in cur:
+                                cur = cur[k]
+                            else:
+                                ok = False
+                                break
+                        if ok and cur:
+                            return str(cur)
+                    return None
+
                 order = place_limit_order(sym, side, entry, size_lots, post_only=True)
                 if not order.get("ok"):
                     body = (order.get("body") or {})
@@ -381,60 +402,122 @@ def scan_and_send_signals():
                         time.sleep(0.2)
                         continue
 
-                LOGGER.info("[%d/%d] Order %s -> %s", idx, len(pairs), sym, order)
-                order_id = ((order.get("data") or {}).get("data") or {}).get("orderId")
-                if not order_id:
-                    LOGGER.error("No orderId returned for %s, skip exits.", sym)
-                    unmark(fp)  # évite blocage
-                    continue
+                order_id = _extract_order_id(order)
+                LOGGER.info("[%d/%d] Order %s -> %s | order_id=%s", idx, len(pairs), sym, order, order_id)
 
-                # 2) attendre un (début de) fill
-                fill = wait_for_fill(order_id, timeout_s=20)
-                if not fill["filled"]:
-                    LOGGER.info("No fill yet on %s — exits delayed | [EXITS] %s", sym, sl_log)
-                    # On garde la marque pour éviter des re-ordres en boucle pendant le TTL
-                    continue
-
-                # 3) purge des anciens exits reduce-only
-                purge_reduce_only(sym)
-
-                # 4) pose des exits maintenant que la position existe (SL initial + TP2)
-                sl_resp, tp_resp = attach_exits_after_fill(
-                    symbol=sym,
-                    side=side,
-                    df=df,
-                    entry=entry,
-                    sl=sl,
-                    tp=tp1_raw,       # TP1 principal
-                    size_lots=size_lots,
-                    tp2=tp2           # TP2 secondaire
-                )
-                LOGGER.info("Exits %s -> SL %s | TP %s | [EXITS] %s", sym, sl_resp, tp_resp, sl_log)
-
-                # 5) Lancer le moniteur Break-Even (déplacement SL à BE à TP1)
-                try:
-                    from breakeven_manager import monitor_breakeven
-                    import threading
-                    threading.Thread(
-                        target=monitor_breakeven,
-                        args=(sym, side, entry, tp1_raw, tp2, size_lots),
-                        daemon=True
-                    ).start()
-                except Exception as e:
-                    LOGGER.warning("BE monitor failed for %s: %s", sym, e)
-
-                # 6) Telegram (succès)
+                # --- Telegram immédiat: ACK de l'ordre placé (même si pas encore rempli)
                 try:
                     from telegram_client import send_telegram_message
                     send_telegram_message(
-                        "✅ " + msg +
-                        f"\nSide: {side.upper()} | Lots: {size_lots} | Entry {entry:.6f} | SL {sl:.6f} | TP1 {tp1_raw:.6f} | TP2 {tp2:.6f} | RR {rr:.2f}"
-                        f"\n[EXITS] {sl_log}"
+                        f"🟡 Ordre placé {sym} ({side.upper()})\n"
+                        f"Lots: {size_lots} | Entry {entry:.6f}\n"
+                        f"SL prévisionnel {sl:.6f} | TP1 {tp1_raw:.6f} | TP2 {tp2:.6f}\n"
+                        f"(SL/TP seront posés dès le fill)"
                     )
                 except Exception:
                     pass
 
-                register_order(sym, notional)
+                # --- Worker asynchrone: attend le fill, pose SL/TP, lance BE, envoie Telegram OK
+                def _monitor_fill_and_attach():
+                    try:
+                        # 2) attendre le fill (fenêtre plus large, ex: 10 minutes)
+                        fill = {"filled": False}
+                        try:
+                            f1 = wait_for_fill(order_id, timeout_s=30) if order_id else {"filled": False}
+                            fill = f1 if isinstance(f1, dict) else {"filled": False}
+                        except Exception:
+                            fill = {"filled": False}
+
+                        # Polling si pas encore rempli
+                        t0 = time.time()
+                        timeout_total = 10 * 60  # 10 minutes
+                        poll_every = 5.0
+                        while not fill.get("filled") and (time.time() - t0) < timeout_total:
+                            time.sleep(poll_every)
+                            try:
+                                f2 = wait_for_fill(order_id, timeout_s=1) if order_id else {"filled": False}
+                                fill = f2 if isinstance(f2, dict) else {"filled": False}
+                            except Exception:
+                                # fallback: si position apparue, on considère "rempli"
+                                try:
+                                    pos = get_open_position(sym) or {}
+                                    qty = float(pos.get("currentQty") or 0.0)
+                                    pos_side = str(pos.get("side") or "").lower()
+                                    if qty > 0 and pos_side == side:
+                                        fill = {"filled": True}
+                                        break
+                                except Exception:
+                                    pass
+
+                        if not fill.get("filled"):
+                            LOGGER.info("No fill yet on %s — exits delayed (worker timeout) | [EXITS] %s", sym, sl_log)
+                            return  # on stoppe le worker; la marque anti-dup reste en place
+
+                        # 3) purge des anciens exits reduce-only
+                        try:
+                            purge_reduce_only(sym)
+                        except Exception as e:
+                            LOGGER.warning("purge_reduce_only failed for %s: %s", sym, e)
+
+                        # 4) pose des exits maintenant que la position existe (SL/TP)
+                        try:
+                            sl_resp, tp_resp = attach_exits_after_fill(
+                                symbol=sym,
+                                side=side,
+                                df=df,
+                                entry=entry,
+                                sl=sl,
+                                tp=tp1_raw,       # TP1 principal
+                                size_lots=size_lots,
+                                tp2=tp2           # TP2 secondaire
+                            )
+                            LOGGER.info("Exits %s -> SL %s | TP %s | [EXITS] %s", sym, sl_resp, tp_resp, sl_log)
+                        except Exception as e:
+                            LOGGER.exception("attach_exits_after_fill failed on %s: %s", sym, e)
+                            # on tente au moins d'annoncer le fill
+                            try:
+                                from telegram_client import send_telegram_message
+                                send_telegram_message(
+                                    f"🟢 {sym} rempli ({side.upper()}) — SL/TP non posés (erreur)."
+                                )
+                            except Exception:
+                                pass
+                            return
+
+                        # 5) Lancer le moniteur Break-Even (déplacement SL à BE à TP1)
+                        try:
+                            from breakeven_manager import monitor_breakeven
+                            import threading
+                            threading.Thread(
+                                target=monitor_breakeven,
+                                args=(sym, side, entry, tp1_raw, tp2, size_lots),
+                                daemon=True
+                            ).start()
+                        except Exception as e:
+                            LOGGER.warning("BE monitor failed for %s: %s", sym, e)
+
+                        # 6) Telegram (succès final)
+                        try:
+                            from telegram_client import send_telegram_message
+                            send_telegram_message(
+                                f"✅ {sym} rempli ({side.upper()})\n"
+                                f"Lots: {size_lots} | Entry {entry:.6f}\n"
+                                f"SL {sl:.6f} | TP1 {tp1_raw:.6f} | TP2 {tp2:.6f} | RR {rr:.2f}\n"
+                                f"[EXITS] {sl_log}"
+                            )
+                        except Exception:
+                            pass
+                    except Exception as e:
+                        LOGGER.exception("monitor_fill_and_attach error on %s: %s", sym, e)
+
+                # démarrage du worker asynchrone
+                try:
+                    import threading
+                    threading.Thread(target=_monitor_fill_and_attach, daemon=True).start()
+                except Exception as e:
+                    LOGGER.warning("Unable to start fill worker for %s: %s", sym, e)
+
+                # on ne bloque plus le loop : on passe au symbole suivant
 
             time.sleep(0.6)
         except Exception as e:
