@@ -178,7 +178,6 @@ def _is_order_open(order_id: str, sym: str) -> bool:
         for o in open_o:
             oid = str(o.get("orderId") or o.get("id") or "")
             if oid == order_id:
-                # on considère encore "ouvert" si pas reduce-only et pas filled
                 st = (o.get("status") or o.get("state") or "").upper()
                 ro = str(o.get("reduceOnly")).lower() == "true"
                 if ro:
@@ -432,7 +431,7 @@ def scan_and_send_signals():
                 except Exception:
                     pass
 
-                # --- Watcher continu (desk pro)
+                # --- Watcher continu (desk pro) ---
                 def _monitor_fill_and_attach():
                     try:
                         # 1) essai court (bonus) via wait_for_fill
@@ -455,7 +454,6 @@ def scan_and_send_signals():
 
                             # check si l'ordre est toujours présent (sinon: annulé/expiré/rejeté)
                             if order_id and not _is_order_open(order_id, sym):
-                                # pas de position + ordre disparu -> considéré annulé
                                 LOGGER.info("[FILL] %s order_id=%s annulé/expiré (pas de position)", sym, order_id)
                                 try:
                                     from telegram_client import send_telegram_message
@@ -476,7 +474,6 @@ def scan_and_send_signals():
                             if max_seconds is not None and (time.time() - t0) > max_seconds:
                                 LOGGER.info("[FILL] %s watcher timeout atteint (%sh), on continue sans exits (ordre reste au carnet)",
                                             sym, FILL_MAX_HOURS)
-                                # pas d’unmark: on garde l’empreinte pour éviter spam tant que l’ordre vit
                                 return
 
                             time.sleep(max(1.0, float(FILL_POLL_SEC)))
@@ -502,17 +499,8 @@ def scan_and_send_signals():
                                 pass
                             return
 
-                        # Break-Even monitor
-                        try:
-                            from breakeven_manager import monitor_breakeven
-                            import threading
-                            threading.Thread(
-                                target=monitor_breakeven,
-                                args=(sym, order_side, entry, tp1_raw, tp2, size_lots),
-                                daemon=True
-                            ).start()
-                        except Exception as e:
-                            LOGGER.warning("BE monitor failed for %s: %s", sym, e)
+                        # ⚠️ Le monitor BE est lancé par exits_manager.attach_exits_after_fill
+                        # via launch_breakeven_thread -> inutile de le relancer ici.
 
                         # Telegram succès final
                         try:
