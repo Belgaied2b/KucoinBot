@@ -12,6 +12,7 @@ scanner.py — orchestration avec exits APRES fill + stops robustes + sizing par
 """
 from __future__ import annotations
 import time, logging, numpy as np, pandas as pd
+from typing import Optional
 
 from kucoin_utils import fetch_all_symbols, fetch_klines, get_contract_info
 from analyze_signal import evaluate_signal
@@ -158,35 +159,44 @@ def _try_advanced(sym, df):
         return (None, "") if FAIL_OPEN_TO_CORE else (None, "BLOCK")
 
 # ------------------------------- Watcher Fill (desk pro) -------------------------------
-def _extract_order_id(resp: dict) -> str | None:
+def _extract_order_id(resp: dict) -> Optional[str]:
     if not resp:
         return None
     for path in [["data", "data", "orderId"], ["data", "orderId"], ["orderId"], ["data", "order_id"]]:
-        cur = resp; ok = True
+        cur = resp
+        ok = True
         for k in path:
             if isinstance(cur, dict) and k in cur:
                 cur = cur[k]
             else:
-                ok = False; break
+                ok = False
+                break
         if ok and cur:
             return str(cur)
     return None
 
 def _is_order_open(order_id: str, sym: str) -> bool:
+    """
+    Vrai si l'ordre d'entrée est encore présent dans les ordres OUVERTS KuCoin
+    (peu importe le champ status exact). On ignore juste les ordres reduce-only (SL/TP).
+    """
     try:
         open_o = list_open_orders(sym) or []
         for o in open_o:
             oid = str(o.get("orderId") or o.get("id") or "")
-            if oid == order_id:
-                st = (o.get("status") or o.get("state") or "").upper()
-                ro = str(o.get("reduceOnly")).lower() == "true"
-                if ro:
-                    continue
-                if st in {"NEW", "PARTIALLY_FILLED", "OPEN", ""}:
-                    return True
+            if oid != order_id:
+                continue
+            ro = str(o.get("reduceOnly")).lower() == "true"
+            if ro:
+                # ce sont nos SL/TP, pas l’entrée
+                continue
+            # s'il est dans la liste des open orders et pas reduce-only -> on le considère ouvert
+            return True
+        # pas trouvé dans les ordres ouverts
         return False
     except Exception:
-        return True  # prudence: si API échoue, on suppose "encore ouvert"
+        # en cas d’erreur API, on préfère considérer l’ordre comme toujours ouvert
+        return True
 
 def _has_position(sym: str, side: str) -> bool:
     try:
@@ -390,7 +400,7 @@ def scan_and_send_signals():
                 # Marquer juste avant d’agir (évite courses)
                 race = is_duplicate_and_mark(fp, ttl_seconds=6*3600, mark=True)
                 if race is True:
-                    LOGGER.info("[DUP] %s condition de course (déjà marqué) → skip", sym)
+                    LOGGER.info("[DUP] %s condition de course (déjà marqué) → skip", sym, side)
                     time.sleep(0.2)
                     continue
 
