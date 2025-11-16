@@ -5,7 +5,7 @@ Nouveautés:
 - Auto-calcul des EXITS si manquants:
     SL: stops.protective_stop_long/short (liquidité > structure > ATR) avec meta + log line compacte
     TP1: tp_clamp.compute_tp1 (clamp dynamique par régime de volatilité) avec meta
-- RR recalculé à partir de (entry, sl, tp1) si rr_estimated invalide/manquant
+- RR recalculé à partir de (entry, sl, tp1/tp2) si rr_estimated invalide/manquant
 - Priorité institutionnelle (MIN_INST_SCORE) + tolérance RR si inst OK et commitment OK
 - Contrôles supplémentaires: HTF alignment, BOS quality (vol+OI), commitment score (OI + CVD)
 """
@@ -91,32 +91,66 @@ def _inst_or_neutral(symbol: str, bias: str) -> Dict[str, Any]:
 
 
 def _safe_rr(signal: Dict[str, Any]) -> Optional[float]:
-    rr = signal.get("rr_estimated")
-    try:
-        if rr is not None:
-            rr = float(rr)
-            if math.isfinite(rr) and rr > 0:
-                return rr
-    except Exception:
-        rr = None
-    # fallback: si exits présents, calculer RR à partir d'eux
+    """
+    Calcule un RR cohérent à partir de entry/SL/TP1/TP2.
+    - Priorité aux TP cohérents (du bon côté de l'entrée), TP1 puis TP2.
+    - Si aucun TP valide: dernier recours sur rr_estimated.
+    """
+    # entry & SL doivent être présents
     try:
         entry = float(signal["entry"])
         sl = float(signal["sl"])
-        tp1 = float(signal["tp1"])
     except Exception:
         return None
-    if entry <= 0 or not all(map(math.isfinite, [entry, sl, tp1])):
+
+    bias = (signal.get("bias") or "LONG").upper()
+
+    # Candidats TP (tp1 / tp2)
+    tp_candidates = []
+    for key in ("tp1", "tp2"):
+        if key in signal and signal[key] is not None:
+            try:
+                tp_candidates.append((key, float(signal[key])))
+            except Exception:
+                continue
+
+    tp_price: Optional[float] = None
+    if bias == "LONG":
+        # TP doit être strictement au-dessus de l'entrée
+        valids = [tp for _k, tp in tp_candidates if tp > entry]
+        if valids:
+            tp_price = max(valids)  # on prend le plus ambitieux
+    else:
+        # SHORT : TP doit être strictement en-dessous de l'entrée
+        valids = [tp for _k, tp in tp_candidates if tp < entry]
+        if valids:
+            tp_price = min(valids)
+
+    # Pas de TP cohérent -> fallback sur rr_estimated si présent
+    if tp_price is None:
+        rr = signal.get("rr_estimated")
+        try:
+            if rr is not None:
+                rr = float(rr)
+                if math.isfinite(rr) and rr > 0:
+                    return rr
+        except Exception:
+            return None
         return None
-    if signal.get("bias", "").upper() == "LONG":
+
+    # Calcul RR propre
+    if bias == "LONG":
         risk = entry - sl
-        reward = tp1 - entry
+        reward = tp_price - entry
     else:
         risk = sl - entry
-        reward = entry - tp1
+        reward = entry - tp_price
+
     if risk <= 0 or reward <= 0:
         return None
-    return float(reward / risk)
+
+    rr = reward / risk
+    return float(rr) if math.isfinite(rr) and rr > 0 else None
 
 
 def _compute_exits_if_needed(signal: Dict[str, Any]) -> Tuple[Dict[str, Any], Optional[str]]:
@@ -387,49 +421,3 @@ def evaluate_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
         return out
 
     # ------------- Rejet : raisons détaillées -------------
-    if rr < RR_MIN_TOLERATED_WITH_INST:
-        reasons.append(f"RR {rr:.2f} < toléré {RR_MIN_TOLERATED_WITH_INST}")
-    elif rr < RR_MIN_STRICT:
-        reasons.append(f"RR {rr:.2f} < strict {RR_MIN_STRICT}")
-
-    if REQUIRE_STRUCTURE and not struct_ok:
-        reasons.append("Structure invalide")
-    if REQUIRE_MOMENTUM and not mom_ok:
-        reasons.append("Momentum faible")
-    if REQUIRE_HTF_ALIGN and not htf_ok:
-        reasons.append("HTF non aligné")
-    if REQUIRE_BOS_QUALITY and not bos_ok_q:
-        reasons.append("Break faible (vol/OI)")
-
-    ote = bool(signal.get("ote", True))
-    if not ote:
-        reasons.append("OTE manquant (toléré)")
-
-    base = {
-        "valid": False,
-        "score": 50 + inst_score * 2 + int(10 * comm),
-        "rr": float(rr),
-        "reasons": reasons,
-        "institutional": inst,
-        "exits": signal.get("exits", {}),
-    }
-    if "sl" in signal:
-        base["sl"] = float(signal["sl"])
-    if "tp1" in signal:
-        base["tp1"] = float(signal["tp1"])
-    if isinstance(struct_ctx, dict):
-        base.update({
-            "bos_direction": struct_ctx.get("bos_direction"),
-            "choch_direction": struct_ctx.get("choch_direction"),
-            "trend": struct_ctx.get("trend_state"),
-            "phase": struct_ctx.get("phase"),
-            "last_event": struct_ctx.get("last_event"),
-            "cos": struct_ctx.get("cos"),
-        })
-    if isinstance(bos_details, dict):
-        base.update({
-            "bos_details": bos_details,
-            "has_liquidity_zone": bos_details.get("has_liquidity_zone"),
-            "liquidity_side": bos_details.get("liquidity_side"),
-        })
-    return base
