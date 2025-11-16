@@ -148,7 +148,7 @@ def analyze_structure(df: pd.DataFrame, bias: Optional[str] = None,
       - cos: 'trend_to_range' / 'range_to_trend' / None
       - last_event: description textuelle du dernier évènement structurel
     """
-    out = {
+    out: Dict[str, Any] = {
         "swings": [],
         "bos_direction": None,
         "choch_direction": None,
@@ -223,7 +223,6 @@ def analyze_structure(df: pd.DataFrame, bias: Optional[str] = None,
     elif trend == "down":
         phase = "expansion" if bos_dir == "DOWN" else "pullback"
     elif trend == "range":
-        # range après tendance haussière/bear → distribution/accumulation
         if prev_trend == "up":
             phase = "distribution"
         elif prev_trend == "down":
@@ -233,12 +232,12 @@ def analyze_structure(df: pd.DataFrame, bias: Optional[str] = None,
     return out
 
 
-# === Structure de base : BOS / Validation structurelle (compatibilité) ===
+# === Interface de base : BOS / Validation structurelle ===
 
 
 def detect_bos(df: pd.DataFrame, lookback: int = 10):
     """
-    Compat: ancien détecteur BOS basé sur rolling remplacé par BOS sur swings.
+    Compatibilité: renvoie 'BOS_UP' / 'BOS_DOWN' ou None à partir de analyze_structure.
     """
     ctx = analyze_structure(df)
     if ctx.get("bos_direction") == "UP":
@@ -269,7 +268,7 @@ def structure_valid(df: pd.DataFrame, bias: str, lookback: int = 10) -> bool:
     return True
 
 
-# === HTF trend (déjà existant, inchangé) ===
+# === HTF trend (EMA) ===
 
 
 def _ema(x: pd.Series, n: int = 20) -> pd.Series:
@@ -294,11 +293,12 @@ def htf_trend_ok(df_htf: Optional[pd.DataFrame], bias: str) -> bool:
     return bool(close.iloc[-1] < ema50.iloc[-1] and ema20.iloc[-1] < ema50.iloc[-1])
 
 
-# === Qualité de break BOS/CHoCH: volume + OI (+liquidité optionnelle) ===
+# === Qualité de break BOS: volume + OI (+liquidité optionnelle) ===
 
 try:
+    # on réutilise la fonction déjà définie dans institutional_data.py
     from institutional_data import detect_liquidity_clusters
-except Exception:  # pragma: no cover - optionnel
+except Exception:  # pragma: no cover
     detect_liquidity_clusters = None  # type: ignore
 
 
@@ -322,11 +322,11 @@ def bos_quality_details(
         "bos_direction": "UP"/"DOWN"/None,
         "has_liquidity_zone": bool,
         "liquidity_side": "UP"/"DOWN"/None,
-        "liq_distance": float or None,       # distance absolue
-        "liq_distance_bps": float or None,   # distance en %*100
+        "liq_distance": float or None,
+        "liq_distance_bps": float or None,
       }
     """
-    out = {
+    out: Dict[str, Any] = {
         "ok": True,
         "vol_ok": True,
         "oi_ok": True,
@@ -340,11 +340,11 @@ def bos_quality_details(
     if df is None or len(df) < max(5, vol_lookback):
         return out
 
+    # direction BOS via structure
     ctx = analyze_structure(df)
-    bos_dir = ctx.get("bos_direction")
-    out["bos_direction"] = bos_dir
+    out["bos_direction"] = ctx.get("bos_direction")
 
-    # Volume
+    # --- Volume ---
     try:
         vol = df["volume"].astype(float).tail(vol_lookback)
         v_last = float(vol.iloc[-1])
@@ -352,10 +352,9 @@ def bos_quality_details(
         vol_ok = v_last >= thresh
     except Exception:
         vol_ok = True
-
     out["vol_ok"] = bool(vol_ok)
 
-    # Open interest
+    # --- Open interest ---
     oi_ok = True
     if oi_series is not None and len(oi_series) >= 3:
         try:
@@ -369,11 +368,10 @@ def bos_quality_details(
                 oi_ok = False
         except Exception:
             oi_ok = True
-
     out["oi_ok"] = bool(oi_ok)
     out["ok"] = bool(vol_ok and oi_ok)
 
-    # Liquidity map: equal highs/lows autour du prix de ref
+    # --- LIQUIDITÉ (equal highs/lows) ---
     ref_price = float(price) if price is not None else float(df["close"].iloc[-1])
     tick = float(tick or 0.0)
 
@@ -384,29 +382,26 @@ def bos_quality_details(
         base_df = df_liq if isinstance(df_liq, pd.DataFrame) else df
         if detect_liquidity_clusters is not None and base_df is not None:
             liq = detect_liquidity_clusters(base_df, lookback=80, tolerance=0.0005)
-            eq_highs = [float(x) for x in liq.get("eq_highs", [])]
-            eq_lows = [float(x) for x in liq.get("eq_lows", [])]
+            # 🔒 protection: on ne fait .get que si c'est bien un dict
+            if isinstance(liq, dict):
+                eq_highs = [float(x) for x in liq.get("eq_highs", [])]
+                eq_lows = [float(x) for x in liq.get("eq_lows", [])]
     except Exception:
-        pass
+        eq_highs = []
+        eq_lows = []
 
     if eq_highs or eq_lows:
         out["has_liquidity_zone"] = True
-
-        # cherche le niveau le plus proche autour du prix de ref
-        all_lvls = [(abs(h - ref_price), h, "UP") for h in eq_highs] + [
-            (abs(l - ref_price), l, "DOWN") for l in eq_lows
-        ]
+        all_lvls = [(abs(h - ref_price), h, "UP") for h in eq_highs] + \
+                   [(abs(l - ref_price), l, "DOWN") for l in eq_lows]
         all_lvls.sort(key=lambda x: x[0])
-
         if all_lvls:
             dist, lvl, side = all_lvls[0]
             out["liquidity_side"] = side
             out["liq_distance"] = float(dist)
-            bps = (dist / max(abs(ref_price), 1e-12)) * 10000.0  # "basis points" ~ 0.01% unit
+            bps = (dist / max(abs(ref_price), 1e-12)) * 10000.0  # basis points
             out["liq_distance_bps"] = float(bps)
 
-            # On ne rend pas le break "KO" pour cause de liquidité, mais cette
-            # info est très utile pour le scoring et le duplicate_guard.
     return out
 
 
@@ -432,7 +427,7 @@ def bos_quality_ok(
     return bool(d.get("ok", True))
 
 
-# === Commitment score (OI + CVD) inchangé ===
+# === Commitment score (OI + CVD) ===
 
 
 def _slope(series: pd.Series, window: int = 10) -> float:
@@ -472,5 +467,5 @@ def commitment_score(
         cvd_comp = float(m / mad)
 
     raw = 0.6 * oi_comp + 0.4 * cvd_comp
-    score = 1.0 / (1.0 + np.exp(-3.5 * raw))
+    score = 1.0 / (1.0 + np.exp(-3.5 * raw))  # logistic
     return float(np.clip(score, 0.0, 1.0))
