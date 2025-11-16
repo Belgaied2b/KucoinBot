@@ -211,6 +211,27 @@ def _compute_exits_if_needed(signal: Dict[str, Any]) -> Tuple[Dict[str, Any], Op
             exits_meta["tp1_meta"] = tp1_meta
             signal["tp1"] = tp1
             signal["exits"] = exits_meta
+
+            # Log TP1 sécurisé: tp1_meta peut être None ou non-dict
+            if isinstance(tp1_meta, dict):
+                rr_base_log = str(tp1_meta.get("rr_base"))
+                rr_eff_log = float(tp1_meta.get("rr_effective", 0.0))
+                regime_log = str(tp1_meta.get("regime"))
+            else:
+                rr_base_log = "n/a"
+                rr_eff_log = 0.0
+                regime_log = "n/a"
+
+            LOGGER.info(
+                "[EXITS][TP1] side=%s entry=%.12f sl=%.12f rr_base=%s rr_eff=%.4f regime=%s -> tp1=%.12f",
+                "LONG" if bias == "LONG" else "SHORT",
+                float(entry),
+                float(sl),
+                rr_base_log,
+                rr_eff_log,
+                regime_log,
+                float(tp1),
+            )
         except Exception as e:
             LOGGER.exception("Failed to compute TP1: %s", e)
             return signal, "tp1_failed"
@@ -421,3 +442,49 @@ def evaluate_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
         return out
 
     # ------------- Rejet : raisons détaillées -------------
+    if rr < RR_MIN_TOLERATED_WITH_INST:
+        reasons.append(f"RR {rr:.2f} < toléré {RR_MIN_TOLERATED_WITH_INST}")
+    elif rr < RR_MIN_STRICT:
+        reasons.append(f"RR {rr:.2f} < strict {RR_MIN_STRICT}")
+
+    if REQUIRE_STRUCTURE and not struct_ok:
+        reasons.append("Structure invalide")
+    if REQUIRE_MOMENTUM and not mom_ok:
+        reasons.append("Momentum faible")
+    if REQUIRE_HTF_ALIGN and not htf_ok:
+        reasons.append("HTF non aligné")
+    if REQUIRE_BOS_QUALITY and not bos_ok_q:
+        reasons.append("Break faible (vol/OI)")
+
+    ote = bool(signal.get("ote", True))
+    if not ote:
+        reasons.append("OTE manquant (toléré)")
+
+    base = {
+        "valid": False,
+        "score": 50 + inst_score * 2 + int(10 * comm),
+        "rr": float(rr),
+        "reasons": reasons,
+        "institutional": inst,
+        "exits": signal.get("exits", {}),
+    }
+    if "sl" in signal:
+        base["sl"] = float(signal["sl"])
+    if "tp1" in signal:
+        base["tp1"] = float(signal["tp1"])
+    if isinstance(struct_ctx, dict):
+        base.update({
+            "bos_direction": struct_ctx.get("bos_direction"),
+            "choch_direction": struct_ctx.get("choch_direction"),
+            "trend": struct_ctx.get("trend_state"),
+            "phase": struct_ctx.get("phase"),
+            "last_event": struct_ctx.get("last_event"),
+            "cos": struct_ctx.get("cos"),
+        })
+    if isinstance(bos_details, dict):
+        base.update({
+            "bos_details": bos_details.get("bos_direction") if isinstance(bos_details, dict) else None,
+            "has_liquidity_zone": bos_details.get("has_liquidity_zone"),
+            "liquidity_side": bos_details.get("liquidity_side"),
+        })
+    return base
