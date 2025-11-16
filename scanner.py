@@ -97,10 +97,17 @@ def _validate_rr_and_fix(
     bias: str, entry: float, sl: float, tp: float, tick: float
 ) -> tuple[bool, float, float, float, float]:
     """
-    Renvoie (ok, entry, sl, tp, rr). Corrige les cas 'borderline' (SL trop proche, mauvais côté).
+    Renvoie (ok, entry, sl, tp, rr).
+
+    Rôle:
+      - Corriger les cas 'borderline' (SL trop proche, TP du mauvais côté).
+      - Vérifier que risk > 0 et reward > 0.
+      - Laisser la décision finale sur le RR (faible/élevé) à analyze_signal (Desk EV / strict).
     """
     min_tick_gap = max(3 * tick, entry * 0.001)  # ≥ 0.1% ou 3 ticks
+
     if bias == "LONG":
+        # SL doit être en-dessous de l'entrée, TP au-dessus
         if sl >= entry - min_tick_gap:
             sl = entry - min_tick_gap
         if tp <= entry + min_tick_gap:
@@ -108,6 +115,7 @@ def _validate_rr_and_fix(
         risk = entry - sl
         reward = tp - entry
     else:
+        # SHORT : SL au-dessus, TP en-dessous
         if sl <= entry + min_tick_gap:
             sl = entry + min_tick_gap
         if tp >= entry - min_tick_gap:
@@ -118,11 +126,14 @@ def _validate_rr_and_fix(
     sl = _round_to_tick(sl, tick)
     tp = _round_to_tick(tp, tick)
 
+    # Géométrie impossible -> on bloque
     if risk <= 0 or reward <= 0:
         return False, entry, sl, tp, 0.0
 
-    rr = reward / risk
-    return (rr >= 1.05), entry, sl, tp, rr
+    rr = reward / max(risk, 1e-12)
+
+    # ⚠️ Pas de filtre RR ici : c'est evaluate_signal qui décide si ce RR est acceptable.
+    return True, entry, sl, tp, rr
 
 def _cap_by_margin(entry: float, lot_mult: float, lot_step: int, size_lots: int) -> int:
     """
