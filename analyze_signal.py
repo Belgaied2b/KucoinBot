@@ -6,6 +6,7 @@ Nouveautés:
     SL: stops.protective_stop_long/short (liquidité > structure > ATR) avec meta + log line compacte
     TP1: tp_clamp.compute_tp1 (clamp dynamique par régime de volatilité) avec meta
 - RR recalculé à partir de (entry, sl, tp1/tp2) si rr_estimated invalide/manquant
+- Fallback TP1 géométrique si clamp renvoie un TP incohérent (RR_MIN_STRICT * risk)
 - Priorité institutionnelle (MIN_INST_SCORE) + tolérance RR si inst OK et commitment OK
 - Contrôles supplémentaires: HTF alignment, BOS quality (vol+OI), commitment score (OI + CVD)
 """
@@ -157,6 +158,8 @@ def _compute_exits_if_needed(signal: Dict[str, Any]) -> Tuple[Dict[str, Any], Op
     """
     Si SL/TP1 manquants, tente de les construire à partir de df/entry/bias.
     Retourne (signal_enrichi, erreur éventuelle).
+    - SL via protective_stop_long/short
+    - TP1 via compute_tp1, avec fallback géométrique si besoin
     """
     df = signal.get("df")
     entry = signal.get("entry")
@@ -198,6 +201,9 @@ def _compute_exits_if_needed(signal: Dict[str, Any]) -> Tuple[Dict[str, Any], Op
 
     # ---- TP1 ----
     if tp1 is None and sl is not None:
+        tp1_val = None
+        tp1_meta = None
+        # 1) tentative via compute_tp1 (clamp)
         try:
             tp1_val, tp1_meta = compute_tp1(
                 df=df,
@@ -207,34 +213,77 @@ def _compute_exits_if_needed(signal: Dict[str, Any]) -> Tuple[Dict[str, Any], Op
                 tick=float(tick),
                 rr_base=float(signal.get("rr_target", 0.0) or 0.0),
             )
-            tp1 = float(tp1_val)
-            exits_meta["tp1_meta"] = tp1_meta
-            signal["tp1"] = tp1
-            signal["exits"] = exits_meta
-
-            # Log TP1 sécurisé: tp1_meta peut être None ou non-dict
-            if isinstance(tp1_meta, dict):
-                rr_base_log = str(tp1_meta.get("rr_base"))
-                rr_eff_log = float(tp1_meta.get("rr_effective", 0.0))
-                regime_log = str(tp1_meta.get("regime"))
-            else:
-                rr_base_log = "n/a"
-                rr_eff_log = 0.0
-                regime_log = "n/a"
-
-            LOGGER.info(
-                "[EXITS][TP1] side=%s entry=%.12f sl=%.12f rr_base=%s rr_eff=%.4f regime=%s -> tp1=%.12f",
-                "LONG" if bias == "LONG" else "SHORT",
-                float(entry),
-                float(sl),
-                rr_base_log,
-                rr_eff_log,
-                regime_log,
-                float(tp1),
-            )
         except Exception as e:
-            LOGGER.exception("Failed to compute TP1: %s", e)
-            return signal, "tp1_failed"
+            LOGGER.exception("Failed to compute TP1 via clamp, will try fallback: %s", e)
+            tp1_val, tp1_meta = None, None
+
+        # 2) validation du TP clampé
+        tp1_ok = False
+        if tp1_val is not None:
+            try:
+                tp1 = float(tp1_val)
+                if bias == "LONG":
+                    tp1_ok = tp1 > entry
+                else:
+                    tp1_ok = tp1 < entry
+            except Exception:
+                tp1 = None
+                tp1_ok = False
+
+        # 3) Fallback géométrique si clamp incohérent
+        if not tp1_ok:
+            try:
+                if bias == "LONG":
+                    risk = entry - float(sl)
+                else:
+                    risk = float(sl) - entry
+            except Exception:
+                return signal, "tp1_failed"
+
+            if risk <= 0:
+                return signal, "tp1_failed"
+
+            base_rr = float(signal.get("rr_target", 0.0) or 0.0)
+            if base_rr <= 0:
+                base_rr = float(RR_MIN_STRICT)
+
+            if bias == "LONG":
+                tp1 = entry + base_rr * risk
+            else:
+                tp1 = entry - base_rr * risk
+
+            tp1_meta = {
+                "regime": "fallback",
+                "rr_base": base_rr,
+                "rr_effective": base_rr,
+            }
+            exits_meta["tp1_fallback"] = True
+
+        # 4) enregistrement & log sécurisé
+        exits_meta["tp1_meta"] = tp1_meta
+        signal["tp1"] = float(tp1)
+        signal["exits"] = exits_meta
+
+        # Log TP1 sécurisé: tp1_meta peut être None ou non-dict
+        if isinstance(tp1_meta, dict):
+            rr_base_log = str(tp1_meta.get("rr_base"))
+            rr_eff_log = float(tp1_meta.get("rr_effective", 0.0))
+            regime_log = str(tp1_meta.get("regime"))
+        else:
+            rr_base_log = "n/a"
+            rr_eff_log = 0.0
+            regime_log = "n/a"
+
+        LOGGER.info(
+            "[EXITS][TP1] side=%s entry=%.12f sl=%.12f rr_base=%s rr_eff=%.4f regime=%s -> tp1=%.12f",
+            "LONG" if bias == "LONG" else "SHORT",
+            float(entry),
+            float(sl),
+            rr_base_log,
+            rr_eff_log,
+            regime_log,
+            float(tp1),
+        )
 
     return signal, None
 
@@ -483,7 +532,7 @@ def evaluate_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
         })
     if isinstance(bos_details, dict):
         base.update({
-            "bos_details": bos_details.get("bos_direction") if isinstance(bos_details, dict) else None,
+            "bos_details": bos_details,
             "has_liquidity_zone": bos_details.get("has_liquidity_zone"),
             "liquidity_side": bos_details.get("liquidity_side"),
         })
