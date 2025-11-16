@@ -9,11 +9,13 @@ Nouveautés:
 - Fallback TP1 géométrique si clamp renvoie un TP incohérent (RR_MIN_STRICT * risk)
 - Priorité institutionnelle (MIN_INST_SCORE) + tolérance RR si inst OK et commitment OK
 - Contrôles supplémentaires: HTF alignment, BOS quality (vol+OI), commitment score (OI + CVD)
+- Mode Desk EV Priority: permet d'accepter un RR plus faible si le bloc institutionnel est extrême
 """
 from __future__ import annotations
 import math
 from typing import Optional, Dict, Any, Tuple
 import logging
+
 import pandas as pd
 
 LOGGER = logging.getLogger(__name__)
@@ -65,6 +67,20 @@ try:
 except Exception:
     COMMITMENT_MIN = 0.55  # seuil 0..1
 
+# Mode Desk EV priority (RR réduit si flux insto ultra forts)
+try:
+    from settings import (
+        DESK_EV_MODE,
+        RR_MIN_DESK_PRIORITY,
+        INST_SCORE_DESK_PRIORITY,
+        COMMITMENT_DESK_PRIORITY,
+    )
+except Exception:
+    # Activé par défaut, avec seuils prudents
+    DESK_EV_MODE = True
+    RR_MIN_DESK_PRIORITY = 0.8        # RR mini en mode EV (peut descendre sous 1.0)
+    INST_SCORE_DESK_PRIORITY = 3      # inst_score max (3/3)
+    COMMITMENT_DESK_PRIORITY = 0.65   # commitment élevé (0..1)
 
 # ----------------------------- Helpers --------------------------------
 def _get_series(signal: Dict[str, Any], key: str) -> Optional[pd.Series]:
@@ -203,16 +219,23 @@ def _compute_exits_if_needed(signal: Dict[str, Any]) -> Tuple[Dict[str, Any], Op
     if tp1 is None and sl is not None:
         tp1_val = None
         tp1_meta = None
-        # 1) tentative via compute_tp1 (clamp)
+
+        # 1) tentative via compute_tp1 (clamp dynamique)
         try:
-            tp1_val, tp1_meta = compute_tp1(
-                df=df,
+            rr_pref = float(signal.get("rr_target", 0.0) or 0.0)
+            tp1_val, rr_used = compute_tp1(
                 entry=float(entry),
                 sl=float(sl),
-                side="LONG" if bias == "LONG" else "SHORT",
+                bias=bias,
+                rr_preferred=rr_pref if rr_pref > 0 else None,
+                df=df,
                 tick=float(tick),
-                rr_base=float(signal.get("rr_target", 0.0) or 0.0),
             )
+            tp1_meta = {
+                "regime": "dynamic",
+                "rr_base": rr_pref if rr_pref > 0 else float(RR_MIN_STRICT),
+                "rr_effective": float(rr_used),
+            }
         except Exception as e:
             LOGGER.exception("Failed to compute TP1 via clamp, will try fallback: %s", e)
             tp1_val, tp1_meta = None, None
@@ -306,15 +329,25 @@ def evaluate_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
         rr_target: float (optionnel) pour TP1 dynamique
       }
 
-    Politique d'acceptation (desk pro):
-      A) Institutionnel prioritaire:
+    Politique d'acceptation (desk pro) :
+
+      A0) Desk EV priority (nouveau) :
+          - DESK_EV_MODE activé
+          - inst_score >= INST_SCORE_DESK_PRIORITY (ex: 3/3)
+          - commitment_score >= COMMITMENT_DESK_PRIORITY (ex: 0.65)
+          - RR >= RR_MIN_DESK_PRIORITY (ex: 0.8)
+          - structure/momentum/HTF/BOS-quality OK
+
+      A) Institutionnel prioritaire :
          - inst_score >= MIN_INST_SCORE
          - commitment_score >= COMMITMENT_MIN
          - RR >= RR_MIN_TOLERATED_WITH_INST
          - + structure/momentum/HTF/BOS-quality selon REQUIRE_*
-      B) Sinon stricte:
+
+      B) Strict technique :
          - RR >= RR_MIN_STRICT
          - + structure/momentum/HTF/BOS-quality selon REQUIRE_*
+
       * OTE manquant = toléré (signal noté, pas bloquant)
     """
     # ------------- Données de base -------------
@@ -322,7 +355,7 @@ def evaluate_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
     bias = (signal.get("bias") or "LONG").upper()
     df = signal.get("df")
 
-    # construit SL/TP1 si besoin
+    # construit SL/TP1 si besoin (SL liquidité/structure/ATR + TP1 clamp dynamique)
     signal, exits_err = _compute_exits_if_needed(signal)
 
     if not isinstance(df, pd.DataFrame) or "close" not in df:
@@ -353,7 +386,6 @@ def evaluate_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
 
     # ------------- Institutionnel (tolérant) -------------
     inst = _inst_or_neutral(symbol, bias)
-
     inst_score = int(inst.get("institutional_score", 0))
 
     # ------------- Techniques -------------
@@ -376,6 +408,7 @@ def evaluate_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
     df_liq = signal.get("df_liq") or signal.get("df_m15")
     tick = float(signal.get("tick", 0.0) or 0.0)
     ref_price = float(signal.get("entry") or close.iloc[-1])
+
     bos_details = bos_quality_details(
         df=df,
         oi_series=oi_series,
@@ -416,6 +449,60 @@ def evaluate_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
 
     reasons = []
 
+    # ------------- Règle A0 : Desk EV priority (RR réduit) -------------
+    if (
+        DESK_EV_MODE
+        and inst_score >= int(INST_SCORE_DESK_PRIORITY)
+        and comm >= float(COMMITMENT_DESK_PRIORITY)
+    ):
+        rr_floor = float(RR_MIN_DESK_PRIORITY)
+        if rr >= rr_floor and struct_ok and mom_ok and htf_ok and bos_ok_q:
+            out = {
+                "valid": True,
+                # score un peu surboosté car edge institutionnel extrême
+                "score": 105 + inst_score * 6 + int(25 * comm),
+                "rr": float(rr),
+                "reasons": [
+                    f"Desk EV priority: inst {inst_score}/3, commitment {comm:.2f}, RR {rr:.2f} ≥ {rr_floor:.2f}"
+                ],
+                "institutional": inst,
+                "exits": signal.get("exits", {}),
+            }
+            # contexte structurel & liquidité pour logs / duplicate_guard
+            if isinstance(struct_ctx, dict):
+                out.update({
+                    "bos_direction": struct_ctx.get("bos_direction"),
+                    "choch_direction": struct_ctx.get("choch_direction"),
+                    "trend": struct_ctx.get("trend_state"),
+                    "phase": struct_ctx.get("phase"),
+                    "last_event": struct_ctx.get("last_event"),
+                    "cos": struct_ctx.get("cos"),
+                })
+            if isinstance(bos_details, dict):
+                out.update({
+                    "bos_details": bos_details,
+                    "has_liquidity_zone": bos_details.get("has_liquidity_zone"),
+                    "liquidity_side": bos_details.get("liquidity_side"),
+                })
+            if "sl" in signal:
+                out["sl"] = float(signal["sl"])
+            if "tp1" in signal:
+                out["tp1"] = float(signal["tp1"])
+            return out
+        else:
+            # On ne rejette pas ici, on laisse les règles A/B décider,
+            # mais on garde une trace des manques pour les logs.
+            if rr < rr_floor:
+                reasons.append(f"RR {rr:.2f} < desk_EV_floor {rr_floor:.2f}")
+            if not struct_ok:
+                reasons.append("Structure invalide")
+            if not mom_ok:
+                reasons.append("Momentum faible")
+            if not htf_ok:
+                reasons.append("HTF non aligné")
+            if not bos_ok_q:
+                reasons.append("Break faible (vol/OI)")
+
     # ------------- Règle A : institutionnel prioritaire -------------
     if inst_score >= MIN_INST_SCORE and comm >= COMMITMENT_MIN and rr >= RR_MIN_TOLERATED_WITH_INST:
         if struct_ok and mom_ok and htf_ok and bos_ok_q:
@@ -449,7 +536,7 @@ def evaluate_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
             if "tp1" in signal:
                 out["tp1"] = float(signal["tp1"])
             return out
-        # expliquer ce qui manque
+        # expliquer ce qui manque si règle A n’est pas satisfaite pleinement
         if not struct_ok:
             reasons.append("Structure invalide")
         if not mom_ok:
