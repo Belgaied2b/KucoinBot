@@ -19,7 +19,14 @@ LOGGER = logging.getLogger(__name__)
 
 # Techniques & structure
 from indicators import compute_rsi, compute_macd, compute_ema, compute_atr, is_momentum_ok
-from structure_utils import structure_valid, htf_trend_ok, bos_quality_ok, commitment_score
+from structure_utils import (
+    structure_valid,
+    htf_trend_ok,
+    bos_quality_ok,
+    bos_quality_details,
+    commitment_score,
+    analyze_structure,
+)
 
 # EXITS (SL + TP1 dynamique)
 from stops import (
@@ -31,25 +38,25 @@ from tp_clamp import compute_tp1
 
 # Institutionnel
 from institutional_data import compute_full_institutional_analysis
-# (optionnel, conservé si tu l'utilises quelque part ailleurs)
-try:
-    from institutional_data import detect_liquidity_clusters  # noqa: F401
-except Exception:
-    pass
 
-# Settings (avec valeurs de secours)
-from settings import (
-    MIN_INST_SCORE, REQUIRE_STRUCTURE, REQUIRE_MOMENTUM,
-    RR_MIN_STRICT, RR_MIN_TOLERATED_WITH_INST
-)
+# ----------------------------- Settings --------------------------------
 try:
-    from settings import REQUIRE_HTF_ALIGN
+    from settings import MIN_INST_SCORE
 except Exception:
+    MIN_INST_SCORE = 2  # score institutionnel minimum
+
+try:
+    from settings import RR_MIN_STRICT, RR_MIN_TOLERATED_WITH_INST
+except Exception:
+    RR_MIN_STRICT = 1.6
+    RR_MIN_TOLERATED_WITH_INST = 1.2
+
+try:
+    from settings import REQUIRE_STRUCTURE, REQUIRE_MOMENTUM, REQUIRE_HTF_ALIGN, REQUIRE_BOS_QUALITY
+except Exception:
+    REQUIRE_STRUCTURE = True
+    REQUIRE_MOMENTUM = True
     REQUIRE_HTF_ALIGN = True
-
-try:
-    from settings import REQUIRE_BOS_QUALITY
-except Exception:
     REQUIRE_BOS_QUALITY = True
 
 try:
@@ -83,58 +90,72 @@ def _inst_or_neutral(symbol: str, bias: str) -> Dict[str, Any]:
         return {"institutional_score": 0, "neutral": True, "reason": f"exception:{e}"}
 
 
-def _build_exits_if_needed(signal: Dict[str, Any]) -> Tuple[Optional[float], Optional[float], Dict[str, Any]]:
-    """
-    Construit SL/TP1 si manquants dans le signal.
-    Attend dans le signal:
-      - 'df': DataFrame H1
-      - 'entry': float
-      - 'tick': float (size)  -> requis pour un calcul propre (surtout SL)
-      - facultatif: 'df_liq' ou 'df_m15' pour la liquidité M15
-      - 'side' / 'bias' ("LONG"/"SHORT")
+def _safe_rr(signal: Dict[str, Any]) -> Optional[float]:
+    rr = signal.get("rr_estimated")
+    try:
+        if rr is not None:
+            rr = float(rr)
+            if math.isfinite(rr) and rr > 0:
+                return rr
+    except Exception:
+        rr = None
+    # fallback: si exits présents, calculer RR à partir d'eux
+    try:
+        entry = float(signal["entry"])
+        sl = float(signal["sl"])
+        tp1 = float(signal["tp1"])
+    except Exception:
+        return None
+    if entry <= 0 or not all(map(math.isfinite, [entry, sl, tp1])):
+        return None
+    if signal.get("bias", "").upper() == "LONG":
+        risk = entry - sl
+        reward = tp1 - entry
+    else:
+        risk = sl - entry
+        reward = entry - tp1
+    if risk <= 0 or reward <= 0:
+        return None
+    return float(reward / risk)
 
-    Retourne: (sl, tp1, exits_dict)
-      exits_dict contient: sl_meta, sl_log, tp1_meta si calculés, sinon {}
+
+def _compute_exits_if_needed(signal: Dict[str, Any]) -> Tuple[Dict[str, Any], Optional[str]]:
     """
-    exits: Dict[str, Any] = {}
+    Si SL/TP1 manquants, tente de les construire à partir de df/entry/bias.
+    Retourne (signal_enrichi, erreur éventuelle).
+    """
     df = signal.get("df")
-    if not isinstance(df, pd.DataFrame) or "close" not in df:
-        return None, None, exits
+    entry = signal.get("entry")
+    bias = (signal.get("bias") or "LONG").upper()
+    tick = float(signal.get("tick", 0.0) or 0.0)
+    if df is None or entry is None or not isinstance(df, pd.DataFrame):
+        return signal, "no_df_or_entry"
 
-    side = str(signal.get("side", signal.get("bias", "LONG"))).lower()
-    if side not in ("long", "short"):
-        side = "long"
-
-    entry = signal.get("entry", None)
-    tick = signal.get("tick", 0.0)
-    if entry is None:
-        return None, None, exits
     try:
         entry = float(entry)
-        tick = float(tick or 0.0)
     except Exception:
-        return None, None, exits
+        return signal, "invalid_entry"
 
-    # Exits éventuellement déjà fournis
-    sl = signal.get("sl", None)
-    tp1 = signal.get("tp1", None)
-
-    df_liq = signal.get("df_liq") or signal.get("df_m15")  # M15 recommandé pour la liquidité
+    sl = signal.get("sl")
+    tp1 = signal.get("tp1")
+    exits_meta = signal.get("exits", {}) or {}
 
     # ---- SL ----
+    sl_meta = None
     if sl is None:
         try:
-            if side == "long":
-                sl_val, sl_meta = protective_stop_long(df, entry, tick, df_liq=df_liq, return_meta=True)
+            if bias == "LONG":
+                sl, sl_meta = protective_stop_long(df, entry, tick, return_meta=True)
             else:
-                sl_val, sl_meta = protective_stop_short(df, entry, tick, df_liq=df_liq, return_meta=True)
-            sl = float(sl_val)
-            exits["sl_meta"] = sl_meta
-            exits["sl_log"] = format_sl_meta_for_log(sl_meta)
-            LOGGER.info("[EXITS][SL] %s | entry=%.12f | sl=%.12f", exits["sl_log"], entry, sl)
+                sl, sl_meta = protective_stop_short(df, entry, tick, return_meta=True)
+            sl = float(sl)
+            exits_meta["sl_meta"] = sl_meta
+            exits_meta["sl_log"] = format_sl_meta_for_log(sl_meta)
+            signal["sl"] = sl
+            signal["exits"] = exits_meta
         except Exception as e:
-            LOGGER.exception("SL build failed: %s", e)
-            sl = None
+            LOGGER.exception("Failed to compute SL: %s", e)
+            return signal, "sl_failed"
     else:
         try:
             sl = float(sl)
@@ -148,89 +169,24 @@ def _build_exits_if_needed(signal: Dict[str, Any]) -> Tuple[Optional[float], Opt
                 df=df,
                 entry=float(entry),
                 sl=float(sl),
-                side=side,
+                side="LONG" if bias == "LONG" else "SHORT",
                 tick=float(tick),
-                rr_base=signal.get("rr_target"),  # fallback interne sur settings.RR_TARGET
-                return_meta=True
+                rr_base=float(signal.get("rr_target", 0.0) or 0.0),
             )
             tp1 = float(tp1_val)
-            exits["tp1_meta"] = tp1_meta
-            LOGGER.info(
-                "[EXITS][TP1] side=%s entry=%.12f sl=%.12f rr_base=%s rr_eff=%.4f regime=%s -> tp1=%.12f",
-                side, float(entry), float(sl),
-                str(tp1_meta.get('rr_base')), float(tp1_meta.get('rr_effective', 0.0)),
-                str(tp1_meta.get('regime')), float(tp1)
-            )
+            exits_meta["tp1_meta"] = tp1_meta
+            signal["tp1"] = tp1
+            signal["exits"] = exits_meta
         except Exception as e:
-            LOGGER.exception("TP1 build failed: %s", e)
-            tp1 = None
-    else:
-        try:
-            tp1 = float(tp1) if tp1 is not None else None
-        except Exception:
-            tp1 = None
+            LOGGER.exception("Failed to compute TP1: %s", e)
+            return signal, "tp1_failed"
 
-    exits["sl"] = sl
-    exits["tp1"] = tp1
-    return sl, tp1, exits
+    return signal, None
 
 
-def _safe_rr(signal: Dict[str, Any]) -> Optional[float]:
-    """
-    Tente de produire un RR utilisable :
-      1) utilise rr_estimated si valable
-      2) sinon recalcule: RR = |tp1-entry| / |entry - sl|
-      3) si sl/tp1 manquants, tente de les construire (EXITS) et recalcule
-    Retourne None si impossible/invalide.
-    """
-    # 1) rr_estimated s'il est fourni et valide
-    rr = signal.get("rr_estimated", None)
-    if rr is not None:
-        try:
-            rr = float(rr)
-            if math.isfinite(rr) and rr > 0:
-                return rr
-        except Exception:
-            pass
-
-    # 2) calcul à partir de données disponibles
-    def _compute_rr_from(signal_dict: Dict[str, Any]) -> Optional[float]:
-        try:
-            entry = float(signal_dict.get("entry"))
-            sl = float(signal_dict.get("sl"))
-            tp1 = float(signal_dict.get("tp1"))
-            r = abs(entry - sl)
-            if r <= 0:
-                return None
-            rr_calc = abs(tp1 - entry) / r
-            return rr_calc if math.isfinite(rr_calc) and rr_calc > 0 else None
-        except Exception:
-            return None
-
-    rr2 = _compute_rr_from(signal)
-    if rr2 is not None:
-        return rr2
-
-    # 3) Si on peut, construit les EXITS et recalcule
-    sl_built, tp1_built, exits = _build_exits_if_needed(signal)
-    if sl_built is not None and tp1_built is not None:
-        tmp = {
-            **signal,
-            "sl": float(sl_built),
-            "tp1": float(tp1_built),
-        }
-        rr3 = _compute_rr_from(tmp)
-        if rr3 is not None:
-            # injecte les exits calculés dans le signal pour le downstream éventuel
-            signal.setdefault("exits", {}).update(exits)
-            signal["sl"] = float(sl_built)
-            signal["tp1"] = float(tp1_built)
-            return rr3
-
-    return None
-
-
-# ----------------------------- Évaluation --------------------------------
+# ----------------------------------------------------------------------
+#                            evaluate_signal
+# ----------------------------------------------------------------------
 def evaluate_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
     """
     signal attendu:
@@ -258,27 +214,54 @@ def evaluate_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
       * OTE manquant = toléré (signal noté, pas bloquant)
     """
     # ------------- Données de base -------------
-    symbol = signal.get("symbol")
-    bias = str(signal.get("bias", signal.get("side", "LONG"))).upper()
+    symbol = signal.get("symbol", "UNKNOWN")
+    bias = (signal.get("bias") or "LONG").upper()
     df = signal.get("df")
+
+    # construit SL/TP1 si besoin
+    signal, exits_err = _compute_exits_if_needed(signal)
+
     if not isinstance(df, pd.DataFrame) or "close" not in df:
         return {
             "valid": False,
             "score": 0,
             "rr": None,
             "reasons": ["DF introuvable ou invalide"],
-            "institutional": {"institutional_score": 0, "neutral": True, "reason": "no_df"}
+            "institutional": {"institutional_score": 0, "neutral": True, "reason": "no_df"},
         }
 
     close = df["close"]
     vol = df["volume"] if "volume" in df else None
 
+    # ------------- Structure locale (swings/BOS/CHoCH/COS) -------------
+    try:
+        struct_ctx = analyze_structure(df, bias)
+    except Exception:
+        struct_ctx = {
+            "swings": [],
+            "bos_direction": None,
+            "choch_direction": None,
+            "trend_state": "unknown",
+            "phase": "unknown",
+            "cos": None,
+            "last_event": None,
+        }
+
     # ------------- Institutionnel (tolérant) -------------
     inst = _inst_or_neutral(symbol, bias)
+
     inst_score = int(inst.get("institutional_score", 0))
 
     # ------------- Techniques -------------
-    struct_ok = structure_valid(df, bias) if REQUIRE_STRUCTURE else True
+    # 1) Structure basique (ancien critère) + phase swing avancée
+    struct_ok_raw = structure_valid(df, bias) if REQUIRE_STRUCTURE else True
+    trend_state = struct_ctx.get("trend_state", "unknown") if isinstance(struct_ctx, dict) else "unknown"
+    # On considère la structure pleinement valide seulement si on est en tendance claire (up/down)
+    if REQUIRE_STRUCTURE and struct_ok_raw:
+        struct_ok = trend_state in ("up", "down")
+    else:
+        struct_ok = struct_ok_raw
+
     mom_ok = (is_momentum_ok(close, vol) if vol is not None else True) if REQUIRE_MOMENTUM else True
 
     # ------------- Garde-fous insto étendus -------------
@@ -286,7 +269,21 @@ def evaluate_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
     htf_ok = htf_trend_ok(df_h4, bias) if REQUIRE_HTF_ALIGN else True
 
     oi_series = _get_series(signal, "oi_series")
-    bos_ok_q = bos_quality_ok(df, oi_series) if REQUIRE_BOS_QUALITY else True
+    df_liq = signal.get("df_liq") or signal.get("df_m15")
+    tick = float(signal.get("tick", 0.0) or 0.0)
+    ref_price = float(signal.get("entry") or close.iloc[-1])
+    bos_details = bos_quality_details(
+        df=df,
+        oi_series=oi_series,
+        vol_lookback=60,
+        vol_pct=0.80,
+        oi_min_trend=0.003,
+        oi_min_squeeze=-0.005,
+        df_liq=df_liq,
+        price=ref_price,
+        tick=tick,
+    ) if REQUIRE_BOS_QUALITY else {"ok": True}
+    bos_ok_q = bool(bos_details.get("ok", True))
 
     cvd_series = _get_series(signal, "cvd_series")
     comm = float(commitment_score(oi_series, cvd_series) or 0.0)  # 0..1
@@ -294,14 +291,24 @@ def evaluate_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
     # ------------- RR garde-fou (avec construction EXITS si besoin) -------------
     rr = _safe_rr(signal)
     if rr is None or not math.isfinite(rr) or rr <= 0:
-        return {
+        base = {
             "valid": False,
             "score": 50,
             "rr": None,
             "reasons": ["RR invalide (entry/SL/TP incohérents ou introuvables)"],
             "institutional": inst,
-            "exits": signal.get("exits", {})
+            "exits": signal.get("exits", {}),
         }
+        if isinstance(struct_ctx, dict):
+            base.update({
+                "bos_direction": struct_ctx.get("bos_direction"),
+                "choch_direction": struct_ctx.get("choch_direction"),
+                "trend": struct_ctx.get("trend_state"),
+                "phase": struct_ctx.get("phase"),
+                "last_event": struct_ctx.get("last_event"),
+                "cos": struct_ctx.get("cos"),
+            })
+        return base
 
     reasons = []
 
@@ -316,17 +323,39 @@ def evaluate_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
                 "institutional": inst,
                 "exits": signal.get("exits", {}),
             }
+            # contexte structurel & liquidité pour logs / duplicate_guard
+            if isinstance(struct_ctx, dict):
+                out.update({
+                    "bos_direction": struct_ctx.get("bos_direction"),
+                    "choch_direction": struct_ctx.get("choch_direction"),
+                    "trend": struct_ctx.get("trend_state"),
+                    "phase": struct_ctx.get("phase"),
+                    "last_event": struct_ctx.get("last_event"),
+                    "cos": struct_ctx.get("cos"),
+                })
+            if isinstance(bos_details, dict):
+                out.update({
+                    "bos_details": bos_details,
+                    "has_liquidity_zone": bos_details.get("has_liquidity_zone"),
+                    "liquidity_side": bos_details.get("liquidity_side"),
+                })
             # propage SL/TP éventuels si présents (utile au reste du pipeline)
-            if "sl" in signal: out["sl"] = float(signal["sl"])
-            if "tp1" in signal: out["tp1"] = float(signal["tp1"])
+            if "sl" in signal:
+                out["sl"] = float(signal["sl"])
+            if "tp1" in signal:
+                out["tp1"] = float(signal["tp1"])
             return out
         # expliquer ce qui manque
-        if not struct_ok: reasons.append("Structure invalide")
-        if not mom_ok: reasons.append("Momentum faible")
-        if not htf_ok: reasons.append("HTF non aligné")
-        if not bos_ok_q: reasons.append("Break faible (vol/OI)")
+        if not struct_ok:
+            reasons.append("Structure invalide")
+        if not mom_ok:
+            reasons.append("Momentum faible")
+        if not htf_ok:
+            reasons.append("HTF non aligné")
+        if not bos_ok_q:
+            reasons.append("Break faible (vol/OI)")
 
-    # ------------- Règle B : stricte (technique+RR) -------------
+    # ------------- Règle B : strict (technique+RR) -------------
     if rr >= RR_MIN_STRICT and struct_ok and mom_ok and htf_ok and bos_ok_q:
         out = {
             "valid": True,
@@ -336,8 +365,25 @@ def evaluate_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
             "institutional": inst,
             "exits": signal.get("exits", {}),
         }
-        if "sl" in signal: out["sl"] = float(signal["sl"])
-        if "tp1" in signal: out["tp1"] = float(signal["tp1"])
+        if isinstance(struct_ctx, dict):
+            out.update({
+                "bos_direction": struct_ctx.get("bos_direction"),
+                "choch_direction": struct_ctx.get("choch_direction"),
+                "trend": struct_ctx.get("trend_state"),
+                "phase": struct_ctx.get("phase"),
+                "last_event": struct_ctx.get("last_event"),
+                "cos": struct_ctx.get("cos"),
+            })
+        if isinstance(bos_details, dict):
+            out.update({
+                "bos_details": bos_details,
+                "has_liquidity_zone": bos_details.get("has_liquidity_zone"),
+                "liquidity_side": bos_details.get("liquidity_side"),
+            })
+        if "sl" in signal:
+            out["sl"] = float(signal["sl"])
+        if "tp1" in signal:
+            out["tp1"] = float(signal["tp1"])
         return out
 
     # ------------- Rejet : raisons détaillées -------------
@@ -359,13 +405,31 @@ def evaluate_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
     if not ote:
         reasons.append("OTE manquant (toléré)")
 
-    return {
+    base = {
         "valid": False,
         "score": 50 + inst_score * 2 + int(10 * comm),
         "rr": float(rr),
         "reasons": reasons,
         "institutional": inst,
         "exits": signal.get("exits", {}),
-        **({"sl": float(signal["sl"])} if "sl" in signal else {}),
-        **({"tp1": float(signal["tp1"])} if "tp1" in signal else {}),
     }
+    if "sl" in signal:
+        base["sl"] = float(signal["sl"])
+    if "tp1" in signal:
+        base["tp1"] = float(signal["tp1"])
+    if isinstance(struct_ctx, dict):
+        base.update({
+            "bos_direction": struct_ctx.get("bos_direction"),
+            "choch_direction": struct_ctx.get("choch_direction"),
+            "trend": struct_ctx.get("trend_state"),
+            "phase": struct_ctx.get("phase"),
+            "last_event": struct_ctx.get("last_event"),
+            "cos": struct_ctx.get("cos"),
+        })
+    if isinstance(bos_details, dict):
+        base.update({
+            "bos_details": bos_details,
+            "has_liquidity_zone": bos_details.get("has_liquidity_zone"),
+            "liquidity_side": bos_details.get("liquidity_side"),
+        })
+    return base
