@@ -9,7 +9,8 @@ Nouveautés:
 - Fallback TP1 géométrique si clamp renvoie un TP incohérent (RR_MIN_STRICT * risk)
 - Priorité institutionnelle (MIN_INST_SCORE) + tolérance RR si inst OK et commitment OK
 - Contrôles supplémentaires: HTF alignment, BOS quality (vol+OI), commitment score (OI + CVD)
-- Mode Desk EV Priority: permet d'accepter un RR plus faible si le bloc institutionnel est extrême
+- Mode Desk EV Priority: permet d'accepter un RR plus faible si le bloc institutionnel est extrême,
+  avec structure/momentum considérés comme SOFT (tolérés si faibles).
 """
 from __future__ import annotations
 import math
@@ -52,7 +53,7 @@ try:
     from settings import RR_MIN_STRICT, RR_MIN_TOLERATED_WITH_INST
 except Exception:
     RR_MIN_STRICT = 1.6
-    RR_MIN_TOLERATED_WITH_INST = 1.2
+    RR_MIN_TOLERATED_WITH_INST = 1.3
 
 try:
     from settings import REQUIRE_STRUCTURE, REQUIRE_MOMENTUM, REQUIRE_HTF_ALIGN, REQUIRE_BOS_QUALITY
@@ -76,11 +77,11 @@ try:
         COMMITMENT_DESK_PRIORITY,
     )
 except Exception:
-    # Activé par défaut, avec seuils prudents
+    # Activé par défaut, avec seuils prudents alignés avec le .env recommandé
     DESK_EV_MODE = True
-    RR_MIN_DESK_PRIORITY = 0.8        # RR mini en mode EV (peut descendre sous 1.0)
-    INST_SCORE_DESK_PRIORITY = 3      # inst_score max (3/3)
-    COMMITMENT_DESK_PRIORITY = 0.65   # commitment élevé (0..1)
+    RR_MIN_DESK_PRIORITY = 1.0       # RR mini accepté en mode EV
+    INST_SCORE_DESK_PRIORITY = 2     # au moins 2/3 insto
+    COMMITMENT_DESK_PRIORITY = 0.60  # commitment élevé (0..1)
 
 # ----------------------------- Helpers --------------------------------
 def _get_series(signal: Dict[str, Any], key: str) -> Optional[pd.Series]:
@@ -331,12 +332,13 @@ def evaluate_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
 
     Politique d'acceptation (desk pro) :
 
-      A0) Desk EV priority (nouveau) :
+      A0) Desk EV priority :
           - DESK_EV_MODE activé
-          - inst_score >= INST_SCORE_DESK_PRIORITY (ex: 3/3)
-          - commitment_score >= COMMITMENT_DESK_PRIORITY (ex: 0.65)
-          - RR >= RR_MIN_DESK_PRIORITY (ex: 0.8)
-          - structure/momentum/HTF/BOS-quality OK
+          - inst_score >= INST_SCORE_DESK_PRIORITY (ex: 2/3)
+          - commitment_score >= COMMITMENT_DESK_PRIORITY (ex: 0.60)
+          - RR >= RR_MIN_DESK_PRIORITY (ex: 1.0)
+          - HTF aligné + BOS quality OK (hard filters)
+          - Structure / Momentum : SOFT (si faibles → seulement en log, pas bloquants)
 
       A) Institutionnel prioritaire :
          - inst_score >= MIN_INST_SCORE
@@ -447,28 +449,35 @@ def evaluate_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
             })
         return base
 
-    reasons = []
+    reasons: list[str] = []
 
-    # ------------- Règle A0 : Desk EV priority (RR réduit) -------------
+    # ------------- Règle A0 : Desk EV priority (RR réduit, structure/momentum SOFT) -------------
     if (
         DESK_EV_MODE
         and inst_score >= int(INST_SCORE_DESK_PRIORITY)
         and comm >= float(COMMITMENT_DESK_PRIORITY)
     ):
         rr_floor = float(RR_MIN_DESK_PRIORITY)
-        if rr >= rr_floor and struct_ok and mom_ok and htf_ok and bos_ok_q:
+
+        # Hard filters en Desk EV: RR mini, HTF, BOS quality
+        if rr >= rr_floor and htf_ok and bos_ok_q:
+            reasons_ev = [
+                f"Desk EV priority: inst {inst_score}/3, commitment {comm:.2f}, RR {rr:.2f} ≥ {rr_floor:.2f}"
+            ]
+            # Structure / momentum deviennent SOFT : on loggue mais on ne bloque pas
+            if not struct_ok:
+                reasons_ev.append("Structure locale faible (tolérée en Desk EV)")
+            if not mom_ok:
+                reasons_ev.append("Momentum faible (toléré en Desk EV)")
+
             out = {
                 "valid": True,
-                # score un peu surboosté car edge institutionnel extrême
                 "score": 105 + inst_score * 6 + int(25 * comm),
                 "rr": float(rr),
-                "reasons": [
-                    f"Desk EV priority: inst {inst_score}/3, commitment {comm:.2f}, RR {rr:.2f} ≥ {rr_floor:.2f}"
-                ],
+                "reasons": reasons_ev,
                 "institutional": inst,
                 "exits": signal.get("exits", {}),
             }
-            # contexte structurel & liquidité pour logs / duplicate_guard
             if isinstance(struct_ctx, dict):
                 out.update({
                     "bos_direction": struct_ctx.get("bos_direction"),
@@ -490,18 +499,17 @@ def evaluate_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
                 out["tp1"] = float(signal["tp1"])
             return out
         else:
-            # On ne rejette pas ici, on laisse les règles A/B décider,
-            # mais on garde une trace des manques pour les logs.
+            # On garde la trace de pourquoi Desk EV n'a pas pu être appliqué
             if rr < rr_floor:
                 reasons.append(f"RR {rr:.2f} < desk_EV_floor {rr_floor:.2f}")
+            if not htf_ok:
+                reasons.append("HTF non aligné (Desk EV)")
+            if not bos_ok_q:
+                reasons.append("Break faible (vol/OI) (Desk EV)")
             if not struct_ok:
                 reasons.append("Structure invalide")
             if not mom_ok:
                 reasons.append("Momentum faible")
-            if not htf_ok:
-                reasons.append("HTF non aligné")
-            if not bos_ok_q:
-                reasons.append("Break faible (vol/OI)")
 
     # ------------- Règle A : institutionnel prioritaire -------------
     if inst_score >= MIN_INST_SCORE and comm >= COMMITMENT_MIN and rr >= RR_MIN_TOLERATED_WITH_INST:
