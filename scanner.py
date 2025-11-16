@@ -8,17 +8,27 @@ scanner.py — orchestration avec exits APRES fill + stops robustes + sizing par
 - Break-Even : déplacement automatique du SL à l'entrée lorsque TP1 est atteint.
 - Anti-doublons: empreinte persistante + garde position/ordres ouverts (même côté).
 - Exposure guard en MARGE (converti depuis notionnel).
-- Desk pro: watcher continu du fill (pas de timeout fixe), attache SL/TP/BE dès exécution, gère annulations.
+- Desk pro: watcher continu du fill, attache SL/TP/BE dès exécution, gère annulations réelles (status KuCoin).
 """
 from __future__ import annotations
-import time, logging, numpy as np, pandas as pd
+import time
+import logging
 from typing import Optional
+
+import numpy as np
+import pandas as pd
 
 from kucoin_utils import fetch_all_symbols, fetch_klines, get_contract_info
 from analyze_signal import evaluate_signal
 from settings import (
-    DRY_RUN, TOP_N_SYMBOLS, ENABLE_SQUEEZE_ENGINE, FAIL_OPEN_TO_CORE,
-    RISK_USDT, RR_TARGET, LEVERAGE, MARGIN_USDT,
+    DRY_RUN,
+    TOP_N_SYMBOLS,
+    ENABLE_SQUEEZE_ENGINE,
+    FAIL_OPEN_TO_CORE,
+    RISK_USDT,
+    RR_TARGET,          # gardé pour compat, même si RR strict est appliqué dans analyze_signal
+    LEVERAGE,
+    MARGIN_USDT,
 )
 
 # (optionnels) contrôles du watcher depuis settings.py
@@ -35,14 +45,12 @@ except Exception:
 from risk_manager import reset_scan_counters, guardrails_ok, register_order
 from kucoin_trader import place_limit_order, get_open_position, list_open_orders
 from exits_manager import purge_reduce_only, attach_exits_after_fill
-from fills import wait_for_fill
+from fills import wait_for_fill, get_order as get_order_status
 
-# nouveaux helpers
 from stops import protective_stop_long, protective_stop_short, format_sl_meta_for_log
 from sizing import lots_by_risk
 from duplicate_guard import signal_fingerprint, is_duplicate_and_mark, unmark
 
-# quick wins
 from ote_utils import compute_ote_zone  # OTE gate auto
 from ladder import build_ladder_prices  # ladder maker
 
@@ -50,17 +58,21 @@ from ladder import build_ladder_prices  # ladder maker
 try:
     from day_guard import day_guard_ok
 except Exception:
-    def day_guard_ok(): return True, "no_day_guard"
+    def day_guard_ok():
+        return True, "no_day_guard"
 
 try:
     from exposure_guard import exposure_ok
     try:
         from risk_manager import get_open_notional_by_symbol
     except Exception:
-        def get_open_notional_by_symbol(): return {}
+        def get_open_notional_by_symbol():
+            return {}
 except Exception:
     exposure_ok = None
-    def get_open_notional_by_symbol(): return {}
+
+    def get_open_notional_by_symbol():
+        return {}
 
 LOGGER = logging.getLogger(__name__)
 
@@ -69,15 +81,21 @@ def _fmt(sym, res, extra: str = ""):
     inst = res.get("institutional", {})
     rr = res.get("rr", None)
     rr_txt = "n/a" if rr is None or not np.isfinite(rr) or rr <= 0 else f"{min(rr, 10.0):.2f}"
-    return (f"🔎 *{sym}* — score {res.get('score',0):.1f} | RR {rr_txt}\n"
-            f"Inst: {inst.get('institutional_score',0)}/3 ({inst.get('institutional_strength','?')}) — {inst.get('institutional_comment','')}{extra}")
+    return (
+        f"🔎 *{sym}* — score {res.get('score', 0):.1f} | RR {rr_txt}\n"
+        f"Inst: {inst.get('institutional_score', 0)}/3 ({inst.get('institutional_strength', '?')}) — "
+        f"{inst.get('institutional_comment', '')}{extra}"
+    )
 
 def _round_to_tick(x: float, tick: float) -> float:
-    if tick <= 0: return float(x)
-    steps = int(float(x)/float(tick))
+    if tick <= 0:
+        return float(x)
+    steps = int(float(x) / float(tick))
     return round(steps * float(tick), 8)
 
-def _validate_rr_and_fix(bias: str, entry: float, sl: float, tp: float, tick: float) -> tuple[bool, float, float, float, float]:
+def _validate_rr_and_fix(
+    bias: str, entry: float, sl: float, tp: float, tick: float
+) -> tuple[bool, float, float, float, float]:
     """
     Renvoie (ok, entry, sl, tp, rr). Corrige les cas 'borderline' (SL trop proche, mauvais côté).
     """
@@ -120,12 +138,19 @@ def _cap_by_margin(entry: float, lot_mult: float, lot_step: int, size_lots: int)
 # ----------- TP engine : 1.5R / 2.5R + alignement swing -----------
 def _swing_levels(df: pd.DataFrame, lookback: int = 20) -> tuple[float, float]:
     swing_high = float(df["high"].rolling(lookback).max().iloc[-2])
-    swing_low  = float(df["low"].rolling(lookback).min().iloc[-2])
+    swing_low = float(df["low"].rolling(lookback).min().iloc[-2])
     return swing_high, swing_low
 
-def _compute_tp_levels(df: pd.DataFrame, entry: float, sl: float, bias: str,
-                       rr1: float = 1.5, rr2: float = 2.5,
-                       tick: float = 0.01, lookback: int = 20) -> tuple[float, float]:
+def _compute_tp_levels(
+    df: pd.DataFrame,
+    entry: float,
+    sl: float,
+    bias: str,
+    rr1: float = 1.5,
+    rr2: float = 2.5,
+    tick: float = 0.01,
+    lookback: int = 20,
+) -> tuple[float, float]:
     swing_high, swing_low = _swing_levels(df, lookback)
     if bias == "LONG":
         risk = max(1e-8, entry - sl)
@@ -140,19 +165,23 @@ def _compute_tp_levels(df: pd.DataFrame, entry: float, sl: float, bias: str,
     return _round_to_tick(tp1, tick), _round_to_tick(tp2, tick)
 
 # ------------------------------- Core fallbacks -------------------------------
-def _build_core(df, sym):
+def _build_core(df: pd.DataFrame, sym: str):
     entry = float(df["close"].iloc[-1])
     return {"symbol": sym, "bias": "LONG", "entry": entry, "df": df, "ote": True}
 
-def _try_advanced(sym, df):
+def _try_advanced(sym: str, df: pd.DataFrame):
     if not ENABLE_SQUEEZE_ENGINE:
         return None, ""
     try:
         from signal_engine import generate_trade_candidate
+
         sig, err, dbg = generate_trade_candidate(sym, df)
         if err:
             return None, ""
-        extra = f"\nConfluence {dbg.get('conf','?')} | ADX {dbg.get('adx','?'):.1f} | HV% {dbg.get('hvp','?'):.0f} | Squeeze {dbg.get('sq','?')}"
+        extra = (
+            f"\nConfluence {dbg.get('conf', '?')} | ADX {dbg.get('adx', '?'):.1f} | "
+            f"HV% {dbg.get('hvp', '?'):.0f} | Squeeze {dbg.get('sq', '?')}"
+        )
         return sig, extra
     except Exception as e:
         LOGGER.exception("Advanced engine error on %s: %s", sym, e)
@@ -175,29 +204,6 @@ def _extract_order_id(resp: dict) -> Optional[str]:
             return str(cur)
     return None
 
-def _is_order_open(order_id: str, sym: str) -> bool:
-    """
-    Vrai si l'ordre d'entrée est encore présent dans les ordres OUVERTS KuCoin
-    (peu importe le champ status exact). On ignore juste les ordres reduce-only (SL/TP).
-    """
-    try:
-        open_o = list_open_orders(sym) or []
-        for o in open_o:
-            oid = str(o.get("orderId") or o.get("id") or "")
-            if oid != order_id:
-                continue
-            ro = str(o.get("reduceOnly")).lower() == "true"
-            if ro:
-                # ce sont nos SL/TP, pas l’entrée
-                continue
-            # s'il est dans la liste des open orders et pas reduce-only -> on le considère ouvert
-            return True
-        # pas trouvé dans les ordres ouverts
-        return False
-    except Exception:
-        # en cas d’erreur API, on préfère considérer l’ordre comme toujours ouvert
-        return True
-
 def _has_position(sym: str, side: str) -> bool:
     try:
         pos = get_open_position(sym) or {}
@@ -205,6 +211,25 @@ def _has_position(sym: str, side: str) -> bool:
         pos_side = str(pos.get("side") or "").lower()
         return qty > 0 and pos_side == side
     except Exception:
+        return False
+
+def _is_order_cancelled(order_id: str) -> bool:
+    """
+    Retourne True uniquement si KuCoin indique explicitement que l'ordre
+    est annulé / rejeté, avec dealSize == 0.
+    On ne se base plus sur list_open_orders pour éviter les faux positifs.
+    """
+    try:
+        d = get_order_status(order_id) or {}
+        # fills.get_order renvoie le JSON complet KuCoin: {"code":"200000","data":{...}}
+        data = d.get("data") or d
+        status = str(data.get("status") or "").lower()
+        filled = float(data.get("dealSize") or 0.0)
+        if status in ("cancelled", "canceled", "cancel", "reject", "rejected") and filled <= 0.0:
+            return True
+        return False
+    except Exception:
+        # En cas d'erreur API, on ne conclut PAS à une annulation.
         return False
 
 # --------------------------------- Main loop ---------------------------------
@@ -273,14 +298,24 @@ def scan_and_send_signals():
 
             ok_rr, entry, sl, tp2, rr = _validate_rr_and_fix(bias, entry, sl_raw, tp2_raw, tick)
             if not ok_rr:
-                LOGGER.info("[%d/%d] Skip %s -> RR invalide (entry/SL/TP incohérents)", idx, len(pairs), sym)
+                LOGGER.info(
+                    "[%d/%d] Skip %s -> RR invalide (entry/SL/TP incohérents)",
+                    idx,
+                    len(pairs),
+                    sym,
+                )
                 continue
 
             # Taille par risque puis cap par marge
             size_lots = lots_by_risk(entry, sl, lot_mult, lot_step, float(RISK_USDT))
             size_lots = _cap_by_margin(entry, lot_mult, lot_step, size_lots)
             if size_lots < lot_step:
-                LOGGER.info("[%d/%d] Skip %s -> taille insuffisante après cap marge", idx, len(pairs), sym)
+                LOGGER.info(
+                    "[%d/%d] Skip %s -> taille insuffisante après cap marge",
+                    idx,
+                    len(pairs),
+                    sym,
+                )
                 continue
 
             # Notionnel & marge estimée (pour logs)
@@ -290,36 +325,79 @@ def scan_and_send_signals():
             # Day guard
             ok_day, why_day = day_guard_ok()
             if not ok_day:
-                LOGGER.info("[%d/%d] Skip %s -> day guard: %s", idx, len(pairs), sym, why_day)
+                LOGGER.info(
+                    "[%d/%d] Skip %s -> day guard: %s",
+                    idx,
+                    len(pairs),
+                    sym,
+                    why_day,
+                )
                 continue
 
             # Exposure guard (marge convertie en interne)
             if exposure_ok is not None:
                 try:
                     open_notional_by_symbol = get_open_notional_by_symbol() or {}
-                    ok_exp, why_exp = exposure_ok(open_notional_by_symbol, sym, notional, float(RISK_USDT))
+                    ok_exp, why_exp = exposure_ok(
+                        open_notional_by_symbol,
+                        sym,
+                        notional,
+                        float(RISK_USDT),
+                    )
                     if not ok_exp:
-                        LOGGER.info("[%d/%d] Skip %s -> exposure guard: %s | est_margin=%.0f | notional=%.0f",
-                                    idx, len(pairs), sym, why_exp, est_margin, notional)
+                        LOGGER.info(
+                            "[%d/%d] Skip %s -> exposure guard: %s | est_margin=%.0f | notional=%.0f",
+                            idx,
+                            len(pairs),
+                            sym,
+                            why_exp,
+                            est_margin,
+                            notional,
+                        )
                         continue
                     else:
-                        LOGGER.info("[EXPO] %s OK | est_margin=%.0f | notional=%.0f", sym, est_margin, notional)
+                        LOGGER.info(
+                            "[EXPO] %s OK | est_margin=%.0f | notional=%.0f",
+                            sym,
+                            est_margin,
+                            notional,
+                        )
                 except Exception as e:
                     LOGGER.debug("Exposure guard unavailable: %s", e)
 
             # Evaluation finale
-            signal.update({
-                "entry": entry, "sl": sl, "tp1": tp1_raw, "tp2": tp2,
-                "size_lots": size_lots, "bias": bias, "rr_estimated": rr, "sl_log": sl_log
-            })
+            signal.update(
+                {
+                    "entry": entry,
+                    "sl": sl,
+                    "tp1": tp1_raw,
+                    "tp2": tp2,
+                    "size_lots": size_lots,
+                    "bias": bias,
+                    "rr_estimated": rr,
+                    "sl_log": sl_log,
+                }
+            )
             res = evaluate_signal(signal)
             if not res.get("valid"):
-                LOGGER.info("[%d/%d] Skip %s -> %s", idx, len(pairs), sym, ", ".join(res.get("reasons") or []))
+                LOGGER.info(
+                    "[%d/%d] Skip %s -> %s",
+                    idx,
+                    len(pairs),
+                    sym,
+                    ", ".join(res.get("reasons") or []),
+                )
                 continue
 
             ok, why = guardrails_ok(sym, notional)
             if not ok:
-                LOGGER.info("[%d/%d] Skip %s -> %s", idx, len(pairs), sym, why)
+                LOGGER.info(
+                    "[%d/%d] Skip %s -> %s",
+                    idx,
+                    len(pairs),
+                    sym,
+                    why,
+                )
                 continue
 
             # ===========================
@@ -383,7 +461,7 @@ def scan_and_send_signals():
             )
 
             # Lecture sans marquage : si présent → skip
-            if is_duplicate_and_mark(fp, ttl_seconds=6*3600, mark=False):
+            if is_duplicate_and_mark(fp, ttl_seconds=6 * 3600, mark=False):
                 LOGGER.info("[DUP] %s empreinte déjà présente → skip", sym)
                 time.sleep(0.2)
                 continue
@@ -392,15 +470,26 @@ def scan_and_send_signals():
 
             if DRY_RUN:
                 # marquage pour éviter re-spam même en dry-run (optionnel)
-                is_duplicate_and_mark(fp, ttl_seconds=6*3600, mark=True)
-                LOGGER.info("[%d/%d] DRY-RUN %s lots=%s entry=%.6f sl=%.6f tp1=%.6f tp2=%.6f rr=%.2f | [EXITS] %s",
-                            idx, len(pairs), sym, size_lots, entry, sl, tp1_raw, tp2, rr, sl_log)
+                is_duplicate_and_mark(fp, ttl_seconds=6 * 3600, mark=True)
+                LOGGER.info(
+                    "[%d/%d] DRY-RUN %s lots=%s entry=%.6f sl=%.6f tp1=%.6f tp2=%.6f rr=%.2f | [EXITS] %s",
+                    idx,
+                    len(pairs),
+                    sym,
+                    size_lots,
+                    entry,
+                    sl,
+                    tp1_raw,
+                    tp2,
+                    rr,
+                    sl_log,
+                )
                 register_order(sym, notional)
             else:
                 # Marquer juste avant d’agir (évite courses)
-                race = is_duplicate_and_mark(fp, ttl_seconds=6*3600, mark=True)
+                race = is_duplicate_and_mark(fp, ttl_seconds=6 * 3600, mark=True)
                 if race is True:
-                    LOGGER.info("[DUP] %s condition de course (déjà marqué) → skip", sym, side)
+                    LOGGER.info("[DUP] %s condition de course (déjà marqué) → skip", sym)
                     time.sleep(0.2)
                     continue
 
@@ -411,27 +500,52 @@ def scan_and_send_signals():
                     body = (order.get("body") or {})
                     code = str((body or {}).get("code"))
                     if code == "300011":
-                        entry_retry = _round_to_tick(entry - tick, tick) if order_side == "buy" else _round_to_tick(entry + tick, tick)
-                        LOGGER.warning("Retry %s maker adjust for code 300011: %.8f -> %.8f", sym, entry, entry_retry)
+                        entry_retry = (
+                            _round_to_tick(entry - tick, tick)
+                            if order_side == "buy"
+                            else _round_to_tick(entry + tick, tick)
+                        )
+                        LOGGER.warning(
+                            "Retry %s maker adjust for code 300011: %.8f -> %.8f",
+                            sym,
+                            entry,
+                            entry_retry,
+                        )
                         order = place_limit_order(sym, order_side, entry_retry, size_lots, post_only=True)
                         if order.get("ok"):
                             entry = entry_retry
                         else:
-                            unmark(fp); time.sleep(0.2); continue
+                            unmark(fp)
+                            time.sleep(0.2)
+                            continue
                     elif code == "300003":
                         LOGGER.error("Balance insuffisante pour %s (marge requise). Skip.", sym)
-                        unmark(fp); time.sleep(0.2); continue
+                        unmark(fp)
+                        time.sleep(0.2)
+                        continue
                     else:
                         LOGGER.error("place_limit_order failed for %s: %s", sym, body)
-                        unmark(fp); time.sleep(0.2); continue
+                        unmark(fp)
+                        time.sleep(0.2)
+                        continue
 
                 order_id = _extract_order_id(order)
-                LOGGER.info("[%d/%d] Order %s placed | order_id=%s | lots=%s | entry=%.8f | notional=%.2f | est_margin=%.2f",
-                            idx, len(pairs), sym, order_id, size_lots, entry, notional, est_margin)
+                LOGGER.info(
+                    "[%d/%d] Order %s placed | order_id=%s | lots=%s | entry=%.8f | notional=%.2f | est_margin=%.2f",
+                    idx,
+                    len(pairs),
+                    sym,
+                    order_id,
+                    size_lots,
+                    entry,
+                    notional,
+                    est_margin,
+                )
 
                 # Telegram immédiat: ACK
                 try:
                     from telegram_client import send_telegram_message
+
                     send_telegram_message(
                         f"🟡 Ordre placé {sym} ({order_side.upper()})\n"
                         f"Lots: {size_lots} | Entry {entry:.6f}\n"
@@ -455,18 +569,23 @@ def scan_and_send_signals():
                         t0 = time.time()
                         max_seconds = float(FILL_MAX_HOURS) * 3600.0 if float(FILL_MAX_HOURS) > 0 else None
 
-                        # 2) boucle infinie (ou jusqu'à max_hours) : surveille fill ou annulation
+                        # 2) boucle jusqu'au fill ou annulation réelle
                         while not fill.get("filled"):
                             # check position (fill effectif)
                             if _has_position(sym, order_side):
                                 fill = {"filled": True}
                                 break
 
-                            # check si l'ordre est toujours présent (sinon: annulé/expiré/rejeté)
-                            if order_id and not _is_order_open(order_id, sym):
-                                LOGGER.info("[FILL] %s order_id=%s annulé/expiré (pas de position)", sym, order_id)
+                            # check statut réel de l'ordre (annulé/rejeté sans fill)
+                            if order_id and _is_order_cancelled(order_id):
+                                LOGGER.info(
+                                    "[FILL] %s order_id=%s annulé/rejeté (pas de position)",
+                                    sym,
+                                    order_id,
+                                )
                                 try:
                                     from telegram_client import send_telegram_message
+
                                     send_telegram_message(
                                         f"⚪️ Ordre annulé {sym} ({order_side.upper()}) — pas de fill.\n"
                                         f"Entry {entry:.6f} | Lots {size_lots}"
@@ -482,8 +601,11 @@ def scan_and_send_signals():
 
                             # timeout max (optionnel)
                             if max_seconds is not None and (time.time() - t0) > max_seconds:
-                                LOGGER.info("[FILL] %s watcher timeout atteint (%sh), on continue sans exits (ordre reste au carnet)",
-                                            sym, FILL_MAX_HOURS)
+                                LOGGER.info(
+                                    "[FILL] %s watcher timeout atteint (%sh), on continue sans exits (ordre reste au carnet)",
+                                    sym,
+                                    FILL_MAX_HOURS,
+                                )
                                 return
 
                             time.sleep(max(1.0, float(FILL_POLL_SEC)))
@@ -496,15 +618,30 @@ def scan_and_send_signals():
 
                         try:
                             sl_resp, tp_resp = attach_exits_after_fill(
-                                symbol=sym, side=order_side, df=df, entry=entry,
-                                sl=sl, tp=tp1_raw, size_lots=size_lots, tp2=tp2
+                                symbol=sym,
+                                side=order_side,
+                                df=df,
+                                entry=entry,
+                                sl=sl,
+                                tp=tp1_raw,
+                                size_lots=size_lots,
+                                tp2=tp2,
                             )
-                            LOGGER.info("Exits %s -> SL %s | TP %s | [EXITS] %s", sym, sl_resp, tp_resp, sl_log)
+                            LOGGER.info(
+                                "Exits %s -> SL %s | TP %s | [EXITS] %s",
+                                sym,
+                                sl_resp,
+                                tp_resp,
+                                sl_log,
+                            )
                         except Exception as e:
                             LOGGER.exception("attach_exits_after_fill failed on %s: %s", sym, e)
                             try:
                                 from telegram_client import send_telegram_message
-                                send_telegram_message(f"🟢 {sym} rempli ({order_side.upper()}) — SL/TP non posés (erreur).")
+
+                                send_telegram_message(
+                                    f"🟢 {sym} rempli ({order_side.upper()}) — SL/TP non posés (erreur)."
+                                )
                             except Exception:
                                 pass
                             return
@@ -515,6 +652,7 @@ def scan_and_send_signals():
                         # Telegram succès final
                         try:
                             from telegram_client import send_telegram_message
+
                             send_telegram_message(
                                 f"✅ {sym} rempli ({order_side.upper()})\n"
                                 f"Lots: {size_lots} | Entry {entry:.6f}\n"
@@ -529,6 +667,7 @@ def scan_and_send_signals():
                 # démarrer le watcher (non bloquant)
                 try:
                     import threading
+
                     threading.Thread(target=_monitor_fill_and_attach, daemon=True).start()
                 except Exception as e:
                     LOGGER.warning("Unable to start fill watcher for %s: %s", sym, e)
