@@ -10,7 +10,7 @@ Nouveautés:
 - Priorité institutionnelle (MIN_INST_SCORE) + tolérance RR si inst OK et commitment OK
 - Contrôles supplémentaires: HTF alignment, BOS quality (vol+OI), commitment score (OI + CVD)
 - Mode Desk EV Priority: permet d'accepter un RR plus faible si le bloc institutionnel est extrême,
-  avec structure/momentum considérés comme SOFT (tolérés si faibles).
+  avec structure/momentum/BOS considérés comme SOFT (tolérés si faibles).
 """
 from __future__ import annotations
 import math
@@ -317,19 +317,6 @@ def _compute_exits_if_needed(signal: Dict[str, Any]) -> Tuple[Dict[str, Any], Op
 # ----------------------------------------------------------------------
 def evaluate_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
     """
-    signal attendu:
-      {
-        symbol, bias('LONG'/'SHORT'),
-        rr_estimated: float (optionnel),
-        df: DataFrame(1H), entry, sl, tp1, tp2, ote: bool,
-        # optionnels:
-        df_h4: DataFrame(4H) pour HTF align,
-        df_liq/df_m15: DataFrame(M15) pour la liquidité,
-        tick: float,
-        oi_series: pd.Series (OI), cvd_series: pd.Series (CVD),
-        rr_target: float (optionnel) pour TP1 dynamique
-      }
-
     Politique d'acceptation (desk pro) :
 
       A0) Desk EV priority :
@@ -337,20 +324,19 @@ def evaluate_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
           - inst_score >= INST_SCORE_DESK_PRIORITY (ex: 2/3)
           - commitment_score >= COMMITMENT_DESK_PRIORITY (ex: 0.60)
           - RR >= RR_MIN_DESK_PRIORITY (ex: 1.0)
-          - HTF aligné + BOS quality OK (hard filters)
-          - Structure / Momentum : SOFT (si faibles → seulement en log, pas bloquants)
+          - HTF aligné (hard)
+          - BOS quality, Structure, Momentum = SOFT (tolérés si faibles, juste logués)
 
       A) Institutionnel prioritaire :
          - inst_score >= MIN_INST_SCORE
          - commitment_score >= COMMITMENT_MIN
          - RR >= RR_MIN_TOLERATED_WITH_INST
-         - + structure/momentum/HTF/BOS-quality selon REQUIRE_*
+         - HTF aligné (hard)
+         - Structure/Momentum/BOS = SOFT
 
       B) Strict technique :
          - RR >= RR_MIN_STRICT
-         - + structure/momentum/HTF/BOS-quality selon REQUIRE_*
-
-      * OTE manquant = toléré (signal noté, pas bloquant)
+         - Structure/Momentum/HTF/BOS = HARD (tous requis)
     """
     # ------------- Données de base -------------
     symbol = signal.get("symbol", "UNKNOWN")
@@ -391,10 +377,8 @@ def evaluate_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
     inst_score = int(inst.get("institutional_score", 0))
 
     # ------------- Techniques -------------
-    # 1) Structure basique (ancien critère) + phase swing avancée
     struct_ok_raw = structure_valid(df, bias) if REQUIRE_STRUCTURE else True
     trend_state = struct_ctx.get("trend_state", "unknown") if isinstance(struct_ctx, dict) else "unknown"
-    # On considère la structure pleinement valide seulement si on est en tendance claire (up/down)
     if REQUIRE_STRUCTURE and struct_ok_raw:
         struct_ok = trend_state in ("up", "down")
     else:
@@ -402,7 +386,7 @@ def evaluate_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
 
     mom_ok = (is_momentum_ok(close, vol) if vol is not None else True) if REQUIRE_MOMENTUM else True
 
-    # ------------- Garde-fous insto étendus -------------
+    # ------------- Garde-fous HTF/BOS -------------
     df_h4 = signal.get("df_h4")
     htf_ok = htf_trend_ok(df_h4, bias) if REQUIRE_HTF_ALIGN else True
 
@@ -451,7 +435,7 @@ def evaluate_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
 
     reasons: list[str] = []
 
-    # ------------- Règle A0 : Desk EV priority (RR réduit, structure/momentum SOFT) -------------
+    # ------------- Règle A0 : Desk EV priority (RR réduit, structure/momentum/BOS SOFT) -------------
     if (
         DESK_EV_MODE
         and inst_score >= int(INST_SCORE_DESK_PRIORITY)
@@ -459,16 +443,18 @@ def evaluate_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
     ):
         rr_floor = float(RR_MIN_DESK_PRIORITY)
 
-        # Hard filters en Desk EV: RR mini, HTF, BOS quality
-        if rr >= rr_floor and htf_ok and bos_ok_q:
+        # Hard filters en Desk EV: RR mini + HTF
+        if rr >= rr_floor and htf_ok:
             reasons_ev = [
                 f"Desk EV priority: inst {inst_score}/3, commitment {comm:.2f}, RR {rr:.2f} ≥ {rr_floor:.2f}"
             ]
-            # Structure / momentum deviennent SOFT : on loggue mais on ne bloque pas
+            # Structure / momentum / BOS deviennent SOFT : on loggue mais on ne bloque pas
             if not struct_ok:
                 reasons_ev.append("Structure locale faible (tolérée en Desk EV)")
             if not mom_ok:
                 reasons_ev.append("Momentum faible (toléré en Desk EV)")
+            if not bos_ok_q:
+                reasons_ev.append("Break faible (vol/OI) (toléré en Desk EV)")
 
             out = {
                 "valid": True,
@@ -504,25 +490,26 @@ def evaluate_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
                 reasons.append(f"RR {rr:.2f} < desk_EV_floor {rr_floor:.2f}")
             if not htf_ok:
                 reasons.append("HTF non aligné (Desk EV)")
-            if not bos_ok_q:
-                reasons.append("Break faible (vol/OI) (Desk EV)")
-            if not struct_ok:
-                reasons.append("Structure invalide")
-            if not mom_ok:
-                reasons.append("Momentum faible")
 
-    # ------------- Règle A : institutionnel prioritaire -------------
+    # ------------- Règle A : institutionnel prioritaire (HTF hard, reste soft) -------------
     if inst_score >= MIN_INST_SCORE and comm >= COMMITMENT_MIN and rr >= RR_MIN_TOLERATED_WITH_INST:
-        if struct_ok and mom_ok and htf_ok and bos_ok_q:
+        if htf_ok:
+            reasons_a = [f"Institutionnel {inst_score}/3 + commitment {comm:.2f}"]
+            if not struct_ok:
+                reasons_a.append("Structure locale faible (tolérée insto)")
+            if not mom_ok:
+                reasons_a.append("Momentum faible (toléré insto)")
+            if not bos_ok_q:
+                reasons_a.append("Break faible (vol/OI) (toléré insto)")
+
             out = {
                 "valid": True,
                 "score": 100 + inst_score * 5 + int(20 * comm),
                 "rr": float(rr),
-                "reasons": [f"Institutionnel {inst_score}/3 + commitment {comm:.2f}"],
+                "reasons": reasons_a,
                 "institutional": inst,
                 "exits": signal.get("exits", {}),
             }
-            # contexte structurel & liquidité pour logs / duplicate_guard
             if isinstance(struct_ctx, dict):
                 out.update({
                     "bos_direction": struct_ctx.get("bos_direction"),
@@ -538,21 +525,13 @@ def evaluate_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
                     "has_liquidity_zone": bos_details.get("has_liquidity_zone"),
                     "liquidity_side": bos_details.get("liquidity_side"),
                 })
-            # propage SL/TP éventuels si présents (utile au reste du pipeline)
             if "sl" in signal:
                 out["sl"] = float(signal["sl"])
             if "tp1" in signal:
                 out["tp1"] = float(signal["tp1"])
             return out
-        # expliquer ce qui manque si règle A n’est pas satisfaite pleinement
-        if not struct_ok:
-            reasons.append("Structure invalide")
-        if not mom_ok:
-            reasons.append("Momentum faible")
-        if not htf_ok:
+        else:
             reasons.append("HTF non aligné")
-        if not bos_ok_q:
-            reasons.append("Break faible (vol/OI)")
 
     # ------------- Règle B : strict (technique+RR) -------------
     if rr >= RR_MIN_STRICT and struct_ok and mom_ok and htf_ok and bos_ok_q:
@@ -627,7 +606,7 @@ def evaluate_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
         })
     if isinstance(bos_details, dict):
         base.update({
-            "bos_details": bos_details,
+            "bos_details": bos_details.get("bos_details") if isinstance(bos_details, dict) else bos_details,
             "has_liquidity_zone": bos_details.get("has_liquidity_zone"),
             "liquidity_side": bos_details.get("liquidity_side"),
         })
