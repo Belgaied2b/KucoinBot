@@ -430,42 +430,108 @@ def bos_quality_ok(
 # === Commitment score (OI + CVD) ===
 
 
-def _slope(series: pd.Series, window: int = 10) -> float:
-    if len(series) < window:
-        return 0.0
-    y = series.tail(window).astype(float).values
-    x = np.arange(len(y))
-    n = len(y)
-    denom = (n * (x ** 2).sum() - x.sum() ** 2) or 1.0
-    a = (n * (x * y).sum() - x.sum() * y.sum()) / denom
-    return float(a)
-
-
-def commitment_score(
-    oi_series: Optional[pd.Series],
-    cvd_series: Optional[pd.Series],
-    window: int = 30,
-) -> float:
+def commitment_score(oi_series, cvd_series, lookback: int = 80) -> float:
     """
-    Combine OI (engagement) + CVD (agressivité nette) en un score 0..1.
-    Normalisation robuste par MAD; clampé à [0, 1].
+    Score de "commitment" institutionnel 0..1 basé sur OI + CVD.
+
+    Idée :
+      - 0.5 = neutre (pas de flux directionnel clair, ou données insuffisantes)
+      - >0.6 = flux net construit (leviers + agression cohérents)
+      - <0.4 = déconstruction / flux contre la position moyenne
+
+    On ne tient PAS compte ici du bias (LONG/SHORT) : c'est un score
+    de "force & cohérence du flux", pas de direction par rapport au trade.
+    La direction est gérée plus haut dans la logique du bot.
     """
-    oi_comp = 0.0
-    if oi_series is not None and len(oi_series) >= 3:
-        o = oi_series.astype(float).tail(window)
-        try:
-            pct = (o.iloc[-1] - o.iloc[0]) / max(1e-12, o.iloc[0])
-            oi_comp = float(pct)
-        except Exception:
-            oi_comp = 0.0
+    try:
+        import numpy as np
+        import pandas as pd
+    except Exception:
+        # Si pandas/numpy indisponibles pour une raison obscure -> neutre
+        return 0.5
 
-    cvd_comp = 0.0
-    if cvd_series is not None and len(cvd_series) >= window:
-        c = cvd_series.astype(float).tail(window)
-        m = _slope(c, window=window)
-        mad = np.median(np.abs(c - np.median(c))) + 1e-12
-        cvd_comp = float(m / mad)
+    if oi_series is None or cvd_series is None:
+        return 0.5
 
-    raw = 0.6 * oi_comp + 0.4 * cvd_comp
-    score = 1.0 / (1.0 + np.exp(-3.5 * raw))  # logistic
-    return float(np.clip(score, 0.0, 1.0))
+    # Convertit en Series si ce n'est pas déjà le cas
+    try:
+        if not isinstance(oi_series, pd.Series):
+            oi_series = pd.Series(oi_series)
+        if not isinstance(cvd_series, pd.Series):
+            cvd_series = pd.Series(cvd_series)
+    except Exception:
+        return 0.5
+
+    oi = oi_series.dropna()
+    cvd = cvd_series.dropna()
+
+    # Pas assez de données -> neutre
+    if len(oi) < 10 or len(cvd) < 10:
+        return 0.5
+
+    # On travaille sur la queue récente
+    w = min(lookback, len(oi), len(cvd))
+    oi = oi.iloc[-w:]
+    cvd = cvd.iloc[-w:]
+
+    try:
+        oi_first, oi_last = float(oi.iloc[0]), float(oi.iloc[-1])
+        cvd_first, cvd_last = float(cvd.iloc[0]), float(cvd.iloc[-1])
+    except Exception:
+        return 0.5
+
+    oi_delta = oi_last - oi_first
+    cvd_delta = cvd_last - cvd_first
+
+    # Normalisation "robuste" des deltas
+    def _safe_norm(delta: float, base: float, alt_scale: float) -> float:
+        base_abs = abs(base)
+        scale = base_abs if base_abs > 0 else abs(alt_scale)
+        if not np.isfinite(delta) or not np.isfinite(scale) or scale <= 0:
+            return 0.0
+        return float(delta / scale)
+
+    oi_scale = oi.std() if np.isfinite(oi.std()) and oi.std() > 0 else (oi_first or 1.0)
+    cvd_scale = cvd.std() if np.isfinite(cvd.std()) and cvd.std() > 0 else (cvd_first or 1.0)
+
+    oi_norm = _safe_norm(oi_delta, oi_first, oi_scale)
+    cvd_norm = _safe_norm(cvd_delta, cvd_first, cvd_scale)
+
+    # Clamp pour éviter les extrêmes délirants
+    oi_norm = float(np.clip(oi_norm, -3.0, 3.0))
+    cvd_norm = float(np.clip(cvd_norm, -3.0, 3.0))
+
+    # Si les deux sont quasi nuls -> pas de flux lisible -> neutre
+    tiny_oi = abs(oi_norm) < 0.1
+    tiny_cvd = abs(cvd_norm) < 0.1
+    if tiny_oi && tiny_cvd:
+        return 0.5
+
+    # Magnitude globale du flux (plus c'est grand, plus c'est engagé)
+    mag_raw = 0.5 * (abs(oi_norm) + abs(cvd_norm))  # ~0..3
+    # On compresse avec une fonction 1 - exp(-x) pour avoir 0..~1
+    mag_score = 1.0 - float(np.exp(-mag_raw))
+    mag_score = float(np.clip(mag_score, 0.0, 1.0))
+
+    # Cohérence de signe :
+    # - si un seul des deux est significatif, on considère "même sens"
+    # - sinon, on teste le signe du produit
+    if tiny_oi ^ tiny_cvd:  # XOR : exactement un fort, un faible
+        same_sign = True
+    else:
+        same_sign = (oi_norm * cvd_norm) > 0
+
+    # Alignement : flux construit (OI et CVD vont dans le même sens)
+    # vs flux divergent (un monte, l'autre baisse)
+    align = mag_score if same_sign else -mag_score
+
+    # Combinaison :
+    #  - 0.5 = neutre
+    #  - +0.4 * align -> va vers ~0.9 en cas de flux massif cohérent
+    #                     et vers ~0.1 en cas de flux massif divergent
+    commitment = 0.5 + 0.4 * align
+
+    if not np.isfinite(commitment):
+        return 0.5
+
+    return float(np.clip(commitment, 0.0, 1.0))
