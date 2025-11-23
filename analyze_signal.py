@@ -11,6 +11,7 @@ Nouveautés:
 - Contrôles supplémentaires: HTF alignment, BOS quality (vol+OI), commitment score (OI + CVD)
 - Mode Desk EV Priority: permet d'accepter un RR plus faible si le bloc institutionnel est extrême,
   avec structure/momentum/BOS considérés comme SOFT (tolérés si faibles).
+- LOGS insto détaillés: pour chaque symbole on logue inst_score, commitment, RR et régime (A0/A/B/rejet).
 """
 from __future__ import annotations
 import math
@@ -93,18 +94,42 @@ def _inst_or_neutral(symbol: str, bias: str) -> Dict[str, Any]:
     """
     Appelle compute_full_institutional_analysis en tolérant les erreurs et
     en fournissant un résultat neutre si nécessaire.
+
+    Ajout: LOGs détaillés si la réponse est neutre/exception.
     """
     try:
         inst = compute_full_institutional_analysis(symbol, bias)
         if not isinstance(inst, dict):
+            LOGGER.warning(
+                "[INST] %s %s -> réponse invalide (type=%s), fallback neutre",
+                symbol,
+                bias,
+                type(inst).__name__,
+            )
             return {"institutional_score": 0, "neutral": True, "reason": "invalid_response"}
+
         # Normalise quelques clés possibles
         if "institutional_score" not in inst:
             inst["institutional_score"] = inst.get("score", 0) or 0
         if "neutral" not in inst:
             inst["neutral"] = False
+
+        # Log brut allégé
+        try:
+            LOGGER.info(
+                "[INST_RAW] %s %s -> score=%s neutral=%s details=%s",
+                symbol,
+                bias,
+                inst.get("institutional_score"),
+                inst.get("neutral"),
+                inst.get("reason") or inst.get("institutional_comment") or "",
+            )
+        except Exception:
+            pass
+
         return inst
     except Exception as e:
+        LOGGER.exception("[INST] %s %s -> exception compute_full_institutional_analysis: %s", symbol, bias, e)
         return {"institutional_score": 0, "neutral": True, "reason": f"exception:{e}"}
 
 
@@ -288,7 +313,6 @@ def _compute_exits_if_needed(signal: Dict[str, Any]) -> Tuple[Dict[str, Any], Op
         signal["tp1"] = float(tp1)
         signal["exits"] = exits_meta
 
-        # Log TP1 sécurisé: tp1_meta peut être None ou non-dict
         if isinstance(tp1_meta, dict):
             rr_base_log = str(tp1_meta.get("rr_base"))
             rr_eff_log = float(tp1_meta.get("rr_effective", 0.0))
@@ -336,7 +360,8 @@ def evaluate_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
 
       B) Strict technique :
          - RR >= RR_MIN_STRICT
-         - Structure/Momentum/HTF/BOS = HARD (tous requis)
+         - HTF aligné (hard)
+         - Structure/Momentum/BOS = SOFT (on log, mais on n’empêche plus)
     """
     # ------------- Données de base -------------
     symbol = signal.get("symbol", "UNKNOWN")
@@ -413,6 +438,25 @@ def evaluate_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
 
     # ------------- RR garde-fou (avec construction EXITS si besoin) -------------
     rr = _safe_rr(signal)
+
+    # LOG synthétique insto + RR pour ce symbole (même en cas de rejet)
+    try:
+        LOGGER.info(
+            "[EVAL_PRE] %s %s -> RR=%.3f inst_score=%s commitment=%.3f neutral=%s struct_ok=%s mom_ok=%s htf_ok=%s bos_ok=%s",
+            symbol,
+            bias,
+            rr if rr is not None else float("nan"),
+            inst_score,
+            comm,
+            inst.get("neutral"),
+            struct_ok,
+            mom_ok,
+            htf_ok,
+            bos_ok_q,
+        )
+    except Exception:
+        pass
+
     if rr is None or not math.isfinite(rr) or rr <= 0:
         base = {
             "valid": False,
@@ -448,7 +492,6 @@ def evaluate_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
             reasons_ev = [
                 f"Desk EV priority: inst {inst_score}/3, commitment {comm:.2f}, RR {rr:.2f} ≥ {rr_floor:.2f}"
             ]
-            # Structure / momentum / BOS deviennent SOFT : on loggue mais on ne bloque pas
             if not struct_ok:
                 reasons_ev.append("Structure locale faible (tolérée en Desk EV)")
             if not mom_ok:
@@ -483,9 +526,19 @@ def evaluate_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
                 out["sl"] = float(signal["sl"])
             if "tp1" in signal:
                 out["tp1"] = float(signal["tp1"])
+
+            # LOG du régime choisi
+            LOGGER.info(
+                "[EVAL] %s %s -> ACCEPT (Desk EV A0) RR=%.3f inst=%s comm=%.3f reasons=%s",
+                symbol,
+                bias,
+                rr,
+                inst_score,
+                comm,
+                "; ".join(reasons_ev),
+            )
             return out
         else:
-            # On garde la trace de pourquoi Desk EV n'a pas pu être appliqué
             if rr < rr_floor:
                 reasons.append(f"RR {rr:.2f} < desk_EV_floor {rr_floor:.2f}")
             if not htf_ok:
@@ -529,17 +582,35 @@ def evaluate_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
                 out["sl"] = float(signal["sl"])
             if "tp1" in signal:
                 out["tp1"] = float(signal["tp1"])
+
+            LOGGER.info(
+                "[EVAL] %s %s -> ACCEPT (Inst A) RR=%.3f inst=%s comm=%.3f reasons=%s",
+                symbol,
+                bias,
+                rr,
+                inst_score,
+                comm,
+                "; ".join(reasons_a),
+            )
             return out
         else:
             reasons.append("HTF non aligné")
 
-    # ------------- Règle B : strict (technique+RR) -------------
-    if rr >= RR_MIN_STRICT and struct_ok and mom_ok and htf_ok and bos_ok_q:
+    # ------------- Règle B : strict (technique+RR) — HTF hard, reste soft -------------
+    if rr >= RR_MIN_STRICT and htf_ok:
+        reasons_b = [f"RR≥{RR_MIN_STRICT} (strict) + HTF aligné"]
+        if not struct_ok:
+            reasons_b.append("Structure locale faible (tolérée en strict)")
+        if not mom_ok:
+            reasons_b.append("Momentum faible (toléré en strict)")
+        if not bos_ok_q:
+            reasons_b.append("Break faible (vol/OI) (toléré en strict)")
+
         out = {
             "valid": True,
             "score": 95 + inst_score * 3 + int(10 * comm),
             "rr": float(rr),
-            "reasons": [f"RR≥{RR_MIN_STRICT} et technique OK"],
+            "reasons": reasons_b,
             "institutional": inst,
             "exits": signal.get("exits", {}),
         }
@@ -562,6 +633,16 @@ def evaluate_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
             out["sl"] = float(signal["sl"])
         if "tp1" in signal:
             out["tp1"] = float(signal["tp1"])
+
+        LOGGER.info(
+            "[EVAL] %s %s -> ACCEPT (Strict B) RR=%.3f inst=%s comm=%.3f reasons=%s",
+            symbol,
+            bias,
+            rr,
+            inst_score,
+            comm,
+            "; ".join(reasons_b),
+        )
         return out
 
     # ------------- Rejet : raisons détaillées -------------
@@ -606,8 +687,23 @@ def evaluate_signal(signal: Dict[str, Any]) -> Dict[str, Any]:
         })
     if isinstance(bos_details, dict):
         base.update({
-            "bos_details": bos_details.get("bos_details") if isinstance(bos_details, dict) else bos_details,
+            "bos_details": bos_details,
             "has_liquidity_zone": bos_details.get("has_liquidity_zone"),
             "liquidity_side": bos_details.get("liquidity_side"),
         })
+
+    # LOG rejet avec détail insto
+    try:
+        LOGGER.info(
+            "[EVAL] %s %s -> REJECT RR=%.3f inst=%s comm=%.3f reasons=%s",
+            symbol,
+            bias,
+            rr,
+            inst_score,
+            comm,
+            "; ".join(reasons),
+        )
+    except Exception:
+        pass
+
     return base
