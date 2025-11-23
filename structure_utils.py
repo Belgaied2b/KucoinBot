@@ -434,26 +434,19 @@ def commitment_score(oi_series, cvd_series, lookback: int = 80) -> float:
     """
     Score de "commitment" institutionnel 0..1 basé sur OI + CVD.
 
-    Idée :
-      - 0.5 = neutre (pas de flux directionnel clair, ou données insuffisantes)
-      - >0.6 = flux net construit (leviers + agression cohérents)
-      - <0.4 = déconstruction / flux contre la position moyenne
-
-    On ne tient PAS compte ici du bias (LONG/SHORT) : c'est un score
-    de "force & cohérence du flux", pas de direction par rapport au trade.
-    La direction est gérée plus haut dans la logique du bot.
+    0.5 = neutre
+    >0.6 = flux construit (bullish ou bearish)
+    <0.4 = flux divergent / faible
     """
     try:
         import numpy as np
         import pandas as pd
     except Exception:
-        # Si pandas/numpy indisponibles pour une raison obscure -> neutre
         return 0.5
 
     if oi_series is None or cvd_series is None:
         return 0.5
 
-    # Convertit en Series si ce n'est pas déjà le cas
     try:
         if not isinstance(oi_series, pd.Series):
             oi_series = pd.Series(oi_series)
@@ -465,11 +458,9 @@ def commitment_score(oi_series, cvd_series, lookback: int = 80) -> float:
     oi = oi_series.dropna()
     cvd = cvd_series.dropna()
 
-    # Pas assez de données -> neutre
     if len(oi) < 10 or len(cvd) < 10:
         return 0.5
 
-    # On travaille sur la queue récente
     w = min(lookback, len(oi), len(cvd))
     oi = oi.iloc[-w:]
     cvd = cvd.iloc[-w:]
@@ -483,7 +474,6 @@ def commitment_score(oi_series, cvd_series, lookback: int = 80) -> float:
     oi_delta = oi_last - oi_first
     cvd_delta = cvd_last - cvd_first
 
-    # Normalisation "robuste" des deltas
     def _safe_norm(delta: float, base: float, alt_scale: float) -> float:
         base_abs = abs(base)
         scale = base_abs if base_abs > 0 else abs(alt_scale)
@@ -497,38 +487,29 @@ def commitment_score(oi_series, cvd_series, lookback: int = 80) -> float:
     oi_norm = _safe_norm(oi_delta, oi_first, oi_scale)
     cvd_norm = _safe_norm(cvd_delta, cvd_first, cvd_scale)
 
-    # Clamp pour éviter les extrêmes délirants
     oi_norm = float(np.clip(oi_norm, -3.0, 3.0))
     cvd_norm = float(np.clip(cvd_norm, -3.0, 3.0))
 
-    # Si les deux sont quasi nuls -> pas de flux lisible -> neutre
     tiny_oi = abs(oi_norm) < 0.1
     tiny_cvd = abs(cvd_norm) < 0.1
-    if tiny_oi && tiny_cvd:
+
+    # ❗ Correction Python : and (pas &&)
+    if tiny_oi and tiny_cvd:
         return 0.5
 
-    # Magnitude globale du flux (plus c'est grand, plus c'est engagé)
-    mag_raw = 0.5 * (abs(oi_norm) + abs(cvd_norm))  # ~0..3
-    # On compresse avec une fonction 1 - exp(-x) pour avoir 0..~1
+    # magnitude globale du flux
+    mag_raw = 0.5 * (abs(oi_norm) + abs(cvd_norm))
     mag_score = 1.0 - float(np.exp(-mag_raw))
     mag_score = float(np.clip(mag_score, 0.0, 1.0))
 
-    # Cohérence de signe :
-    # - si un seul des deux est significatif, on considère "même sens"
-    # - sinon, on teste le signe du produit
-    if tiny_oi ^ tiny_cvd:  # XOR : exactement un fort, un faible
+    # cohérence du signe
+    if tiny_oi ^ tiny_cvd:
         same_sign = True
     else:
         same_sign = (oi_norm * cvd_norm) > 0
 
-    # Alignement : flux construit (OI et CVD vont dans le même sens)
-    # vs flux divergent (un monte, l'autre baisse)
     align = mag_score if same_sign else -mag_score
 
-    # Combinaison :
-    #  - 0.5 = neutre
-    #  - +0.4 * align -> va vers ~0.9 en cas de flux massif cohérent
-    #                     et vers ~0.1 en cas de flux massif divergent
     commitment = 0.5 + 0.4 * align
 
     if not np.isfinite(commitment):
