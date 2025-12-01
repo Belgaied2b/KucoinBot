@@ -26,7 +26,7 @@ from settings import (
     ENABLE_SQUEEZE_ENGINE,
     FAIL_OPEN_TO_CORE,
     RISK_USDT,
-    RR_TARGET,          # gardé pour compat, même si RR strict est appliqué dans analyze_signal
+    RR_TARGET,          # gardé pour compat
     LEVERAGE,
     MARGIN_USDT,
 )
@@ -47,7 +47,7 @@ from kucoin_trader import (
     place_limit_order,
     get_open_position,
     list_open_orders,
-    get_order as get_order_status,  # 🔄 on unifie ici
+    get_order as get_order_status,  # 🔴 UNIFIE ici
 )
 from exits_manager import purge_reduce_only, attach_exits_after_fill
 
@@ -102,8 +102,7 @@ def _validate_rr_and_fix(
 ) -> tuple[bool, float, float, float, float]:
     """
     Renvoie (ok, entry, sl, tp, rr).
-    Rôle: corriger les cas borderline (SL/TP mauvais côté), vérifier risk/reward > 0.
-    Le filtre RR final reste dans analyze_signal.
+    Corrige SL/TP géométriquement, laisse le filtre RR strict à analyze_signal.
     """
     min_tick_gap = max(3 * tick, entry * 0.001)  # ≥ 0.1% ou 3 ticks
 
@@ -198,7 +197,6 @@ def _try_advanced(sym: str, df: pd.DataFrame):
 def _extract_order_id(resp: dict) -> Optional[str]:
     """
     Essaye d'extraire l'orderId de la réponse KuCoin.
-    Si rien n'est trouvé, on considère que la création d'ordre est douteuse.
     """
     if not resp:
         return None
@@ -217,21 +215,14 @@ def _extract_order_id(resp: dict) -> Optional[str]:
 
 def _get_order_status_flat(order_id: str) -> dict:
     """
-    Récupère le 'data' de KuCoin pour un orderId, aplati.
-    On attend un truc du genre:
-      {"id": "...", "symbol": "...", "status": "done", "dealSize": "...", ...}
+    Récupère le dict ordre via kucoin_trader.get_order(order_id).
+    get_order retourne déjà data->dict.
     """
     if not order_id:
         return {}
     try:
         d = get_order_status(order_id) or {}
-        # get_order_status (kucoin_trader) renvoie déjà data->dict
-        if isinstance(d, dict) and "status" in d:
-            return d
-        data = d.get("data") if isinstance(d, dict) else {}
-        if isinstance(data, dict):
-            return data
-        return {}
+        return d if isinstance(d, dict) else {}
     except Exception as e:
         LOGGER.debug("get_order_status error %s: %s", order_id, e)
         return {}
@@ -251,7 +242,7 @@ def _has_position(sym: str, side: str) -> bool:
         else:
             pos_side = raw_side
         side_norm = (side or "").lower()
-        LOGGER.debug("[FILL-FB] %s position qty=%s side=%s(norm=%s)", sym, qty, raw_side, pos_side)
+        LOGGER.debug("[FILL-FB] %s position qty=%s side_raw=%s side_norm=%s", sym, qty, raw_side, pos_side)
         return qty > 0 and pos_side == side_norm
     except Exception as e:
         LOGGER.debug("_has_position error on %s: %s", sym, e)
@@ -288,6 +279,7 @@ def scan_and_send_signals():
             bias = (signal.get("bias") or "LONG").upper()
             if bias not in ("LONG", "SHORT"):
                 bias = "LONG"
+            order_side = "buy" if bias == "LONG" else "sell"
 
             # --- Gate OTE (H1 swing propre) + ladder maker ---
             ote_zone = None
@@ -301,11 +293,8 @@ def scan_and_send_signals():
                 low, high = float(ote_zone[0]), float(ote_zone[1])
                 last = float(df["close"].iloc[-1])
                 in_ote = (low - tick) <= last <= (high + tick)
-                order_side = "buy" if bias == "LONG" else "sell"
                 ladder_prices = build_ladder_prices(order_side, low, high, tick, n=3) or [entry]
                 entry = float(ladder_prices[0])
-            else:
-                order_side = "buy" if bias == "LONG" else "sell"
 
             signal["ote"] = bool(in_ote)
 
@@ -516,7 +505,7 @@ def scan_and_send_signals():
                 # 1) envoyer l'entrée (LIMIT maker) + retry si 300011
                 order = place_limit_order(sym, order_side, entry, size_lots, post_only=True)
                 if not order.get("ok"):
-                    body = (order.get("data") or order.get("body") or {})  # selon impl
+                    body = (order.get("data") or order.get("body") or {})
                     code = str((body or {}).get("code"))
                     if code == "300011":
                         entry_retry = (
