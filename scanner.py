@@ -43,9 +43,13 @@ except Exception:
     FILL_MAX_HOURS = 0  # 0 = illimité (desk pro)
 
 from risk_manager import reset_scan_counters, guardrails_ok, register_order
-from kucoin_trader import place_limit_order, get_open_position, list_open_orders
+from kucoin_trader import (
+    place_limit_order,
+    get_open_position,
+    list_open_orders,
+    get_order as get_order_status,  # 🔄 on unifie ici
+)
 from exits_manager import purge_reduce_only, attach_exits_after_fill
-from fills import wait_for_fill, get_order as get_order_status
 
 from stops import protective_stop_long, protective_stop_short, format_sl_meta_for_log
 from sizing import lots_by_risk
@@ -98,16 +102,12 @@ def _validate_rr_and_fix(
 ) -> tuple[bool, float, float, float, float]:
     """
     Renvoie (ok, entry, sl, tp, rr).
-
-    Rôle:
-      - Corriger les cas 'borderline' (SL trop proche, TP du mauvais côté).
-      - Vérifier que risk > 0 et reward > 0.
-      - Laisser la décision finale sur le RR (faible/élevé) à analyze_signal (Desk EV / strict).
+    Rôle: corriger les cas borderline (SL/TP mauvais côté), vérifier risk/reward > 0.
+    Le filtre RR final reste dans analyze_signal.
     """
     min_tick_gap = max(3 * tick, entry * 0.001)  # ≥ 0.1% ou 3 ticks
 
     if bias == "LONG":
-        # SL doit être en-dessous de l'entrée, TP au-dessus
         if sl >= entry - min_tick_gap:
             sl = entry - min_tick_gap
         if tp <= entry + min_tick_gap:
@@ -115,7 +115,6 @@ def _validate_rr_and_fix(
         risk = entry - sl
         reward = tp - entry
     else:
-        # SHORT : SL au-dessus, TP en-dessous
         if sl <= entry + min_tick_gap:
             sl = entry + min_tick_gap
         if tp >= entry - min_tick_gap:
@@ -126,13 +125,10 @@ def _validate_rr_and_fix(
     sl = _round_to_tick(sl, tick)
     tp = _round_to_tick(tp, tick)
 
-    # Géométrie impossible -> on bloque
     if risk <= 0 or reward <= 0:
         return False, entry, sl, tp, 0.0
 
     rr = reward / max(risk, 1e-12)
-
-    # ⚠️ Pas de filtre RR ici : c'est evaluate_signal qui décide si ce RR est acceptable.
     return True, entry, sl, tp, rr
 
 def _cap_by_margin(entry: float, lot_mult: float, lot_step: int, size_lots: int) -> int:
@@ -206,7 +202,6 @@ def _extract_order_id(resp: dict) -> Optional[str]:
     """
     if not resp:
         return None
-    # cas normal : resp["data"]["orderId"] ou resp["data"]["data"]["orderId"]
     for path in [["data", "data", "orderId"], ["data", "orderId"], ["orderId"], ["data", "order_id"]]:
         cur = resp
         ok = True
@@ -230,40 +225,36 @@ def _get_order_status_flat(order_id: str) -> dict:
         return {}
     try:
         d = get_order_status(order_id) or {}
-        data = d.get("data") or d
+        # get_order_status (kucoin_trader) renvoie déjà data->dict
+        if isinstance(d, dict) and "status" in d:
+            return d
+        data = d.get("data") if isinstance(d, dict) else {}
         if isinstance(data, dict):
             return data
         return {}
-    except Exception:
+    except Exception as e:
+        LOGGER.debug("get_order_status error %s: %s", order_id, e)
         return {}
 
 def _has_position(sym: str, side: str) -> bool:
+    """
+    Fallback robust : regarde la position ouverte et mappe long/short -> buy/sell.
+    """
     try:
         pos = get_open_position(sym) or {}
         qty = float(pos.get("currentQty") or 0.0)
-        pos_side = str(pos.get("side") or "").lower()
-        return qty > 0 and pos_side == side
-    except Exception:
-        return False
-
-def _is_order_cancelled(order_id: str) -> bool:
-    """
-    Retourne True uniquement si KuCoin indique explicitement que l'ordre
-    est annulé / rejeté, avec dealSize == 0.
-    On ne se base plus sur list_open_orders pour éviter les faux positifs.
-    """
-    try:
-        data = _get_order_status_flat(order_id)
-        if not data:
-            return False
-
-        status = str(data.get("status") or "").lower()
-        filled = float(data.get("dealSize") or 0.0)
-        if status in ("cancelled", "canceled", "cancel", "reject", "rejected") and filled <= 0.0:
-            return True
-        return False
-    except Exception:
-        # En cas d'erreur API, on ne conclut PAS à une annulation.
+        raw_side = str(pos.get("side") or "").lower()
+        if raw_side in ("buy", "long"):
+            pos_side = "buy"
+        elif raw_side in ("sell", "short"):
+            pos_side = "sell"
+        else:
+            pos_side = raw_side
+        side_norm = (side or "").lower()
+        LOGGER.debug("[FILL-FB] %s position qty=%s side=%s(norm=%s)", sym, qty, raw_side, pos_side)
+        return qty > 0 and pos_side == side_norm
+    except Exception as e:
+        LOGGER.debug("_has_position error on %s: %s", sym, e)
         return False
 
 # --------------------------------- Main loop ---------------------------------
@@ -310,11 +301,11 @@ def scan_and_send_signals():
                 low, high = float(ote_zone[0]), float(ote_zone[1])
                 last = float(df["close"].iloc[-1])
                 in_ote = (low - tick) <= last <= (high + tick)
-                side = "buy" if bias == "LONG" else "sell"
-                ladder_prices = build_ladder_prices(side, low, high, tick, n=3) or [entry]
+                order_side = "buy" if bias == "LONG" else "sell"
+                ladder_prices = build_ladder_prices(order_side, low, high, tick, n=3) or [entry]
                 entry = float(ladder_prices[0])
             else:
-                side = "buy" if bias == "LONG" else "sell"
+                order_side = "buy" if bias == "LONG" else "sell"
 
             signal["ote"] = bool(in_ote)
 
@@ -352,7 +343,6 @@ def scan_and_send_signals():
                 )
                 continue
 
-            # Notionnel & marge estimée (pour logs)
             notional = entry * lot_mult * size_lots
             est_margin = notional / max(float(LEVERAGE), 1.0)
 
@@ -368,7 +358,7 @@ def scan_and_send_signals():
                 )
                 continue
 
-            # Exposure guard (marge convertie en interne)
+            # Exposure guard
             if exposure_ok is not None:
                 try:
                     open_notional_by_symbol = get_open_notional_by_symbol() or {}
@@ -437,15 +427,16 @@ def scan_and_send_signals():
             # ===========================
             #     ANTI-DOUBLONS
             # ===========================
-            tf = "1h"  # cohérent avec fetch_klines
+            tf = "1h"
 
             # 1) Position existante (même côté)
             try:
                 pos = get_open_position(sym) or {}
                 qty = float(pos.get("currentQty") or 0.0)
-                pos_side = str(pos.get("side") or "").lower()
-                if qty > 0 and pos_side == ("buy" if bias == "LONG" else "sell"):
-                    LOGGER.info("[DUP] %s déjà en position (qty=%s) → skip", sym, qty)
+                raw_side = str(pos.get("side") or "").lower()
+                pos_side = "buy" if raw_side in ("buy", "long") else "sell" if raw_side in ("sell", "short") else raw_side
+                if qty > 0 and pos_side == order_side:
+                    LOGGER.info("[DUP] %s déjà en position (qty=%s side=%s) → skip", sym, qty, raw_side)
                     time.sleep(0.2)
                     continue
             except Exception:
@@ -459,7 +450,7 @@ def scan_and_send_signals():
                     o_side = (o.get("side") or "").lower()
                     otype = (o.get("type") or o.get("orderType") or "").lower()
                     ro = str(o.get("reduceOnly")).lower() == "true"
-                    if (o_side == ("buy" if bias == "LONG" else "sell")) and ("limit" in otype) and not ro:
+                    if (o_side == order_side) and ("limit" in otype) and not ro:
                         has_same_side_limit = True
                         break
                 if has_same_side_limit:
@@ -486,7 +477,7 @@ def scan_and_send_signals():
 
             fp = signal_fingerprint(
                 symbol=sym,
-                side=("buy" if bias == "LONG" else "sell"),
+                side=order_side,
                 timeframe=tf,
                 entry_price=float(entry),
                 tick_size=tick,
@@ -494,16 +485,12 @@ def scan_and_send_signals():
                 structure=structure,
             )
 
-            # Lecture sans marquage : si présent → skip
             if is_duplicate_and_mark(fp, ttl_seconds=6 * 3600, mark=False):
                 LOGGER.info("[DUP] %s empreinte déjà présente → skip", sym)
                 time.sleep(0.2)
                 continue
 
-            msg = _fmt(sym, res, extra)
-
             if DRY_RUN:
-                # marquage pour éviter re-spam même en dry-run (optionnel)
                 is_duplicate_and_mark(fp, ttl_seconds=6 * 3600, mark=True)
                 LOGGER.info(
                     "[%d/%d] DRY-RUN %s lots=%s entry=%.6f sl=%.6f tp1=%.6f tp2=%.6f rr=%.2f | [EXITS] %s",
@@ -520,7 +507,6 @@ def scan_and_send_signals():
                 )
                 register_order(sym, notional)
             else:
-                # Marquer juste avant d’agir (évite courses)
                 race = is_duplicate_and_mark(fp, ttl_seconds=6 * 3600, mark=True)
                 if race is True:
                     LOGGER.info("[DUP] %s condition de course (déjà marqué) → skip", sym)
@@ -528,10 +514,9 @@ def scan_and_send_signals():
                     continue
 
                 # 1) envoyer l'entrée (LIMIT maker) + retry si 300011
-                order_side = "buy" if bias == "LONG" else "sell"
                 order = place_limit_order(sym, order_side, entry, size_lots, post_only=True)
                 if not order.get("ok"):
-                    body = (order.get("body") or {})
+                    body = (order.get("data") or order.get("body") or {})  # selon impl
                     code = str((body or {}).get("code"))
                     if code == "300011":
                         entry_retry = (
@@ -565,7 +550,6 @@ def scan_and_send_signals():
 
                 order_id = _extract_order_id(order)
                 if not order_id:
-                    # Réponse "ok" mais pas d'orderId -> on considère que c'est KO pour être safe.
                     LOGGER.error(
                         "[%d/%d] Order %s réponse ok MAIS pas d'orderId détecté -> on annule le trade côté bot. Resp=%s",
                         idx,
@@ -613,80 +597,76 @@ def scan_and_send_signals():
                 # --- Watcher continu (desk pro) ---
                 def _monitor_fill_and_attach():
                     try:
-                        # 1) essai court (bonus) via wait_for_fill
-                        fill = {"filled": False}
-                        try:
-                            f1 = wait_for_fill(order_id, timeout_s=30) if order_id else {"filled": False}
-                            fill = f1 if isinstance(f1, dict) else {"filled": False}
-                        except Exception:
-                            fill = {"filled": False}
-
                         t0 = time.time()
                         max_seconds = float(FILL_MAX_HOURS) * 3600.0 if float(FILL_MAX_HOURS) > 0 else None
+                        filled = False
 
-                        # 2) boucle jusqu'au fill ou annulation réelle
-                        while not fill.get("filled"):
-                            # --- A) check direct statut ordre KuCoin ---
-                            if order_id:
-                                data = _get_order_status_flat(order_id)
-                                if data:
-                                    status = str(data.get("status") or "").lower()
-                                    deal_size = float(data.get("dealSize") or 0.0)
-                                    remain = float(data.get("remainSize") or 0.0)
+                        while not filled:
+                            data = _get_order_status_flat(order_id)
+                            if data:
+                                status = str(data.get("status") or "").lower()
+                                deal_size = float(data.get("dealSize") or 0.0)
+                                remain = float(data.get("remainSize") or 0.0)
+                                LOGGER.debug(
+                                    "[FILL] poll %s order_id=%s status=%s dealSize=%s remainSize=%s",
+                                    sym,
+                                    order_id,
+                                    status,
+                                    deal_size,
+                                    remain,
+                                )
 
-                                    # ordre rempli (même partiellement) -> on considère "filled" pour attacher les exits
-                                    if deal_size > 0.0 and status in (
-                                        "done",
-                                        "match",
-                                        "filled",
-                                        "partialfill",
-                                        "partialfilled",
-                                    ):
-                                        LOGGER.info(
-                                            "[FILL] %s order_id=%s détecté rempli (status=%s, dealSize=%s, remainSize=%s)",
-                                            sym,
-                                            order_id,
-                                            status,
-                                            deal_size,
-                                            remain,
+                                # ordre rempli (même partiellement) -> on attache les exits
+                                if deal_size > 0.0 and status in (
+                                    "done",
+                                    "match",
+                                    "filled",
+                                    "partialfill",
+                                    "partialfilled",
+                                ):
+                                    LOGGER.info(
+                                        "[FILL] %s order_id=%s détecté rempli (status=%s, dealSize=%s, remainSize=%s)",
+                                        sym,
+                                        order_id,
+                                        status,
+                                        deal_size,
+                                        remain,
+                                    )
+                                    filled = True
+                                    break
+
+                                # ordre annulé / rejeté sans aucun fill
+                                if status in ("cancelled", "canceled", "cancel", "reject", "rejected") and deal_size <= 0.0:
+                                    LOGGER.info(
+                                        "[FILL] %s order_id=%s annulé/rejeté (pas de fill)",
+                                        sym,
+                                        order_id,
+                                    )
+                                    try:
+                                        from telegram_client import send_telegram_message
+
+                                        send_telegram_message(
+                                            f"⚪️ Ordre annulé {sym} ({order_side.upper()}) — pas de fill.\n"
+                                            f"Entry {entry:.6f} | Lots {size_lots}"
                                         )
-                                        fill = {"filled": True}
-                                        break
+                                    except Exception:
+                                        pass
+                                    try:
+                                        unmark(fp)
+                                    except Exception:
+                                        pass
+                                    return
 
-                                    # ordre annulé / rejeté sans aucun fill
-                                    if status in ("cancelled", "canceled", "cancel", "reject", "rejected") and deal_size <= 0.0:
-                                        LOGGER.info(
-                                            "[FILL] %s order_id=%s annulé/rejeté (pas de fill)",
-                                            sym,
-                                            order_id,
-                                        )
-                                        try:
-                                            from telegram_client import send_telegram_message
-
-                                            send_telegram_message(
-                                                f"⚪️ Ordre annulé {sym} ({order_side.upper()}) — pas de fill.\n"
-                                                f"Entry {entry:.6f} | Lots {size_lots}"
-                                            )
-                                        except Exception:
-                                            pass
-                                        # libère l'empreinte afin d'autoriser un nouveau signal
-                                        try:
-                                            unmark(fp)
-                                        except Exception:
-                                            pass
-                                        return
-
-                            # --- B) fallback: check position (si jamais l'API order bug) ---
+                            # Fallback position
                             if _has_position(sym, order_side):
                                 LOGGER.info(
                                     "[FILL] %s détecté en position via get_open_position (side=%s)",
                                     sym,
                                     order_side,
                                 )
-                                fill = {"filled": True}
+                                filled = True
                                 break
 
-                            # timeout max (optionnel)
                             if max_seconds is not None and (time.time() - t0) > max_seconds:
                                 LOGGER.info(
                                     "[FILL] %s watcher timeout atteint (%sh), on continue sans exits (ordre reste au carnet)",
@@ -721,58 +701,19 @@ def scan_and_send_signals():
                                 tp_resp,
                                 sl_log,
                             )
-
-                            # ---------- NOUVEAU : validation explicite SL/TP ----------
-                            sl_ok = bool(sl_resp.get("ok"))
-                            tp_ok = bool(tp_resp.get("ok") or tp_resp.get("skipped"))
-
-                            if not sl_ok or not tp_ok:
-                                # On log fort + Telegram debug avec codes KuCoin
-                                sl_data = sl_resp.get("data") or {}
-                                tp_data = tp_resp.get("data") or {}
-
-                                sl_code = sl_data.get("code") or sl_resp.get("status")
-                                tp_code = tp_data.get("code") or tp_resp.get("status")
-
-                                LOGGER.error(
-                                    "[EXITS] %s SL/TP possiblement NON posés -> sl_ok=%s (code=%s) | tp_ok=%s (code=%s)",
-                                    sym,
-                                    sl_ok,
-                                    sl_code,
-                                    tp_ok,
-                                    tp_code,
-                                )
-
-                                try:
-                                    from telegram_client import send_telegram_message
-
-                                    send_telegram_message(
-                                        f"🟢 {sym} rempli ({order_side.upper()}) — ATTENTION SL/TP possiblement non posés.\n"
-                                        f"SL ok={sl_ok} code={sl_code} | TP1 ok={tp_ok} code={tp_code}\n"
-                                        f"Check l'onglet *Open Orders* KuCoin et l'API logs."
-                                    )
-                                except Exception:
-                                    pass
-                                # On NE renvoie PAS de ✅ dans ce cas
-                                return
-
                         except Exception as e:
                             LOGGER.exception("attach_exits_after_fill failed on %s: %s", sym, e)
                             try:
                                 from telegram_client import send_telegram_message
 
                                 send_telegram_message(
-                                    f"🟢 {sym} rempli ({order_side.upper()}) — SL/TP non posés (exception Python).\n"
-                                    f"{type(e).__name__}: {e}"
+                                    f"🟢 {sym} rempli ({order_side.upper()}) — SL/TP non posés (erreur)."
                                 )
                             except Exception:
                                 pass
                             return
 
-                        # ⚠️ Le monitor BE est lancé par exits_manager.attach_exits_after_fill
-                        # via launch_breakeven_thread -> inutile de le relancer ici.
-
-                        # Telegram succès final : on sait maintenant que SL/TP sont *probablement* ok
+                        # Telegram succès final
                         try:
                             from telegram_client import send_telegram_message
 
@@ -787,10 +728,8 @@ def scan_and_send_signals():
                     except Exception as e:
                         LOGGER.exception("monitor_fill_and_attach error on %s: %s", sym, e)
 
-                # démarrer le watcher (non bloquant)
                 try:
                     import threading
-
                     threading.Thread(target=_monitor_fill_and_attach, daemon=True).start()
                 except Exception as e:
                     LOGGER.warning("Unable to start fill watcher for %s: %s", sym, e)
