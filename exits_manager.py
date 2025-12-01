@@ -1,11 +1,14 @@
 """
-exits_manager.py — SL + TP1/TP2 reduce-only institutionnels, avec vérification, retry et lancement du BE monitor.
+exits_manager.py — SL + TP1/TP2 reduce-only institutionnels, avec vérification légère
+et lancement du monitor break-even.
+
 Compatibilité : attach_exits_after_fill(symbol, side, df, entry, sl, tp, size_lots, tp2=None, ...)
-- SL : posé sur 100% de la taille
-- TP1 : posé sur ~50% (ou 1 lot si impossible) au prix 'tp' (normalisé = plus proche de l'entry)
-- TP2 : (optionnel) la cible plus lointaine ; peut être posée maintenant ou via le BE monitor
+- SL  : posé sur 100% de la taille (reduce-only)
+- TP1 : posé sur ~50% (ou 1 lot si impossible) au prix "tp" (normalisé, bon côté de l'entry)
+- TP2 : (optionnel) cible plus lointaine ; peut être posée maintenant ou laissée au monitor BE
 """
 from __future__ import annotations
+
 import logging
 import time
 from typing import Tuple, Optional, Callable
@@ -14,30 +17,18 @@ from kucoin_utils import get_contract_info
 from kucoin_trader import (
     place_reduce_only_stop,
     place_reduce_only_tp_limit,
-    list_open_orders,  # helper fiable (status=open)
+    list_open_orders,
 )
 from breakeven_manager import launch_breakeven_thread
 
-# (optionnel) si tu utilises le module exits.py (stopOrders natif)
-try:
-    from exits import place_take_profit as place_tp_fixed, place_stop_loss as place_sl_fixed
-    USE_FIXED_TPSL = True
-except Exception:
-    place_tp_fixed = None  # type: ignore
-    place_sl_fixed = None  # type: ignore
-    USE_FIXED_TPSL = False
-
 LOGGER = logging.getLogger(__name__)
 
-# Anti-doublon local pour le lancement du BE monitor (clé par position)
-_BE_LAUNCH_GUARD: dict[str, float] = {}
-_BE_GUARD_TTL = 30.0  # secondes
-
 # ---- Petites bornes (fallbacks si pas dans settings.py) ----
-try:
-    from settings import MIN_TP_TICKS  # écart minimal TP1/TP2 et par rapport à l'entry
+try:  # écart minimal TP / entry en ticks
+    from settings import MIN_TP_TICKS  # type: ignore
 except Exception:
     MIN_TP_TICKS = 1
+
 
 # ------------------------------- Utils -------------------------------
 def _round_to_tick(x: float, tick: float) -> float:
@@ -46,6 +37,7 @@ def _round_to_tick(x: float, tick: float) -> float:
         return float(x)
     steps = round(float(x) / float(tick))
     return round(steps * float(tick), 12)
+
 
 def _split_half(lots: int) -> Tuple[int, int]:
     """Retourne (tp1_lots, tp2_lots) ~50/50 ; garantit min 1 lot pour TP1 si lots>=1."""
@@ -58,10 +50,18 @@ def _split_half(lots: int) -> Tuple[int, int]:
         a, b = 1, max(0, lots - 1)
     return a, b
 
+
 def _ensure_demi_espace(side: str, entry: float, price: float, tick: float) -> float:
-    """Force le TP du bon côté de l'entrée (au moins 1 tick dans le bon demi-espace)."""
+    """
+    Force un TP dans le “bon demi-espace” par rapport à l'entry:
+      - buy : TP > entry
+      - sell: TP < entry
+    Avec au moins 1 tick d'écart.
+    """
     s = (side or "").lower()
-    e = float(entry); p = float(price); t = float(tick)
+    e = float(entry)
+    p = float(price)
+    t = float(tick)
     if s == "buy":
         if p <= e:
             p = e + max(t, 0.0)
@@ -70,162 +70,77 @@ def _ensure_demi_espace(side: str, entry: float, price: float, tick: float) -> f
             p = e - max(t, 0.0)
     return _round_to_tick(p, t)
 
+
 def _normalize_targets(
+    *,
     side: str,
     entry: float,
     tp1: float,
     tp2: Optional[float],
     tick: float,
-    min_tp_ticks: int = 1
-) -> Tuple[float, Optional[float], bool, bool]:
+    min_tp_ticks: int,
+) -> Tuple[float, Optional[float]]:
     """
-    Garantit : TP1 = target la plus proche de l'entry dans le bon sens ; TP2 = plus lointaine.
-    Impose un écart minimal en ticks et évite TP1==TP2 après arrondi.
-    Retourne (tp1_norm, tp2_norm, swapped, adjusted)
-    - swapped=True si inversion TP1/TP2
-    - adjusted=True si correction demi-espace/écart min effectuée
+    Normalise TP1/TP2 pour éviter les inversions et garantir un écart mini:
+      - TP1 dans le bon demi-espace, à au moins min_tp_ticks d'entry.
+      - Si TP2 fourni:
+          * côté buy  : entry < TP1 <= TP2
+          * côté sell : entry > TP1 >= TP2
+      - Si TP2 absent: TP1 seulement, mais avec distance mini en ticks.
     """
     s = (side or "").lower()
-    e = float(entry); t = float(tick)
+    e = float(entry)
     t1 = float(tp1)
     t2 = float(tp2) if tp2 is not None else None
-    swapped = False
-    adjusted = False
+    t = float(tick)
 
-    # 1) Demi-espace minimum (≥ 1 tick dans le bon sens)
+    # 1) demi-espace
     t1 = _ensure_demi_espace(s, e, t1, t)
-    if tp2 is not None:
+    if t2 is not None:
         t2 = _ensure_demi_espace(s, e, t2, t)
 
-    # 2) Si TP2 absent → normalisation simple
-    if t2 is None:
-        # s'assurer qu'au moins min_tp_ticks par rapport à entry
-        min_d = max(int(min_tp_ticks) * t, t if t > 0 else 0.0)
-        if s == "buy" and (t1 - e) < min_d:
-            t1 = _round_to_tick(e + min_d, t); adjusted = True
-        elif s == "sell" and (e - t1) < min_d:
-            t1 = _round_to_tick(e - min_d, t); adjusted = True
-        return t1, None, swapped, adjusted
-
-    # 3) Choisir proche/loin dans le bon demi-espace
-    if s == "buy":
-        candidates = [x for x in (t1, t2) if x > e]
-        if len(candidates) == 2:
-            near = min(candidates, key=lambda x: x - e)
-            far  = max(candidates, key=lambda x: x - e)
-            swapped = not (near == t1 and far == t2)
-            t1, t2 = near, far
-        # sinon on laisse tel quel mais on fera les garde-fous ci-dessous
-    else:
-        candidates = [x for x in (t1, t2) if x < e]
-        if len(candidates) == 2:
-            # le plus proche de e est la valeur la plus grande (côté inférieur)
-            near = max(candidates)
-            far  = min(candidates)
-            swapped = not (near == t1 and far == t2)
-            t1, t2 = near, far
-
-    # 4) Ecart minimal en ticks entre entry/TP1 et TP1/TP2
+    # 2) distance mini entry -> TP1
     min_d = max(int(min_tp_ticks) * t, t if t > 0 else 0.0)
-
-    # entry -> TP1
     if s == "buy":
         if (t1 - e) < min_d:
-            t1 = _round_to_tick(e + min_d, t); adjusted = True
+            t1 = _round_to_tick(e + min_d, t)
     else:
         if (e - t1) < min_d:
-            t1 = _round_to_tick(e - min_d, t); adjusted = True
+            t1 = _round_to_tick(e - min_d, t)
 
-    # TP1 -> TP2
-    if s == "buy":
-        if (t2 - t1) < min_d:
-            t2 = _round_to_tick(t1 + min_d, t); adjusted = True
-    else:
-        if (t1 - t2) < min_d:
-            t2 = _round_to_tick(t1 - min_d, t); adjusted = True
+    # 3) cohérence TP1/TP2 si TP2 fourni
+    if t2 is not None:
+        if s == "buy":
+            if t2 < t1:
+                t1, t2 = t2, t1
+        else:
+            if t2 > t1:
+                t1, t2 = t2, t1
 
-    # 5) Eviter collision TP1==TP2 après réalignement
-    if t2 == t1:
-        t2 = _round_to_tick(t1 + (t if s == "buy" else -t), t); adjusted = True
+        # léger écart mini TP1/TP2
+        if s == "buy" and (t2 - t1) < min_d:
+            t2 = _round_to_tick(t1 + min_d, t)
+        elif s == "sell" and (t1 - t2) < min_d:
+            t2 = _round_to_tick(t1 - min_d, t)
 
-    # 6) Sécurité finale : toujours dans le bon demi-espace après tous ajustements
-    t1 = _ensure_demi_espace(s, e, t1, t)
-    t2 = _ensure_demi_espace(s, e, t2, t)
+    return t1, t2
 
-    return t1, t2, swapped, adjusted
 
-def _retry_if_needed(symbol: str, side: str,
-                     sl: float, tp_price: float,
-                     sl_lots: int, tp_lots: int,
-                     sl_resp: dict, tp_resp: dict) -> Tuple[dict, dict]:
-    """
-    Si SL/TP non 'ok', on retente une fois. Ensuite on vérifie la présence
-    d'au moins un des ordres via open orders, avec backoff tolérant (anti-404/latence d'indexation).
-    IMPORTANT: on ne s'arrête pas sur une liste vide — on tente jusqu'à max_tries.
-    """
-    if not sl_resp.get("ok"):
-        LOGGER.warning("Retry SL for %s at %.12f (lots=%d)", symbol, sl, sl_lots)
-        sl_resp = place_reduce_only_stop(symbol, side, new_stop=sl, size_lots=int(sl_lots))
-
-    if not tp_resp.get("ok") and tp_lots > 0:
-        LOGGER.warning("Retry TP1 for %s at %.12f (lots=%d)", symbol, tp_price, tp_lots)
-        tp_resp = place_reduce_only_tp_limit(symbol, side, take_profit=tp_price, size_lots=int(tp_lots))
-
-    # Backoff progressif pour laisser KuCoin indexer
-    max_tries = 5
-    oo = []
-    for attempt in range(1, max_tries + 1):
-        time.sleep(0.6 * attempt)
-        try:
-            res = list_open_orders(symbol)
-            if isinstance(res, list):
-                oo = res
-                if len(oo) > 0 or attempt == max_tries:
-                    break
-        except Exception:
-            pass
-
-    try:
-        n_open = len(oo) if isinstance(oo, list) else 0
-        LOGGER.info("Open orders on %s after exits: %s (after %d tries)", symbol, n_open, attempt)
-        for o in (oo[:8] if isinstance(oo, list) else []):
-            LOGGER.info("  - id=%s side=%s type=%s price=%s stopPrice=%s size=%s reduceOnly=%s postOnly=%s status=%s",
-                        o.get("id") or o.get("orderId"),
-                        o.get("side"),
-                        o.get("type") or o.get("orderType"),
-                        o.get("price"),
-                        o.get("stopPrice"),
-                        o.get("size"),
-                        o.get("reduceOnly"),
-                        o.get("postOnly"),
-                        o.get("status"))
-        # Note: on ne “force” rien ici, le BE monitor re-assert si besoin.
-    except Exception as e:
-        LOGGER.warning("open-orders verification failed for %s: %s", symbol, e)
-
-    return sl_resp, tp_resp
-
-# --------- Guard BE par position (clé = symbol + entry arrondi au tick) ---------
-def _be_guard_key(symbol: str, entry: float, tick: float) -> str:
-    return f"{symbol}#{_round_to_tick(float(entry), float(tick))}"
-
-def _should_launch_be(symbol: str, entry: float, tick: float) -> bool:
-    now = time.time()
-    key = _be_guard_key(symbol, entry, tick)
-    last = _BE_LAUNCH_GUARD.get(key, 0.0)
-    if (now - last) < _BE_GUARD_TTL:
-        LOGGER.info("[EXITS] BE monitor launch guarded for %s (%.1fs remaining)",
-                    key, _BE_GUARD_TTL - (now - last))
-        return False
-    _BE_LAUNCH_GUARD[key] = now
-    return True
-
+# --------------------------- API utilitaire ---------------------------
 def purge_reduce_only(symbol: str) -> None:
-    """Optionnel : annule d’anciens exits si tu as un cancel. Laisser vide sinon."""
+    """
+    Optionnel : annule d’anciens exits si tu as un cancel manuel.
+
+    Pour l'instant, on ne fait rien ici pour éviter de toucher à des ordres
+    existants. La logique d'annulation peut être implémentée plus tard
+    (via list_open_orders + cancel_order) si besoin.
+    """
     try:
-        pass
+        # No-op volontaire (on ne touche pas aux exits existants).
+        return
     except Exception as e:
         LOGGER.warning("purge_reduce_only(%s) error: %s", symbol, e)
+
 
 # --------------------------- API principale ---------------------------
 def attach_exits_after_fill(
@@ -243,96 +158,193 @@ def attach_exits_after_fill(
     notifier: Optional[Callable[[str], None]] = None,  # callback (ex: Telegram)
 ) -> Tuple[dict, dict]:
     """
-    Pose SL + TP1 (+ éventuellement TP2) et lance le monitor BE (qui déplacera SL->BE quand TP1 est rempli).
+    Pose SL + TP1 (+ éventuellement TP2) et lance le monitor BE (qui déplacera SL->BE
+    quand TP1 est rempli).
+
     Retourne (sl_resp, tp1_resp) pour compatibilité avec l’appelant.
     """
-    meta = get_contract_info(symbol)
-    tick = float(price_tick) if price_tick else float(meta.get("tickSize", 0.01))
+    meta = get_contract_info(symbol) or {}
+    tick = float(price_tick) if price_tick else float(meta.get("tickSize", 0.01) or 0.01)
+    side = (side or "").lower()
+    if side not in ("buy", "sell"):
+        LOGGER.warning("[EXITS] %s side invalide '%s', fallback 'buy'", symbol, side)
+        side = "buy"
 
-    # --- 0) Normalisation des targets (clé pour éviter TP1/TP2 inversés + écart min/tick) ---
-    tp1_norm, tp2_norm, swapped, adjusted = _normalize_targets(
-        side=side, entry=float(entry), tp1=float(tp), tp2=tp2 if tp2 is not None else None,
-        tick=tick, min_tp_ticks=int(MIN_TP_TICKS)
+    # --- Normalisation TP1/TP2 ---
+    tp1_norm, tp2_norm = _normalize_targets(
+        side=side,
+        entry=float(entry),
+        tp1=float(tp),
+        tp2=tp2,
+        tick=tick,
+        min_tp_ticks=int(MIN_TP_TICKS),
     )
-    if swapped or adjusted:
-        LOGGER.warning(
-            "[EXITS] %s side=%s — Targets normalisées (swapped=%s adjusted=%s): "
-            "tp1_in=%.12f tp2_in=%s -> tp1=%.12f tp2=%s",
-            symbol, side, swapped, adjusted,
-            float(tp), f"{tp2:.12f}" if tp2 is not None else "None",
-            tp1_norm, f"{tp2_norm:.12f}" if tp2_norm is not None else "None"
-        )
 
-    sl_r  = _round_to_tick(float(sl),      tick)
+    sl_r = _round_to_tick(float(sl), tick)
     tp1_r = _round_to_tick(float(tp1_norm), tick)
     tp2_r = _round_to_tick(float(tp2_norm), tick) if tp2_norm is not None else None
 
     lots_full = int(size_lots)
+    if lots_full <= 0:
+        raise ValueError(f"[EXITS] lots invalides pour {symbol}: {lots_full}")
+
     tp1_lots, tp2_lots = _split_half(lots_full)
     if lots_full >= 1 and tp1_lots == 0:
         tp1_lots, tp2_lots = 1, max(0, lots_full - 1)
 
     LOGGER.info(
         "[EXITS] %s side=%s lots=%d -> SL@%.12f | TP1: %d @ %.12f | TP2: %s",
-        symbol, side, lots_full, sl_r, tp1_lots, tp1_r,
-        f"{tp2_lots} @ {tp2_r:.12f}" if (tp2_r is not None and tp2_lots > 0) else "none"
+        symbol,
+        side,
+        lots_full,
+        sl_r,
+        tp1_lots,
+        tp1_r,
+        f"{tp2_lots} @ {tp2_r:.12f}" if (tp2_r is not None and tp2_lots > 0) else "none",
     )
 
-    # 1) SL sur 100%
-    if USE_FIXED_TPSL and place_sl_fixed:
-        sl_resp = place_sl_fixed(symbol, side, size_lots=lots_full, stop_price=sl_r)
-        if not sl_resp.get("ok"):
-            LOGGER.warning("[EXITS] /stopOrders SL refusé -> fallback reduce-only /orders")
-            sl_resp = place_reduce_only_stop(symbol, side, new_stop=sl_r, size_lots=lots_full)
-    else:
-        sl_resp = place_reduce_only_stop(symbol, side, new_stop=sl_r, size_lots=lots_full)
-
-    # 2) TP1 sur ~50% (ou 1 lot si impossible) — LIMIT reduce-only, GTC (pas post-only)
-    if tp1_lots > 0:
-        if USE_FIXED_TPSL and place_tp_fixed:
-            tp1_resp = place_tp_fixed(symbol, side, size_lots=tp1_lots, tp_price=tp1_r)
-            if not tp1_resp.get("ok"):
-                LOGGER.warning("[EXITS] /stopOrders TP1 refusé -> fallback reduce-only /orders")
-                tp1_resp = place_reduce_only_tp_limit(symbol, side, take_profit=tp1_r, size_lots=tp1_lots)
-        else:
-            tp1_resp = place_reduce_only_tp_limit(symbol, side, take_profit=tp1_r, size_lots=tp1_lots)
-    else:
-        tp1_resp = {"ok": False, "skipped": True, "reason": "no_tp1_lots"}
-
-    # 3) TP2 maintenant ? (ou laisser le monitor le poser à TP1)
-    if place_tp2_now and (tp2_r is not None) and tp2_lots > 0:
-        if USE_FIXED_TPSL and place_tp_fixed:
-            tp2_resp = place_tp_fixed(symbol, side, size_lots=tp2_lots, tp_price=tp2_r)
-            if not tp2_resp.get("ok"):
-                LOGGER.warning("[EXITS] /stopOrders TP2 refusé -> fallback reduce-only /orders")
-                _ = place_reduce_only_tp_limit(symbol, side, take_profit=tp2_r, size_lots=tp2_lots)
-        else:
-            _ = place_reduce_only_tp_limit(symbol, side, take_profit=tp2_r, size_lots=tp2_lots)
-
-    # 4) retry + contrôle basique pour TP1 uniquement (TP2 est optionnel ici)
-    sl_resp, tp1_resp = _retry_if_needed(
-        symbol, side,
-        sl=sl_r, tp_price=tp1_r,
-        sl_lots=lots_full, tp_lots=tp1_lots,
-        sl_resp=sl_resp, tp_resp=tp1_resp
-    )
-
-    # 5) Lancer le monitor BE (déplacement SL->BE quand TP1 est rempli, et pose TP2 si non posé)
+    # =======================
+    # 1) SL reduce-only FULL
+    # =======================
+    sl_resp: dict
     try:
-        now_ok = _should_launch_be(symbol, float(entry), float(tick))   # guard par position (symbol+entry~tick)
-        if now_ok:
-            launch_breakeven_thread(
-                symbol=symbol,
-                side=side,
-                entry=float(entry),
-                tp1=float(tp1_r),                                   # TP1 NORMALISÉ
-                tp2=float(tp2_r) if tp2_r is not None else None,
-                price_tick=float(tick),                             # tick au monitor
-                notifier=notifier,
+        sl_resp = place_reduce_only_stop(
+            symbol,
+            side,
+            new_stop=sl_r,
+            size_lots=lots_full,
+        )
+    except Exception as e:
+        LOGGER.exception("[EXITS] place_reduce_only_stop failed on %s: %s", symbol, e)
+        raise
+
+    if not sl_resp or not sl_resp.get("ok"):
+        LOGGER.error("[EXITS] SL placement not ok on %s: %s", symbol, sl_resp)
+        raise RuntimeError(f"SL not placed correctly on {symbol}")
+
+    # ==========================
+    # 2) TP1 reduce-only (split)
+    # ==========================
+    tp1_resp: dict
+    if tp1_lots > 0:
+        try:
+            tp1_resp = place_reduce_only_tp_limit(
+                symbol,
+                side,
+                take_profit=tp1_r,
+                size_lots=tp1_lots,
             )
-            LOGGER.info("[EXITS] BE monitor launched for %s", symbol)
-        else:
-            LOGGER.info("[EXITS] Skipped launching BE monitor for %s (guarded)", symbol)
+        except Exception as e:
+            LOGGER.exception("[EXITS] place_reduce_only_tp_limit(TP1) failed on %s: %s", symbol, e)
+            raise
+
+        if not tp1_resp or not tp1_resp.get("ok"):
+            LOGGER.error("[EXITS] TP1 placement not ok on %s: %s", symbol, tp1_resp)
+            raise RuntimeError(f"TP1 not placed correctly on {symbol}")
+    else:
+        tp1_resp = {"ok": False, "reason": "no_lots_for_tp1"}
+
+    # ==========================
+    # 3) TP2 immédiat (option)
+    # ==========================
+    if place_tp2_now and tp2_r is not None and tp2_lots > 0:
+        try:
+            tp2_resp = place_reduce_only_tp_limit(
+                symbol,
+                side,
+                take_profit=tp2_r,
+                size_lots=tp2_lots,
+            )
+            LOGGER.info(
+                "[EXITS] TP2 placed for %s: lots=%d @ %.12f -> resp=%s",
+                symbol,
+                tp2_lots,
+                tp2_r,
+                tp2_resp,
+            )
+        except Exception as e:
+            LOGGER.exception("[EXITS] place_reduce_only_tp_limit(TP2) failed on %s: %s", symbol, e)
+            # on ne raise pas ici : SL+TP1 sont déjà en place
+
+    # ==========================
+    # 4) Vérification light
+    # ==========================
+    try:
+        max_tries = 3
+        last_oo = []
+        for attempt in range(1, max_tries + 1):
+            time.sleep(0.4 * attempt)
+            try:
+                oo = list_open_orders(symbol) or []
+                last_oo = oo
+            except Exception as e:
+                LOGGER.warning(
+                    "[EXITS] list_open_orders error on %s try %d/%d: %s",
+                    symbol,
+                    attempt,
+                    max_tries,
+                    e,
+                )
+                continue
+
+            if not isinstance(oo, list):
+                break
+
+            # on log et on sort si on voit au moins 1 SL et 1 TP reduce-only
+            has_sl = False
+            has_tp = False
+            for o in oo:
+                try:
+                    ro = str(o.get("reduceOnly") or "").lower() == "true"
+                    o_type = (o.get("type") or o.get("orderType") or "").lower()
+                    if not ro:
+                        continue
+                    if "stop" in o_type:
+                        has_sl = True
+                    elif "limit" in o_type or "take" in o_type:
+                        has_tp = True
+                except Exception:
+                    continue
+
+            if has_sl and has_tp:
+                break
+
+        n_open = len(last_oo) if isinstance(last_oo, list) else 0
+        LOGGER.info("[EXITS] Open reduce-only orders on %s after exits: %s", symbol, n_open)
+        for o in (last_oo[:8] if isinstance(last_oo, list) else []):
+            try:
+                LOGGER.info(
+                    "  - id=%s side=%s type=%s price=%s stopPrice=%s size=%s "
+                    "reduceOnly=%s postOnly=%s status=%s",
+                    o.get("id") or o.get("orderId"),
+                    o.get("side"),
+                    o.get("type") or o.get("orderType"),
+                    o.get("price"),
+                    o.get("stopPrice"),
+                    o.get("size"),
+                    o.get("reduceOnly"),
+                    o.get("postOnly"),
+                    o.get("status"),
+                )
+            except Exception:
+                continue
+    except Exception as e:
+        LOGGER.warning("[EXITS] open-orders verification failed for %s: %s", symbol, e)
+
+    # ==========================
+    # 5) Lancer le monitor BE
+    # ==========================
+    try:
+        launch_breakeven_thread(
+            symbol=symbol,
+            side=side,
+            entry=float(entry),
+            tp1=float(tp1_r),
+            tp2=float(tp2_r) if tp2_r is not None else None,
+            price_tick=float(tick),
+            notifier=notifier,
+        )
+        LOGGER.info("[EXITS] BE monitor launched for %s", symbol)
     except Exception as e:
         LOGGER.exception("[EXITS] Failed to launch BE monitor for %s: %s", symbol, e)
 
