@@ -215,6 +215,23 @@ def _extract_order_id(resp: dict) -> Optional[str]:
             return str(cur)
     return None
 
+def _get_order_status_flat(order_id: str) -> dict:
+    """
+    Récupère le 'data' de KuCoin pour un orderId, aplati.
+    On attend un truc du genre:
+      {"id": "...", "symbol": "...", "status": "done", "dealSize": "...", ...}
+    """
+    if not order_id:
+        return {}
+    try:
+        d = get_order_status(order_id) or {}
+        data = d.get("data") or d
+        if isinstance(data, dict):
+            return data
+        return {}
+    except Exception:
+        return {}
+
 def _has_position(sym: str, side: str) -> bool:
     try:
         pos = get_open_position(sym) or {}
@@ -231,9 +248,10 @@ def _is_order_cancelled(order_id: str) -> bool:
     On ne se base plus sur list_open_orders pour éviter les faux positifs.
     """
     try:
-        d = get_order_status(order_id) or {}
-        # fills.get_order renvoie le JSON complet KuCoin: {"code":"200000","data":{...}}
-        data = d.get("data") or d
+        data = _get_order_status_flat(order_id)
+        if not data:
+            return False
+
         status = str(data.get("status") or "").lower()
         filled = float(data.get("dealSize") or 0.0)
         if status in ("cancelled", "canceled", "cancel", "reject", "rejected") and filled <= 0.0:
@@ -582,33 +600,65 @@ def scan_and_send_signals():
 
                         # 2) boucle jusqu'au fill ou annulation réelle
                         while not fill.get("filled"):
-                            # check position (fill effectif)
+                            # --- A) check direct statut ordre KuCoin ---
+                            if order_id:
+                                data = _get_order_status_flat(order_id)
+                                if data:
+                                    status = str(data.get("status") or "").lower()
+                                    deal_size = float(data.get("dealSize") or 0.0)
+                                    remain = float(data.get("remainSize") or 0.0)
+
+                                    # ordre rempli (même partiellement) -> on considère "filled" pour attacher les exits
+                                    if deal_size > 0.0 and status in (
+                                        "done",
+                                        "match",
+                                        "filled",
+                                        "partialfill",
+                                        "partialfilled",
+                                    ):
+                                        LOGGER.info(
+                                            "[FILL] %s order_id=%s détecté rempli (status=%s, dealSize=%s, remainSize=%s)",
+                                            sym,
+                                            order_id,
+                                            status,
+                                            deal_size,
+                                            remain,
+                                        )
+                                        fill = {"filled": True}
+                                        break
+
+                                    # ordre annulé / rejeté sans aucun fill
+                                    if status in ("cancelled", "canceled", "cancel", "reject", "rejected") and deal_size <= 0.0:
+                                        LOGGER.info(
+                                            "[FILL] %s order_id=%s annulé/rejeté (pas de fill)",
+                                            sym,
+                                            order_id,
+                                        )
+                                        try:
+                                            from telegram_client import send_telegram_message
+
+                                            send_telegram_message(
+                                                f"⚪️ Ordre annulé {sym} ({order_side.upper()}) — pas de fill.\n"
+                                                f"Entry {entry:.6f} | Lots {size_lots}"
+                                            )
+                                        except Exception:
+                                            pass
+                                        # libère l'empreinte afin d'autoriser un nouveau signal
+                                        try:
+                                            unmark(fp)
+                                        except Exception:
+                                            pass
+                                        return
+
+                            # --- B) fallback: check position (si jamais l'API order bug) ---
                             if _has_position(sym, order_side):
+                                LOGGER.info(
+                                    "[FILL] %s détecté en position via get_open_position (side=%s)",
+                                    sym,
+                                    order_side,
+                                )
                                 fill = {"filled": True}
                                 break
-
-                            # check statut réel de l'ordre (annulé/rejeté sans fill)
-                            if order_id and _is_order_cancelled(order_id):
-                                LOGGER.info(
-                                    "[FILL] %s order_id=%s annulé/rejeté (pas de position)",
-                                    sym,
-                                    order_id,
-                                )
-                                try:
-                                    from telegram_client import send_telegram_message
-
-                                    send_telegram_message(
-                                        f"⚪️ Ordre annulé {sym} ({order_side.upper()}) — pas de fill.\n"
-                                        f"Entry {entry:.6f} | Lots {size_lots}"
-                                    )
-                                except Exception:
-                                    pass
-                                # libère l'empreinte afin d'autoriser un nouveau signal
-                                try:
-                                    unmark(fp)
-                                except Exception:
-                                    pass
-                                return
 
                             # timeout max (optionnel)
                             if max_seconds is not None and (time.time() - t0) > max_seconds:
