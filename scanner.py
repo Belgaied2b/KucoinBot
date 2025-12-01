@@ -200,8 +200,13 @@ def _try_advanced(sym: str, df: pd.DataFrame):
 
 # ------------------------------- Watcher Fill (desk pro) -------------------------------
 def _extract_order_id(resp: dict) -> Optional[str]:
+    """
+    Essaye d'extraire l'orderId de la réponse KuCoin.
+    Si rien n'est trouvé, on considère que la création d'ordre est douteuse.
+    """
     if not resp:
         return None
+    # cas normal : resp["data"]["orderId"] ou resp["data"]["data"]["orderId"]
     for path in [["data", "data", "orderId"], ["data", "orderId"], ["orderId"], ["data", "order_id"]]:
         cur = resp
         ok = True
@@ -284,7 +289,7 @@ def scan_and_send_signals():
             # ---- Construction SL/TP robustes + sizing par risque ----
             meta = get_contract_info(sym)
             tick = float(meta.get("tickSize", 0.01))
-            lot_mult = float(meta.get( "multiplier", 1.0))
+            lot_mult = float(meta.get("multiplier", 1.0))
             lot_step = int(meta.get("lotSize", 1))
 
             entry = float(signal.get("entry") or df["close"].iloc[-1])
@@ -559,6 +564,27 @@ def scan_and_send_signals():
                         continue
 
                 order_id = _extract_order_id(order)
+                if not order_id:
+                    # Réponse "ok" mais pas d'orderId -> on considère que c'est KO pour être safe.
+                    LOGGER.error(
+                        "[%d/%d] Order %s réponse ok MAIS pas d'orderId détecté -> on annule le trade côté bot. Resp=%s",
+                        idx,
+                        len(pairs),
+                        sym,
+                        order,
+                    )
+                    try:
+                        from telegram_client import send_telegram_message
+                        send_telegram_message(
+                            f"⚪️ KuCoin a répondu OK pour {sym} mais aucun orderId détecté.\n"
+                            f"L'ordre n'est PAS considéré comme placé par le bot. Check manuel conseillé."
+                        )
+                    except Exception:
+                        pass
+                    unmark(fp)
+                    time.sleep(0.2)
+                    continue
+
                 LOGGER.info(
                     "[%d/%d] Order %s placed | order_id=%s | lots=%s | entry=%.8f | notional=%.2f | est_margin=%.2f",
                     idx,
@@ -672,43 +698,10 @@ def scan_and_send_signals():
                             time.sleep(max(1.0, float(FILL_POLL_SEC)))
 
                         # ---- Dès qu'on est rempli : attacher exits & BE ----
-                        # 1) purge d'éventuels vieux reduce-only
                         try:
                             purge_reduce_only(sym)
                         except Exception as e:
                             LOGGER.warning("purge_reduce_only failed for %s: %s", sym, e)
-
-                        # 2) lire la position RÉELLE pour connaître la taille exacte (partial fills, etc.)
-                        try:
-                            pos = get_open_position(sym) or {}
-                            pos_lots = int(float(pos.get("currentQty") or 0.0))
-                        except Exception:
-                            pos = {}
-                            pos_lots = 0
-
-                        if pos_lots <= 0:
-                            LOGGER.warning(
-                                "[FILL] %s fill détecté mais position introuvable ou vide (currentQty=%s) — pas d'exits posés",
-                                sym,
-                                pos.get("currentQty"),
-                            )
-                            try:
-                                from telegram_client import send_telegram_message
-
-                                send_telegram_message(
-                                    f"⚠️ {sym} : fill détecté côté ordre, mais aucune position ouverte "
-                                    f"(pas de SL/TP posés)."
-                                )
-                            except Exception:
-                                pass
-                            # on libère l'empreinte pour ne pas bloquer le symbole
-                            try:
-                                unmark(fp)
-                            except Exception:
-                                pass
-                            return
-
-                        eff_size_lots = pos_lots  # taille effective à protéger
 
                         try:
                             sl_resp, tp_resp = attach_exits_after_fill(
@@ -718,24 +711,59 @@ def scan_and_send_signals():
                                 entry=entry,
                                 sl=sl,
                                 tp=tp1_raw,
-                                size_lots=eff_size_lots,
+                                size_lots=size_lots,
                                 tp2=tp2,
                             )
                             LOGGER.info(
-                                "Exits %s -> SL %s | TP %s | lots_effectifs=%s | [EXITS] %s",
+                                "Exits %s -> SL_resp=%s | TP1_resp=%s | [EXITS] %s",
                                 sym,
                                 sl_resp,
                                 tp_resp,
-                                eff_size_lots,
                                 sl_log,
                             )
+
+                            # ---------- NOUVEAU : validation explicite SL/TP ----------
+                            sl_ok = bool(sl_resp.get("ok"))
+                            tp_ok = bool(tp_resp.get("ok") or tp_resp.get("skipped"))
+
+                            if not sl_ok or not tp_ok:
+                                # On log fort + Telegram debug avec codes KuCoin
+                                sl_data = sl_resp.get("data") or {}
+                                tp_data = tp_resp.get("data") or {}
+
+                                sl_code = sl_data.get("code") or sl_resp.get("status")
+                                tp_code = tp_data.get("code") or tp_resp.get("status")
+
+                                LOGGER.error(
+                                    "[EXITS] %s SL/TP possiblement NON posés -> sl_ok=%s (code=%s) | tp_ok=%s (code=%s)",
+                                    sym,
+                                    sl_ok,
+                                    sl_code,
+                                    tp_ok,
+                                    tp_code,
+                                )
+
+                                try:
+                                    from telegram_client import send_telegram_message
+
+                                    send_telegram_message(
+                                        f"🟢 {sym} rempli ({order_side.upper()}) — ATTENTION SL/TP possiblement non posés.\n"
+                                        f"SL ok={sl_ok} code={sl_code} | TP1 ok={tp_ok} code={tp_code}\n"
+                                        f"Check l'onglet *Open Orders* KuCoin et l'API logs."
+                                    )
+                                except Exception:
+                                    pass
+                                # On NE renvoie PAS de ✅ dans ce cas
+                                return
+
                         except Exception as e:
                             LOGGER.exception("attach_exits_after_fill failed on %s: %s", sym, e)
                             try:
                                 from telegram_client import send_telegram_message
 
                                 send_telegram_message(
-                                    f"🟢 {sym} rempli ({order_side.upper()}) — SL/TP non posés (erreur)."
+                                    f"🟢 {sym} rempli ({order_side.upper()}) — SL/TP non posés (exception Python).\n"
+                                    f"{type(e).__name__}: {e}"
                                 )
                             except Exception:
                                 pass
@@ -744,13 +772,13 @@ def scan_and_send_signals():
                         # ⚠️ Le monitor BE est lancé par exits_manager.attach_exits_after_fill
                         # via launch_breakeven_thread -> inutile de le relancer ici.
 
-                        # Telegram succès final
+                        # Telegram succès final : on sait maintenant que SL/TP sont *probablement* ok
                         try:
                             from telegram_client import send_telegram_message
 
                             send_telegram_message(
                                 f"✅ {sym} rempli ({order_side.upper()})\n"
-                                f"Lots: {eff_size_lots} | Entry {entry:.6f}\n"
+                                f"Lots: {size_lots} | Entry {entry:.6f}\n"
                                 f"SL {sl:.6f} | TP1 {tp1_raw:.6f} | TP2 {tp2:.6f} | RR {rr:.2f}\n"
                                 f"[EXITS] {sl_log}"
                             )
