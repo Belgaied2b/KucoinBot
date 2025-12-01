@@ -284,7 +284,7 @@ def scan_and_send_signals():
             # ---- Construction SL/TP robustes + sizing par risque ----
             meta = get_contract_info(sym)
             tick = float(meta.get("tickSize", 0.01))
-            lot_mult = float(meta.get("multiplier", 1.0))
+            lot_mult = float(meta.get( "multiplier", 1.0))
             lot_step = int(meta.get("lotSize", 1))
 
             entry = float(signal.get("entry") or df["close"].iloc[-1])
@@ -672,10 +672,43 @@ def scan_and_send_signals():
                             time.sleep(max(1.0, float(FILL_POLL_SEC)))
 
                         # ---- Dès qu'on est rempli : attacher exits & BE ----
+                        # 1) purge d'éventuels vieux reduce-only
                         try:
                             purge_reduce_only(sym)
                         except Exception as e:
                             LOGGER.warning("purge_reduce_only failed for %s: %s", sym, e)
+
+                        # 2) lire la position RÉELLE pour connaître la taille exacte (partial fills, etc.)
+                        try:
+                            pos = get_open_position(sym) or {}
+                            pos_lots = int(float(pos.get("currentQty") or 0.0))
+                        except Exception:
+                            pos = {}
+                            pos_lots = 0
+
+                        if pos_lots <= 0:
+                            LOGGER.warning(
+                                "[FILL] %s fill détecté mais position introuvable ou vide (currentQty=%s) — pas d'exits posés",
+                                sym,
+                                pos.get("currentQty"),
+                            )
+                            try:
+                                from telegram_client import send_telegram_message
+
+                                send_telegram_message(
+                                    f"⚠️ {sym} : fill détecté côté ordre, mais aucune position ouverte "
+                                    f"(pas de SL/TP posés)."
+                                )
+                            except Exception:
+                                pass
+                            # on libère l'empreinte pour ne pas bloquer le symbole
+                            try:
+                                unmark(fp)
+                            except Exception:
+                                pass
+                            return
+
+                        eff_size_lots = pos_lots  # taille effective à protéger
 
                         try:
                             sl_resp, tp_resp = attach_exits_after_fill(
@@ -685,14 +718,15 @@ def scan_and_send_signals():
                                 entry=entry,
                                 sl=sl,
                                 tp=tp1_raw,
-                                size_lots=size_lots,
+                                size_lots=eff_size_lots,
                                 tp2=tp2,
                             )
                             LOGGER.info(
-                                "Exits %s -> SL %s | TP %s | [EXITS] %s",
+                                "Exits %s -> SL %s | TP %s | lots_effectifs=%s | [EXITS] %s",
                                 sym,
                                 sl_resp,
                                 tp_resp,
+                                eff_size_lots,
                                 sl_log,
                             )
                         except Exception as e:
@@ -716,7 +750,7 @@ def scan_and_send_signals():
 
                             send_telegram_message(
                                 f"✅ {sym} rempli ({order_side.upper()})\n"
-                                f"Lots: {size_lots} | Entry {entry:.6f}\n"
+                                f"Lots: {eff_size_lots} | Entry {entry:.6f}\n"
                                 f"SL {sl:.6f} | TP1 {tp1_raw:.6f} | TP2 {tp2:.6f} | RR {rr:.2f}\n"
                                 f"[EXITS] {sl_log}"
                             )
