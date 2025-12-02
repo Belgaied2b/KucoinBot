@@ -13,6 +13,7 @@ scanner.py — orchestration avec exits APRES fill + stops robustes + sizing par
 from __future__ import annotations
 import time
 import logging
+import threading
 from typing import Optional
 
 import numpy as np
@@ -57,6 +58,13 @@ from duplicate_guard import signal_fingerprint, is_duplicate_and_mark, unmark
 
 from ote_utils import compute_ote_zone  # OTE gate auto
 from ladder import build_ladder_prices  # ladder maker
+
+# optionnel : fast-path via ancien module fills, sinon no-op
+try:
+    from fills import wait_for_fill
+except Exception:  # pragma: no cover
+    def wait_for_fill(order_id: str, timeout_s: int = 20):
+        return {"filled": False}
 
 # optionnels (fail-safe si absents)
 try:
@@ -197,6 +205,7 @@ def _try_advanced(sym: str, df: pd.DataFrame):
 def _extract_order_id(resp: dict) -> Optional[str]:
     """
     Essaye d'extraire l'orderId de la réponse KuCoin.
+    Compatible avec place_limit_order (kucoin_trader).
     """
     if not resp:
         return None
@@ -216,15 +225,21 @@ def _extract_order_id(resp: dict) -> Optional[str]:
 def _get_order_status_flat(order_id: str) -> dict:
     """
     Récupère le dict ordre via kucoin_trader.get_order(order_id).
-    get_order retourne déjà data->dict.
+    - get_order retourne déjà data->dict avec status/dealSize
+    - fallback si jamais une couche "data" supplémentaire existe.
     """
     if not order_id:
         return {}
     try:
         d = get_order_status(order_id) or {}
-        return d if isinstance(d, dict) else {}
+        if isinstance(d, dict) and d.get("status") is not None:
+            return d
+        data = d.get("data") if isinstance(d, dict) else {}
+        if isinstance(data, dict):
+            return data
+        return {}
     except Exception as e:
-        LOGGER.debug("get_order_status error %s: %s", order_id, e)
+        LOGGER.debug("get_order_status_flat error %s: %s", order_id, e)
         return {}
 
 def _has_position(sym: str, side: str) -> bool:
@@ -586,16 +601,33 @@ def scan_and_send_signals():
                 # --- Watcher continu (desk pro) ---
                 def _monitor_fill_and_attach():
                     try:
+                        LOGGER.info("[FILL] watcher start %s order_id=%s side=%s", sym, order_id, order_side)
+
+                        # Fast-path: petit wait_for_fill si dispo
+                        filled = False
+                        try:
+                            fast = wait_for_fill(order_id, timeout_s=5)
+                            if isinstance(fast, dict) and fast.get("filled"):
+                                LOGGER.info("[FILL] %s order_id=%s rempli via wait_for_fill (fast-path)", sym, order_id)
+                                filled = True
+                        except Exception as e:
+                            LOGGER.debug("wait_for_fill fast-path error %s: %s", order_id, e)
+                            filled = False
+
                         t0 = time.time()
                         max_seconds = float(FILL_MAX_HOURS) * 3600.0 if float(FILL_MAX_HOURS) > 0 else None
-                        filled = False
 
                         while not filled:
                             data = _get_order_status_flat(order_id)
                             if data:
                                 status = str(data.get("status") or "").lower()
-                                deal_size = float(data.get("dealSize") or 0.0)
-                                remain = float(data.get("remainSize") or 0.0)
+                                # compat : dealSize ou filledSize selon les endpoints
+                                deal_size = float(
+                                    data.get("dealSize") or data.get("filledSize") or 0.0
+                                )
+                                remain = float(
+                                    data.get("remainSize") or data.get("remainQty") or 0.0
+                                )
                                 LOGGER.debug(
                                     "[FILL] poll %s order_id=%s status=%s dealSize=%s remainSize=%s",
                                     sym,
@@ -718,7 +750,6 @@ def scan_and_send_signals():
                         LOGGER.exception("monitor_fill_and_attach error on %s: %s", sym, e)
 
                 try:
-                    import threading
                     threading.Thread(target=_monitor_fill_and_attach, daemon=True).start()
                 except Exception as e:
                     LOGGER.warning("Unable to start fill watcher for %s: %s", sym, e)
