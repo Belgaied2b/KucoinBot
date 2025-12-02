@@ -731,4 +731,4 @@ def scan_and_send_signals():
                     except Exception as e:
                         LOGGER.exception("monitor_fill_and_attach error on %s: %s", sym, e)
 
-                        LOGGER.info("Scan done.")
+LOGGER.info("Scan done.")
