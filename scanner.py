@@ -602,98 +602,89 @@ def scan_and_send_signals():
                 def _monitor_fill_and_attach():
                     """
                     Watcher unique par ordre:
-                    - ne passe PLUS par wait_for_fill (fast-path) pour éviter tout mélange d'orderId / symbole.
-                    - se base uniquement sur get_order_status(order_id) + fallback get_open_position(sym).
+                    - ne passe PLUS par wait_for_fill (fast-path)
+                    - se base uniquement sur get_order_status(order_id)
+                    - fallback get_open_position(sym) si nécessaire
                     """
                     try:
                         t0 = time.time()
                         max_seconds = float(FILL_MAX_HOURS) * 3600.0 if float(FILL_MAX_HOURS) > 0 else None
                         filled = False
 
-                        LOGGER.info("[FILL] watcher start %s order_id=%s side=%s", sym, order_id, order_side)
+                        LOGGER.info("[FILL] watcher start %s order_id=%s side=%s",
+                                    sym, order_id, order_side)
 
-                        # boucle jusqu'au fill ou annulation réelle
+                        # === Boucle de surveillance du remplissage ===
                         while not filled:
-                            # --- A) check direct statut ordre KuCoin ---
+
+                            # --- A) Status direct de l’ordre ---
                             if order_id:
                                 data = _get_order_status_flat(order_id)
+
                                 if data:
                                     status = str(data.get("status") or "").lower()
                                     deal_size = float(data.get("dealSize") or 0.0)
                                     remain = float(data.get("remainSize") or 0.0)
+
                                     LOGGER.debug(
                                         "[FILL] poll %s order_id=%s status=%s dealSize=%s remainSize=%s",
-                                        sym,
-                                        order_id,
-                                        status,
-                                        deal_size,
-                                        remain,
+                                        sym, order_id, status, deal_size, remain
                                     )
 
-                                    # ordre rempli (même partiellement) -> on attache les exits
+                                    # Détection fill
                                     if deal_size > 0.0 and status in (
-                                        "done",
-                                        "match",
-                                        "filled",
-                                        "partialfill",
-                                        "partialfilled",
+                                        "done", "match", "filled",
+                                        "partialfill", "partialfilled",
                                     ):
                                         LOGGER.info(
-                                            "[FILL] %s order_id=%s détecté rempli (status=%s, dealSize=%s, remainSize=%s)",
-                                            sym,
-                                            order_id,
-                                            status,
-                                            deal_size,
-                                            remain,
+                                            "[FILL] %s order_id=%s détecté rempli (status=%s, dealSize=%s)",
+                                            sym, order_id, status, deal_size
                                         )
                                         filled = True
                                         break
 
-                                    # ordre annulé / rejeté sans aucun fill
+                                    # Détection annulation
                                     if status in ("cancelled", "canceled", "cancel", "reject", "rejected") and deal_size <= 0.0:
                                         LOGGER.info(
-                                            "[FILL] %s order_id=%s annulé/rejeté (pas de fill)",
-                                            sym,
-                                            order_id,
+                                            "[FILL] %s order_id=%s annulé (pas de fill)",
+                                            sym, order_id
                                         )
                                         try:
                                             from telegram_client import send_telegram_message
-
                                             send_telegram_message(
                                                 f"⚪️ Ordre annulé {sym} ({order_side.upper()}) — pas de fill.\n"
                                                 f"Entry {entry:.6f} | Lots {size_lots}"
                                             )
                                         except Exception:
                                             pass
-                                        # libère l'empreinte afin d'autoriser un nouveau signal
+
                                         try:
                                             unmark(fp)
                                         except Exception:
                                             pass
-                                        return
 
-                            # --- B) fallback: check position (si jamais l'API order bug) ---
+                                        return  # STOP watcher ici
+
+                            # --- B) Fallback via position ---
                             if _has_position(sym, order_side):
                                 LOGGER.info(
-                                    "[FILL] %s détecté en position via get_open_position (side=%s)",
-                                    sym,
-                                    order_side,
+                                    "[FILL] %s détecté en position via get_open_position (fallback)",
+                                    sym
                                 )
                                 filled = True
                                 break
 
-                            # timeout max (optionnel)
+                            # Timeout éventuel
                             if max_seconds is not None and (time.time() - t0) > max_seconds:
                                 LOGGER.info(
-                                    "[FILL] %s watcher timeout atteint (%sh), on continue sans exits (ordre reste au carnet)",
-                                    sym,
-                                    FILL_MAX_HOURS,
+                                    "[FILL] %s watcher timeout (%sh) — exits NON posés",
+                                    sym, FILL_MAX_HOURS
                                 )
                                 return
 
                             time.sleep(max(1.0, float(FILL_POLL_SEC)))
 
-                        # ---- Dès qu'on est rempli : attacher exits & BE ----
+                        # === Attach exits ===
                         try:
                             purge_reduce_only(sym)
                         except Exception as e:
@@ -711,28 +702,23 @@ def scan_and_send_signals():
                                 tp2=tp2,
                             )
                             LOGGER.info(
-                                "Exits %s -> SL_resp=%s | TP1_resp=%s | [EXITS] %s",
-                                sym,
-                                sl_resp,
-                                tp_resp,
-                                sl_log,
+                                "[EXITS] %s -> SL_resp=%s | TP1_resp=%s | meta=%s",
+                                sym, sl_resp, tp_resp, sl_log
                             )
                         except Exception as e:
                             LOGGER.exception("attach_exits_after_fill failed on %s: %s", sym, e)
                             try:
                                 from telegram_client import send_telegram_message
-
                                 send_telegram_message(
-                                    f"🟢 {sym} rempli ({order_side.upper()}) — SL/TP non posés (erreur)."
+                                    f"🟢 {sym} rempli ({order_side.upper()}) — SL/TP non posés (erreur interne)."
                                 )
                             except Exception:
                                 pass
                             return
 
-                        # Telegram succès final
+                        # === Telegram succès final ===
                         try:
                             from telegram_client import send_telegram_message
-
                             send_telegram_message(
                                 f"✅ {sym} rempli ({order_side.upper()})\n"
                                 f"Lots: {size_lots} | Entry {entry:.6f}\n"
@@ -741,7 +727,8 @@ def scan_and_send_signals():
                             )
                         except Exception:
                             pass
+
                     except Exception as e:
                         LOGGER.exception("monitor_fill_and_attach error on %s: %s", sym, e)
 
-    LOGGER.info("Scan done.")
+                        LOGGER.info("Scan done.")
