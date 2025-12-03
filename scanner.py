@@ -88,6 +88,7 @@ except Exception:
 
 LOGGER = logging.getLogger(__name__)
 
+
 # -------------------------- utilitaires locaux --------------------------
 def _fmt(sym, res, extra: str = ""):
     inst = res.get("institutional", {})
@@ -99,11 +100,13 @@ def _fmt(sym, res, extra: str = ""):
         f"{inst.get('institutional_comment', '')}{extra}"
     )
 
+
 def _round_to_tick(x: float, tick: float) -> float:
     if tick <= 0:
         return float(x)
     steps = int(float(x) / float(tick))
     return round(steps * float(tick), 8)
+
 
 def _validate_rr_and_fix(
     bias: str, entry: float, sl: float, tp: float, tick: float
@@ -138,6 +141,7 @@ def _validate_rr_and_fix(
     rr = reward / max(risk, 1e-12)
     return True, entry, sl, tp, rr
 
+
 def _cap_by_margin(entry: float, lot_mult: float, lot_step: int, size_lots: int) -> int:
     """
     Cap la taille pour que la marge requise <= MARGIN_USDT.
@@ -149,11 +153,13 @@ def _cap_by_margin(entry: float, lot_mult: float, lot_step: int, size_lots: int)
     max_lots_margin -= (max_lots_margin % max(1, lot_step))
     return max(lot_step, min(size_lots, max_lots_margin))
 
+
 # ----------- TP engine : 1.5R / 2.5R + alignement swing -----------
 def _swing_levels(df: pd.DataFrame, lookback: int = 20) -> tuple[float, float]:
     swing_high = float(df["high"].rolling(lookback).max().iloc[-2])
     swing_low = float(df["low"].rolling(lookback).min().iloc[-2])
     return swing_high, swing_low
+
 
 def _compute_tp_levels(
     df: pd.DataFrame,
@@ -178,10 +184,12 @@ def _compute_tp_levels(
         tp2 = swing_low if (swing_low < entry and swing_low > tp2_rr) else tp2_rr
     return _round_to_tick(tp1, tick), _round_to_tick(tp2, tick)
 
+
 # ------------------------------- Core fallbacks -------------------------------
 def _build_core(df: pd.DataFrame, sym: str):
     entry = float(df["close"].iloc[-1])
     return {"symbol": sym, "bias": "LONG", "entry": entry, "df": df, "ote": True}
+
 
 def _try_advanced(sym: str, df: pd.DataFrame):
     if not ENABLE_SQUEEZE_ENGINE:
@@ -200,6 +208,7 @@ def _try_advanced(sym: str, df: pd.DataFrame):
     except Exception as e:
         LOGGER.exception("Advanced engine error on %s: %s", sym, e)
         return (None, "") if FAIL_OPEN_TO_CORE else (None, "BLOCK")
+
 
 # ------------------------------- Watcher Fill (desk pro) -------------------------------
 def _extract_order_id(resp: dict) -> Optional[str]:
@@ -222,6 +231,7 @@ def _extract_order_id(resp: dict) -> Optional[str]:
             return str(cur)
     return None
 
+
 def _get_order_status_flat(order_id: str) -> dict:
     """
     Récupère le dict ordre via kucoin_trader.get_order(order_id).
@@ -241,6 +251,7 @@ def _get_order_status_flat(order_id: str) -> dict:
     except Exception as e:
         LOGGER.debug("get_order_status_flat error %s: %s", order_id, e)
         return {}
+
 
 def _has_position(sym: str, side: str) -> bool:
     """
@@ -263,6 +274,7 @@ def _has_position(sym: str, side: str) -> bool:
         LOGGER.debug("_has_position error on %s: %s", sym, e)
         return False
 
+
 def _wait_until_position_visible(sym: str, side: str, timeout_s: float = 5.0) -> bool:
     """
     Après détection du fill, on attend que la position soit réellement visible
@@ -277,6 +289,7 @@ def _wait_until_position_visible(sym: str, side: str, timeout_s: float = 5.0) ->
         time.sleep(0.5)
     LOGGER.warning("[FILL] %s position PAS visible après %.1fs (side=%s)", sym, timeout_s, side)
     return False
+
 
 # --------------------------------- Main loop ---------------------------------
 def scan_and_send_signals():
@@ -651,19 +664,16 @@ def scan_and_send_signals():
                                         sym, order_id, status, deal_size, remain
                                     )
 
-                                    # Détection fill
-                                    if deal_size > 0.0 and status in (
-                                        "done", "match", "filled",
-                                        "partialfill", "partialfilled",
-                                    ):
+                                    # ✅ Détection fill ROBUSTE : size > 0 = rempli (même si status reste 'open')
+                                    if deal_size > 0.0:
                                         LOGGER.info(
-                                            "[FILL] %s order_id=%s détecté rempli (status=%s, dealSize=%s)",
+                                            "[FILL] %s order_id=%s détecté rempli via dealSize>0 (status=%s, dealSize=%s)",
                                             sym, order_id, status, deal_size
                                         )
                                         filled = True
                                         break
 
-                                    # Détection annulation
+                                    # Détection annulation SANS fill
                                     if status in ("cancelled", "canceled", "cancel", "reject", "rejected") and deal_size <= 0.0:
                                         LOGGER.info(
                                             "[FILL] %s order_id=%s annulé (pas de fill)",
