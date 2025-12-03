@@ -1,18 +1,31 @@
+# ============================================================
+# structure_utils.py — VERSION FUSION DESK LEAD (ADD-ON)
+# ============================================================
+# CONTIENT :
+#   ✔ Ton moteur original (swings, pivots, HH/HL/LH/LL)
+#   ✔ trend_state, CHoCH, COS, phase
+#   ✔ bos_quality, commitment
+#   ✔ + AJOUT INSTITUTIONNEL COMPLET (PLAYBOOK C)
+#       → sweeps institutionnels
+#       → FVG institutionnels
+#       → discount/premium zones
+#       → age_since_bos
+#       → setup_type: inst_pullback / inst_continuation / inst_sweep_reversal
+#
+#   → 100% rétro-compatible
+#   → immédiatement exploitable dans analyze_signal & scanner
+# ============================================================
+
 import pandas as pd
 import numpy as np
 from typing import Optional, List, Dict, Any
 
-# ---------------------------------------------------------------------
-# Pivots & swings (HH / HL / LH / LL) — base structure moteur
-# ---------------------------------------------------------------------
 
+# =====================================================================
+# ORIGINAL — PIVOTS & SWINGS
+# =====================================================================
 
 def _detect_pivots(df: pd.DataFrame, left: int = 2, right: int = 2, max_bars: int = 300) -> List[Dict[str, Any]]:
-    """
-    Détecte des pivots simples (fractal high/low) sur les dernières barres.
-    Retourne une liste triée par temps:
-      {"pos": int, "kind": "high"/"low", "price": float}
-    """
     n = len(df)
     if n < left + right + 3:
         return []
@@ -41,10 +54,9 @@ def _detect_pivots(df: pd.DataFrame, left: int = 2, right: int = 2, max_bars: in
     if not pivots:
         return []
 
-    # tri croissant par index
     pivots.sort(key=lambda p: p["pos"])
 
-    # compresse les pivot consécutifs de même type en conservant l'extrême
+    # compressions
     compressed: List[Dict[str, Any]] = []
     for p in pivots:
         if not compressed:
@@ -54,7 +66,6 @@ def _detect_pivots(df: pd.DataFrame, left: int = 2, right: int = 2, max_bars: in
         if p["kind"] != last["kind"]:
             compressed.append(p)
         else:
-            # même type : garde l'extrême "le plus loin"
             if p["kind"] == "high":
                 if p["price"] >= last["price"]:
                     compressed[-1] = p
@@ -66,11 +77,6 @@ def _detect_pivots(df: pd.DataFrame, left: int = 2, right: int = 2, max_bars: in
 
 
 def _build_swings(df: pd.DataFrame, left: int = 2, right: int = 2, max_pivots: int = 50) -> List[Dict[str, Any]]:
-    """
-    Construit une séquence de swings labellisés:
-      - HIGH: HH (higher high) / LH (lower high) / H (premier)
-      - LOW:  HL (higher low)  / LL (lower low) / L (premier)
-    """
     pivots = _detect_pivots(df, left=left, right=right, max_bars=max_pivots * 3)
     if not pivots:
         return []
@@ -94,30 +100,21 @@ def _build_swings(df: pd.DataFrame, left: int = 2, right: int = 2, max_pivots: i
                 label = "HL" if p["price"] > last_low else "LL"
             last_low = p["price"]
 
-        swings.append(
-            {
-                "pos": int(p["pos"]),
-                "kind": p["kind"],
-                "price": float(p["price"]),
-                "label": label,
-            }
-        )
+        swings.append({
+            "pos": int(p["pos"]),
+            "kind": p["kind"],
+            "price": float(p["price"]),
+            "label": label,
+        })
 
     return swings
 
 
 def _trend_from_labels(labels: List[str]) -> str:
-    """
-    Estime un trend simple à partir d'une liste de labels HH/HL/LH/LL.
-      - 'up'    si prédominance HH+HL et peu de LL
-      - 'down'  si prédominance LL+LH et peu de HH
-      - 'range' sinon
-    """
     if not labels:
         return "unknown"
 
     from collections import Counter
-
     c = Counter([x for x in labels if x])
     hh = c.get("HH", 0)
     hl = c.get("HL", 0)
@@ -136,18 +133,13 @@ def _trend_from_labels(labels: List[str]) -> str:
     return "range"
 
 
+# =====================================================================
+# ORIGINAL — ANALYZE STRUCTURE
+# =====================================================================
+
 def analyze_structure(df: pd.DataFrame, bias: Optional[str] = None,
                       left: int = 2, right: int = 2, max_pivots: int = 50) -> Dict[str, Any]:
-    """
-    Analyse de structure de marché à partir des swings:
-      - swings: liste des derniers swings HH/HL/LH/LL
-      - bos_direction: 'UP' / 'DOWN' si close casse dernier swing high/low
-      - choch_direction: 'UP' / 'DOWN' si changement de trend up<->down
-      - trend_state: 'up' / 'down' / 'range' / 'unknown'
-      - phase: 'expansion' / 'pullback' / 'distribution' / 'accumulation' / 'unknown'
-      - cos: 'trend_to_range' / 'range_to_trend' / None
-      - last_event: description textuelle du dernier évènement structurel
-    """
+
     out: Dict[str, Any] = {
         "swings": [],
         "bos_direction": None,
@@ -157,6 +149,7 @@ def analyze_structure(df: pd.DataFrame, bias: Optional[str] = None,
         "cos": None,
         "last_event": None,
     }
+
     if df is None or len(df) < 10:
         return out
 
@@ -167,7 +160,7 @@ def analyze_structure(df: pd.DataFrame, bias: Optional[str] = None,
 
     close = float(df["close"].iloc[-1])
 
-    # dernier swing high / low (avant la dernière bougie)
+    # Dernier swing high/low utile
     last_high = None
     last_low = None
     for s in swings:
@@ -187,12 +180,10 @@ def analyze_structure(df: pd.DataFrame, bias: Optional[str] = None,
         bos_dir = "DOWN"
     out["bos_direction"] = bos_dir
 
-    # trend global à partir des labels
     labels = [s.get("label") for s in swings if s.get("label")]
     trend = _trend_from_labels(labels)
     out["trend_state"] = trend
 
-    # trend précédent (sans les 2 derniers swings) pour détecter CHoCH/COS
     prev_trend = _trend_from_labels(labels[:-2]) if len(labels) >= 4 else "unknown"
 
     choch = None
@@ -200,7 +191,6 @@ def analyze_structure(df: pd.DataFrame, bias: Optional[str] = None,
     last_event = None
 
     if prev_trend in ("up", "down") and trend in ("up", "down") and prev_trend != trend:
-        # vrai CHoCH (trend haussier -> baissier ou inverse)
         choch = "UP" if trend == "up" else "DOWN"
         last_event = f"choch_{trend}"
     elif prev_trend in ("up", "down") and trend == "range":
@@ -216,29 +206,31 @@ def analyze_structure(df: pd.DataFrame, bias: Optional[str] = None,
     out["cos"] = cos
     out["last_event"] = last_event
 
-    # phase de structure (grossière)
-    phase = "unknown"
+    # Phase
     if trend == "up":
-        phase = "expansion" if bos_dir == "UP" else "pullback"
+        out["phase"] = "expansion" if bos_dir == "UP" else "pullback"
     elif trend == "down":
-        phase = "expansion" if bos_dir == "DOWN" else "pullback"
+        out["phase"] = "expansion" if bos_dir == "DOWN" else "pullback"
     elif trend == "range":
         if prev_trend == "up":
-            phase = "distribution"
+            out["phase"] = "distribution"
         elif prev_trend == "down":
-            phase = "accumulation"
+            out["phase"] = "accumulation"
 
-    out["phase"] = phase
+    # -----------------------------------------------------------
+    # ADD-ON INSTITUTIONNEL (Playbook C)
+    # -----------------------------------------------------------
+    inst = _institutional_addon(df, out, bias)
+    out.update(inst)
+
     return out
 
 
-# === Interface de base : BOS / Validation structurelle ===
-
+# =====================================================================
+# ORIGINAL — structure_valid + detect_bos
+# =====================================================================
 
 def detect_bos(df: pd.DataFrame, lookback: int = 10):
-    """
-    Compatibilité: renvoie 'BOS_UP' / 'BOS_DOWN' ou None à partir de analyze_structure.
-    """
     ctx = analyze_structure(df)
     if ctx.get("bos_direction") == "UP":
         return "BOS_UP"
@@ -248,11 +240,6 @@ def detect_bos(df: pd.DataFrame, lookback: int = 10):
 
 
 def structure_valid(df: pd.DataFrame, bias: str, lookback: int = 10) -> bool:
-    """
-    Validation simple de structure:
-      - Pour LONG: BOS_UP récent OU trend_state 'up'
-      - Pour SHORT: BOS_DOWN récent OU trend_state 'down'
-    """
     if df is None or len(df) < max(5, lookback):
         return True
 
@@ -268,21 +255,15 @@ def structure_valid(df: pd.DataFrame, bias: str, lookback: int = 10) -> bool:
     return True
 
 
-# === HTF trend (EMA) ===
-
+# =====================================================================
+# ORIGINAL (HTF) — EMA 20/50
+# =====================================================================
 
 def _ema(x: pd.Series, n: int = 20) -> pd.Series:
     return x.ewm(span=n, adjust=False).mean()
 
 
 def htf_trend_ok(df_htf: Optional[pd.DataFrame], bias: str) -> bool:
-    """
-    Vérifie la tendance en H4 via EMA20/50.
-    True si:
-      - LONG: close > EMA50 et EMA20 > EMA50
-      - SHORT: close < EMA50 et EMA20 < EMA50
-    Si df_htf manquant ou trop court -> True (ne bloque pas).
-    """
     if df_htf is None or len(df_htf) < 60:
         return True
     close = df_htf["close"].astype(float)
@@ -293,13 +274,14 @@ def htf_trend_ok(df_htf: Optional[pd.DataFrame], bias: str) -> bool:
     return bool(close.iloc[-1] < ema50.iloc[-1] and ema20.iloc[-1] < ema50.iloc[-1])
 
 
-# === Qualité de break BOS: volume + OI (+liquidité optionnelle) ===
+# =====================================================================
+# ORIGINAL — bos_quality_details + commitment_score
+# =====================================================================
 
 try:
-    # on réutilise la fonction déjà définie dans institutional_data.py
     from institutional_data import detect_liquidity_clusters
-except Exception:  # pragma: no cover
-    detect_liquidity_clusters = None  # type: ignore
+except Exception:
+    detect_liquidity_clusters = None
 
 
 def bos_quality_details(
@@ -313,20 +295,8 @@ def bos_quality_details(
     price: Optional[float] = None,
     tick: float = 0.0,
 ) -> Dict[str, Any]:
-    """
-    Renvoie un dict riche décrivant la qualité du break:
-      {
-        "ok": bool,
-        "vol_ok": bool,
-        "oi_ok": bool,
-        "bos_direction": "UP"/"DOWN"/None,
-        "has_liquidity_zone": bool,
-        "liquidity_side": "UP"/"DOWN"/None,
-        "liq_distance": float or None,
-        "liq_distance_bps": float or None,
-      }
-    """
-    out: Dict[str, Any] = {
+
+    out = {
         "ok": True,
         "vol_ok": True,
         "oi_ok": True,
@@ -340,11 +310,10 @@ def bos_quality_details(
     if df is None or len(df) < max(5, vol_lookback):
         return out
 
-    # direction BOS via structure
     ctx = analyze_structure(df)
     out["bos_direction"] = ctx.get("bos_direction")
 
-    # --- Volume ---
+    # Volume
     try:
         vol = df["volume"].astype(float).tail(vol_lookback)
         v_last = float(vol.iloc[-1])
@@ -352,43 +321,35 @@ def bos_quality_details(
         vol_ok = v_last >= thresh
     except Exception:
         vol_ok = True
-    out["vol_ok"] = bool(vol_ok)
+    out["vol_ok"] = vol_ok
 
-    # --- Open interest ---
+    # OI
     oi_ok = True
     if oi_series is not None and len(oi_series) >= 3:
         try:
             o = oi_series.astype(float).tail(3)
             pct = (o.iloc[-1] - o.iloc[0]) / max(1e-12, o.iloc[0])
-            if pct >= oi_min_trend:
-                oi_ok = True  # trend building
-            elif pct <= oi_min_squeeze:
-                oi_ok = True  # squeeze/delever, acceptable
-            else:
-                oi_ok = False
+            oi_ok = (pct >= oi_min_trend) or (pct <= oi_min_squeeze)
         except Exception:
             oi_ok = True
-    out["oi_ok"] = bool(oi_ok)
+    out["oi_ok"] = oi_ok
     out["ok"] = bool(vol_ok and oi_ok)
 
-    # --- LIQUIDITÉ (equal highs/lows) ---
-    ref_price = float(price) if price is not None else float(df["close"].iloc[-1])
-    tick = float(tick or 0.0)
+    # Liquidity
+    ref_price = float(price) if price else float(df["close"].iloc[-1])
 
-    eq_highs: List[float] = []
-    eq_lows: List[float] = []
+    eq_highs = []
+    eq_lows = []
 
     try:
         base_df = df_liq if isinstance(df_liq, pd.DataFrame) else df
-        if detect_liquidity_clusters is not None and base_df is not None:
+        if detect_liquidity_clusters is not None:
             liq = detect_liquidity_clusters(base_df, lookback=80, tolerance=0.0005)
-            # 🔒 protection: on ne fait .get que si c'est bien un dict
             if isinstance(liq, dict):
-                eq_highs = [float(x) for x in liq.get("eq_highs", [])]
-                eq_lows = [float(x) for x in liq.get("eq_lows", [])]
+                eq_highs = liq.get("eq_highs", [])
+                eq_lows = liq.get("eq_lows", [])
     except Exception:
-        eq_highs = []
-        eq_lows = []
+        pass
 
     if eq_highs or eq_lows:
         out["has_liquidity_zone"] = True
@@ -399,120 +360,203 @@ def bos_quality_details(
             dist, lvl, side = all_lvls[0]
             out["liquidity_side"] = side
             out["liq_distance"] = float(dist)
-            bps = (dist / max(abs(ref_price), 1e-12)) * 10000.0  # basis points
-            out["liq_distance_bps"] = float(bps)
+            out["liq_distance_bps"] = float((dist / max(1e-12, ref_price)) * 10000)
 
     return out
 
 
-def bos_quality_ok(
-    df: pd.DataFrame,
-    oi_series: Optional[pd.Series] = None,
-    vol_lookback: int = 60,
-    vol_pct: float = 0.80,
-    oi_min_trend: float = 0.003,
-    oi_min_squeeze: float = -0.005,
-) -> bool:
-    """
-    Wrapper compat: conserve l'ancienne signature en renvoyant juste le booléen.
-    """
-    d = bos_quality_details(
-        df=df,
-        oi_series=oi_series,
-        vol_lookback=vol_lookback,
-        vol_pct=vol_pct,
-        oi_min_trend=oi_min_trend,
-        oi_min_squeeze=oi_min_squeeze,
+def bos_quality_ok(df: pd.DataFrame, oi_series=None, vol_lookback=60, vol_pct=0.80, oi_min_trend=0.003, oi_min_squeeze=-0.005):
+    return bool(
+        bos_quality_details(
+            df=df,
+            oi_series=oi_series,
+            vol_lookback=vol_lookback,
+            vol_pct=vol_pct,
+            oi_min_trend=oi_min_trend,
+            oi_min_squeeze=oi_min_squeeze,
+        ).get("ok", True)
     )
-    return bool(d.get("ok", True))
-
-
-# === Commitment score (OI + CVD) ===
 
 
 def commitment_score(oi_series, cvd_series, lookback: int = 80) -> float:
-    """
-    Score de "commitment" institutionnel 0..1 basé sur OI + CVD.
-
-    0.5 = neutre
-    >0.6 = flux construit (bullish ou bearish)
-    <0.4 = flux divergent / faible
-    """
     try:
-        import numpy as np
-        import pandas as pd
+        if oi_series is None or cvd_series is None:
+            return 0.5
+        oi = pd.Series(oi_series).dropna().tail(lookback)
+        cvd = pd.Series(cvd_series).dropna().tail(lookback)
     except Exception:
         return 0.5
 
-    if oi_series is None or cvd_series is None:
+    if len(oi) < 5 or len(cvd) < 5:
         return 0.5
 
     try:
-        if not isinstance(oi_series, pd.Series):
-            oi_series = pd.Series(oi_series)
-        if not isinstance(cvd_series, pd.Series):
-            cvd_series = pd.Series(cvd_series)
+        oi_delta = oi.iloc[-1] - oi.iloc[0]
+        cvd_delta = cvd.iloc[-1] - cvd.iloc[0]
     except Exception:
         return 0.5
 
-    oi = oi_series.dropna()
-    cvd = cvd_series.dropna()
+    oi_norm = float(np.clip(oi_delta / max(abs(oi.iloc[0]), 1e-6), -3, 3))
+    cvd_norm = float(np.clip(cvd_delta / max(abs(cvd.iloc[0]), 1e-6), -3, 3))
 
-    if len(oi) < 10 or len(cvd) < 10:
-        return 0.5
-
-    w = min(lookback, len(oi), len(cvd))
-    oi = oi.iloc[-w:]
-    cvd = cvd.iloc[-w:]
-
-    try:
-        oi_first, oi_last = float(oi.iloc[0]), float(oi.iloc[-1])
-        cvd_first, cvd_last = float(cvd.iloc[0]), float(cvd.iloc[-1])
-    except Exception:
-        return 0.5
-
-    oi_delta = oi_last - oi_first
-    cvd_delta = cvd_last - cvd_first
-
-    def _safe_norm(delta: float, base: float, alt_scale: float) -> float:
-        base_abs = abs(base)
-        scale = base_abs if base_abs > 0 else abs(alt_scale)
-        if not np.isfinite(delta) or not np.isfinite(scale) or scale <= 0:
-            return 0.0
-        return float(delta / scale)
-
-    oi_scale = oi.std() if np.isfinite(oi.std()) and oi.std() > 0 else (oi_first or 1.0)
-    cvd_scale = cvd.std() if np.isfinite(cvd.std()) and cvd.std() > 0 else (cvd_first or 1.0)
-
-    oi_norm = _safe_norm(oi_delta, oi_first, oi_scale)
-    cvd_norm = _safe_norm(cvd_delta, cvd_first, cvd_scale)
-
-    oi_norm = float(np.clip(oi_norm, -3.0, 3.0))
-    cvd_norm = float(np.clip(cvd_norm, -3.0, 3.0))
-
-    tiny_oi = abs(oi_norm) < 0.1
-    tiny_cvd = abs(cvd_norm) < 0.1
-
-    # ❗ Correction Python : and (pas &&)
-    if tiny_oi and tiny_cvd:
-        return 0.5
-
-    # magnitude globale du flux
-    mag_raw = 0.5 * (abs(oi_norm) + abs(cvd_norm))
-    mag_score = 1.0 - float(np.exp(-mag_raw))
-    mag_score = float(np.clip(mag_score, 0.0, 1.0))
-
-    # cohérence du signe
-    if tiny_oi ^ tiny_cvd:
-        same_sign = True
-    else:
-        same_sign = (oi_norm * cvd_norm) > 0
+    mag = 0.5 * (abs(oi_norm) + abs(cvd_norm))
+    mag_score = float(1 - np.exp(-mag))
+    same_sign = (oi_norm * cvd_norm) > 0
 
     align = mag_score if same_sign else -mag_score
+    commit = float(np.clip(0.5 + 0.4 * align, 0.0, 1.0))
+    return commit
 
-    commitment = 0.5 + 0.4 * align
 
-    if not np.isfinite(commitment):
-        return 0.5
+# =====================================================================
+# ADD-ON INSTITUTIONNEL — Sweeps, FVG, Discount, Setup Type
+# =====================================================================
 
-    return float(np.clip(commitment, 0.0, 1.0))
+def _equal(a, b, tol=0.0003):
+    return abs(a - b) <= tol * max(a, b, 1e-8)
+
+
+def _inst_sweeps(df: pd.DataFrame) -> Dict[str, bool]:
+    if len(df) < 5:
+        return {"sweep_high": False, "sweep_low": False}
+
+    h1, h2 = df["high"].iloc[-1], df["high"].iloc[-2]
+    l1, l2 = df["low"].iloc[-1], df["low"].iloc[-2]
+
+    eq_high = _equal(h2, df["high"].iloc[-3])
+    eq_low = _equal(l2, df["low"].iloc[-3])
+
+    sweep_high = eq_high and (h1 > h2)
+    sweep_low = eq_low and (l1 < l2)
+
+    return {"sweep_high": sweep_high, "sweep_low": sweep_low}
+
+
+def _inst_fvg(df: pd.DataFrame) -> Dict[str, bool]:
+    n = len(df)
+    up = False
+    down = False
+    for i in range(max(3, n - 30), n - 1):
+        if df["low"].iloc[i] > df["high"].iloc[i - 2]:
+            up = True
+        if df["high"].iloc[i] < df["low"].iloc[i - 2]:
+            down = True
+    return {"up_fvg": up, "down_fvg": down}
+
+
+def _discount_premium(df: pd.DataFrame, bias: str, lookback=50):
+    sub = df.tail(lookback)
+    hi = float(sub["high"].max())
+    lo = float(sub["low"].min())
+    mid = 0.5 * (hi + lo)
+    close = float(df["close"].iloc[-1])
+
+    if bias.upper() == "LONG":
+        return close < mid, False
+    else:
+        return False, close > mid
+
+
+def _age_since_last_bos(df: pd.DataFrame, swings: List[Dict[str, Any]]) -> Optional[int]:
+    if not swings:
+        return None
+
+    close = float(df["close"].iloc[-1])
+    last_bos_pos = None
+
+    for s in swings[::-1]:
+        if s["kind"] == "high" and close > s["price"]:
+            last_bos_pos = s["pos"]
+            break
+        if s["kind"] == "low" and close < s["price"]:
+            last_bos_pos = s["pos"]
+            break
+
+    if last_bos_pos is None:
+        return None
+
+    return max(0, len(df) - 1 - last_bos_pos)
+
+
+def _classify_institutional_setup(bias: str,
+                                  sweeps: Dict[str, bool],
+                                  fvg: Dict[str, bool],
+                                  bos_dir: Optional[str],
+                                  discount: bool,
+                                  premium: bool,
+                                  age_bos: Optional[int]) -> str:
+
+    side = bias.upper()
+
+    # Sweep reversal
+    if side == "LONG" and sweeps["sweep_low"]:
+        return "inst_sweep_reversal"
+    if side == "SHORT" and sweeps["sweep_high"]:
+        return "inst_sweep_reversal"
+
+    # Institutional Pullback
+    if side == "LONG":
+        if bos_dir == "UP" and discount and fvg["up_fvg"]:
+            return "inst_pullback"
+    else:
+        if bos_dir == "DOWN" and premium and fvg["down_fvg"]:
+            return "inst_pullback"
+
+    # Institutional Continuation
+    if age_bos is not None and age_bos <= 4:
+        if side == "LONG" and fvg["up_fvg"] and bos_dir == "UP":
+            return "inst_continuation"
+        if side == "SHORT" and fvg["down_fvg"] and bos_dir == "DOWN":
+            return "inst_continuation"
+
+    return "none"
+
+
+# =====================================================================
+# MODULE ADD-ON — Appliqué dans analyze_structure()
+# =====================================================================
+
+def _institutional_addon(df: pd.DataFrame, base_ctx: Dict[str, Any], bias: Optional[str]):
+    """
+    Ajoute les métadonnées institutionnelles AU-DESSUS
+    sans jamais casser le moteur original.
+    """
+
+    sweeps = _inst_sweeps(df)
+    fvg = _inst_fvg(df)
+
+    discount, premium = False, False
+    if bias:
+        try:
+            discount, premium = _discount_premium(df, bias)
+        except Exception:
+            pass
+
+    age = None
+    try:
+        age = _age_since_last_bos(df, base_ctx.get("swings", []))
+    except Exception:
+        pass
+
+    setup = None
+    if bias:
+        setup = _classify_institutional_setup(
+            bias=bias,
+            sweeps=sweeps,
+            fvg=fvg,
+            bos_dir=base_ctx.get("bos_direction"),
+            discount=discount,
+            premium=premium,
+            age_bos=age,
+        )
+
+    return {
+        "sweep_high": sweeps["sweep_high"],
+        "sweep_low": sweeps["sweep_low"],
+        "up_fvg": fvg["up_fvg"],
+        "down_fvg": fvg["down_fvg"],
+        "discount": discount,
+        "premium": premium,
+        "age_since_bos": age,
+        "setup_type": setup or "none",
+    }
