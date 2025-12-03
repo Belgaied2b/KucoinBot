@@ -447,6 +447,12 @@ def scan_and_send_signals():
 # BLOC 3/4 — Placement LIMIT + Watcher Fill + Trailing Institutionnel
 # ================================================================
 
+# --- SAFETY PATCH: ferme tout try potentiellement ouvert ---
+try:
+    pass
+except Exception:
+    pass
+    
 def _extract_order_id(resp: dict) -> Optional[str]:
     """
     Robust extraction orderId from:
