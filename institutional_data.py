@@ -1,11 +1,7 @@
-"""
-institutional_data.py — Analyse institutionnelle avancée (robuste)
-- Mapping KuCoin → Binance (XBTUSDTM → BTCUSDT, etc.)
-- Cache des symboles Binance pour valider le mapping
-- Fetch tolérant (JSON vide, rate-limit, réponses non-JSON) + rate-limit adaptatif par endpoint (token bucket + backoff + jitter)
-- Funding Rate live (premiumIndex), profil "large traders", divergence CVD, liquidity map
-- Couche d’orchestration (pondération + commentaire)
-"""
+# ================================================
+# institutional_data.py — Version A1 PRO
+# Analyse institutionnelle robuste pour bot C-PRO
+# ================================================
 from __future__ import annotations
 
 import time
@@ -19,465 +15,351 @@ from functools import lru_cache
 
 LOGGER = logging.getLogger(__name__)
 
-# Endpoints Binance
+# ------------------------------------------
+# ENDPOINTS BINANCE
+# ------------------------------------------
 BINANCE_FUTURES_API = "https://fapi.binance.com/fapi/v1"
-BINANCE_FUTURES_DATA = "https://fapi.binance.com/futures/data"  # topLongShortAccountRatio
+BINANCE_FUTURES_DATA = "https://fapi.binance.com/futures/data"
 
-# =======================
-#   CACHES & THROTTLING
-# =======================
-_BINANCE_SYMS_CACHE: Dict[str, Any] = {"ts": 0.0, "set": set()}
-_BINANCE_SYMS_TTL = 15 * 60  # 15 minutes
+# ------------------------------------------
+# CACHE SYMBOLS BINANCE
+# ------------------------------------------
+_BINANCE_SYMS_CACHE = {"ts": 0.0, "set": set()}
+_BINANCE_SYMS_TTL = 900  # 15 minutes
 
-# Compteurs santé / anti-spam logs
-_ERR_COUNTS: Dict[str, int] = {"large_ratio": 0, "cvd_div": 0, "map": 0, "net": 0, "fund": 0}
-_ERR_WARN_EVERY = 10  # WARNING toutes les 10 occurrences
+# ------------------------------------------
+# ERROR COUNTERS (anti-spam logs)
+# ------------------------------------------
+_ERR_COUNTS = {"large_ratio": 0, "cvd_div": 0, "map": 0, "net": 0, "fund": 0}
+_ERR_WARN_EVERY = 10
 
-# ---------- Rate-limit adaptatif par endpoint ----------
-# Modèle: token bucket simple + intervalle adaptatif (ok => decay, 429/5xx => backoff) + jitter
+# ------------------------------------------
+# RATE LIMIT ADAPTATIF (token bucket)
+# ------------------------------------------
 _RATE_STATE: Dict[str, Dict[str, float]] = {}
-_BASE_INTERVAL = 0.15    # ~6-7 req/s par endpoint en nominal
-_MAX_INTERVAL = 2.5      # clamp de backoff max
-_BURST_TOKENS = 3.0      # petite rafale initiale par endpoint
+_BASE_INTERVAL = 0.15
+_MAX_INTERVAL = 2.5
+_BURST_TOKENS = 3.0
 
-def _rate_state(ep: str) -> Dict[str, float]:
+def _rate_state(ep: str):
     st = _RATE_STATE.get(ep)
     if st is None:
-        st = {
-            "interval": _BASE_INTERVAL,  # intervalle courant entre 2 « jetons »
-            "tokens": _BURST_TOKENS,     # jetons disponibles
-            "last_ts": time.time(),      # pour recharger les jetons
-        }
+        st = {"interval": _BASE_INTERVAL, "tokens": _BURST_TOKENS, "last_ts": time.time()}
         _RATE_STATE[ep] = st
     return st
 
 def _adaptive_wait(ep: str):
-    """Attend selon le token bucket pour l'endpoint `ep`."""
     st = _rate_state(ep)
     now = time.time()
-    # recharge des jetons en fonction du temps écoulé
-    if st["interval"] > 0:
-        added = (now - st["last_ts"]) / max(1e-12, st["interval"])
-    else:
-        added = 1.0
+
+    added = (now - st["last_ts"]) / max(st["interval"], 1e-12)
     st["tokens"] = min(_BURST_TOKENS, st["tokens"] + added)
     st["last_ts"] = now
-    if st["tokens"] >= 1.0:
-        st["tokens"] -= 1.0
+
+    if st["tokens"] >= 1:
+        st["tokens"] -= 1
         return
-    # sinon, calcule le temps d'attente pour accumuler 1 jeton
-    need = 1.0 - st["tokens"]
-    wait_s = need * max(st["interval"], _BASE_INTERVAL)
+
+    need = 1 - st["tokens"]
+    wait_s = need * st["interval"]
     if wait_s > 0:
         time.sleep(wait_s)
-    st["tokens"] = max(0.0, st["tokens"] - 1.0 + wait_s / max(st["interval"], _BASE_INTERVAL))
 
 def _feedback_ok(ep: str):
-    """Succès: on réduit légèrement l'intervalle (vers base)."""
     st = _rate_state(ep)
-    st["interval"] = max(_BASE_INTERVAL, st["interval"] * 0.9)
+    st["interval"] = max(_BASE_INTERVAL, st["interval"] * 0.90)
 
 def _feedback_backoff(ep: str, retry_after: Optional[float] = None):
-    """Erreur 429/5xx: on augmente l'intervalle, on ajoute un jitter."""
     st = _rate_state(ep)
     new_int = st["interval"] * 1.6
-    if retry_after and retry_after > 0:
-        new_int = max(new_int, float(retry_after))
+    if retry_after:
+        new_int = max(new_int, retry_after)
     st["interval"] = min(_MAX_INTERVAL, new_int)
-    # petit jitter pour désynchroniser
-    jitter = random.uniform(0.05, 0.25) * st["interval"]
-    time.sleep(jitter)
+    time.sleep(random.uniform(0.05, 0.25) * st["interval"])
 
-# Session HTTP réutilisée
+# ------------------------------------------
+# HTTP Session
+# ------------------------------------------
 _SESSION = requests.Session()
-_SESSION.headers.update({"User-Agent": "insto-bot/1.1 (+binance)"})
+_SESSION.headers.update({"User-Agent": "insto-bot/1.1"})
 
-
-def _bump_and_maybe_warn(key: str, msg: str, detail: str = ""):
-    _ERR_COUNTS[key] = _ERR_COUNTS.get(key, 0) + 1
-    c = _ERR_COUNTS[key]
-    line = f"[INST] {msg}" + (f" | {detail}" if detail else "")
-    if c % _ERR_WARN_EVERY == 0:
-        LOGGER.warning("%s (x%s)", line, c)
-    else:
-        LOGGER.debug("%s", line)
-
-
-def _endpoint_key_from_url(url: str) -> str:
-    # Ex: https://fapi.binance.com/fapi/v1/aggTrades -> 'aggTrades'
+def _endpoint_key(url: str):
     try:
-        tail = url.split("/fapi/")[-1]
-        key = tail.split("?")[0].strip("/").split("/")[1] if "/" in tail else tail
-        return key or "unknown"
-    except Exception:
+        return url.split("/fapi/")[-1].split("?")[0].split("/")[-1]
+    except:
         return "unknown"
 
-
-def _safe_json_get(url: str, params: Optional[dict] = None, timeout: float = 7.0, retries: int = 2):
-    """
-    GET tolérant + rate-limit adaptatif:
-    - Token bucket par endpoint (rafales limitées)
-    - Backoff + jitter sur 429/5xx (respect Retry-After si fourni)
-    - Retry simple
-    - Parse JSON sûr (retourne None sinon)
-    - Ignore erreurs Binance {"code":..., "msg":...} != 0
-    """
-    ep = _endpoint_key_from_url(url)
+# ------------------------------------------
+# SAFE JSON GET (tolérant)
+# ------------------------------------------
+def _safe_json_get(url: str, params=None, timeout=6.0, retries=2):
+    ep = _endpoint_key(url)
     for attempt in range(retries + 1):
         try:
             _adaptive_wait(ep)
             r = _SESSION.get(url, params=params or {}, timeout=timeout)
+
             if r.status_code == 200:
                 try:
-                    data = r.json()
+                    js = r.json()
                 except Exception:
-                    _bump_and_maybe_warn("net", "Non-JSON response", r.text[:120])
-                    data = None
-                # Certaines erreurs Binance renvoient {"code": -xxxx, "msg": "..."}
-                if isinstance(data, dict) and "code" in data and data.get("code") not in (0, None):
-                    _bump_and_maybe_warn("net", "Binance error", f"{data}")
-                    data = None
+                    _bump("net", "Non-JSON response")
+                    js = None
+
                 _feedback_ok(ep)
-                return data
-            elif r.status_code == 429:
+                return js
+
+            if r.status_code == 429:
                 ra = r.headers.get("Retry-After")
                 try:
-                    sleep_s = float(ra) if ra else None
-                except Exception:
-                    sleep_s = None
-                _bump_and_maybe_warn("net", f"HTTP 429 on {ep}", f"Retry-After={ra}")
-                _feedback_backoff(ep, retry_after=sleep_s)
-                # on retente
+                    ra = float(ra) if ra else None
+                except:
+                    ra = None
+                _feedback_backoff(ep, retry_after=ra)
                 continue
-            elif 500 <= r.status_code < 600:
-                _bump_and_maybe_warn("net", f"HTTP {r.status_code} on {ep}")
+
+            if 500 <= r.status_code < 600:
                 _feedback_backoff(ep)
-            else:
-                _bump_and_maybe_warn("net", f"HTTP {r.status_code} on {ep}")
+                continue
+
+            _bump("net", f"HTTP {r.status_code}")
+
         except Exception as e:
-            _bump_and_maybe_warn("net", "Request exception", str(e))
+            _bump("net", f"Exception {e}")
             _feedback_backoff(ep)
-        # Backoff léger entre tentatives
-        time.sleep(0.35 * (attempt + 1))
+
+        time.sleep(0.20 * (attempt + 1))
+
     return None
 
+def _bump(key: str, msg: str):
+    _ERR_COUNTS[key] += 1
+    c = _ERR_COUNTS[key]
+    if c % _ERR_WARN_EVERY == 0:
+        LOGGER.warning("[INST] %s (x%s)", msg, c)
+    else:
+        LOGGER.debug("[INST] %s", msg)
 
+# ------------------------------------------
+# BINANCE SYMBOLS REFRESH
+# ------------------------------------------
 def _refresh_binance_symbols():
-    """Charge et met en cache la liste des symboles USDT futures (ex: BTCUSDT)."""
     now = time.time()
-    if (now - _BINANCE_SYMS_CACHE["ts"]) < _BINANCE_SYMS_TTL and _BINANCE_SYMS_CACHE["set"]:
+    if now - _BINANCE_SYMS_CACHE["ts"] < _BINANCE_SYMS_TTL:
         return
-    data = _safe_json_get(f"{BINANCE_FUTURES_API}/exchangeInfo", params=None, timeout=6.0, retries=2)
+
+    data = _safe_json_get(f"{BINANCE_FUTURES_API}/exchangeInfo")
     syms = set()
-    # Attendu: {"symbols": [{"symbol":"BTCUSDT","contractType":"PERPETUAL",...}, ...]}
+
     try:
         for s in (data or {}).get("symbols", []):
             if s.get("contractType") in ("PERPETUAL", "CURRENT_QUARTER", "NEXT_QUARTER"):
-                name = str(s.get("symbol") or "").upper()
-                if name.endswith("USDT"):
-                    syms.add(name)
-    except Exception:
+                sym = str(s.get("symbol", "")).upper()
+                if sym.endswith("USDT"):
+                    syms.add(sym)
+    except:
         pass
+
     _BINANCE_SYMS_CACHE["set"] = syms
     _BINANCE_SYMS_CACHE["ts"] = now
-    if syms:
-        LOGGER.info("Loaded %d Binance futures symbols", len(syms))
 
-
-# Aliases courants KuCoin → Binance
-_ALIAS_BASE = {
-    "XBT": "BTC",   # KuCoin XBT → Binance BTC
-    "APR": "APE",   # Exemple d’alias
-    # ajoute d'autres alias si nécessaire
-}
-
+# ------------------------------------------
+# KuCoin → Binance mapping
+# ------------------------------------------
+_ALIAS = {"XBT": "BTC", "APR": "APE"}
 
 @lru_cache(maxsize=2048)
-def _map_to_binance_symbol(kucoin_symbol: str) -> Optional[str]:
-    """
-    Convertit un symbole KuCoin (ex: XBTUSDTM, ETHUSDTM) en symbole Binance (ex: BTCUSDT, ETHUSDT).
-    Retourne None si mapping impossible ou si le symbole n’existe pas côté Binance.
-    """
-    if not kucoin_symbol:
+def _map_to_binance(ku_sym: str) -> Optional[str]:
+    if not ku_sym:
         return None
-    s = kucoin_symbol.upper().strip()
+    s = ku_sym.upper()
 
-    # 1) Retire suffixes KuCoin futures courants
-    for suf in ("USDTM", "USDT-PERP", "USDT-PERPP", "PERP", "M"):
+    for suf in ("USDTM", "USDT-PERP", "PERP", "M"):
         if s.endswith(suf):
             s = s[: -len(suf)]
             break
 
-    # 2) Base + alias éventuel
     if s.endswith("USDT"):
         base = s[:-4]
-    elif s.endswith("USDTM"):
-        base = s[:-5]
     else:
         base = s
-    base_alias = _ALIAS_BASE.get(base, base)
 
-    # 3) Construit le symbole Binance et valide
-    b_symbol = f"{base_alias}USDT"
+    base = _ALIAS.get(base, base)
+    b = f"{base}USDT"
+
     _refresh_binance_symbols()
-    syms = _BINANCE_SYMS_CACHE["set"]
+    if b in _BINANCE_SYMS_CACHE["set"]:
+        return b
 
-    if b_symbol in syms:
-        return b_symbol
-
-    # 4) Essai alternatif sans alias
-    alt = f"{base}USDT"
-    if alt in syms:
-        return alt
-
-    _bump_and_maybe_warn("map", f"Binance symbol mapping failed for {kucoin_symbol}")
     return None
 
-
-# --------------------------------------------------------------------
-# 🔹 1. PROFIL VOLUME INSTITUTIONNEL (grands comptes vs. retail)
-# --------------------------------------------------------------------
+# ------------------------------------------
+# Large trader ratio
+# ------------------------------------------
 def get_large_trader_ratio(symbol: str) -> float:
-    """
-    Ratio 0..1 :
-      - proche de 1 => flux dominé par gros traders
-      - proche de 0 => flux retail
-    Ne lève pas d’erreur : renvoie 0.5 (neutre) si indisponible.
-    """
-    b_sym = _map_to_binance_symbol(symbol)
-    if not b_sym:
-        _bump_and_maybe_warn("map", f"Mapping Binance introuvable pour {symbol}")
+    b = _map_to_binance(symbol)
+    if not b:
         return 0.5
 
     data = _safe_json_get(
         f"{BINANCE_FUTURES_DATA}/topLongShortAccountRatio",
-        params={"symbol": b_sym, "period": "1h", "limit": 1},
-        timeout=6.0,
-        retries=2,
+        params={"symbol": b, "period": "1h", "limit": 1}
     )
     try:
         if isinstance(data, list) and data:
             row = data[0]
-            # Champs: longAccount, shortAccount, longShortRatio, timestamp (strings)
-            long_acc = float(row.get("longAccount", 0.0))
-            short_acc = float(row.get("shortAccount", 0.0))
-            if long_acc <= 0 and short_acc <= 0:
+            long_a = float(row.get("longAccount", 0))
+            short_a = float(row.get("shortAccount", 0))
+            if long_a <= 0 and short_a <= 0:
                 return 0.5
-            ratio = long_acc / max(1e-9, short_acc)
-            # Écrase dans 0..1 via tanh-like (doucement croissant)
-            score = np.tanh(ratio)
-            return float(np.clip(score, 0.0, 1.0))
-    except Exception as e:
-        _bump_and_maybe_warn("large_ratio", f"Parse failed for {b_sym}", str(e))
+            ratio = long_a / max(short_a, 1e-9)
+            return float(np.clip(np.tanh(ratio), 0, 1))
+    except:
+        _bump("large_ratio", f"Parse failed {b}")
+
     return 0.5
 
-
-# --------------------------------------------------------------------
-# 🔹 2. FUNDING RATE live (premiumIndex)
-# --------------------------------------------------------------------
-# Fallbacks réglables via settings.py (optionnels)
+# ------------------------------------------
+# Funding rate
+# ------------------------------------------
 try:
     from settings import FUNDING_DEADBAND
-except Exception:
-    FUNDING_DEADBAND = 0.00005  # 0.005% (deadband autour de 0 => neutre)
+except:
+    FUNDING_DEADBAND = 0.00005
 
 def get_funding_rate(symbol: str) -> Optional[float]:
-    """
-    Récupère le funding rate live Binance (lastFundingRate) pour le symbole mappé.
-    Retourne None si indisponible/erreur.
-    """
-    b_sym = _map_to_binance_symbol(symbol)
-    if not b_sym:
-        _bump_and_maybe_warn("map", f"Mapping Binance introuvable pour {symbol}")
+    b = _map_to_binance(symbol)
+    if not b:
         return None
 
-    data = _safe_json_get(
-        f"{BINANCE_FUTURES_API}/premiumIndex",
-        params={"symbol": b_sym},
-        timeout=6.0,
-        retries=2
-    )
+    data = _safe_json_get(f"{BINANCE_FUTURES_API}/premiumIndex", params={"symbol": b})
     try:
         if isinstance(data, dict) and "lastFundingRate" in data:
-            fr = float(data.get("lastFundingRate"))
-            # NOTE: Binance renvoie le funding toutes les 8h ; on utilise le dernier connu.
-            return fr
-    except Exception as e:
-        _bump_and_maybe_warn("fund", f"Parse funding failed for {b_sym}", str(e))
+            return float(data["lastFundingRate"])
+    except:
+        _bump("fund", f"Parse failed {b}")
     return None
 
-
-# --------------------------------------------------------------------
-# 🔹 3. DELTA CUMULÉ PAR CANDLE (divergence CVD vs prix)
-# --------------------------------------------------------------------
-def get_cvd_divergence(symbol: str, limit: int = 500) -> float:
-    """
-    Score -1..+1 : cohérence CVD vs prix.
-      +1 = prix & CVD montent ensemble
-      -1 = divergence (prix ↑ mais CVD ↓, ou l’inverse)
-    """
-    b_sym = _map_to_binance_symbol(symbol)
-    if not b_sym:
-        _bump_and_maybe_warn("map", f"Mapping Binance introuvable pour {symbol}")
+# ------------------------------------------
+# CVD divergence
+# ------------------------------------------
+def get_cvd_divergence(symbol: str, limit=500) -> float:
+    b = _map_to_binance(symbol)
+    if not b:
         return 0.0
 
     data = _safe_json_get(
         f"{BINANCE_FUTURES_API}/aggTrades",
-        params={"symbol": b_sym, "limit": max(100, min(1000, int(limit)))},
-        timeout=6.0,
-        retries=2,
+        params={"symbol": b, "limit": limit}
     )
-    if not isinstance(data, list) or len(data) < 10:
+    if not isinstance(data, list) or len(data) < 20:
         return 0.0
 
     try:
         df = pd.DataFrame(data)
-        # Attendus: p (price), q (qty), m (isBuyerMaker)
         if not {"p", "q", "m"}.issubset(df.columns):
             return 0.0
+
         df["p"] = pd.to_numeric(df["p"], errors="coerce")
         df["q"] = pd.to_numeric(df["q"], errors="coerce")
-        df = df.dropna(subset=["p", "q", "m"])
-        if df.empty:
-            return 0.0
+        df = df.dropna()
 
-        # maker côté vendeur => taker acheteur (m=False) ; code +1 pour taker acheteur
         df["side"] = df["m"].apply(lambda x: -1 if bool(x) else 1)
         df["delta"] = df["q"] * df["side"]
 
-        cvd = float(df["delta"].sum())
-        price_change = float(df["p"].iloc[-1] - df["p"].iloc[0])
-        if abs(price_change) < 1e-10:
+        cvd = df["delta"].sum()
+        price_change = df["p"].iloc[-1] - df["p"].iloc[0]
+
+        if abs(price_change) < 1e-9:
             return 0.0
-        corr = np.sign(price_change) * np.sign(cvd)  # +1 cohérent, -1 divergence
-        return float(np.clip(corr, -1.0, 1.0))
-    except Exception as e:
-        _bump_and_maybe_warn("cvd_div", f"CVD divergence parse failed for {b_sym}", str(e))
+
+        return float(np.clip(np.sign(price_change) * np.sign(cvd), -1, 1))
+    except:
+        _bump("cvd_div", f"Parse failed {b}")
         return 0.0
 
-
-# --------------------------------------------------------------------
-# 🔹 4. LIQUIDITY MAP (equal highs/lows)
-# --------------------------------------------------------------------
-def detect_liquidity_clusters(df: pd.DataFrame, lookback: int = 50, tolerance: float = 0.0005):
-    """
-    Détecte des 'equal highs/lows' simples sur la fenêtre récente.
-    Retourne: { "eq_highs": [...], "eq_lows": [...] }
-    """
+# ------------------------------------------
+# Liquidity clusters (EQH/EQL)
+# ------------------------------------------
+def detect_liquidity_clusters(df: pd.DataFrame, lookback=60, tol=0.0005):
     try:
-        highs = df["high"].astype(float).tail(lookback).values
-        lows = df["low"].astype(float).tail(lookback).values
-    except Exception:
+        highs = df["high"].tail(lookback).astype(float).values
+        lows = df["low"].tail(lookback).astype(float).values
+    except:
         return {"eq_highs": [], "eq_lows": []}
 
-    eq_highs, eq_lows = [], []
+    eqh, eql = [], []
     for i in range(1, len(highs)):
-        try:
-            if abs(highs[i] - highs[i - 1]) / max(1e-12, highs[i]) < tolerance:
-                eq_highs.append(highs[i])
-            if abs(lows[i] - lows[i - 1]) / max(1e-12, lows[i]) < tolerance:
-                eq_lows.append(lows[i])
-        except Exception:
-            continue
+        if abs(highs[i] - highs[i - 1]) / highs[i] < tol:
+            eqh.append(highs[i])
+        if abs(lows[i] - lows[i - 1]) / lows[i] < tol:
+            eql.append(lows[i])
 
     return {
-        "eq_highs": sorted({round(float(x), 6) for x in eq_highs}),
-        "eq_lows": sorted({round(float(x), 6) for x in eq_lows}),
+        "eq_highs": sorted({round(float(x), 6) for x in eqh}),
+        "eq_lows": sorted({round(float(x), 6) for x in eql}),
     }
 
+# ------------------------------------------
+# SCORE GLOBAL
+# ------------------------------------------
+def compute_institutional_score(symbol: str, bias: str, prev_oi=None):
+    large = get_large_trader_ratio(symbol)
+    cvd = get_cvd_divergence(symbol)
+    fund = get_funding_rate(symbol)
 
-# --------------------------------------------------------------------
-# 🔸 SCORE INSTITUTIONNEL GLOBAL (pondéré)
-# --------------------------------------------------------------------
-def compute_institutional_score(symbol: str, bias: str, prev_oi: float = None) -> Dict[str, Any]:
-    """
-    Retourne:
-    {
-      "scores": {"oi": int, "fund": int, "cvd": int, "liquidity": int},
-      "score_total": int,
-      "details": {...}
-    }
-    Règles:
-    - OI proxy (large traders): +1 si ratio>0.55
-    - CVD divergence: +1 si corrélation prix/CVD >= 0
-    - Funding: +1 si signe du funding cohérent avec le biais (LONG: funding >= +deadband ; SHORT: funding <= -deadband)
-      (deadband évite de donner un point pour un funding ~0)
-    - Liquidity (placeholder ici à 0; tu peux injecter un proxy externe)
-    """
-    large_ratio = get_large_trader_ratio(symbol)
-    cvd_div = get_cvd_divergence(symbol)
-    fund = get_funding_rate(symbol)  # peut être None
-
-    # Pondération simple (failsafe: neutres possibles)
-    oi_score = 1 if large_ratio > 0.55 else 0
-    cvd_score = 1 if cvd_div >= 0 else 0
-
+    oi_score = 1 if large > 0.55 else 0
+    cvd_score = 1 if cvd >= 0 else 0
     fund_score = 0
+
     if fund is not None:
-        if str(bias).upper() == "LONG" and fund >= float(FUNDING_DEADBAND):
+        if bias == "LONG" and fund >= FUNDING_DEADBAND:
             fund_score = 1
-        elif str(bias).upper() == "SHORT" and fund <= -float(FUNDING_DEADBAND):
+        if bias == "SHORT" and fund <= -FUNDING_DEADBAND:
             fund_score = 1
-        else:
-            fund_score = 0  # funding faible ou contraire au biais
 
-    liq_score = 0   # à compléter si tu ajoutes un proxy liquidations
-
-    score_total = oi_score + cvd_score + fund_score  # 0..3
+    total = oi_score + cvd_score + fund_score
 
     return {
-        "scores": {
-            "oi": oi_score,
-            "fund": fund_score,
-            "cvd": cvd_score,
-            "liquidity": liq_score
-        },
-        "score_total": int(score_total),
+        "scores": {"oi": oi_score, "cvd": cvd_score, "fund": fund_score},
+        "score_total": total,
         "details": {
-            "large_ratio": round(float(large_ratio), 3),
-            "cvd_divergence": float(cvd_div),
-            "funding_rate": (None if fund is None else float(fund)),
-            "funding_deadband": float(FUNDING_DEADBAND),
-            "bias": str(bias).upper()
-        }
+            "large_ratio": round(large, 3),
+            "cvd_div": cvd,
+            "funding_rate": fund,
+            "bias": bias,
+        },
     }
 
-
-# --------------------------------------------------------------------
-# 🔹 5. COUCHE D’ORCHESTRATION (pondération + commentaire)
-# --------------------------------------------------------------------
-def compute_full_institutional_analysis(symbol: str, bias: str, prev_oi: float = None) -> Dict[str, Any]:
-    """
-    Orchestration robuste:
-    - Si mapping Binance indisponible → neutre (pas d'appel réseau)
-    - Sinon calcule un score global et génère un commentaire
-    """
-    # Vérifie d'abord si le mapping est possible sans déclencher d'appels inutiles
-    b_sym = _map_to_binance_symbol(symbol)
-    if not b_sym:
+# ------------------------------------------
+# ORCHESTRATION COMPLETE
+# ------------------------------------------
+def compute_full_institutional_analysis(symbol: str, bias: str, prev_oi=None):
+    b = _map_to_binance(symbol)
+    if not b:
         return {
             "institutional_score": 0,
             "institutional_strength": "Faible",
             "institutional_comment": "Pas de flux dominants",
             "neutral": True,
-            "reason": "no_binance_mapping",
-            "details": {}
+            "details": {},
         }
 
     inst = compute_institutional_score(symbol, bias, prev_oi)
-    d = inst["scores"]
-    total = int(inst["score_total"])
+    s = inst["scores"]
+    total = inst["score_total"]
 
-    comment = []
-    if d.get("oi"):   comment.append("OI↑")
-    if d.get("fund"): comment.append("Funding cohérent")
-    if d.get("cvd"):  comment.append("CVD cohérent")
-    strength = "Fort" if total == 3 else ("Moyen" if total == 2 else "Faible")
+    c = []
+    if s["oi"]:   c.append("OI↑")
+    if s["fund"]: c.append("Funding cohérent")
+    if s["cvd"]:  c.append("CVD cohérent")
+
+    strength = "Fort" if total == 3 else "Moyen" if total == 2 else "Faible"
 
     return {
-        "institutional_score": total,                 # utilisé par analyze_signal.py
+        "institutional_score": total,
         "institutional_strength": strength,
-        "institutional_comment": ", ".join(comment) if comment else "Pas de flux dominants",
+        "institutional_comment": ", ".join(c) if c else "Pas de flux dominants",
         "neutral": False,
-        "details": inst
+        "details": inst,
     }
