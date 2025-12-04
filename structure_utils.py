@@ -297,6 +297,38 @@ def structure_valid(df, bias: str, lookback: int = 10) -> bool:
         return bos == "DOWN" or trend == "down"
     return True
 
+# =====================================================================
+# HTF Trend — EMA 20/50 (LEGACY REQUIRED BY analyze_signal.py)
+# =====================================================================
+
+def _ema(x: pd.Series, n: int = 20) -> pd.Series:
+    """
+    EMA simple pour le filtre HTF.
+    """
+    return x.ewm(span=n, adjust=False).mean()
+
+
+def htf_trend_ok(df_htf: Optional[pd.DataFrame], bias: str) -> bool:
+    """
+    Filtre HTF utilisé par analyze_signal.py.
+    Confirme que la tendance H4/H1 soutient le biais de trade.
+    - LONG : close > EMA50 et EMA20 > EMA50
+    - SHORT : close < EMA50 et EMA20 < EMA50
+    """
+    if df_htf is None or len(df_htf) < 60:
+        return True  # fallback permissif
+
+    close = df_htf["close"].astype(float)
+    ema20 = _ema(close, 20)
+    ema50 = _ema(close, 50)
+
+    if str(bias).upper() == "LONG":
+        return bool(close.iloc[-1] > ema50.iloc[-1] and ema20.iloc[-1] > ema50.iloc[-1])
+
+    if str(bias).upper() == "SHORT":
+        return bool(close.iloc[-1] < ema50.iloc[-1] and ema20.iloc[-1] < ema50.iloc[-1])
+
+    return True
 
 # ============================================================
 # Engulfing (legacy)
