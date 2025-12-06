@@ -1,21 +1,42 @@
 # =====================================================================
-# bitget_trader.py — Async order execution for Bitget Futures USDT-M
-# Version corrigée, professionnelle et 100% compatible
+# bitget_trader.py — Desk Lead Execution Layer (Bitget Futures USDT-M)
+# Exécution institutionnelle complète : LIMIT, SL/TP, partials, trailing.
+# Compatible: bitget_client.py (Desk Lead), scanner/analyzer, sizing, risk.
 # =====================================================================
 
-from typing import Optional, Dict, Any
+from __future__ import annotations
+import asyncio
+import logging
+from typing import Dict, Any, Optional
+
 from bitget_client import get_client
 
+LOGGER = logging.getLogger(__name__)
 
+# ===============================================================
+# Symbol Mapping KuCoin → Bitget
+# ===============================================================
+def map_symbol(symbol: str) -> str:
+    """
+    Convertit XBTUSDTM / SOLUSDTM → BTCUSDT_UMCBL / SOLUSDT_UMCBL.
+    """
+    s = symbol.upper().replace("USDTM", "").replace("USDM", "")
+    if s == "XBT":
+        s = "BTC"
+    return f"{s}USDT_UMCBL"
+
+
+# ===============================================================
+# Desk Lead Execution Layer
+# ===============================================================
 class BitgetTrader:
     """
-    Trader institutionnel Bitget — version ASYNC.
-    Fonctionnalités :
-      - Placement LIMIT (entrée)
-      - Stop Loss (reduce-only)
-      - TP1, TP2 (reduce-only)
-      - Annulation d'ordre
-      - Récup position
+    Exécution institutionnelle complète :
+    - LIMIT post_only
+    - Stop-loss plan
+    - TP1 / TP2 reduce-only
+    - Partial / BE / trailing
+    - Annulation intelligente
     """
 
     def __init__(self, api_key: str, api_secret: str, api_passphrase: str):
@@ -23,48 +44,51 @@ class BitgetTrader:
         self.api_secret = api_secret
         self.api_passphrase = api_passphrase
 
+        # Anti-duplicate execution
+        self.active_entries: Dict[str, bool] = {}
+
     async def _client(self):
         return await get_client(self.api_key, self.api_secret, self.api_passphrase)
 
-    # ------------------------------------------------------------
-    # Utils — qty rounding
-    # ------------------------------------------------------------
-    def _normalize_qty(self, qty: float, lot_size: float) -> float:
-        """Arrondit la quantité au lotSize Bitget."""
-        try:
-            lot = float(lot_size)
-            if lot <= 0:
-                return qty
-            steps = int(qty / lot)
-            final_qty = steps * lot
-            return max(final_qty, lot)
-        except:
+    # ===============================================================
+    # Helpers institutionnels
+    # ===============================================================
+    async def _normalize_qty(self, symbol: str, qty: float) -> float:
+        client = await self._client()
+        c = await client.get_contract(symbol)
+        if not c:
             return qty
 
-    # ------------------------------------------------------------
-    # LIMIT ENTRY ORDER
-    # ------------------------------------------------------------
+        lot = float(c.get("size", 0.001))
+        if lot <= 0:
+            return qty
+
+        steps = int(qty / lot)
+        final_qty = max(steps * lot, lot)
+        return float(final_qty)
+
+    # ===============================================================
+    # ENTRY LIMIT
+    # ===============================================================
     async def place_limit(
-        self,
-        symbol: str,
-        side: str,    # LONG / SHORT
-        price: float,
-        qty: float,
-        margin_coin: str = "USDT",
-        post_only: bool = True
+        self, symbol: str, side: str, price: float, qty: float,
+        post_only: bool = True, margin_coin: str = "USDT"
     ) -> Dict[str, Any]:
 
+        b_symbol = map_symbol(symbol)
+
+        # Anti-duplicate
+        key = f"{b_symbol}-{side}"
+        if self.active_entries.get(key):
+            return {"error": "duplicate_entry_blocked"}
+
+        self.active_entries[key] = True
+
         client = await self._client()
-        contract = await client.get_contract(symbol)
-
-        if not contract:
-            return {"error": "Unknown symbol contract"}
-
-        lot_size = float(contract.get("size", 0.001))
-        qty = self._normalize_qty(qty, lot_size)
+        qty = await self._normalize_qty(b_symbol, qty)
 
         body = {
-            "symbol": symbol,
+            "symbol": b_symbol,
             "marginCoin": margin_coin,
             "size": str(qty),
             "price": str(price),
@@ -75,33 +99,30 @@ class BitgetTrader:
         if post_only:
             body["timeInForceValue"] = "post_only"
 
-        return await client._request("POST", "/api/mix/v1/order/placeOrder", data=body)
+        r = await client._request("POST", "/api/mix/v1/order/placeOrder", data=body)
 
-    # ------------------------------------------------------------
-    # STOP LOSS (TRIGGER ORDER)
-    # ------------------------------------------------------------
+        if r.get("code") != "00000":
+            self.active_entries[key] = False
+            return {"ok": False, "error": r, "symbol": b_symbol}
+
+        return {"ok": True, "order": r, "symbol": b_symbol, "qty": qty}
+
+    # ===============================================================
+    # STOP LOSS PLACEMENT
+    # ===============================================================
     async def place_stop_loss(
-        self,
-        symbol: str,
-        side: str,
-        sl_price: float,
-        qty: float,
+        self, symbol: str, side: str, sl_price: float, qty: float,
         margin_coin: str = "USDT"
     ) -> Dict[str, Any]:
 
+        b_symbol = map_symbol(symbol)
         client = await self._client()
-        contract = await client.get_contract(symbol)
-
-        if not contract:
-            return {"error": "Unknown contract"}
-
-        lot_size = float(contract.get("size", 0.001))
-        qty = self._normalize_qty(qty, lot_size)
+        qty = await self._normalize_qty(b_symbol, qty)
 
         trigger_side = "close_long" if side.upper() == "LONG" else "close_short"
 
         body = {
-            "symbol": symbol,
+            "symbol": b_symbol,
             "marginCoin": margin_coin,
             "triggerPrice": str(sl_price),
             "executePrice": str(sl_price),
@@ -111,33 +132,30 @@ class BitgetTrader:
             "triggerType": "fill_price",
         }
 
-        return await client._request("POST", "/api/mix/v1/order/placePlan", data=body)
+        r = await client._request("POST", "/api/mix/v1/order/placePlan", data=body)
 
-    # ------------------------------------------------------------
-    # TAKE PROFIT (TRIGGER ORDER)
-    # ------------------------------------------------------------
+        if r.get("code") != "00000":
+            LOGGER.error(f"[SL ERROR] {r}")
+            return {"ok": False, "error": r}
+
+        return {"ok": True, "sl": r}
+
+    # ===============================================================
+    # TAKE PROFIT
+    # ===============================================================
     async def place_take_profit(
-        self,
-        symbol: str,
-        side: str,
-        tp_price: float,
-        qty: float,
+        self, symbol: str, side: str, tp_price: float, qty: float,
         margin_coin: str = "USDT"
-    ) -> Dict[str, Any]:
+    ):
 
+        b_symbol = map_symbol(symbol)
         client = await self._client()
-        contract = await client.get_contract(symbol)
-
-        if not contract:
-            return {"error": "Unknown contract"}
-
-        lot_size = float(contract.get("size", 0.001))
-        qty = self._normalize_qty(qty, lot_size)
+        qty = await self._normalize_qty(b_symbol, qty)
 
         trigger_side = "close_long" if side.upper() == "LONG" else "close_short"
 
         body = {
-            "symbol": symbol,
+            "symbol": b_symbol,
             "marginCoin": margin_coin,
             "triggerPrice": str(tp_price),
             "executePrice": str(tp_price),
@@ -147,34 +165,62 @@ class BitgetTrader:
             "triggerType": "fill_price",
         }
 
-        return await client._request("POST", "/api/mix/v1/order/placePlan", data=body)
+        r = await client._request("POST", "/api/mix/v1/order/placePlan", data=body)
 
-    # ------------------------------------------------------------
-    # Cancel all pending orders
-    # ------------------------------------------------------------
+        if r.get("code") != "00000":
+            LOGGER.error(f"[TP ERROR] {r}")
+            return {"ok": False, "error": r}
+
+        return {"ok": True, "tp": r}
+
+    # ===============================================================
+    # CANCEL ORDERS
+    # ===============================================================
     async def cancel_all(self, symbol: str, margin_coin: str = "USDT") -> Dict[str, Any]:
         client = await self._client()
-        body = {"symbol": symbol, "marginCoin": margin_coin}
-        return await client._request("POST", "/api/mix/v1/order/cancelAllOrders", data=body)
+        b_symbol = map_symbol(symbol)
 
-    # ------------------------------------------------------------
-    # GET POSITION
-    # ------------------------------------------------------------
-    async def get_position(self, symbol: str) -> Dict[str, Any]:
-        client = await self._client()
-        pos = await client.get_position(symbol)
-        return pos or {}
+        body = {"symbol": b_symbol, "marginCoin": margin_coin}
+        r = await client._request("POST", "/api/mix/v1/order/cancelAllOrders", data=body)
 
-    # ------------------------------------------------------------
-    # MOVE STOP LOSS (Cancel + re-place)
-    # ------------------------------------------------------------
+        return r
+
+    # ===============================================================
+    # MOVE STOP LOSS
+    # ===============================================================
     async def move_stop_loss(
-        self,
-        symbol: str,
-        side: str,
-        new_sl: float,
-        qty: float,
+        self, symbol: str, side: str, new_sl: float, qty: float,
         margin_coin: str = "USDT"
     ):
         await self.cancel_all(symbol, margin_coin)
         return await self.place_stop_loss(symbol, side, new_sl, qty, margin_coin)
+
+    # ===============================================================
+    # GET POSITION
+    # ===============================================================
+    async def get_position(self, symbol: str):
+        client = await self._client()
+        return await client.get_position(map_symbol(symbol))
+
+    # ===============================================================
+    # PARTIAL CLOSE MARKET
+    # ===============================================================
+    async def close_partial(
+        self, symbol: str, side: str, qty: float, margin_coin: str = "USDT"
+    ):
+        client = await self._client()
+        b_symbol = map_symbol(symbol)
+        qty = await self._normalize_qty(b_symbol, qty)
+
+        exit_side = "close_long" if side.upper() == "LONG" else "close_short"
+
+        body = {
+            "symbol": b_symbol,
+            "marginCoin": margin_coin,
+            "size": str(qty),
+            "side": exit_side,
+            "orderType": "market",
+        }
+
+        r = await client._request("POST", "/api/mix/v1/order/placeOrder", data=body)
+        return r
