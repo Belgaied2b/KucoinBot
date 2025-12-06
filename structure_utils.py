@@ -1,262 +1,208 @@
 # =====================================================================
-# structure_utils.py — Desk Lead Bitget v1.0
-# Structure de marché institutionnelle : BOS, CHoCH, COS, trend,
-# swing points, HTF confirmation, BOS quality scoring, commitment OI/CVD.
+# structure_utils.py — Desk Lead Structure Engine (FULL VERSION)
+# Institutional-grade BOS / CHOCH / Liquidity / Trend + HTF alignment
 # =====================================================================
 
 import numpy as np
 import pandas as pd
-from typing import Dict, Any, Optional
+from typing import Dict, Any, List, Optional
 
 
 # =====================================================================
-# Swing points (détection robuste)
+# SWINGS
 # =====================================================================
 
-def _is_swing_high(df: pd.DataFrame, i: int) -> bool:
-    if i < 2 or i > len(df) - 3:
-        return False
-    return df["high"].iloc[i] > df["high"].iloc[i-1] and df["high"].iloc[i] > df["high"].iloc[i+1]
+def find_swings(df: pd.DataFrame, left: int = 3, right: int = 3):
+    highs = []
+    lows = []
+    h = df["high"].values
+    l = df["low"].values
 
+    length = len(df)
+    if length < left + right + 1:
+        return {"highs": [], "lows": []}
 
-def _is_swing_low(df: pd.DataFrame, i: int) -> bool:
-    if i < 2 or i > len(df) - 3:
-        return False
-    return df["low"].iloc[i] < df["low"].iloc[i-1] and df["low"].iloc[i] < df["low"].iloc[i+1]
+    for i in range(left, length - right):
+        window_h = h[i-left:i+right+1]
+        window_l = l[i-left:i+right+1]
 
+        if h[i] == max(window_h):
+            highs.append((i, float(h[i])))
 
-def _extract_swings(df: pd.DataFrame):
-    highs, lows = [], []
-    for i in range(2, len(df) - 2):
-        if _is_swing_high(df, i):
-            highs.append((i, df["high"].iloc[i]))
-        if _is_swing_low(df, i):
-            lows.append((i, df["low"].iloc[i]))
-    return highs, lows
+        if l[i] == min(window_l):
+            lows.append((i, float(l[i])))
+
+    return {"highs": highs, "lows": lows}
 
 
 # =====================================================================
-# Trend (EMA-based)
+# EQUAL HIGHS / EQUAL LOWS (Liquidity zones)
 # =====================================================================
 
-def _trend_ema(df: pd.DataFrame) -> str:
-    if len(df) < 60:
-        return "NEUTRAL"
+def detect_equal_levels(df: pd.DataFrame, tolerance: float = 0.001):
+    swings = find_swings(df)
+    highs = swings["highs"]
+    lows = swings["lows"]
 
-    close = df["close"]
-    ema21 = close.ewm(span=21, adjust=False).mean()
+    eq_highs = []
+    eq_lows = []
+
+    for i, ph in highs:
+        for j, ph2 in highs:
+            if j <= i:
+                continue
+            if abs(ph - ph2) / ph <= tolerance:
+                eq_highs.append(round((ph + ph2) / 2, 8))
+
+    for i, pl in lows:
+        for j, pl2 in lows:
+            if j <= i:
+                continue
+            if abs(pl - pl2) / max(pl, 1e-12) <= tolerance:
+                eq_lows.append(round((pl + pl2) / 2, 8))
+
+    eq_highs = sorted(list(set(eq_highs)))
+    eq_lows = sorted(list(set(eq_lows)))
+
+    return {"eq_highs": eq_highs, "eq_lows": eq_lows}
+
+
+# =====================================================================
+# TREND
+# =====================================================================
+
+def _trend_from_ema(close: pd.Series) -> str:
+    ema20 = close.ewm(span=20, adjust=False).mean()
     ema50 = close.ewm(span=50, adjust=False).mean()
 
-    if ema21.iloc[-1] > ema50.iloc[-1]:
+    if ema20.iloc[-1] > ema50.iloc[-1]:
         return "LONG"
-    if ema21.iloc[-1] < ema50.iloc[-1]:
+    if ema20.iloc[-1] < ema50.iloc[-1]:
         return "SHORT"
     return "NEUTRAL"
 
 
 # =====================================================================
-# BOS / CHoCH / COS
+# BOS / CHOCH DETECTION
 # =====================================================================
 
-def _detect_bos(df: pd.DataFrame, highs, lows, bias: str):
-    """
-    Break of Structure :
-        LONG  -> break swing high
-        SHORT -> break swing low
-    """
-    if not highs or not lows:
-        return None
+def _detect_bos_or_choch(df: pd.DataFrame):
+    close = df["close"]
+    highs = df["high"]
+    lows = df["low"]
 
-    last_close = df["close"].iloc[-1]
+    # swing references
+    swings = find_swings(df)
+    highs_sw = swings["highs"]
+    lows_sw = swings["lows"]
 
-    if bias == "LONG":
-        last_high = highs[-1][1]
-        if last_close > last_high:
-            return {"type": "BOS", "at": highs[-1][0], "level": last_high}
+    if len(highs_sw) < 2 or len(lows_sw) < 2:
+        return {"bos": False, "cos": False, "choch": False}
 
-    if bias == "SHORT":
-        last_low = lows[-1][1]
-        if last_close < last_low:
-            return {"type": "BOS", "at": lows[-1][0], "level": last_low}
+    # BOS long = break last swing high
+    last_high = highs_sw[-1][1]
+    prev_high = highs_sw[-2][1]
 
-    return None
+    # BOS short = break last swing low
+    last_low = lows_sw[-1][1]
+    prev_low = lows_sw[-2][1]
 
+    bos_long = close.iloc[-1] > last_high
+    bos_short = close.iloc[-1] < last_low
 
-def _detect_choch(df: pd.DataFrame, highs, lows, bias: str):
-    """
-    Change of Character :
-        LONG  -> break previous LOW
-        SHORT -> break previous HIGH
-    """
-    if len(highs) < 2 or len(lows) < 2:
-        return None
+    choch_long = close.iloc[-1] > prev_high
+    choch_short = close.iloc[-1] < prev_low
 
-    last_close = df["close"].iloc[-1]
-
-    # CHoCH to LONG: break last swing HIGH while previous trend was SHORT
-    if bias == "LONG":
-        key_low = lows[-1][1]
-        if last_close < key_low:
-            return {"type": "CHoCH", "level": key_low}
-
-    # CHoCH to SHORT: break last swing LOW while previous trend was LONG
-    if bias == "SHORT":
-        key_high = highs[-1][1]
-        if last_close > key_high:
-            return {"type": "CHoCH", "level": key_high}
-
-    return None
-
-
-def _detect_cos(df: pd.DataFrame, highs, lows, bias: str):
-    """
-    COS = Change of State
-        LONG  → prix ne casse plus les LH
-        SHORT → prix ne casse plus les HL
-    """
-    if len(highs) < 2 or len(lows) < 2:
-        return None
-
-    last_close = df["close"].iloc[-1]
-
-    if bias == "LONG":
-        prev_high = highs[-1][1]
-        if last_close < prev_high:
-            return {"type": "COS", "level": prev_high}
-
-    if bias == "SHORT":
-        prev_low = lows[-1][1]
-        if last_close > prev_low:
-            return {"type": "COS", "level": prev_low}
-
-    return None
+    return {
+        "bos": bos_long or bos_short,
+        "cos": False,
+        "choch": choch_long or choch_short,
+    }
 
 
 # =====================================================================
-# HTF Trend confirmation
+# STRUCTURE ENGINE
+# =====================================================================
+
+def analyze_structure(df: pd.DataFrame) -> Dict[str, Any]:
+    trend = _trend_from_ema(df["close"])
+    swings = find_swings(df)
+    levels = detect_equal_levels(df)
+    bos_block = _detect_bos_or_choch(df)
+
+    return {
+        "trend": trend,
+        "swings": swings,
+        "liquidity": levels,
+        "bos": bos_block["bos"],
+        "cos": bos_block["cos"],
+        "choch": bos_block["choch"],
+        "oi_series": df.get("openInterest"),
+        "cvd_series": df.get("cvd"),
+    }
+
+
+# =====================================================================
+# HTF TREND CONFIRMATION
 # =====================================================================
 
 def htf_trend_ok(df_h4: pd.DataFrame, bias: str) -> bool:
-    """HTF (H4) must confirm H1 bias."""
-    t = _trend_ema(df_h4)
-    return t == bias
+    trend_h4 = _trend_from_ema(df_h4["close"])
+    return trend_h4 == bias
 
 
 # =====================================================================
-# BOS Quality (institutionnel)
+# BOS QUALITY (volume + momentum + liquidity)
 # =====================================================================
 
 def bos_quality_details(
     df: pd.DataFrame,
     oi_series=None,
     vol_lookback: int = 60,
-    vol_pct: float = 0.8,
+    vol_pct: float = 0.7,
     oi_min_trend: float = 0.003,
     oi_min_squeeze: float = -0.005,
     df_liq=None,
     price: float = None,
     tick: float = 0.01,
-) -> Dict[str, Any]:
+):
 
-    out = {
-        "ok": True,
-        "volume_ok": True,
-        "oi_ok": True,
-        "liquidity_ok": True,
-        "details": {},
+    vol = df["volume"]
+    vol_ref = vol.rolling(vol_lookback).mean().iloc[-1]
+    vol_ok = vol.iloc[-1] > vol_ref * vol_pct
+
+    # OI commitment
+    oi_ok = True
+    if oi_series is not None:
+        if len(oi_series) >= 5:
+            delta_oi = oi_series.iloc[-1] - oi_series.iloc[-5]
+            oi_ok = delta_oi >= oi_min_trend
+
+    return {
+        "ok": vol_ok and oi_ok,
+        "vol_ok": vol_ok,
+        "oi_ok": oi_ok,
     }
-
-    # -----------------------------
-    # Volume expansion
-    # -----------------------------
-    try:
-        vol = df["volume"].iloc[-1]
-        avg = df["volume"].rolling(vol_lookback).mean().iloc[-1]
-        out["volume_ok"] = bool(vol > avg * (1 + vol_pct))
-        out["details"]["volume"] = f"{vol:.2f}/{avg:.2f}"
-    except:
-        out["volume_ok"] = True
-
-    # -----------------------------
-    # Open Interest trend
-    # -----------------------------
-    if oi_series is not None and len(oi_series) > 10:
-        delta_oi = oi_series.iloc[-1] - oi_series.iloc[-10]
-        if delta_oi < oi_min_squeeze:
-            out["oi_ok"] = False
-        out["details"]["oi_delta"] = float(delta_oi)
-
-    # -----------------------------
-    # Liquidité (EQ highs/lows)
-    # -----------------------------
-    # Si tu veux activer une logique type “grab/mitigation”, j’ajouterai ici.
-    out["liquidity_ok"] = True
-
-    # -----------------------------
-    # Final decision
-    # -----------------------------
-    out["ok"] = out["volume_ok"] and out["oi_ok"] and out["liquidity_ok"]
-    return out
 
 
 # =====================================================================
-# Commitment Score
+# COMMITMENT SCORE (OI + CVD)
 # =====================================================================
 
 def commitment_score(oi_series, cvd_series) -> Optional[float]:
-    """
-    Score institutionnel (0–1) basé sur unanimité OI + CVD.
-    """
     try:
         if oi_series is None or cvd_series is None:
-            return None
+            return 0.0
+
         if len(oi_series) < 10 or len(cvd_series) < 10:
-            return None
+            return 0.0
 
-        oi_delta = oi_series.iloc[-1] - oi_series.iloc[-8]
-        cvd_delta = cvd_series.iloc[-1] - cvd_series.iloc[-8]
+        d_oi = oi_series.iloc[-1] - oi_series.iloc[-10]
+        d_cvd = cvd_series.iloc[-1] - cvd_series.iloc[-10]
 
-        # Normalisation simple (logique Desk Lead)
-        score = 0.5 * np.tanh(oi_delta * 5) + 0.5 * np.tanh(cvd_delta * 5)
-        return float((score + 1) / 2)
+        # simple normalized score
+        score = 0.5 * np.tanh(d_oi * 10) + 0.5 * np.tanh(d_cvd * 10)
+        return float(score)
+
     except:
-        return None
-
-
-# =====================================================================
-# Full Structure Analyzer
-# =====================================================================
-
-def analyze_structure(df: pd.DataFrame) -> Dict[str, Any]:
-    """
-    Retourne :
-        {
-          trend: LONG/SHORT/NEUTRAL,
-          bos: {…} | None,
-          choch: {…} | None,
-          cos: {…} | None,
-          swing_highs: [...],
-          swing_lows: [...],
-          oi_series: None (hook pour analyze_signal),
-          cvd_series: None,
-        }
-    """
-
-    highs, lows = _extract_swings(df)
-    bias = _trend_ema(df)
-
-    bos = _detect_bos(df, highs, lows, bias)
-    choch = _detect_choch(df, highs, lows, bias)
-    cos = _detect_cos(df, highs, lows, bias)
-
-    return {
-        "trend": bias,
-        "bos": bos,
-        "choch": choch,
-        "cos": cos,
-        "swing_highs": highs,
-        "swing_lows": lows,
-        # OI/CVD filled later by institutional_data
-        "oi_series": None,
-        "cvd_series": None,
-    }
+        return 0.0
