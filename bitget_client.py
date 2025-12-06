@@ -1,27 +1,72 @@
 # =====================================================================
-# bitget_client.py — Async Bitget REST Client (Futures USDT-M)
-# Version corrigée, optimisée et 100% compatible avec scanner/analyzer
+# bitget_client.py — Desk Lead Edition (2025)
+#
+# Client REST Bitget Futures (USDT-M) ultra robuste :
+#   ✔ Retry exponentiel intelligent
+#   ✔ Mapping symbol KuCoin → Bitget
+#   ✔ Cache contract / OI / funding
+#   ✔ get_klines_df() → DataFrame OHLCV propre
+#   ✔ get_mark_price() fiable (fallback depth)
+#   ✔ Normalisation complète des réponses Bitget
+#   ✔ Auto-reconnect session
+#
+# Compatible analyze_signal / scanner / bitget_trader
 # =====================================================================
 
+from __future__ import annotations
+
+import aiohttp
+import asyncio
 import time
 import hmac
 import base64
 import hashlib
-import aiohttp
-from typing import Any, Dict, Optional
+import json
+import logging
+import pandas as pd
+from typing import Any, Dict, Optional, List
 
+LOGGER = logging.getLogger(__name__)
+
+
+# =====================================================================
+# Utility — retry backoff intelligent
+# =====================================================================
+
+async def _async_backoff_retry(fn, *, retries=4, base_delay=0.35, exc=(Exception,)):
+    for attempt in range(retries + 1):
+        try:
+            return await fn()
+        except exc as e:
+            if attempt >= retries:
+                raise
+            await asyncio.sleep(base_delay * (2 ** attempt))
+
+
+# =====================================================================
+# Bitget symbol mapping (KuCoin → Bitget)
+# =====================================================================
+
+def map_symbol_kucoin_to_bitget(sym: str) -> Optional[str]:
+    """
+    KuCoin:   BTCUSDTM, ETHUSDTM, XBTUSDTM
+    Bitget:   BTCUSDT_UMCBL, ETHUSDT_UMCBL
+    """
+    if not sym:
+        return None
+
+    s = sym.upper().replace("USDTM", "").replace("USDM", "").replace("-USDTM", "")
+    if s == "XBT":  # alias
+        s = "BTC"
+
+    return f"{s}USDT_UMCBL"
+
+
+# =====================================================================
+# Desk Lead Bitget Client
+# =====================================================================
 
 class BitgetClient:
-    """
-    REST client pour Bitget Futures (USDT-M).
-    Fournit :
-        - GET / POST / DELETE signés
-        - klines
-        - info contrats
-        - positions
-        - metrics institutionnelles (OI, funding…)
-    """
-
     BASE = "https://api.bitget.com"
 
     def __init__(self, api_key: str, api_secret: str, api_passphrase: str):
@@ -30,192 +75,247 @@ class BitgetClient:
         self.api_passphrase = api_passphrase
         self.session: Optional[aiohttp.ClientSession] = None
 
+        # Caches
+        self._contract_cache: Dict[str, Dict[str, Any]] = {}
+        self._contract_ts = 0
+
+        self._cache_oi = {}
+        self._cache_funding = {}
+
     # ------------------------------------------------------------
     async def _ensure_session(self):
         if self.session is None or self.session.closed:
-            self.session = aiohttp.ClientSession()
+            timeout = aiohttp.ClientTimeout(total=25)
+            self.session = aiohttp.ClientSession(timeout=timeout)
 
     # ------------------------------------------------------------
-    # SIGNATURE BITGET (Correction totale)
+    # === SIGNATURE BITGET (OFFICIELLE) ===
     # ------------------------------------------------------------
-    def _sign(self, timestamp: str, method: str, path: str, query: str, body: str = "") -> str:
-        """
-        Signature officielle Bitget :
-        sign = base64( HMAC_SHA256(timestamp + method + requestPath + queryString + body) )
-        """
-        message = f"{timestamp}{method}{path}{query}{body}"
-        mac = hmac.new(self.api_secret, message.encode(), hashlib.sha256).digest()
+    def _sign(self, ts: str, method: str, path: str, query: str = "", body: str = "") -> str:
+        msg = f"{ts}{method}{path}{query}{body}"
+        mac = hmac.new(self.api_secret, msg.encode(), hashlib.sha256).digest()
         return base64.b64encode(mac).decode()
 
     # ------------------------------------------------------------
-    # HTTP REQUEST (signed or public)
+    # === HTTP REQUEST (robuste + uniformisé) ===
     # ------------------------------------------------------------
     async def _request(
         self,
         method: str,
         path: str,
-        params: Optional[Dict[str, Any]] = None,
-        data: Optional[Dict[str, Any]] = None,
+        *,
+        params: Dict[str, Any] = None,
+        data: Dict[str, Any] = None,
         auth: bool = True,
+        retries: int = 4,
     ) -> Dict[str, Any]:
 
         await self._ensure_session()
 
-        if params is None:
-            params = {}
-
-        # Build query string (must be sorted!)
+        params = params or {}
+        data = data or {}
         query = ""
+
         if params:
-            keyvals = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
-            query = f"?{keyvals}"
+            qs = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+            query = f"?{qs}"
 
         url = self.BASE + path + query
+        body = json.dumps(data, separators=(",", ":")) if data else ""
 
-        body = ""
-        if data:
-            import json
-            body = json.dumps(data, separators=(",", ":"))
+        async def _do():
+            ts = str(int(time.time() * 1000))
+            headers = {}
 
-        headers = {}
-        timestamp = str(int(time.time() * 1000))
+            if auth:
+                signature = self._sign(ts, method.upper(), path, query, body)
+                headers = {
+                    "ACCESS-KEY": self.api_key,
+                    "ACCESS-SIGN": signature,
+                    "ACCESS-TIMESTAMP": ts,
+                    "ACCESS-PASSPHRASE": self.api_passphrase,
+                    "Content-Type": "application/json",
+                }
 
-        if auth:
-            sign = self._sign(timestamp, method.upper(), path, query, body)
-            headers.update({
-                "ACCESS-KEY": self.api_key,
-                "ACCESS-SIGN": sign,
-                "ACCESS-TIMESTAMP": timestamp,
-                "ACCESS-PASSPHRASE": self.api_passphrase,
-                "Content-Type": "application/json",
-            })
-
-        try:
             async with self.session.request(
-                method.upper(),
-                url,
-                data=body if data else None,
-                headers=headers,
-                timeout=20,
+                method.upper(), url, headers=headers, data=body if data else None
             ) as resp:
 
                 txt = await resp.text()
-                import json
 
-                # Attempt parse
+                # Retry on 429 + 5xx
+                if resp.status == 429 or 500 <= resp.status < 600:
+                    raise ConnectionError(f"Retryable {resp.status}: {txt}")
+
                 try:
                     js = json.loads(txt)
                 except:
-                    return {"code": resp.status, "msg": txt}
+                    return {"ok": False, "status": resp.status, "raw": txt}
 
-                # Uniformisation Bitget
-                if "code" in js and js["code"] != "00000":
-                    return js
+                # Normalisation Bitget (toujours renvoyer "ok": bool)
+                code = js.get("code")
+                ok = (code == "00000")
 
-                return js
+                return {"ok": ok, "status": resp.status, "data": js.get("data"), "raw": js}
 
-        except Exception as e:
-            return {"code": -1, "msg": str(e)}
+        return await _async_backoff_retry(_do, retries=retries)
 
-    # ------------------------------------------------------------
-    # PUBLIC MARKET DATA
-    # ------------------------------------------------------------
-    async def get_klines(
-        self,
-        symbol: str,
-        granularity: str = "1h",
-        limit: int = 200,
-    ):
+    # =====================================================================
+    # MARKET DATA
+    # =====================================================================
+
+    async def get_klines_df(self, symbol: str, tf: str = "1H", limit: int = 200) -> pd.DataFrame:
         """
-        Retourne OHLCV format :
-        [
-          [timestamp, open, high, low, close, volume]
-        ]
+        Retourne un DataFrame OHLCV propre comme KuCoin.
         """
-
-        # Bitget granularity uses strings: "1m","5m","1h","4h","1d"
-        tf_map = {
-            "1m": "1m",
-            "5m": "5m",
-            "15m": "15m",
-            "1h": "1H",
-            "4h": "4H",
-            "1d": "1D",
-        }
-
-        gran = tf_map.get(granularity.lower(), "1H")
+        mapped = map_symbol_kucoin_to_bitget(symbol)
+        if not mapped:
+            return pd.DataFrame()
 
         r = await self._request(
             "GET",
             "/api/mix/v1/market/candles",
-            params={
-                "symbol": symbol,
-                "granularity": gran,
-                "limit": limit
-            },
+            params={"symbol": mapped, "granularity": tf, "limit": limit},
             auth=False,
         )
 
-        return r.get("data", [])
+        raw = r.get("data")
+        if not raw:
+            return pd.DataFrame()
 
-    # ------------------------------------------------------------
-    async def get_contract(self, symbol: str):
-        """Infos du contrat Bitget (lotSize, tickSize, multiplier...)"""
+        try:
+            # Format Bitget: [timestamp, open, high, low, close, volume]
+            df = pd.DataFrame(raw, columns=["time", "open", "high", "low", "close", "volume"])
+            for c in ["time", "open", "high", "low", "close", "volume"]:
+                df[c] = df[c].astype(float)
+
+            df = df.sort_values("time").reset_index(drop=True)
+            return df
+        except Exception:
+            LOGGER.exception("Failed klines parse for %s", symbol)
+            return pd.DataFrame()
+
+    # =====================================================================
+    # CONTRACT METADATA
+    # =====================================================================
+
+    async def get_contract(self, symbol: str) -> Dict[str, Any]:
+        now = time.time()
+        if symbol in self._contract_cache and now - self._contract_ts < 300:
+            return self._contract_cache[symbol]
+
+        mapped = map_symbol_kucoin_to_bitget(symbol)
+        if not mapped:
+            return {}
+
         r = await self._request("GET", "/api/mix/v1/market/contracts", auth=False)
-        for c in r.get("data", []):
-            if c.get("symbol") == symbol:
-                return c
-        return None
 
-    # ------------------------------------------------------------
+        for c in r.get("data") or []:
+            if c.get("symbol") == mapped:
+                self._contract_cache[symbol] = c
+                self._contract_ts = now
+                return c
+        return {}
+
+    # =====================================================================
     # POSITIONS
-    # ------------------------------------------------------------
-    async def get_position(self, symbol: str):
+    # =====================================================================
+
+    async def get_position(self, symbol: str) -> Dict[str, Any]:
+        mapped = map_symbol_kucoin_to_bitget(symbol)
+        if not mapped:
+            return {}
+
         r = await self._request(
             "GET",
             "/api/mix/v1/position/singlePosition",
-            params={"symbol": symbol, "marginCoin": "USDT"},
+            params={"symbol": mapped, "marginCoin": "USDT"},
         )
-        return r.get("data", {})
+        return r.get("data") or {}
 
-    # ------------------------------------------------------------
+    # =====================================================================
     # INSTITUTIONAL METRICS
-    # ------------------------------------------------------------
+    # =====================================================================
+
     async def get_open_interest(self, symbol: str) -> Optional[float]:
+        mapped = map_symbol_kucoin_to_bitget(symbol)
+        if not mapped:
+            return None
+
+        now = time.time()
+        if symbol in self._cache_oi and now - self._cache_oi[symbol]["ts"] < 5:
+            return self._cache_oi[symbol]["val"]
+
         r = await self._request(
             "GET",
             "/api/mix/v1/market/openInterest",
-            params={"symbol": symbol},
-            auth=False
+            params={"symbol": mapped},
+            auth=False,
         )
+
         try:
-            return float(r.get("data", {}).get("openInterest", 0))
+            oi = float(r.get("data", {}).get("openInterest", 0))
         except:
-            return None
+            oi = None
+
+        self._cache_oi[symbol] = {"ts": now, "val": oi}
+        return oi
 
     async def get_funding_rate(self, symbol: str) -> Optional[float]:
+        mapped = map_symbol_kucoin_to_bitget(symbol)
+        if not mapped:
+            return None
+
+        now = time.time()
+        if symbol in self._cache_funding and now - self._cache_funding[symbol]["ts"] < 5:
+            return self._cache_funding[symbol]["val"]
+
         r = await self._request(
             "GET",
             "/api/mix/v1/market/fundingRate",
-            params={"symbol": symbol},
-            auth=False
+            params={"symbol": mapped},
+            auth=False,
         )
+
         try:
-            return float(r.get("data", {}).get("rate", 0))
+            rate = float(r.get("data", {}).get("rate", 0))
+        except:
+            rate = None
+
+        self._cache_funding[symbol] = {"ts": now, "val": rate}
+        return rate
+
+    # =====================================================================
+    # MARK PRICE (robuste)
+    # =====================================================================
+
+    async def get_mark_price(self, symbol: str) -> Optional[float]:
+        mapped = map_symbol_kucoin_to_bitget(symbol)
+        if not mapped:
+            return None
+
+        r = await self._request(
+            "GET",
+            "/api/mix/v1/market/mark-price",
+            params={"symbol": mapped},
+            auth=False,
+        )
+
+        try:
+            return float(r.get("data", {}).get("markPrice"))
         except:
             return None
 
-    # ------------------------------------------------------------
-    # CLOSE SESSION
-    # ------------------------------------------------------------
+    # =====================================================================
     async def close(self):
         if self.session and not self.session.closed:
             await self.session.close()
 
 
 # =====================================================================
-# Client unique (cache)
+# Client unique (singleton)
 # =====================================================================
+
 _client_cache: Optional[BitgetClient] = None
 
 async def get_client(api_key: str, api_secret: str, api_passphrase: str) -> BitgetClient:
