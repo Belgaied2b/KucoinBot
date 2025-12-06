@@ -4,8 +4,8 @@
 import pandas as pd
 import numpy as np
 from typing import Dict, Any, Optional
-from .structure_utils import find_swings, detect_equal_levels
-from .indicators import true_atr, volatility_regime
+from structure_utils import find_swings, detect_equal_levels
+from indicators import true_atr, volatility_regime
 
 
 def _round_to_tick(x: float, tick: float) -> float:
