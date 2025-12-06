@@ -1,40 +1,28 @@
 # =====================================================================
-# main.py — Entry point du bot institutionnel Bitget (Async)
+# main.py — Entry point Railway Bitget Bot
 # =====================================================================
+
 import asyncio
-import os
-from dotenv import load_dotenv
-from scanner import run_scanner
+import logging
+from scanner import start_scanner
 
+logging.basicConfig(level=logging.INFO)
 
-def load_env():
-    load_dotenv()
-
-    missing = []
-    env_vars = ["API_KEY", "API_SECRET", "API_PASSPHRASE", "TELEGRAM_TOKEN", "TELEGRAM_CHAT_ID"]
-
-    for v in env_vars:
-        if os.getenv(v) in [None, ""]:
-            missing.append(v)
-
-    if missing:
-        print("⚠️ Variables manquantes:", missing)
-        print("Veuillez compléter votre fichier .env")
-        exit(1)
-
+print("🚀 Bot Bitget Institutionnel — Démarrage...")
 
 async def main():
-    print("🚀 Bot Bitget Institutionnel — Démarrage...")
-
     try:
-        await run_scanner()
+        await start_scanner()   # <= START SCANNER IS NOW ASYNC SAFE
     except Exception as e:
-        print("❌ ERREUR GLOBALE :", e)
-        await asyncio.sleep(5)
-        print("🔁 Redémarrage automatique...")
-        await main()
-
+        print(f"❌ ERREUR GLOBALE : {e}")
 
 if __name__ == "__main__":
-    load_env()
-    asyncio.run(main())
+    # IMPORTANT : we do NOT call asyncio.run() inside an already running loop
+    try:
+        # If no event loop is running → use asyncio.run normally
+        asyncio.run(main())
+    except RuntimeError:
+        # If Railway or PTB already created a loop → reuse it
+        loop = asyncio.get_event_loop()
+        loop.create_task(main())
+        loop.run_forever()
