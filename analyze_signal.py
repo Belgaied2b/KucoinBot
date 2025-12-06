@@ -1,6 +1,8 @@
 # =====================================================================
 # analyze_signal.py — Cerveau du bot institutionnel Bitget
+# Version corrigée, optimisée, compatible scanner / structure / momentum
 # =====================================================================
+
 import pandas as pd
 from typing import Dict, Any, Optional
 
@@ -19,12 +21,12 @@ class SignalAnalyzer:
     """
     Analyse complète d’un signal institutionnel strict.
     Conditions :
-        - Structure alignée (trend, bos/cos)
+        - Structure alignée (trend, bos/cos/choch)
         - HTF confirmation (H4)
         - Score institutionnel >= 2
-        - Momentum propre
-        - Entrée en zone OTE
-        - RR >= 1.6
+        - Momentum institutionnel propre
+        - Entrée dans la zone OTE
+        - RR >= 1.6 (dynamique)
     """
 
     def __init__(self, api_key: str, api_secret: str, api_passphrase: str):
@@ -40,94 +42,95 @@ class SignalAnalyzer:
         rr_min: float = 1.6,
     ) -> Optional[Dict[str, Any]]:
         """
-        Analyse complète.
-        Retourne None si le signal est rejeté,
-        sinon retourne un dictionnaire avec tous les détails du trade.
+        Retourne un signal structuré OU None si le trade est rejeté.
         """
 
         # ------------------------------------------------------------
-        # 1) Structure H1
+        # 1) STRUCTURE H1
         # ------------------------------------------------------------
         struct = analyze_structure(df_h1)
         trend = struct["trend"]
 
         if trend not in ("LONG", "SHORT"):
-            return None  # pas de structure claire
+            return None
 
-        bos = struct["bos"]
-        cos = struct["cos"]
-
-        if not bos and not cos:
-            return None  # pas de rupture validée
+        # BOS, COS ou CHOCH doivent exister
+        if not struct["bos"] and not struct["cos"] and not struct["choch"]:
+            return None
 
         # ------------------------------------------------------------
-        # 2) HTF confirmation (H4)
+        # 2) CONFIRMATION H4
         # ------------------------------------------------------------
         htf = htf_confirm(df_h4)
         if htf != trend:
-            return None  # pas aligné HTF
+            return None
 
         # ------------------------------------------------------------
-        # 3) Momentum
+        # 3) MOMENTUM INSTITUTIONNEL
         # ------------------------------------------------------------
         mom = institutional_momentum(df_h1)
-        if trend == "LONG" and mom != "BULLISH":
+
+        if trend == "LONG" and mom not in ("BULLISH", "STRONG_BULLISH"):
             return None
-        if trend == "SHORT" and mom != "BEARISH":
+
+        if trend == "SHORT" and mom not in ("BEARISH", "STRONG_BEARISH"):
             return None
 
         # ------------------------------------------------------------
-        # 4) Institutional Score
+        # 4) SCORE INSTITUTIONNEL (Funding, OI, CVD, Liquidations)
         # ------------------------------------------------------------
         inst = await self.inst.compute_score(symbol)
+
         if inst["score"] < 2.0:
             return None
 
         # ------------------------------------------------------------
-        # 5) Stop-loss institutionnel
+        # 5) STOP LOSS institutionnel
         # ------------------------------------------------------------
-        tick = float(contract.get("pricePlace", 2))
-        tick = 1 / (10 ** tick)  # Bitget pricePlace → tickSize
+        price_place = int(contract.get("pricePlace", 2))
+        tick = 1 / (10 ** price_place)
 
         sl = compute_stop_loss(df_h1, trend, tick)
 
         # ------------------------------------------------------------
-        # 6) RR Check (minimum 1.6)
+        # 6) RR THEORIQUE MINIMAL
         # ------------------------------------------------------------
-        close = float(df_h1["close"].iloc[-1])
-        risk = abs(close - sl)
+        entry = float(df_h1["close"].iloc[-1])
+        risk = abs(entry - sl)
 
-        # TP1 target theoretical (RR = 1.6)
-        tp_theoretical = close + 1.6 * risk if trend == "LONG" else close - 1.6 * risk
+        tp_test = entry + rr_min * risk if trend == "LONG" else entry - rr_min * risk
 
-        if trend == "LONG" and tp_theoretical <= close:
-            return None
-        if trend == "SHORT" and tp_theoretical >= close:
+        # Rejet si mathématiquement impossible
+        if trend == "LONG" and tp_test <= entry:
             return None
 
+        if trend == "SHORT" and tp_test >= entry:
+            return None
+
         # ------------------------------------------------------------
-        # 7) OTE validation
+        # 7) VALIDATION OTE
         # ------------------------------------------------------------
         ote = compute_ote(df_h1, trend)
         ote62 = ote.get("ote_62")
         ote705 = ote.get("ote_705")
 
         in_ote = False
+
         if trend == "LONG":
-            if ote62 and ote705 and close >= ote62 and close <= ote705:
+            if ote62 and ote705 and ote62 <= entry <= ote705:
                 in_ote = True
         else:
-            if ote62 and ote705 and close <= ote62 and close >= ote705:
+            if ote62 and ote705 and ote705 <= entry <= ote62:
                 in_ote = True
 
         if not in_ote:
             return None
 
         # ------------------------------------------------------------
-        # 8) TP1 Dyn clamp
+        # 8) TP1 dynamique institutionnel
         # ------------------------------------------------------------
         tp1, rr_used = compute_tp1(
-            entry=close,
+            entry=entry,
             sl=sl,
             bias=trend,
             df=df_h1,
@@ -138,11 +141,11 @@ class SignalAnalyzer:
             return None
 
         # ------------------------------------------------------------
-        # Pack result
+        # 9) PACK RESULT FINAL
         # ------------------------------------------------------------
         return {
             "side": trend,
-            "entry": close,
+            "entry": entry,
             "sl": sl,
             "tp1": tp1,
             "rr": rr_used,
