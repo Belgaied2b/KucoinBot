@@ -215,9 +215,21 @@ async def scan_loop():
         await asyncio.sleep(SCAN_INTERVAL_MIN * 60)
 
 
-def run_scanner():
-    asyncio.run(scan_loop())
+# ============================================================
+# MAIN ENTRY — ASYNC SAFE FOR RAILWAY
+# ============================================================
+
+async def run_scanner():
+    await scan_loop()
 
 
 if __name__ == "__main__":
-    run_scanner()
+    try:
+        # Cas normal : aucune event-loop existante → on utilise run
+        asyncio.run(run_scanner())
+    except RuntimeError:
+        # Cas Railway/PTB : une loop existe déjà → on la réutilise
+        loop = asyncio.get_event_loop()
+        loop.create_task(run_scanner())
+        loop.run_forever()
+
