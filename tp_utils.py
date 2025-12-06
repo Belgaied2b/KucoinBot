@@ -3,7 +3,7 @@
 # =====================================================================
 import pandas as pd
 from typing import Tuple
-from .indicators import true_atr
+from indicators import true_atr
 
 
 def _round_to_tick(x: float, tick: float) -> float:
