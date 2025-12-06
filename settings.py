@@ -28,6 +28,13 @@ def _to_float(v: str) -> float:
     except:
         return float(v.replace(",", "."))
 
+# ============================================================
+# API KEYS (BITGET)
+# ============================================================
+API_KEY = _get("API_KEY")
+API_SECRET = _get("API_SECRET")
+API_PASSPHRASE = _get("API_PASSPHRASE")
+
 
 # ============================================================
 # TELEGRAM / ENV
