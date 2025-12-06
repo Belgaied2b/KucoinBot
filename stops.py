@@ -1,178 +1,111 @@
 # =====================================================================
-# stops.py — Stop-loss institutionnel strict (structure + liquidité + ATR)
+# stops.py — Desk Lead Institutional Stop Engine (FULL VERSION)
+# Compatible analyze_signal.py (protective_stop_long / protective_stop_short)
 # =====================================================================
+
 import pandas as pd
 import numpy as np
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Tuple, Optional
+
 from structure_utils import find_swings, detect_equal_levels
-from indicators import true_atr, volatility_regime
 
 
-def _round_to_tick(x: float, tick: float) -> float:
-    if tick <= 0:
-        return float(x)
-    steps = round(x / tick)
-    return round(steps * tick, 12)
+# =====================================================================
+# Helper — Round to Tick
+# =====================================================================
+
+def _round_to_tick(price: float, tick: float) -> float:
+    return round(price / tick) * tick
 
 
-def stop_structure(df: pd.DataFrame, bias: str) -> Optional[float]:
+# =====================================================================
+# CORE LOGIC — Protective Stop for LONG
+# =====================================================================
+
+def protective_stop_long(df: pd.DataFrame, entry: float, tick: float,
+                         return_meta: bool = False) -> Tuple[float, Dict[str, Any]]:
     """
-    SL basé sur swing structure :
-        - LONG : sous le dernier swing low
-        - SHORT : au-dessus du dernier swing high
+    Stop Loss institutionnel pour un long :
+        - sous swing low récent
+        - sous blocs de liquidité (equal lows)
+        - sous ATR buffer
+        - jamais trop loin (clamp max)
     """
-    swings = find_swings(df)
-    if bias.upper() == "LONG":
-        lows = swings["lows"]
-        if not lows:
-            return None
-        idx = lows[-1]
-        return float(df["low"].iloc[idx])
 
-    else:
-        highs = swings["highs"]
-        if not highs:
-            return None
-        idx = highs[-1]
-        return float(df["high"].iloc[idx])
-
-
-def stop_liquidity(df: pd.DataFrame, bias: str) -> Optional[float]:
-    """
-    SL sous les equal lows (LONG) ou au-dessus des equal highs (SHORT).
-    """
+    lows = df["low"]
+    swings = find_swings(df, left=3, right=3)["lows"]
     liq = detect_equal_levels(df)
-    if bias.upper() == "LONG":
-        eql = liq["equal_lows"]
-        if not eql:
-            return None
-        # choisir le LOW le plus "proche" (dernier)
-        lvl = float(df["low"].iloc[eql[-1]])
-        return lvl
 
+    # Dernier swing low propre
+    if swings:
+        last_swing_low = float(swings[-1][1])
     else:
-        eqh = liq["equal_highs"]
-        if not eqh:
-            return None
-        lvl = float(df["high"].iloc[eqh[-1]])
-        return lvl
+        last_swing_low = float(lows.tail(10).min())
+
+    # Equal lows (liquidity pools)
+    eq_lows = liq.get("eq_lows", [])
+    liq_low = min(eq_lows) if eq_lows else last_swing_low
+
+    # ATR buffer
+    atr = df["high"].rolling(14).max() - df["low"].rolling(14).min()
+    atr_val = float(atr.iloc[-1] if not np.isnan(atr.iloc[-1]) else atr.mean())
+
+    sl_raw = min(last_swing_low, liq_low) - atr_val * 0.2
+    sl_final = _round_to_tick(sl_raw, tick)
+
+    meta = {
+        "last_swing_low": last_swing_low,
+        "liq_low": liq_low,
+        "atr": atr_val,
+        "sl_raw": sl_raw,
+    }
+
+    if return_meta:
+        return sl_final, meta
+    return sl_final, {}
 
 
-def stop_atr(df: pd.DataFrame, bias: str, mult: float = 1.8) -> Optional[float]:
+# =====================================================================
+# CORE LOGIC — Protective Stop for SHORT
+# =====================================================================
+
+def protective_stop_short(df: pd.DataFrame, entry: float, tick: float,
+                          return_meta: bool = False) -> Tuple[float, Dict[str, Any]]:
     """
-    ATR SL fallback : entry +/- ATR*x
+    Stop Loss institutionnel pour un short :
+        - au-dessus dernier swing high
+        - au-dessus equal highs (liquidity)
+        - ATR buffer
     """
-    atr = true_atr(df)
-    if len(atr) < 5:
-        return None
-    a = float(atr.iloc[-1])
-    c = float(df["close"].iloc[-1])
 
-    if bias.upper() == "LONG":
-        return c - a * mult
+    highs = df["high"]
+    swings = find_swings(df, left=3, right=3)["highs"]
+    liq = detect_equal_levels(df)
+
+    # Dernier swing high propre
+    if swings:
+        last_swing_high = float(swings[-1][1])
     else:
-        return c + a * mult
+        last_swing_high = float(highs.tail(10).max())
 
+    # Equal highs (liquidity pools)
+    eq_highs = liq.get("eq_highs", [])
+    liq_high = max(eq_highs) if eq_highs else last_swing_high
 
-def stop_regime_adjust(sl: float, df: pd.DataFrame, bias: str) -> float:
-    """
-    Ajuste SL selon régime volatilité :
-        HIGH vol → SL élargi
-        LOW vol  → SL resserré légèrement
-    """
-    regime = volatility_regime(df)
-    c = float(df["close"].iloc[-1])
-    dist = abs(c - sl)
+    # ATR buffer
+    atr = df["high"].rolling(14).max() - df["low"].rolling(14).min()
+    atr_val = float(atr.iloc[-1] if not np.isnan(atr.iloc[-1]) else atr.mean())
 
-    if regime == "HIGH":
-        dist *= 1.25
-    elif regime == "LOW":
-        dist *= 0.9
+    sl_raw = max(last_swing_high, liq_high) + atr_val * 0.2
+    sl_final = _round_to_tick(sl_raw, tick)
 
-    if bias.upper() == "LONG":
-        return c - dist
-    else:
-        return c + dist
+    meta = {
+        "last_swing_high": last_swing_high,
+        "liq_high": liq_high,
+        "atr": atr_val,
+        "sl_raw": sl_raw,
+    }
 
-
-def compute_stop_loss(
-    df: pd.DataFrame,
-    bias: str,
-    tick: float = 0.01,
-    prefer_liquidity: bool = True
-) -> float:
-    """
-    Stop-loss institutionnel final.
-    Ordre de priorité :
-        1) Liquidité (equal highs/lows) si dispo
-        2) Structure swing
-        3) ATR fallback
-    Puis :
-        + ajustement regime de volatilité
-        + arrondi au tick
-        + fail-safe global
-    """
-
-    bias = bias.upper()
-    close = float(df["close"].iloc[-1])
-
-    # ------------------------------
-    # 1) Liquidité
-    # ------------------------------
-    sl_liq = stop_liquidity(df, bias) if prefer_liquidity else None
-
-    # ------------------------------
-    # 2) Structure swing
-    # ------------------------------
-    sl_struct = stop_structure(df, bias)
-
-    # ------------------------------
-    # 3) ATR fallback
-    # ------------------------------
-    sl_atr = stop_atr(df, bias)
-
-    # Choix du SL brut
-    candidates = []
-
-    if sl_liq is not None:
-        candidates.append(sl_liq)
-    if sl_struct is not None:
-        candidates.append(sl_struct)
-    if sl_atr is not None:
-        candidates.append(sl_atr)
-
-    if not candidates:
-        # Dernier fail-safe
-        if bias == "LONG":
-            sl_raw = close * 0.97
-        else:
-            sl_raw = close * 1.03
-    else:
-        if bias == "LONG":
-            # On veut le SL le plus bas parmi les options
-            sl_raw = min(candidates)
-        else:
-            # On veut le SL le plus haut parmi les options
-            sl_raw = max(candidates)
-
-    # ------------------------------
-    # Ajustement régime volatilité
-    # ------------------------------
-    sl_adj = stop_regime_adjust(sl_raw, df, bias)
-
-    # ------------------------------
-    # Arrondi au tick
-    # ------------------------------
-    sl_final = _round_to_tick(sl_adj, tick)
-
-    # ------------------------------
-    # Fail-safe : éviter SL trop serré
-    # ------------------------------
-    dist = abs(close - sl_final)
-    if dist < close * 0.0015:  # <0.15%
-        if bias == "LONG":
-            sl_final = close * 0.9985
-        else:
-            sl_final = close * 1.0015
-
-    return float(sl_final)
+    if return_meta:
+        return sl_final, meta
+    return sl_final, {}
