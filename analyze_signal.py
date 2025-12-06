@@ -4,15 +4,15 @@
 import pandas as pd
 from typing import Dict, Any, Optional
 
-from .structure_utils import analyze_structure, htf_confirm
-from .indicators import (
+from structure_utils import analyze_structure, htf_confirm
+from indicators import (
     institutional_momentum,
     compute_ote,
     true_atr,
 )
-from .stops import compute_stop_loss
-from .tp_utils import compute_tp1
-from .institutional_data import InstitutionalData
+from stops import compute_stop_loss
+from tp_utils import compute_tp1
+from institutional_data import InstitutionalData
 
 
 class SignalAnalyzer:
