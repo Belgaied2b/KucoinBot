@@ -1,12 +1,12 @@
 # =====================================================================
 # scanner.py — Bitget Desk Lead Scanner (Institutionnel H1+H4)
+# Version stable, corrigée, compatible SignalAnalyzer v1.0
 # =====================================================================
 
 import asyncio
 import logging
 import time
 import pandas as pd
-from datetime import datetime
 
 from settings import (
     API_KEY, API_SECRET, API_PASSPHRASE,
@@ -19,20 +19,22 @@ from bitget_trader import BitgetTrader
 from analyze_signal import SignalAnalyzer
 from telegram.ext import Application
 
+
 LOGGER = logging.getLogger(__name__)
 
-# ============================================================
-# TELEGRAM (instance unique)
-# ============================================================
+# =====================================================================
+# TELEGRAM — INSTANCE UNIQUE (fix erreurs "app already started")
+# =====================================================================
 
 TELEGRAM_APP: Application | None = None
 
 async def init_telegram():
+    """Initialize telegram application once."""
     global TELEGRAM_APP
     if TELEGRAM_APP is None:
         TELEGRAM_APP = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-        await TELEGRAM_APP.initialize()        # <<< IMPORTANT
-        await TELEGRAM_APP.start()             # <<< IMPORTANT
+        await TELEGRAM_APP.initialize()
+        await TELEGRAM_APP.start()
 
 async def send_telegram(text: str):
     try:
@@ -46,49 +48,48 @@ async def send_telegram(text: str):
         LOGGER.error(f"Telegram error: {e}")
 
 
-# ============================================================
+# =====================================================================
 # OHLCV → DataFrame
-# ============================================================
+# =====================================================================
 
-def to_df(ohlcv_raw):
-    if not ohlcv_raw:
+def to_df(raw):
+    if not raw:
         return pd.DataFrame()
 
     df = pd.DataFrame(
-        ohlcv_raw,
-        columns=["timestamp", "open", "high", "low", "close", "volume"]
+        raw, columns=["timestamp", "open", "high", "low", "close", "volume"]
     )
 
     df = df.astype({
-        "timestamp": "float",
-        "open": "float",
-        "high": "float",
-        "low": "float",
-        "close": "float",
-        "volume": "float",
+        "timestamp": float,
+        "open": float,
+        "high": float,
+        "low": float,
+        "close": float,
+        "volume": float,
     })
 
     return df.sort_values("timestamp").reset_index(drop=True)
 
 
-# ============================================================
-# FETCH SYMBOLS BITGET
-# ============================================================
+# =====================================================================
+# FETCH SYMBOLS
+# =====================================================================
 
 async def fetch_all_symbols_bitget(client):
     data = await client._request("GET", "/api/mix/v1/market/contracts", auth=False)
 
-    syms = []
+    symbols = []
     for c in data.get("data", []):
-        if c.get("quoteCoin") == "USDT" and c.get("symbol", "").endswith("_UMCBL"):
-            syms.append(c["symbol"])
+        if c.get("quoteCoin") == "USDT" and c["symbol"].endswith("_UMCBL"):
+            symbols.append(c["symbol"])
 
-    return syms
+    return symbols
 
 
-# ============================================================
-# FETCH MULTI-TF OHLCV
-# ============================================================
+# =====================================================================
+# FETCH OHLCV TF
+# =====================================================================
 
 async def fetch_tf_df(symbol: str, tf: str, limit: int = 200):
     client = await get_client(API_KEY, API_SECRET, API_PASSPHRASE)
@@ -96,26 +97,24 @@ async def fetch_tf_df(symbol: str, tf: str, limit: int = 200):
     return to_df(raw)
 
 
-# ============================================================
+# =====================================================================
 # MACRO CACHE
-# ============================================================
+# =====================================================================
 
 MACRO_CACHE = {"ts": 0, "BTC": None}
 MACRO_TTL = 120
 
-async def fetch_macro_data():
+async def fetch_macro():
     now = time.time()
     if now - MACRO_CACHE["ts"] < MACRO_TTL:
         return MACRO_CACHE
 
     client = await get_client(API_KEY, API_SECRET, API_PASSPHRASE)
-
-    raw_btc = await client.get_klines("BTCUSDT_UMCBL", "1H", limit=200)
-    df_btc = to_df(raw_btc)
+    raw = await client.get_klines("BTCUSDT_UMCBL", "1H", limit=200)
 
     MACRO_CACHE.update({
         "ts": now,
-        "BTC": df_btc,
+        "BTC": to_df(raw),
         "TOTAL": None,
         "TOTAL2": None,
     })
@@ -123,9 +122,9 @@ async def fetch_macro_data():
     return MACRO_CACHE
 
 
-# ============================================================
-# PROCESS SYMBOL
-# ============================================================
+# =====================================================================
+# PROCESS A SINGLE SYMBOL
+# =====================================================================
 
 async def process_symbol(symbol: str, analyzer: SignalAnalyzer, trader: BitgetTrader):
     try:
@@ -135,57 +134,64 @@ async def process_symbol(symbol: str, analyzer: SignalAnalyzer, trader: BitgetTr
         if df_h1.empty or df_h4.empty or len(df_h1) < 80:
             return
 
-        macro = await fetch_macro_data()
+        macro = await fetch_macro()
 
-        # --- Analyse principale (ASYNC)
-        result = await analyzer.analyze(symbol, df_h1, df_h4, macro)
+        # Analyze (ASYNC)
+        result = await analyzer.analyze(symbol, df_h1, df_h4)
 
-        if not result or not result.get("signal"):
+        if not result or not result.get("valid"):
             return
 
-        sig = result["signal"]
-        side = sig["side"]
-        entry = sig["entry"]
-        sl = sig["sl"]
-        tp1 = sig.get("tp1")
-        tp2 = sig.get("tp2")
-        qty = sig["qty"]
+        # Extract signal
+        bias = result["bias"]
+        entry = result["entry"]
+        sl = result["sl"]
+        tp1 = result["tp1"]
+        rr = result["rr"]
 
-        LOGGER.warning(f"🎯 SIGNAL {symbol} → {side} @ {entry}")
+        # Sizing already done inside analyzer
+        qty = result.get("qty", None)
+        if qty is None:
+            LOGGER.error(f"No qty returned by analyzer for {symbol}")
+            return
+
+        LOGGER.warning(f"🎯 {symbol} — {bias} @ {entry} (RR {rr:.2f})")
 
         # Telegram
         await send_telegram(
-            f"🚀 *Signal détecté*\n"
-            f"• **{symbol}**\n"
-            f"• Direction: *{side}*\n"
+            f"🚀 *Signal confirmé — Desk Lead*\n"
+            f"• **{symbol}** — *{bias}*\n"
             f"• Entrée: `{entry}`\n"
             f"• SL: `{sl}`\n"
-            f"• TP1: `{tp1}` | TP2: `{tp2}`\n"
+            f"• TP1: `{tp1}`\n"
+            f"• RR: `{rr:.2f}`\n"
             f"• Qty: `{qty}`\n"
-            f"• Score core: `{result.get('score')}`\n"
+            f"• Inst score: `{result.get('institutional_score')}`\n"
         )
 
-        # === EXECUTION DESK LEAD ===
-        entry_res = await trader.place_limit(symbol, side, entry, qty)
+        # ===============================
+        # EXECUTION (Desk Lead Mode)
+        # ===============================
 
+        entry_res = await trader.place_limit(symbol, bias, entry, qty)
         if entry_res.get("code") != "00000":
-            LOGGER.error(f"Entry error {symbol}: {entry_res}")
+            LOGGER.error(f"Entry failed for {symbol}: {entry_res}")
             return
 
-        await trader.place_stop_loss(symbol, side, sl, qty)
+        await trader.place_stop_loss(symbol, bias, sl, qty)
+        await trader.place_take_profit(symbol, bias, tp1, qty * 0.5)
 
-        if tp1:
-            await trader.place_take_profit(symbol, side, tp1, qty * 0.5)
+        tp2 = result.get("tp2")
         if tp2:
-            await trader.place_take_profit(symbol, side, tp2, qty * 0.5)
+            await trader.place_take_profit(symbol, bias, tp2, qty * 0.5)
 
     except Exception as e:
         LOGGER.error(f"[{symbol}] process_symbol error: {e}")
 
 
-# ============================================================
+# =====================================================================
 # MAIN LOOP
-# ============================================================
+# =====================================================================
 
 async def scan_loop():
     client = await get_client(API_KEY, API_SECRET, API_PASSPHRASE)
@@ -195,21 +201,23 @@ async def scan_loop():
     while True:
         try:
             LOGGER.info("=== START SCAN ===")
-            symbols = await fetch_all_symbols_bitget(client)
 
-            tasks = [process_symbol(sym, analyzer, trader) for sym in symbols]
+            symbols = await fetch_all_symbols_bitget(client)
+            tasks = [process_symbol(s, analyzer, trader) for s in symbols]
+
             await asyncio.gather(*tasks)
 
             LOGGER.info("=== END SCAN ===")
+
         except Exception as e:
             LOGGER.error(f"SCAN ERROR: {e}")
 
         await asyncio.sleep(SCAN_INTERVAL_MIN * 60)
 
 
-def start_scanner():
+def run_scanner():
     asyncio.run(scan_loop())
 
 
 if __name__ == "__main__":
-    start_scanner()
+    run_scanner()
