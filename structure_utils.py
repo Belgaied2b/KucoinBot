@@ -1,6 +1,8 @@
 # =====================================================================
 # structure_utils.py — Structure de marché institutionnelle (BOS/CHOCH/COS)
+# Optimisé pour analyze_signal, stops, tp_utils et moteur Bitget
 # =====================================================================
+
 import numpy as np
 import pandas as pd
 from typing import List, Dict, Optional, Any
@@ -11,46 +13,52 @@ from typing import List, Dict, Optional, Any
 # ---------------------------------------------------------------------
 def find_swings(df: pd.DataFrame, left: int = 2, right: int = 2) -> Dict[str, List[int]]:
     """
-    Détecte les swings highs / lows simples.
+    Détecte les swings highs / lows robustes.
     left/right = nombre de bougies de chaque côté.
     """
+
     highs = []
     lows = []
 
     high = df["high"].values
     low = df["low"].values
 
-    for i in range(left, len(df) - right):
-        if all(high[i] > high[i - j - 1] for j in range(left)) and \
-           all(high[i] > high[i + j + 1] for j in range(right)):
+    length = len(df)
+    if length < left + right + 3:
+        return {"highs": [], "lows": []}
+
+    for i in range(left, length - right):
+        if all(high[i] > high[i - (j + 1)] for j in range(left)) and \
+           all(high[i] > high[i + (j + 1)] for j in range(right)):
             highs.append(i)
 
-        if all(low[i] < low[i - j - 1] for j in range(left)) and \
-           all(low[i] < low[i + j + 1] for j in range(right)):
+        if all(low[i] < low[i - (j + 1)] for j in range(left)) and \
+           all(low[i] < low[i + (j + 1)] for j in range(right)):
             lows.append(i)
 
     return {"highs": highs, "lows": lows}
 
 
 # ---------------------------------------------------------------------
-# EQUAL HIGHS / EQUAL LOWS — LIQUIDITY ZONES
+# LIQUIDITY ZONES (Equal Highs / Equal Lows)
 # ---------------------------------------------------------------------
 def detect_equal_levels(df: pd.DataFrame, tolerance: float = 0.0015) -> Dict[str, List[int]]:
     """
-    Trouve equal highs / equal lows dans une tolérance relative.
+    Détecte equal highs / equal lows avec tolérance relative.
     tolerance = 0.0015 → 0.15%
     """
+
     eqh = []
     eql = []
 
     high = df["high"].values
     low = df["low"].values
+    length = len(df)
 
-    for i in range(2, len(df) - 2):
-        # Detect Equal Highs
+    for i in range(1, length - 1):
         if abs(high[i] - high[i - 1]) / max(high[i], 1e-8) <= tolerance:
             eqh.append(i)
-        # Detect Equal Lows
+
         if abs(low[i] - low[i - 1]) / max(low[i], 1e-8) <= tolerance:
             eql.append(i)
 
@@ -58,13 +66,13 @@ def detect_equal_levels(df: pd.DataFrame, tolerance: float = 0.0015) -> Dict[str
 
 
 # ---------------------------------------------------------------------
-# Trend direction simple (higher-high / lower-low)
+# TREND DIRECTION (HH/HL / LH/LL)
 # ---------------------------------------------------------------------
 def detect_trend(df: pd.DataFrame, swings: Dict[str, List[int]]) -> str:
     """
-    Trend = LONG si structure monte (HH / HL)
-            SHORT si structure descend (LH / LL)
-            NEUTRAL si indéfini
+    Trend = LONG si HH / HL
+            SHORT si LH / LL
+            NEUTRAL sinon
     """
 
     highs = swings["highs"]
@@ -73,16 +81,17 @@ def detect_trend(df: pd.DataFrame, swings: Dict[str, List[int]]) -> str:
     if len(highs) < 2 or len(lows) < 2:
         return "NEUTRAL"
 
-    last_highs = highs[-2:]
-    last_lows = lows[-2:]
+    h0, h1 = highs[-2], highs[-1]
+    l0, l1 = lows[-2], lows[-1]
 
-    hh = df["high"].iloc[last_highs[1]] > df["high"].iloc[last_highs[0]]
-    ll = df["low"].iloc[last_lows[1]] < df["low"].iloc[last_lows[0]]
+    hh = df["high"].iloc[h1] > df["high"].iloc[h0]
+    ll = df["low"].iloc[l1] < df["low"].iloc[l0]
 
     if hh and not ll:
         return "LONG"
     if ll and not hh:
         return "SHORT"
+
     return "NEUTRAL"
 
 
@@ -91,25 +100,34 @@ def detect_trend(df: pd.DataFrame, swings: Dict[str, List[int]]) -> str:
 # ---------------------------------------------------------------------
 def detect_bos(df: pd.DataFrame, swings: Dict[str, List[int]]) -> Optional[Dict[str, Any]]:
     """
-    BOS = cassure d'un swing récent avec clôture au-dessus/dessous.
+    BOS = cassure avec clôture au-dessus (UP) ou en-dessous (DOWN)
     """
+
     highs = swings["highs"]
     lows = swings["lows"]
 
     if len(highs) < 2 or len(lows) < 2:
         return None
 
-    close = df["close"].values
+    close_val = df["close"].iloc[-1]
 
-    # Break up (bullish BOS)
+    # Bullish BOS → cassure du dernier swing high
     last_high = highs[-2]
-    if close[-1] > df["high"].iloc[last_high]:
-        return {"type": "BOS_UP", "level": df["high"].iloc[last_high], "index": last_high}
+    if close_val > df["high"].iloc[last_high]:
+        return {
+            "type": "BOS_UP",
+            "level": float(df["high"].iloc[last_high]),
+            "index": last_high,
+        }
 
-    # Break down (bearish BOS)
+    # Bearish BOS → cassure du dernier swing low
     last_low = lows[-2]
-    if close[-1] < df["low"].iloc[last_low]:
-        return {"type": "BOS_DOWN", "level": df["low"].iloc[last_low], "index": last_low}
+    if close_val < df["low"].iloc[last_low]:
+        return {
+            "type": "BOS_DOWN",
+            "level": float(df["low"].iloc[last_low]),
+            "index": last_low,
+        }
 
     return None
 
@@ -119,11 +137,12 @@ def detect_bos(df: pd.DataFrame, swings: Dict[str, List[int]]) -> Optional[Dict[
 # ---------------------------------------------------------------------
 def detect_choch(df: pd.DataFrame, swings: Dict[str, List[int]]) -> Optional[Dict[str, Any]]:
     """
-    CHOCH = BOS dans la direction opposée du trend.
+    CHOCH = BOS dans la direction opposée à la tendance.
     """
 
     trend = detect_trend(df, swings)
     bos = detect_bos(df, swings)
+
     if not bos:
         return None
 
@@ -141,11 +160,12 @@ def detect_choch(df: pd.DataFrame, swings: Dict[str, List[int]]) -> Optional[Dic
 # ---------------------------------------------------------------------
 def detect_cos(df: pd.DataFrame, swings: Dict[str, List[int]]) -> Optional[Dict[str, Any]]:
     """
-    COS = cassure dans la direction du trend.
+    COS = BOS dans la direction de la tendance.
     """
 
     trend = detect_trend(df, swings)
     bos = detect_bos(df, swings)
+
     if not bos:
         return None
 
@@ -159,7 +179,7 @@ def detect_cos(df: pd.DataFrame, swings: Dict[str, List[int]]) -> Optional[Dict[
 
 
 # ---------------------------------------------------------------------
-# HTF trend confirmation (e.g. H4)
+# HTF CONFIRMATION (H4 Trend)
 # ---------------------------------------------------------------------
 def htf_confirm(htf_df: pd.DataFrame) -> str:
     swings = find_swings(htf_df)
@@ -167,9 +187,13 @@ def htf_confirm(htf_df: pd.DataFrame) -> str:
 
 
 # ---------------------------------------------------------------------
-# Structure summary for analyze_signal
+# MASTER STRUCTURE ANALYSIS
 # ---------------------------------------------------------------------
 def analyze_structure(df: pd.DataFrame) -> Dict[str, Any]:
+    """
+    Résumé complet pour analyze_signal.py
+    """
+
     swings = find_swings(df)
     trend = detect_trend(df, swings)
     bos = detect_bos(df, swings)
