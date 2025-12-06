@@ -5,13 +5,13 @@ import asyncio
 import pandas as pd
 from typing import List, Dict, Any
 
-from core.bitget_client import get_client
-from core.bitget_trader import BitgetTrader
-from core.analyze_signal import SignalAnalyzer
-from core.sizing import compute_position_size
-from core.risk_manager import RiskManager
-from utils.duplicate_guard import DuplicateGuard
-from utils.telegram_client import send_telegram_message
+from bitget_client import get_client
+from bitget_trader import BitgetTrader
+from analyze_signal import SignalAnalyzer
+from sizing import compute_position_size
+from risk_manager import RiskManager
+from duplicate_guard import DuplicateGuard
+from telegram_client import send_telegram_message
 
 
 # ============================================================
