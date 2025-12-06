@@ -8,14 +8,11 @@ import aiohttp
 import numpy as np
 from typing import Dict, Any
 
-
 BINANCE_FUTURES = "https://fapi.binance.com"
-
 
 # ================================================================
 # Helpers
 # ================================================================
-
 async def _fetch(session, url, params=None):
     try:
         async with session.get(url, params=params, timeout=5) as r:
@@ -23,18 +20,15 @@ async def _fetch(session, url, params=None):
     except Exception:
         return {}
 
-
 def _slope(series, lookback=5):
     """Simple slope estimator."""
     if series is None or len(series) < lookback + 1:
         return 0.0
     return float(series[-1] - series[-lookback]) / max(abs(series[-lookback]), 1e-9)
 
-
 # ================================================================
 # Fetchers — Binance
 # ================================================================
-
 async def fetch_oi(session, symbol: str):
     url = BINANCE_FUTURES + "/futures/data/openInterestHist"
     r = await _fetch(session, url, params={"symbol": symbol, "period": "5m", "limit": 30})
@@ -42,7 +36,6 @@ async def fetch_oi(session, symbol: str):
         return [float(x["sumOpenInterest"]) for x in r]
     except:
         return None
-
 
 async def fetch_funding(session, symbol: str):
     url = BINANCE_FUTURES + "/fapi/v1/fundingRate"
@@ -52,33 +45,29 @@ async def fetch_funding(session, symbol: str):
     except:
         return 0.0
 
-
 async def fetch_cvd(session, symbol: str):
     url = BINANCE_FUTURES + "/fapi/v1/depth"
     r = await _fetch(session, url, params={"symbol": symbol, "limit": 100})
     try:
-        bids = sum(float(b[1]) for b in r["bids"])
-        asks = sum(float(a[1]) for a in r["asks"])
-        return bids - asks
+        bids = sum(float(b[1]) for b in r.get("bids", []))
+        asks = sum(float(a[1]) for a in r.get("asks", []))
+        return bids - asks  # real-time imbalance
     except:
         return 0.0
 
-
 async def fetch_liquidations(session, symbol: str):
     url = BINANCE_FUTURES + "/futures/data/liquidationOrders"
-    r = await _fetch(session, url, params={"symbol": symbol, "limit": 50"})
+    r = await _fetch(session, url, params={"symbol": symbol, "limit": 50})
     try:
-        buys = sum(float(x["executedQty"]) for x in r if x["side"] == "BUY")
-        sells = sum(float(x["executedQty"]) for x in r if x["side"] == "SELL")
+        buys = sum(float(x["executedQty"]) for x in r if x.get("side") == "BUY")
+        sells = sum(float(x["executedQty"]) for x in r if x.get("side") == "SELL")
         return buys, sells
     except:
         return 0.0, 0.0
 
-
 # ================================================================
 # Institutional Analysis — Main function
 # ================================================================
-
 async def compute_full_institutional_analysis(symbol: str, bias: str) -> Dict[str, Any]:
     """
     Retourne :
@@ -90,7 +79,8 @@ async def compute_full_institutional_analysis(symbol: str, bias: str) -> Dict[st
         - pressure directionnelle
     """
 
-    binance_symbol = symbol.replace("_UMCBL", "").upper()  # EX: BTCUSDT
+    # Bitget → Binance symbol conversion
+    binance_symbol = symbol.replace("_UMCBL", "").upper()
 
     async with aiohttp.ClientSession() as session:
 
@@ -100,8 +90,8 @@ async def compute_full_institutional_analysis(symbol: str, bias: str) -> Dict[st
         liq_buy, liq_sell = await fetch_liquidations(session, binance_symbol)
 
     # Slopes
-    oi_slope = _slope(oi) if oi else 0.0
-    cvd_slope = cvd  # cvd = real-time imbalance
+    oi_slope = _slope(oi)
+    cvd_slope = cvd  # direct imbalance from orderbook
 
     # Liquidation imbalance
     liq_pressure = (liq_buy - liq_sell) / max(liq_buy + liq_sell + 1e-9, 1)
@@ -123,7 +113,7 @@ async def compute_full_institutional_analysis(symbol: str, bias: str) -> Dict[st
     if (bias == "LONG" and funding > 0) or (bias == "SHORT" and funding < 0):
         score += 1
 
-    # Pressure combines cvd & liquidation imbalance
+    # Directional pressure (smoothed)
     pressure = 0.5 * np.tanh(cvd_slope / 5000) + 0.5 * liq_pressure
 
     return {
@@ -135,7 +125,8 @@ async def compute_full_institutional_analysis(symbol: str, bias: str) -> Dict[st
         "liq_pressure": liq_pressure,
 
         "pressure": float(pressure),
-        "institutional_score": score,   # utilisé par analyze_signal
+        "institutional_score": int(score),
+
         "details": {
             "oi_trend": oi_slope,
             "cvd": cvd_slope,
