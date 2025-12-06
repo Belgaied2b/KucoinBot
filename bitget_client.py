@@ -1,0 +1,1 @@
+# Bitget client placeholder
