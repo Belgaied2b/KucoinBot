@@ -72,18 +72,36 @@ def to_df(ohlcv_raw):
 
 
 # ============================================================
-# FETCH SYMBOLS BITGET
+# FETCH SYMBOLS BITGET — VERSION 100% SAFE (NE PEUT PAS RENVOYER None)
 # ============================================================
 
 async def fetch_all_symbols_bitget(client):
-    data = await client._request("GET", "/api/mix/v1/market/contracts", auth=False)
+    try:
+        data = await client._request("GET", "/api/mix/v1/market/contracts", auth=False)
 
-    syms = []
-    for c in data.get("data", []):
-        if c.get("quoteCoin") == "USDT" and c.get("symbol", "").endswith("_UMCBL"):
-            syms.append(c["symbol"])
+        # Toujours récupérer une liste, même si data["data"] = None
+        items = data.get("data") or []
 
-    return syms
+        syms = []
+        for c in items:
+            if (
+                isinstance(c, dict)
+                and c.get("quoteCoin") == "USDT"
+                and str(c.get("symbol", "")).endswith("_UMCBL")
+            ):
+                syms.append(c["symbol"])
+
+        # Fallback si Bitget retourne vide → au moins BTC & ETH
+        if not syms:
+            LOGGER.warning("⚠️ Bitget returned empty symbol list — fallback BTC/ETH")
+            return ["BTCUSDT_UMCBL", "ETHUSDT_UMCBL"]
+
+        return syms
+
+    except Exception as e:
+        LOGGER.error(f"fetch_all_symbols_bitget ERROR: {e}")
+        # Fallback ultime
+        return ["BTCUSDT_UMCBL"]
 
 
 # ============================================================
@@ -186,7 +204,7 @@ async def process_symbol(symbol: str, analyzer: SignalAnalyzer, trader: BitgetTr
 # ============================================================
 
 async def run_scanner():
-    """Fonction appelée par start_scanner() ET main.py"""
+    """Démarre le scanner en boucle"""
     client = await get_client(API_KEY, API_SECRET, API_PASSPHRASE)
     trader = BitgetTrader(API_KEY, API_SECRET, API_PASSPHRASE)
     analyzer = SignalAnalyzer(API_KEY, API_SECRET, API_PASSPHRASE)
