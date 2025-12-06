@@ -1,128 +1,175 @@
-# ============================================================
-# settings.py — Bitget Desk Lead Settings
-# Chargement intelligent des variables d’environnement
-# (convertit automatiquement en int, float, bool)
-# ============================================================
+# =====================================================================
+# settings.py — Desk Lead Settings Loader
+# Charge toutes les variables depuis l’environnement
+# =====================================================================
 
 import os
 
 
-# ------------------------------
-# Helpers
-# ------------------------------
-def _get(key, default=None):
-    return os.getenv(key, default)
+# ============================================================
+# HELPERS
+# ============================================================
 
-def _to_bool(v: str) -> bool:
-    return str(v).lower() in ("1", "true", "yes", "y", "on")
-
-def _to_int(v: str) -> int:
-    try:
+def _get(key: str, default=None):
+    v = os.getenv(key, default)
+    if isinstance(v, str) and v.isdigit():
         return int(v)
-    except:
-        return int(float(v))
+    return v
 
-def _to_float(v: str) -> float:
+
+def _get_float(key: str, default=None):
     try:
-        return float(v)
+        return float(os.getenv(key, default))
     except:
-        return float(v.replace(",", "."))
+        return default
 
-# ============================================================
-# API KEYS (BITGET)
-# ============================================================
-API_KEY = _get("API_KEY")
-API_SECRET = _get("API_SECRET")
-API_PASSPHRASE = _get("API_PASSPHRASE")
+
+def _get_bool(key: str, default="false"):
+    return str(os.getenv(key, default)).lower() in ("1", "true", "yes", "on")
 
 
 # ============================================================
-# TELEGRAM / ENV
+# BITGET API
 # ============================================================
-TOKEN = _get("TELEGRAM_BOT_TOKEN")
-ENV = _get("ENV", "production")
-TZ = _get("TZ", "Europe/Paris")
-DRY_RUN = _to_bool(_get("DRY_RUN", "false"))
 
+API_KEY = os.getenv("API_KEY")
+API_SECRET = os.getenv("API_SECRET")
+API_PASSPHRASE = os.getenv("API_PASSPHRASE")
 
-# ============================================================
-# RISK / ORDER SETTINGS
-# ============================================================
-MARGIN_USDT = _to_float(_get("MARGIN_USDT", "20"))
-LEVERAGE = _to_int(_get("LEVERAGE", "10"))
-SCAN_INTERVAL_MIN = _to_int(_get("SCAN_INTERVAL_MIN", "5"))
-MAX_ORDERS_PER_SCAN = _to_int(_get("MAX_ORDERS_PER_SCAN", "5"))
+if not API_KEY:
+    print("⚠️ WARNING: API_KEY missing")
+if not API_SECRET:
+    print("⚠️ WARNING: API_SECRET missing")
+if not API_PASSPHRASE:
+    print("⚠️ WARNING: API_PASSPHRASE missing")
 
-MIN_INST_SCORE = _to_int(_get("MIN_INST_SCORE", "2"))
-
-REQUIRE_STRUCTURE = _to_bool(_get("REQUIRE_STRUCTURE", "true"))
-REQUIRE_MOMENTUM = _to_bool(_get("REQUIRE_MOMENTUM", "true"))
-REQUIRE_HTF_ALIGN = _to_bool(_get("REQUIRE_HTF_ALIGN", "true"))
-REQUIRE_BOS_QUALITY = _to_bool(_get("REQUIRE_BOS_QUALITY", "true"))
-
-RR_MIN_STRICT = _to_float(_get("RR_MIN_STRICT", "1.5"))
-RR_MIN_TOLERATED_WITH_INST = _to_float(_get("RR_MIN_TOLERATED_WITH_INST", "1.20"))
-COMMITMENT_MIN = _to_float(_get("COMMITMENT_MIN", "0.55"))
-
-DESK_EV_MODE = _to_bool(_get("DESK_EV_MODE", "true"))
-RR_MIN_DESK_PRIORITY = _to_float(_get("RR_MIN_DESK_PRIORITY", "1.10"))
-INST_SCORE_DESK_PRIORITY = _to_int(_get("INST_SCORE_DESK_PRIORITY", "2"))
-COMMITMENT_DESK_PRIORITY = _to_float(_get("COMMITMENT_DESK_PRIORITY", "0.60"))
-
-STOP_TRIGGER_TYPE_SL = _get("STOP_TRIGGER_TYPE_SL", "MP")
-STOP_TRIGGER_TYPE_TP = _get("STOP_TRIGGER_TYPE_TP", "TP")
-
-ATR_LEN = _to_int(_get("ATR_LEN", "14"))
-ATR_MULT_SL = _to_float(_get("ATR_MULT_SL", "2.5"))
-ATR_MULT_SL_CAP = _to_float(_get("ATR_MULT_SL_CAP", "3.5"))
-
-SL_BUFFER_PCT = _to_float(_get("SL_BUFFER_PCT", "0.0020"))
-SL_BUFFER_TICKS = _to_int(_get("SL_BUFFER_TICKS", "3"))
-MIN_SL_TICKS = _to_int(_get("MIN_SL_TICKS", "3"))
-MAX_SL_PCT = _to_float(_get("MAX_SL_PCT", "0.07"))
-
-STRUCT_LOOKBACK = _to_int(_get("STRUCT_LOOKBACK", "20"))
-BE_FEE_BUFFER_TICKS = _to_int(_get("BE_FEE_BUFFER_TICKS", "1"))
-
-TP1_R_CLAMP_MIN = _to_float(_get("TP1_R_CLAMP_MIN", "1.4"))
-TP1_R_CLAMP_MAX = _to_float(_get("TP1_R_CLAMP_MAX", "1.6"))
-TP2_R_TARGET = _to_float(_get("TP2_R_TARGET", "2.8"))
-MIN_TP_TICKS = _to_int(_get("MIN_TP_TICKS", "1"))
-TP1_R_BY_VOL = _to_bool(_get("TP1_R_BY_VOL", "true"))
-
-VOL_REGIME_ATR_PCT_LOW = _to_float(_get("VOL_REGIME_ATR_PCT_LOW", "0.015"))
-VOL_REGIME_ATR_PCT_HIGH = _to_float(_get("VOL_REGIME_ATR_PCT_HIGH", "0.035"))
-
-ACCOUNT_EQUITY_USDT = _to_float(_get("ACCOUNT_EQUITY_USDT", "10000"))
-MAX_GROSS_EXPOSURE = _to_float(_get("MAX_GROSS_EXPOSURE", "2.0"))
-MAX_SYMBOL_EXPOSURE = _to_float(_get("MAX_SYMBOL_EXPOSURE", "0.25"))
-CORR_GROUP_CAP = _to_float(_get("CORR_GROUP_CAP", "0.5"))
-CORR_BTC_THRESHOLD = _to_float(_get("CORR_BTC_THRESHOLD", "0.7"))
-
-RISK_USDT = _to_float(_get("RISK_USDT", "20"))
-RR_TARGET = _to_float(_get("RR_TARGET", "1.6"))
-TOP_N_SYMBOLS = _to_int(_get("TOP_N_SYMBOLS", "80"))
-
-ENABLE_SQUEEZE_ENGINE = _to_bool(_get("ENABLE_SQUEEZE_ENGINE", "true"))
-FAIL_OPEN_TO_CORE = _to_bool(_get("FAIL_OPEN_TO_CORE", "true"))
 
 # ============================================================
-# BINANCE PARAMETERS (Institutional Data)
+# TELEGRAM BOT
 # ============================================================
-BINANCE_MIN_INTERVAL_S = _to_float(_get("BINANCE_MIN_INTERVAL_S", "0.35"))
-BINANCE_HTTP_TIMEOUT_S = _to_float(_get("BINANCE_HTTP_TIMEOUT_S", "7.0"))
-BINANCE_HTTP_RETRIES = _to_int(_get("BINANCE_HTTP_RETRIES", "2"))
-BINANCE_SYMBOLS_TTL_S = _to_int(_get("BINANCE_SYMBOLS_TTL_S", "900"))
 
-RETRY_300011_MAX = _to_int(_get("RETRY_300011_MAX", "3"))
-RETRY_BACKOFF_MS_BASE = _to_int(_get("RETRY_BACKOFF_MS_BASE", "250"))
-RETRY_BACKOFF_JITTER_MIN = _to_int(_get("RETRY_BACKOFF_JITTER_MIN", "50"))
-RETRY_BACKOFF_JITTER_MAX = _to_int(_get("RETRY_BACKOFF_JITTER_MAX", "200"))
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-PRICE_NUDGE_TICKS_MIN = _to_int(_get("PRICE_NUDGE_TICKS_MIN", "0"))
-PRICE_NUDGE_TICKS_MAX = _to_int(_get("PRICE_NUDGE_TICKS_MAX", "2"))
+if not TELEGRAM_BOT_TOKEN:
+    print("⚠️ WARNING: TELEGRAM_BOT_TOKEN missing")
+if not TELEGRAM_CHAT_ID:
+    print("⚠️ WARNING: TELEGRAM_CHAT_ID missing")
 
-SLIPPAGE_TICKS_LIMIT = _to_int(_get("SLIPPAGE_TICKS_LIMIT", "2"))
-LIQ_LOOKBACK = _to_int(_get("LIQ_LOOKBACK", "60"))
-LIQ_BUFFER_PCT = _to_float(_get("LIQ_BUFFER_PCT", "0.0008"))
-LIQ_BUFFER_TICKS = _to_int(_get("LIQ_BUFFER_TICKS", "3"))
+
+# ============================================================
+# GLOBAL BOT SETTINGS
+# ============================================================
+
+ENV = os.getenv("ENV", "production")
+TZ = os.getenv("TZ", "Europe/Paris")
+SCAN_INTERVAL_MIN = _get("SCAN_INTERVAL_MIN", 5)
+
+TOP_N_SYMBOLS = _get("TOP_N_SYMBOLS", 80)
+
+
+# ============================================================
+# RISK SETTINGS
+# ============================================================
+
+MARGIN_USDT = _get_float("MARGIN_USDT", 20.0)
+LEVERAGE = _get_float("LEVERAGE", 10.0)
+ACCOUNT_EQUITY_USDT = _get_float("ACCOUNT_EQUITY_USDT", 10000)
+RISK_USDT = _get_float("RISK_USDT", 20.0)
+
+MAX_GROSS_EXPOSURE = _get_float("MAX_GROSS_EXPOSURE", 2.0)
+MAX_SYMBOL_EXPOSURE = _get_float("MAX_SYMBOL_EXPOSURE", 0.25)
+CORR_GROUP_CAP = _get_float("CORR_GROUP_CAP", 0.5)
+CORR_BTC_THRESHOLD = _get_float("CORR_BTC_THRESHOLD", 0.7)
+
+
+# ============================================================
+# STRUCTURE / MOMENTUM SETTINGS
+# ============================================================
+
+REQUIRE_STRUCTURE = _get_bool("REQUIRE_STRUCTURE", "true")
+REQUIRE_MOMENTUM = _get_bool("REQUIRE_MOMENTUM", "true")
+REQUIRE_HTF_ALIGN = _get_bool("REQUIRE_HTF_ALIGN", "true")
+REQUIRE_BOS_QUALITY = _get_bool("REQUIRE_BOS_QUALITY", "true")
+
+STRUCT_LOOKBACK = _get("STRUCT_LOOKBACK", 20)
+
+
+# ============================================================
+# RR PARAMETERS
+# ============================================================
+
+RR_MIN_STRICT = _get_float("RR_MIN_STRICT", 1.5)
+RR_MIN_TOLERATED_WITH_INST = _get_float("RR_MIN_TOLERATED_WITH_INST", 1.20)
+
+RR_MIN_DESK_PRIORITY = _get_float("RR_MIN_DESK_PRIORITY", 1.10)
+RR_TARGET = _get_float("RR_TARGET", 1.6)
+
+TP1_R_CLAMP_MIN = _get_float("TP1_R_CLAMP_MIN", 1.4)
+TP1_R_CLAMP_MAX = _get_float("TP1_R_CLAMP_MAX", 1.6)
+TP2_R_TARGET = _get_float("TP2_R_TARGET", 2.8)
+
+
+# ============================================================
+# SL PARAMETERS
+# ============================================================
+
+ATR_LEN = _get("ATR_LEN", 14)
+ATR_MULT_SL = _get_float("ATR_MULT_SL", 2.5)
+ATR_MULT_SL_CAP = _get_float("ATR_MULT_SL_CAP", 3.5)
+
+SL_BUFFER_PCT = _get_float("SL_BUFFER_PCT", 0.0020)
+SL_BUFFER_TICKS = _get("SL_BUFFER_TICKS", 3)
+MIN_SL_TICKS = _get("MIN_SL_TICKS", 3)
+MAX_SL_PCT = _get_float("MAX_SL_PCT", 0.07)
+
+STOP_TRIGGER_TYPE_SL = os.getenv("STOP_TRIGGER_TYPE_SL", "MP")
+STOP_TRIGGER_TYPE_TP = os.getenv("STOP_TRIGGER_TYPE_TP", "TP")
+
+
+# ============================================================
+# LIQUIDITY SETTINGS
+# ============================================================
+
+LIQ_LOOKBACK = _get("LIQ_LOOKBACK", 60)
+LIQ_BUFFER_PCT = _get_float("LIQ_BUFFER_PCT", 0.0008)
+LIQ_BUFFER_TICKS = _get("LIQ_BUFFER_TICKS", 3)
+
+
+# ============================================================
+# INSTITUTIONAL SETTINGS
+# ============================================================
+
+MIN_INST_SCORE = _get_float("MIN_INST_SCORE", 2.0)
+COMMITMENT_MIN = _get_float("COMMITMENT_MIN", 0.55)
+
+INST_SCORE_DESK_PRIORITY = _get_float("INST_SCORE_DESK_PRIORITY", 2)
+COMMITMENT_DESK_PRIORITY = _get_float("COMMITMENT_DESK_PRIORITY", 0.60)
+
+ENABLE_SQUEEZE_ENGINE = _get_bool("ENABLE_SQUEEZE_ENGINE", "true")
+DESK_EV_MODE = _get_bool("DESK_EV_MODE", "true")
+
+
+# ============================================================
+# RETRY / NETWORK
+# ============================================================
+
+BINANCE_MIN_INTERVAL_S = _get_float("BINANCE_MIN_INTERVAL_S", 0.35)
+BINANCE_HTTP_TIMEOUT_S = _get_float("BINANCE_HTTP_TIMEOUT_S", 7.0)
+BINANCE_HTTP_RETRIES = _get("BINANCE_HTTP_RETRIES", 2)
+BINANCE_SYMBOLS_TTL_S = _get("BINANCE_SYMBOLS_TTL_S", 900)
+
+RETRY_300011_MAX = _get("RETRY_300011_MAX", 3)
+RETRY_BACKOFF_MS_BASE = _get("RETRY_BACKOFF_MS_BASE", 250)
+RETRY_BACKOFF_JITTER_MIN = _get("RETRY_BACKOFF_JITTER_MIN", 50)
+RETRY_BACKOFF_JITTER_MAX = _get("RETRY_BACKOFF_JITTER_MAX", 200)
+
+
+# ============================================================
+# MISC
+# ============================================================
+
+FAIL_OPEN_TO_CORE = _get_bool("FAIL_OPEN_TO_CORE", "true")
+PRICE_NUDGE_TICKS_MIN = _get("PRICE_NUDGE_TICKS_MIN", 0)
+PRICE_NUDGE_TICKS_MAX = _get("PRICE_NUDGE_TICKS_MAX", 2)
+SLIPPAGE_TICKS_LIMIT = _get("SLIPPAGE_TICKS_LIMIT", 2)
