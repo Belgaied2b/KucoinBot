@@ -1,6 +1,6 @@
 # =====================================================================
-# analyze_signal.py — Desk Lead Bitget v2.0
-# Analyse institutionnelle stricte (structure + intent + momentum)
+# analyze_signal.py — Desk Lead Bitget v1.0
+# Analyse institutionnelle complète (structure + intent + momentum)
 # Async — Compatible scanner Bitget + trader Bitget + institutional_data
 # =====================================================================
 
@@ -9,45 +9,43 @@ import logging
 import pandas as pd
 from typing import Dict, Any, Optional
 
-# Structure & technique
+# ============================================================
+# IMPORTS CORRIGÉS
+# ============================================================
+
 from structure_utils import (
     analyze_structure,
-    htf_confirm,
+    htf_trend_ok,              # <<< correct replacement of htf_confirm
     bos_quality_details,
     commitment_score,
 )
 
-# Indicators (version REMISE EN COHÉRENCE avec ton indicators.py)
 from indicators import (
-    rsi,
-    macd,
-    ema,
-    institutional_momentum,
-    compute_ote,
+    compute_rsi,
+    compute_macd,
+    compute_ema,
+    institutional_momentum_score,
+    compute_premium_discount,
     volatility_regime,
+    structural_momentum_flag,
+    is_momentum_ok,
 )
 
-# Stops / TP
 from stops import protective_stop_long, protective_stop_short
 from tp_clamp import compute_tp1
-
-# Institutional engine (Binance OI/Funding/Liq)
 from institutional_data import compute_full_institutional_analysis
-
 
 LOGGER = logging.getLogger(__name__)
 
 
 # =====================================================================
-# Helpers
+# HELPERS
 # =====================================================================
 
 def _safe_rr(entry: float, sl: float, tp1: float, bias: str) -> Optional[float]:
     """Compute RR safely and robustly."""
     try:
-        entry = float(entry)
-        sl = float(sl)
-        tp1 = float(tp1)
+        entry, sl, tp1 = float(entry), float(sl), float(tp1)
     except:
         return None
 
@@ -89,7 +87,7 @@ def _compute_exits(df: pd.DataFrame, entry: float, bias: str, tick: float) -> Di
 
 
 # =====================================================================
-# Class — Desk Lead Analyzer
+# CLASS — DESK LEAD ANALYZER
 # =====================================================================
 
 class DeskLeadAnalyzer:
@@ -108,14 +106,15 @@ class DeskLeadAnalyzer:
         contract: Dict[str, Any],
     ) -> Optional[Dict[str, Any]]:
         """
-        Analyse Desk Lead :
-            - Structure H1 complète
-            - BOS quality + commitment OI/CVD
+        Analyse Desk Lead complète :
+            - Structure H1
+            - BOS quality + Commitment OI/CVD
             - HTF alignment (H4)
-            - Institutional analysis (OI, FUND, CVD, LIQ)
-            - Institutional momentum (MACD/RSI/volume)
-            - Premium/Discount + volatility regime
-            - SL/TP institutionnels
+            - Institutional score (Binance)
+            - Institutional momentum
+            - Volatility regime
+            - Premium/Discount
+            - SL/TP1 institutionnel
         """
 
         # =====================================================================
@@ -137,19 +136,19 @@ class DeskLeadAnalyzer:
         if bias not in ("LONG", "SHORT"):
             return None
 
-        # Au moins un signal structurel
+        # doit avoir au moins une structure valide : BOS / COS / CHOCH
         if not (struct.get("bos") or struct.get("cos") or struct.get("choch")):
             return None
 
         # =====================================================================
-        # 2) H4 ALIGNMENT
+        # 2) HTF TREND CONFIRMATION (correct replacement)
         # =====================================================================
 
-        if not htf_confirm(df_h4, bias):
+        if not htf_trend_ok(df_h4, bias):
             return None
 
         # =====================================================================
-        # 3) BOS QUALITY + COMMITMENT
+        # 3) BOS QUALITY + COMMITMENT (OI + CVD)
         # =====================================================================
 
         oi_series = struct.get("oi_series")
@@ -177,15 +176,14 @@ class DeskLeadAnalyzer:
         # =====================================================================
 
         inst = await compute_full_institutional_analysis(symbol, bias)
-        inst_score = float(inst.get("institutional_score", 0))
+        inst_score = int(inst.get("institutional_score", 0))
 
-        try:
-            LOGGER.info(
-                f"[INST_RAW] {symbol} {bias} score={inst_score} "
-                f"pressure={inst.get('pressure')} details={inst.get('details')}"
-            )
-        except:
-            pass
+        LOGGER.info(
+            "[INST_RAW] %s %s score=%s pressure=%.2f details=%s",
+            symbol, bias, inst_score,
+            inst.get("pressure"),
+            inst.get("details"),
+        )
 
         if inst_score < 2:
             return None
@@ -194,25 +192,26 @@ class DeskLeadAnalyzer:
         # 5) INSTITUTIONAL MOMENTUM
         # =====================================================================
 
-        mom = institutional_momentum(df_h1)
+        mom_score = institutional_momentum_score(df_h1["close"], df_h1["volume"])
 
-        if bias == "LONG" and mom not in ("BULLISH", "STRONG_BULLISH"):
+        if bias == "LONG" and mom_score < 0.55:
             return None
-        if bias == "SHORT" and mom not in ("BEARISH", "STRONG_BEARISH"):
+        if bias == "SHORT" and mom_score < 0.55:
             return None
 
         # =====================================================================
-        # 6) PREMIUM / DISCOUNT + VOLATILITY
+        # 6) PREMIUM / DISCOUNT + VOLATILITY REGIME
         # =====================================================================
 
+        discount, premium = compute_premium_discount(df_h1, 80)
         regime = volatility_regime(df_h1)
 
-        # Sanction si expansion non soutenue par BOS validé
-        if regime == "HIGH" and not struct.get("bos"):
+        # rejet expansion violente non alignée à la structure
+        if regime == "expansion" and not struct.get("bos"):
             return None
 
         # =====================================================================
-        # 7) EXITS (SL + TP1 institutionnels)
+        # 7) SL / TP1 institutionnels
         # =====================================================================
 
         exits = _compute_exits(df_h1, entry, bias, tick)
@@ -220,7 +219,7 @@ class DeskLeadAnalyzer:
         tp1 = exits["tp1"]
         rr_used = exits["rr_used"]
 
-        # Validation RR
+        # RR minimal institutionnel
         if rr_used < self.rr_min_inst:
             return None
 
@@ -229,7 +228,7 @@ class DeskLeadAnalyzer:
             return None
 
         # =====================================================================
-        # 8) PACK RESULT — VALID SIGNAL
+        # 8) VALID PACK
         # =====================================================================
 
         signal = {
@@ -249,15 +248,17 @@ class DeskLeadAnalyzer:
             "institutional": inst,
             "institutional_score": inst_score,
 
-            "momentum_inst": mom,
+            "momentum_inst": mom_score,
+            "premium": premium,
+            "discount": discount,
             "volatility_regime": regime,
 
             "exits": exits,
         }
 
         LOGGER.info(
-            f"[EVAL] {symbol} {bias} -> VALID "
-            f"RR={rr:.2f} inst={inst_score:.1f} comm={comm:.2f} mom={mom}"
+            "[EVAL] %s %s -> VALID RR=%.2f inst=%s comm=%.2f mom=%.2f",
+            symbol, bias, rr, inst_score, comm, mom_score
         )
 
         return signal
