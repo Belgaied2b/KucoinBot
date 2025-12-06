@@ -219,17 +219,22 @@ async def scan_loop():
 # MAIN ENTRY — ASYNC SAFE FOR RAILWAY
 # ============================================================
 
-async def run_scanner():
-    await scan_loop()
+# ============================================================
+# MAIN ENTRYPOINT COMPATIBLE RAILWAY
+# ============================================================
+
+async def start_scanner():
+    """Entrypoint utilisé par main.py"""
+    await run_scanner()
 
 
+# Option exécutable en local
 if __name__ == "__main__":
     try:
-        # Cas normal : aucune event-loop existante → on utilise run
-        asyncio.run(run_scanner())
+        asyncio.run(start_scanner())
     except RuntimeError:
-        # Cas Railway/PTB : une loop existe déjà → on la réutilise
+        # Si une boucle existe déjà (cas PTB / environnements managés)
         loop = asyncio.get_event_loop()
-        loop.create_task(run_scanner())
+        loop.create_task(start_scanner())
         loop.run_forever()
 
