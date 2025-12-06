@@ -1,46 +1,76 @@
 # =====================================================================
-# indicators.py — outils techniques institutionnels
+# indicators.py — Desk Lead Premium Technical Suite
+# Institutionnel, robuste, optimisé Bitget
 # =====================================================================
+
 import numpy as np
 import pandas as pd
-from typing import Dict, Any, Optional, Tuple
+from typing import Dict, Any, Optional
 
 
-# -------------------------------------------------------------
+# =====================================================================
+# SAFE HELPERS
+# =====================================================================
+
+def _safe_len(obj) -> int:
+    try:
+        return len(obj)
+    except:
+        return 0
+
+
+# =====================================================================
 # EMA / SMA
-# -------------------------------------------------------------
+# =====================================================================
+
 def ema(series: pd.Series, length: int) -> pd.Series:
+    if _safe_len(series) < 2:
+        return pd.Series([np.nan] * _safe_len(series))
     return series.ewm(span=length, adjust=False).mean()
 
 
 def sma(series: pd.Series, length: int) -> pd.Series:
+    if _safe_len(series) < length:
+        return pd.Series([np.nan] * _safe_len(series))
     return series.rolling(length).mean()
 
 
-# -------------------------------------------------------------
-# RSI
-# -------------------------------------------------------------
+# =====================================================================
+# RSI (EMA-Based smoothing, pro)
+# =====================================================================
+
 def rsi(series: pd.Series, length: int = 14) -> pd.Series:
+    if _safe_len(series) < length + 5:
+        return pd.Series([50] * _safe_len(series))
+
     delta = series.diff()
-    gain = np.where(delta > 0, delta, 0)
-    loss = np.where(delta < 0, -delta, 0)
 
-    gain_ema = pd.Series(gain).ewm(span=length, adjust=False).mean()
-    loss_ema = pd.Series(loss).ewm(span=length, adjust=False).mean()
+    gain = delta.clip(lower=0)
+    loss = (-delta).clip(lower=0)
 
-    rs = gain_ema / (loss_ema + 1e-12)
-    return 100 - (100 / (1 + rs))
+    avg_gain = gain.ewm(alpha=1/length, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1/length, adjust=False).mean()
+
+    rs = avg_gain / (avg_loss + 1e-10)
+    rsi_val = 100 - (100 / (1 + rs))
+    return rsi_val.fillna(50)
 
 
-# -------------------------------------------------------------
+# =====================================================================
 # MACD
-# -------------------------------------------------------------
+# =====================================================================
+
 def macd(series: pd.Series, fast=12, slow=26, signal=9) -> Dict[str, pd.Series]:
+    if _safe_len(series) < slow + signal:
+        empty = pd.Series([0] * _safe_len(series))
+        return {"macd": empty, "signal": empty, "hist": empty}
+
     fast_ema = ema(series, fast)
     slow_ema = ema(series, slow)
     macd_line = fast_ema - slow_ema
     signal_line = ema(macd_line, signal)
     hist = macd_line - signal_line
+
     return {
         "macd": macd_line,
         "signal": signal_line,
@@ -48,112 +78,108 @@ def macd(series: pd.Series, fast=12, slow=26, signal=9) -> Dict[str, pd.Series]:
     }
 
 
-# -------------------------------------------------------------
-# ATR (vrai)
-# -------------------------------------------------------------
+# =====================================================================
+# TRUE ATR (institutionnel)
+# =====================================================================
+
 def true_atr(df: pd.DataFrame, length: int = 14) -> pd.Series:
+    if _safe_len(df) < length + 2:
+        return pd.Series([np.nan] * _safe_len(df))
+
     high = df["high"]
     low = df["low"]
-    close = df["close"]
-    prev_close = close.shift(1)
+    prev_close = df["close"].shift(1)
 
-    tr = pd.concat(
-        [
-            (high - low).abs(),
-            (high - prev_close).abs(),
-            (low - prev_close).abs(),
-        ],
-        axis=1,
-    ).max(axis=1)
+    tr = pd.concat([
+        (high - low).abs(),
+        (high - prev_close).abs(),
+        (low - prev_close).abs(),
+    ], axis=1).max(axis=1)
 
-    return tr.rolling(length).mean()
+    return tr.ewm(span=length, adjust=False).mean().fillna(method="bfill")
 
 
-# -------------------------------------------------------------
-# Momentum simple
-# -------------------------------------------------------------
+# =====================================================================
+# MOMENTUM (simple)
+# =====================================================================
+
 def momentum(series: pd.Series, length: int = 10) -> pd.Series:
     return series - series.shift(length)
 
 
-# -------------------------------------------------------------
-# Divergence RSI
-# -------------------------------------------------------------
+# =====================================================================
+# RSI DIVERGENCE (pro)
+# =====================================================================
+
 def detect_rsi_divergence(df: pd.DataFrame) -> Optional[str]:
-    """
-    Divergence classique :
-        - Bullish : prix ↓ mais RSI ↑
-        - Bearish : prix ↑ mais RSI ↓
-    """
-    r = rsi(df["close"], 14)
-    if len(r) < 20:
+    if _safe_len(df) < 25:
         return None
 
     close = df["close"]
+    r = rsi(close)
 
-    # Lookback court
-    p1 = close.iloc[-1]
-    p2 = close.iloc[-5]
-    r1 = r.iloc[-1]
-    r2 = r.iloc[-5]
+    p1, p2 = close.iloc[-1], close.iloc[-6]
+    r1, r2 = r.iloc[-1], r.iloc[-6]
 
+    # Bullish div
     if p1 < p2 and r1 > r2:
         return "BULLISH"
+
+    # Bearish div
     if p1 > p2 and r1 < r2:
         return "BEARISH"
+
     return None
 
 
-# -------------------------------------------------------------
-# OTE (Optimal Trade Entry)
-# -------------------------------------------------------------
-def compute_ote(df: pd.DataFrame, bias: str) -> Dict[str, float]:
-    """
-    Retourne les niveaux OTE 62% / 705% :
-        - Biais LONG → swing low vers swing high
-        - Biais SHORT → swing high vers swing low
-    """
-    if len(df) < 10:
-        return {"ote_62": None, "ote_705": None}
+# =====================================================================
+# OTE (62% / 70.5%)
+# =====================================================================
 
-    high = df["high"].iloc[-10:].max()
-    low = df["low"].iloc[-10:].min()
+def compute_ote(df: pd.DataFrame, bias: str) -> Dict[str, float]:
+    lookback = df.tail(30)
+
+    high = lookback["high"].max()
+    low = lookback["low"].min()
 
     if bias.upper() == "LONG":
-        ote_62 = low + (high - low) * 0.62
-        ote_705 = low + (high - low) * 0.705
-    else:
-        ote_62 = high - (high - low) * 0.62
-        ote_705 = high - (high - low) * 0.705
+        return {
+            "ote_62": low + (high - low) * 0.62,
+            "ote_705": low + (high - low) * 0.705,
+        }
 
-    return {"ote_62": ote_62, "ote_705": ote_705}
+    return {
+        "ote_62": high - (high - low) * 0.62,
+        "ote_705": high - (high - low) * 0.705,
+    }
 
 
-# -------------------------------------------------------------
-# Volatility regime (simple ATR%)
-# -------------------------------------------------------------
+# =====================================================================
+# VOLATILITY REGIME (ATR relative)
+# =====================================================================
+
 def volatility_regime(df: pd.DataFrame, length: int = 14) -> str:
     atr = true_atr(df, length)
     close = df["close"]
-    atrp = atr / close
 
-    if atrp.iloc[-1] > 0.02:   # très volatile
+    atrp = (atr / close).iloc[-1]
+
+    if atrp > 0.03:
+        return "EXTREME"
+    if atrp > 0.02:
         return "HIGH"
-    if atrp.iloc[-1] < 0.008:  # faible
+    if atrp < 0.008:
         return "LOW"
+
     return "NORMAL"
 
 
-# -------------------------------------------------------------
-# Fair Value Gap (FVG)
-# -------------------------------------------------------------
+# =====================================================================
+# FVG (3-leg ICT)
+# =====================================================================
+
 def detect_fvg(df: pd.DataFrame) -> Optional[str]:
-    """
-    Simple FVG 3-candles :
-        - Bullish FVG → low[n] > high[n-2]
-        - Bearish FVG → high[n] < low[n-2]
-    """
-    if len(df) < 5:
+    if _safe_len(df) < 5:
         return None
 
     h2 = df["high"].iloc[-3]
@@ -164,56 +190,68 @@ def detect_fvg(df: pd.DataFrame) -> Optional[str]:
 
     if l0 > h2:
         return "BULLISH_FVG"
-
     if h0 < l2:
         return "BEARISH_FVG"
-
     return None
 
 
-# -------------------------------------------------------------
-# Volume anomalies (simplifié)
-# -------------------------------------------------------------
-def detect_volume_spike(df: pd.DataFrame, factor: float = 2.0) -> bool:
-    """
-    Spike de volume simple :
-        volume[n] > factor * moyenne(20)
-    """
-    if "volume" not in df.columns:
-        return False
+# =====================================================================
+# Volume spike (institutionnel)
+# =====================================================================
 
+def detect_volume_spike(df: pd.DataFrame, factor: float = 2.2) -> bool:
     vol = df["volume"]
-    if len(vol) < 21:
+    if _safe_len(vol) < 25:
         return False
 
-    if vol.iloc[-1] > factor * vol.rolling(20).mean().iloc[-1]:
-        return True
-
-    return False
+    avg = vol.rolling(20).mean().iloc[-1]
+    return vol.iloc[-1] > factor * avg
 
 
-# -------------------------------------------------------------
-# Momentum institutionnel simple (MACD + RSI + vol)
-# -------------------------------------------------------------
+# =====================================================================
+# INSTITUTIONAL MOMENTUM (PRO)
+# Combinaison :
+#   - MACD hist slope
+#   - EMA20/50 trend
+#   - RSI confirmation
+#   - Volume anomalies
+# =====================================================================
+
 def institutional_momentum(df: pd.DataFrame) -> str:
-    mac = macd(df["close"])
-    r = rsi(df["close"])
+    close = df["close"]
+
+    mac = macd(close)
+    hist = mac["hist"]
+
+    r = rsi(close)
+    ema20 = ema(close, 20)
+    ema50 = ema(close, 50)
+
+    # MACD slope = accélération court terme institutionnelle
+    macd_slope = hist.iloc[-1] - hist.iloc[-4]
+
     vol_spike = detect_volume_spike(df)
 
     bullish = (
-        mac["hist"].iloc[-1] > 0 and
-        r.iloc[-1] > 50 and
-        not vol_spike
+        hist.iloc[-1] > 0
+        and macd_slope > 0
+        and ema20.iloc[-1] > ema50.iloc[-1]
+        and r.iloc[-1] > 50
+        and not vol_spike
     )
 
     bearish = (
-        mac["hist"].iloc[-1] < 0 and
-        r.iloc[-1] < 50 and
-        not vol_spike
+        hist.iloc[-1] < 0
+        and macd_slope < 0
+        and ema20.iloc[-1] < ema50.iloc[-1]
+        and r.iloc[-1] < 50
+        and not vol_spike
     )
 
     if bullish:
-        return "BULLISH"
+        return "STRONG_BULLISH" if macd_slope > 0 else "BULLISH"
+
     if bearish:
-        return "BEARISH"
+        return "STRONG_BEARISH" if macd_slope < 0 else "BEARISH"
+
     return "NEUTRAL"
