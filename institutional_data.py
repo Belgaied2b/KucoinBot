@@ -1,221 +1,210 @@
 # =====================================================================
-# institutional_data.py — Metrics institutionnels Bitget + CVD Binance
+# institutional_data.py — Desk Lead Binance v1.0
+# Flux institutionnel temps réel (Open Interest, Funding, CVD, Liquidations)
+# Compatible analyze_signal.py + structure_utils.py
 # =====================================================================
+
+from __future__ import annotations
 import aiohttp
-import asyncio
-from typing import Dict, Optional, Any
-from bitget_client import get_client
-import time
 import numpy as np
+from typing import Dict, Any, Optional, List
 
 
-BINANCE_BASE = "https://fapi.binance.com"  # Pour le CVD uniquement
+# =====================================================================
+# Mapping Bitget → Binance Futures
+# =====================================================================
 
+def map_to_binance(symbol: str) -> Optional[str]:
+    """
+    Convertit un symbole Bitget (ex: BTCUSDT_UMCBL) en symbole Binance Futures (BTCUSDT).
+    Règles :
+        - enlever suffixes _UMCBL / _DMCBL
+        - base intacte: XRPUSDT
+    """
+    if not symbol:
+        return None
+
+    s = symbol.upper().replace("_UMCBL", "").replace("_DMCBL", "")
+    return s if s.endswith("USDT") else None
+
+
+# =====================================================================
+# Binance HTTP Client
+# =====================================================================
+
+class BinanceHTTP:
+    BASE = "https://fapi.binance.com"
+
+    @staticmethod
+    async def get(session: aiohttp.ClientSession, endpoint: str, params=None):
+        try:
+            async with session.get(BinanceHTTP.BASE + endpoint, params=params, timeout=5) as r:
+                if r.status != 200:
+                    return {}
+                return await r.json()
+        except:
+            return {}
+
+    # -------------------------
+    @staticmethod
+    async def fetch_open_interest(session, symbol: str) -> Optional[float]:
+        data = await BinanceHTTP.get(session, "/fapi/v1/openInterest", params={"symbol": symbol})
+        try:
+            return float(data.get("openInterest", 0))
+        except:
+            return None
+
+    @staticmethod
+    async def fetch_funding(session, symbol: str) -> Optional[float]:
+        data = await BinanceHTTP.get(session, "/fapi/v1/premiumIndex", params={"symbol": symbol})
+        try:
+            return float(data.get("lastFundingRate", 0))
+        except:
+            return None
+
+    # -------------------------
+    @staticmethod
+    async def fetch_agg_trades(session, symbol: str, limit: int = 200):
+        data = await BinanceHTTP.get(
+            session,
+            "/fapi/v1/aggTrades",
+            params={"symbol": symbol, "limit": limit},
+        )
+        return data if isinstance(data, list) else []
+
+
+# =====================================================================
+# CVD computation (desk-grade)
+# =====================================================================
+
+def compute_cvd_from_trades(trades: List[Dict[str, Any]]) -> float:
+    """
+    CVD = Σ (buy - sell) approximé via flag 'm':
+        m = True  => maker = SELL aggressor
+        m = False => BUY aggressor
+    """
+    buy, sell = 0.0, 0.0
+    try:
+        for t in trades:
+            qty = float(t.get("q", 0.0))
+            maker = t.get("m", False)
+            if maker:
+                sell += qty
+            else:
+                buy += qty
+    except:
+        pass
+    return buy - sell
+
+
+# =====================================================================
+# Liquidations (strong institutional signal)
+# =====================================================================
+
+async def fetch_liquidations(session, symbol: str, limit: int = 100) -> float:
+    """
+    Approx liquidation volume aggregator (public Binance liquidation stream unavailable REST).
+    Trick :
+        - utilise aggTrades large qty > threshold comme proxy
+    """
+    data = await BinanceHTTP.get(
+        session,
+        "/fapi/v1/aggTrades",
+        params={"symbol": symbol, "limit": limit},
+    )
+
+    if not isinstance(data, list):
+        return 0.0
+
+    # threshold dynamique — repère agressions massives
+    vols = []
+    for t in data:
+        try:
+            qty = float(t.get("q", 0.0))
+            vols.append(qty)
+        except:
+            continue
+
+    if not vols:
+        return 0.0
+
+    avg = np.mean(vols)
+    large = [v for v in vols if v > avg * 3.0]
+    return float(sum(large))
+
+
+# =====================================================================
+# SCORE INSTITUTIONNEL — Desk Lead Standard
+# =====================================================================
 
 class InstitutionalData:
-    """
-    Fournit les données institutionnelles pour un symbole :
-        - Open Interest (Bitget)
-        - Funding Rate (Bitget)
-        - Long/Short Ratio (Bitget)
-        - Liquidations (Bitget)
-        - CVD (Binance fallback)
-        - Score institutionnel global (0 → 3)
-    """
-
     def __init__(self, api_key: str, api_secret: str, api_passphrase: str):
+        # On ne les utilise pas pour Binance (public API)
         self.api_key = api_key
         self.api_secret = api_secret
         self.api_passphrase = api_passphrase
 
-    async def _bitget(self):
-        return await get_client(self.api_key, self.api_secret, self.api_passphrase)
-
-    # ----------------------------------------------------------------------
-    # BITGET — OPEN INTEREST
-    # ----------------------------------------------------------------------
-    async def get_oi(self, symbol: str) -> Optional[float]:
-        client = await self._bitget()
-        return await client.get_open_interest(symbol)
-
-    # ----------------------------------------------------------------------
-    # BITGET — FUNDING RATE
-    # ----------------------------------------------------------------------
-    async def get_funding(self, symbol: str) -> Optional[float]:
-        client = await self._bitget()
-        return await client.get_funding_rate(symbol)
-
-    # ----------------------------------------------------------------------
-    # BITGET — LONG/SHORT RATIO
-    # ----------------------------------------------------------------------
-    async def get_long_short_ratio(self, symbol: str) -> Optional[float]:
-        """
-        Ratio long/short traders Bitget.
-        Retourne :
-            >1 bullish
-            <1 bearish
-        """
-        path = "/api/mix/v1/market/takerBuySellRatio"
-        client = await self._bitget()
-        r = await client._request("GET", path, params={"symbol": symbol}, auth=False)
-        try:
-            data = r.get("data", [])
-            if not data:
-                return None
-            return float(data[-1].get("takerBuySellRatio", 1))
-        except:
-            return None
-
-    # ----------------------------------------------------------------------
-    # BITGET — LIQUIDATIONS (simplifié)
-    # ----------------------------------------------------------------------
-    async def get_liquidations(self, symbol: str) -> Dict[str, float]:
-        """
-        Liquidations approximées via 'markPriceKlines' Bitget.
-        On mesure juste la taille des mèches vs corps.
-        Retour :
-            {"bull": score, "bear": score}
-        """
-
-        client = await self._bitget()
-
-        r = await client._request(
-            "GET",
-            "/api/mix/v1/market/markPriceCandles",
-            params={"symbol": symbol, "granularity": "1h", "limit": 30},
-            auth=False,
-        )
-        data = r.get("data", [])
-        if not data:
-            return {"bull": 0.0, "bear": 0.0}
-
-        bull_lq = 0
-        bear_lq = 0
-
-        for k in data[-20:]:
-            # Format Bitget: [timestamp, open, high, low, close]
-            _, o, h, l, c = float(k[0]), float(k[1]), float(k[2]), float(k[3]), float(k[4])
-            body = abs(c - o)
-            wick_up = h - max(o, c)
-            wick_down = min(o, c) - l
-
-            if wick_up > body * 2:
-                bear_lq += wick_up
-            if wick_down > body * 2:
-                bull_lq += wick_down
-
-        # Normalisation simple
-        scale = max(bull_lq + bear_lq, 1e-12)
-        return {
-            "bull": float(bull_lq / scale),
-            "bear": float(bear_lq / scale),
-        }
-
-    # ----------------------------------------------------------------------
-    # BINANCE — CVD via aggTrades
-    # ----------------------------------------------------------------------
-    async def get_cvd(self, symbol: str) -> Optional[float]:
-        """
-        CVD approximatif via aggTrades Binance.
-        symbol Bitget ex: BTCUSDT → Binance : BTCUSDT
-        """
-        binance_symbol = symbol.replace("_UMCBL", "")  # Ex: BTCUSDT_UMCBL
-
-        url = f"{BINANCE_BASE}/fapi/v1/aggTrades"
-        params = {"symbol": binance_symbol, "limit": 500}
-
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, params=params, timeout=10) as resp:
-                    if resp.status != 200:
-                        return None
-                    trades = await resp.json()
-        except:
-            return None
-
-        if not trades:
-            return None
-
-        cvd = 0
-        for t in trades:
-            qty = float(t["q"])
-            is_buy = t["m"]  # Binance: m=True → seller is maker → selling pressure
-            if is_buy:
-                cvd -= qty
-            else:
-                cvd += qty
-
-        return cvd
-
-    # ----------------------------------------------------------------------
-    # SCORE INSTITUTIONNEL
-    # ----------------------------------------------------------------------
+    # ------------------------------------------------------------
     async def compute_score(self, symbol: str) -> Dict[str, Any]:
         """
-        Score institutionnel global basé sur :
-            - direction OI
-            - funding bias
-            - long/short ratio
-            - liquidations
-            - CVD Binance
-        Score final = 0 → 3.
+        Retourne :
+            {
+              score: 0..4,
+              oi: float,
+              funding: float,
+              cvd: float,
+              liq: float,
+              details: {...}
+            }
         """
+        b_symbol = map_to_binance(symbol)
+        if not b_symbol:
+            return {"score": 0, "error": "unmappable_symbol"}
 
-        oi = await self.get_oi(symbol)
-        funding = await self.get_funding(symbol)
-        ratio = await self.get_long_short_ratio(symbol)
-        liq = await self.get_liquidations(symbol)
-        cvd = await self.get_cvd(symbol)
+        async with aiohttp.ClientSession() as session:
+            oi = await BinanceHTTP.fetch_open_interest(session, b_symbol)
+            funding = await BinanceHTTP.fetch_funding(session, b_symbol)
 
-        # -------- PROCESSING --------
+            trades = await BinanceHTTP.fetch_agg_trades(session, b_symbol, limit=200)
+            cvd = compute_cvd_from_trades(trades)
+
+            liq = await fetch_liquidations(session, b_symbol)
+
+        # -------------------------
+        # Scoring institutionnel
+        # -------------------------
+
         score = 0
-        details = {}
+        det = {}
 
-        # Open Interest (trend)
-        if oi is not None:
-            details["oi"] = oi
-            if oi > 0:
-                score += 1
+        # OI expansion
+        if oi and oi > 0:
+            det["oi"] = oi
+            score += 1
 
-        # Funding rate
+        # Funding aligné
         if funding is not None:
-            details["funding"] = funding
-            if funding > 0:
+            det["funding"] = funding
+            if abs(funding) > 0.0001:
                 score += 1
 
-        # Long/Short ratio
-        if ratio is not None:
-            details["ratio"] = ratio
-            if ratio > 1.0:
-                score += 0.5
+        # CVD dominance
+        det["cvd"] = cvd
+        if abs(cvd) > 0:
+            score += 1
 
-        # Liquidations
-        if liq:
-            bull = liq["bull"]
-            bear = liq["bear"]
-            details["liquidations"] = liq
-            if bull > bear:
-                score += 0.25
-            elif bear > bull:
-                score += 0.25
-
-        # CVD (Binance)
-        if cvd is not None:
-            details["cvd"] = cvd
-            if cvd > 0:
-                score += 1
-            else:
-                score += 0
-
-        # Clamp
-        score = min(3.0, max(0.0, score))
+        # Liquidations présentes
+        det["liq"] = liq
+        if liq > 0:
+            score += 1
 
         return {
-            "score": score,
+            "symbol": symbol,
+            "binance_symbol": b_symbol,
             "oi": oi,
             "funding": funding,
-            "ratio": ratio,
             "cvd": cvd,
             "liq": liq,
-            "details": details,
+            "score": float(score),
+            "details": det,
         }
