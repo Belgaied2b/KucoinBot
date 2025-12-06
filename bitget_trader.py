@@ -4,7 +4,7 @@
 import aiohttp
 import asyncio
 from typing import Optional, Dict, Any
-from .bitget_client import get_client
+from bitget_client import get_client
 
 
 class BitgetTrader:
