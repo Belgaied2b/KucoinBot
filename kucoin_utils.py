@@ -1,159 +1,176 @@
-"""
-kucoin_utils.py — robustifié
-- fetch_all_symbols(limit): USDT-M, triés par turnover
-- fetch_klines(...): granularité en minutes, parsing 6/7 colonnes
-- get_contract_info(symbol): lotSize, multiplier, tickSize, max/min, turnover
-"""
-import logging
-import time
-from typing import List, Optional, Dict, Any
+# bitget_utils.py — Base REST Bitget Futures USDT-M (retry, auth, public, klines)
 
-import pandas as pd
+import time
+import hmac
+import hashlib
+import logging
 import requests
+import json
+from typing import Any, Dict, Optional, List, Union
 
 LOGGER = logging.getLogger(__name__)
 
-BASE = "https://api-futures.kucoin.com"
-ACTIVE_ENDPOINT = "/api/v1/contracts/active"
-KLINE_ENDPOINT = "/api/v1/kline/query"
+# ================================================================
+# 🔑 ENV / CONFIG
+# ================================================================
+BITGET_API_KEY = ""
+BITGET_API_SECRET = ""
+BITGET_API_PASSPHRASE = ""
 
-_CONTRACTS_CACHE: Dict[str, Dict[str, Any]] = {}
-_CONTRACTS_TS = 0.0
-_CONTRACTS_TTL = 600.0  # 10min
+BASE_URL = "https://api.bitget.com"
+
+# retry simple
+MAX_RETRIES = 5
+RETRY_DELAY = 0.35
+
+# ================================================================
+# 🔧 SIGNATURE
+# ================================================================
+def sign(message: str, secret: str) -> str:
+    return hmac.new(
+        secret.encode("utf-8"),
+        message.encode("utf-8"),
+        hashlib.sha256
+    ).hexdigest()
+
+def _timestamp_ms():
+    return str(int(time.time() * 1000))
 
 
-# ---------------------------
-# HTTP util
-# ---------------------------
-def _get(url: str, params=None, retries: int = 3, timeout: int = 12):
-    last_err = None
-    for i in range(retries):
+# ================================================================
+# 🔧 REQUEST CORE
+# ================================================================
+def bitget_request(
+    method: str,
+    path: str,
+    params: Optional[dict] = None,
+    body: Optional[dict] = None,
+    auth: bool = False
+) -> Any:
+
+    url = BASE_URL + path
+    params = params or {}
+    body = body or {}
+
+    for retry in range(1, MAX_RETRIES + 1):
+
         try:
-            r = requests.get(url, params=params, timeout=timeout)
-            r.raise_for_status()
-            return r.json()
-        except Exception as e:
-            last_err = e
-            LOGGER.warning("GET %s failed (%s) try %d/%d", url, e, i + 1, retries)
-            time.sleep(0.5 * (2 ** i))
-    LOGGER.error("GET %s failed after retries: %s", url, last_err)
-    return {}
+            ts = _timestamp_ms()
 
-
-# ---------------------------
-# Symbols & Contracts
-# ---------------------------
-def _is_usdt_futures(contract: dict) -> bool:
-    sym = str(contract.get("symbol", "")).upper()
-    settle = (contract.get("settleCurrency") or "").upper()
-    return settle == "USDT" or sym.endswith("USDTM") or sym.endswith("USDM")
-
-
-def _load_contracts(force: bool = False) -> Dict[str, Dict[str, Any]]:
-    global _CONTRACTS_CACHE, _CONTRACTS_TS
-    now = time.time()
-    if (not force) and _CONTRACTS_CACHE and (now - _CONTRACTS_TS < _CONTRACTS_TTL):
-        return _CONTRACTS_CACHE
-
-    data = _get(BASE + ACTIVE_ENDPOINT)
-    items = data.get("data") or []
-    cache = {}
-    for c in items:
-        try:
-            sym = str(c.get("symbol") or "").strip()
-            if not sym:
-                continue
-            cache[sym] = {
-                "symbol": sym,
-                # valeurs clés pour sizing & arrondis
-                "lotSize": int(c.get("lotSize") or 1),           # unité : lots (entier)
-                "multiplier": float(c.get("multiplier") or 1.0), # base-coin par lot (ex XBTUSDTM = 0.001 BTC/lot)
-                "tickSize": float(c.get("tickSize") or 0.01),    # pas minimal de prix
-                "maxOrderQty": float(c.get("maxOrderQty") or 1e12),
-                "minPrice": float(c.get("minPrice") or 0.0),
-                "maxPrice": float(c.get("maxPrice") or 9e12),
-                "turnoverOf24h": float(c.get("turnoverOf24h") or 0.0),
+            headers = {
+                "Content-Type": "application/json",
             }
+
+            if auth:
+                # message = timestamp + method + path + body_json
+                body_json = json.dumps(body) if body else ""
+                msg = ts + method.upper() + path + body_json
+                sig = sign(msg, BITGET_API_SECRET)
+
+                headers.update({
+                    "ACCESS-KEY": BITGET_API_KEY,
+                    "ACCESS-SIGN": sig,
+                    "ACCESS-PASSPHRASE": BITGET_API_PASSPHRASE,
+                    "ACCESS-TIMESTAMP": ts,
+                })
+
+            if method.upper() == "GET":
+                r = requests.get(url, params=params, headers=headers, timeout=8)
+            elif method.upper() == "POST":
+                r = requests.post(url, params=params, data=json.dumps(body), headers=headers, timeout=8)
+            else:
+                raise ValueError(f"Unsupported method {method}")
+
+            # Too many requests → retry
+            if r.status_code == 429:
+                LOGGER.warning(f"[BITGET] 429 rate-limited {path}, retry {retry}/{MAX_RETRIES}")
+                time.sleep(RETRY_DELAY * retry)
+                continue
+
+            # network error
+            if r.status_code >= 500:
+                LOGGER.warning(f"[BITGET] server error {r.status_code} {path}, retry {retry}")
+                time.sleep(RETRY_DELAY * retry)
+                continue
+
+            data = r.json()
+            return data
+
         except Exception as e:
-            LOGGER.debug("Skip contract parse error: %s", e)
-    if cache:
-        _CONTRACTS_CACHE = cache
-        _CONTRACTS_TS = now
-        LOGGER.info("Cached %d contracts metadata", len(cache))
-    return _CONTRACTS_CACHE
+            LOGGER.warning(f"[BITGET] request error {path} retry {retry}: {e}")
+            time.sleep(RETRY_DELAY * retry)
+
+    raise RuntimeError(f"[BITGET] request failed after retries: {path}")
+
+
+# ================================================================
+# 📡 PUBLIC API
+# ================================================================
+def get_klines(symbol: str, granularity: str = "1m", limit: int = 200) -> List[dict]:
+    """
+    Bitget Futures klines:
+    granularity = 1m, 5m, 15m, 1h, 4h, 1d …
+    """
+    path = "/api/mix/v1/market/candles"
+    params = {
+        "symbol": symbol,
+        "granularity": granularity,
+        "limit": limit
+    }
+    r = bitget_request("GET", path, params=params, auth=False)
+    # format returned: [timestamp, open, high, low, close, volume, …]
+    if not isinstance(r, list):
+        return []
+    out = []
+    for c in r:
+        out.append({
+            "ts": int(c[0]),
+            "open": float(c[1]),
+            "high": float(c[2]),
+            "low": float(c[3]),
+            "close": float(c[4]),
+            "volume": float(c[5]),
+        })
+    return list(reversed(out))  # oldest → newest
+
+
+def fetch_all_symbols() -> List[str]:
+    """Retourne tous les PERP USDT-M disponibles."""
+    path = "/api/mix/v1/market/contracts"
+    params = {"productType": "umcbl"}  # USDT-M Perp
+    r = bitget_request("GET", path, params=params)
+    out = []
+    try:
+        for s in r.get("data", []):
+            out.append(s["symbol"])
+    except Exception:
+        pass
+    return out
 
 
 def get_contract_info(symbol: str) -> Dict[str, Any]:
-    """
-    Retourne le dict metadata du contrat (lotSize, multiplier, tickSize, ...).
-    """
-    contracts = _load_contracts()
-    return contracts.get(symbol, {})
+    """Tick size, min size, precision, etc."""
+    path = "/api/mix/v1/market/contracts"
+    params = {"productType": "umcbl"}
+    r = bitget_request("GET", path, params=params)
 
-
-def fetch_all_symbols(limit: Optional[int] = None) -> List[str]:
-    """
-    USDT-M triés par turnover (desc).
-    """
-    contracts = _load_contracts()
-    rows = []
-    for c in contracts.values():
-        if not _is_usdt_futures(c):
-            continue
-        rows.append((c["symbol"], c["turnoverOf24h"]))
-    if not rows:
-        LOGGER.warning("No contracts after filter — fallback static")
-        return ["XBTUSDTM", "ETHUSDTM", "SOLUSDTM", "BNBUSDTM"]
-    rows.sort(key=lambda x: x[1], reverse=True)
-    symbols = [r[0] for r in rows]
-    if limit:
-        symbols = symbols[:limit]
-    LOGGER.info("Fetched %d futures symbols (USDT-M)", len(symbols))
-    return symbols
-
-
-# ---------------------------
-# Klines
-# ---------------------------
-def _granularity(interval: str) -> int:
-    mapping = {"1m": 1, "3m": 3, "5m": 5, "15m": 15, "30m": 30, "1h": 60, "2h": 120, "4h": 240, "8h": 480, "12h": 720, "1d": 1440, "1w": 10080}
-    return mapping.get(interval, 60)
-
-
-def _parse_kline_rows(raw):
-    if not raw:
-        return pd.DataFrame(columns=["time", "open", "high", "low", "close", "volume"])
-    df = pd.DataFrame(raw)
-    if df.shape[1] == 7:
-        df.columns = ["time", "open", "close", "high", "low", "volume", "turnover"]
-        out = df[["time", "open", "high", "low", "close", "volume"]].copy()
-    elif df.shape[1] == 6:
-        df.columns = ["time", "c1", "c2", "c3", "c4", "volume"]
-        testA = df.rename(columns={"c1": "open", "c2": "close", "c3": "high", "c4": "low"})
-        if (testA["high"] >= testA["low"]).all():
-            out = testA[["time", "open", "high", "low", "close", "volume"]].copy()
-        else:
-            testB = df.rename(columns={"c1": "open", "c2": "high", "c3": "low", "c4": "close"})
-            out = testB[["time", "open", "high", "low", "close", "volume"]].copy()
-    else:
-        cols = ["time", "open", "close", "high", "low", "volume"][: df.shape[1]]
-        df.columns = cols
-        out = df.reindex(columns=["time", "open", "high", "low", "close", "volume"], fill_value=0)
-    for c in ["time", "open", "high", "low", "close", "volume"]:
-        out[c] = out[c].astype(float)
-    return out.sort_values("time").reset_index(drop=True)
-
-
-def fetch_klines(symbol: str, interval="1h", limit=200) -> pd.DataFrame:
-    url = BASE + KLINE_ENDPOINT
-    params = {"symbol": symbol, "granularity": _granularity(interval), "limit": limit}
-    data = _get(url, params=params)
-    raw = data.get("data") or []
-    if not raw:
-        LOGGER.warning("No kline data for %s", symbol)
-        return pd.DataFrame(columns=["time", "open", "high", "low", "close", "volume"])
     try:
-        return _parse_kline_rows(raw)
-    except Exception as e:
-        LOGGER.exception("Failed to parse klines for %s: %s", symbol, e)
-        return pd.DataFrame(columns=["time", "open", "high", "low", "close", "volume"])
+        for s in r.get("data", []):
+            if s["symbol"] == symbol:
+                return {
+                    "symbol": symbol,
+                    "tickSize": float(s["priceEndStep"]),
+                    "minSize": float(s["minTradeNum"]),
+                    "sizeStep": float(s["volumePlace"]),
+                    "contractSize": 1.0  # bitget = 1 by default
+                }
+    except Exception:
+        pass
+
+    return {
+        "symbol": symbol,
+        "tickSize": 0.01,
+        "minSize": 0.001,
+        "sizeStep": 1.0,
+        "contractSize": 1.0
+    }
