@@ -12,17 +12,16 @@ print("🚀 Bot Bitget Institutionnel — Démarrage...")
 
 async def main():
     try:
-        await start_scanner()   # <= START SCANNER IS NOW ASYNC SAFE
+        await start_scanner()   # ASYNC SAFE — OK !!
     except Exception as e:
         print(f"❌ ERREUR GLOBALE : {e}")
 
 if __name__ == "__main__":
-    # IMPORTANT : we do NOT call asyncio.run() inside an already running loop
     try:
-        # If no event loop is running → use asyncio.run normally
+        # Tentative normale
         asyncio.run(main())
     except RuntimeError:
-        # If Railway or PTB already created a loop → reuse it
+        # Si une boucle event existe déjà (cas Railway, PTB)
         loop = asyncio.get_event_loop()
         loop.create_task(main())
         loop.run_forever()
