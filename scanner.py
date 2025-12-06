@@ -1,203 +1,218 @@
 # =====================================================================
-# scanner.py — Scanner ASYNC institutionnel pour Bitget Futures
-# Version corrigée et optimisée (5 min, 80 pairs, API Railway)
+# scanner.py — Bitget Desk Lead Scanner (Institutionnel H1+H4)
+# Analyse structurelle + institutionnelle + momentum HTF
+# Entrées LIMIT + SL/TP via BitgetTrader
 # =====================================================================
 
-import os
 import asyncio
-import pandas as pd
-from typing import List, Dict, Any
+import logging
+import time
+from datetime import datetime
+
+from settings import (
+    API_KEY, API_SECRET, API_PASSPHRASE,
+    TELEGRAM_CHAT_ID, TELEGRAM_BOT_TOKEN,
+    SCAN_INTERVAL_MIN,
+)
 
 from bitget_client import get_client
 from bitget_trader import BitgetTrader
-from analyze_signal import SignalAnalyzer
-from sizing import compute_position_size
-from risk_manager import RiskManager
-from duplicate_guard import DuplicateGuard
-from telegram_client import send_telegram_message
+from analyze_signal import analyze_signal
+from telegram.ext import Application
+
+LOGGER = logging.getLogger(__name__)
+
+# Cache macro pour éviter surcharge API
+MACRO_CACHE = {
+    "timestamp": 0,
+    "BTC": None,
+    "TOTAL": None,
+    "TOTAL2": None,
+}
+MACRO_TTL = 90  # 90 sec
 
 
 # =====================================================================
-# CHARGEMENT DES VARIABLES RAILWAY
+# TELEGRAM
 # =====================================================================
-API_KEY = os.getenv("API_KEY", "")
-API_SECRET = os.getenv("API_SECRET", "")
-API_PASSPHRASE = os.getenv("API_PASSPHRASE", "")
-
-# 80 paires les plus courantes Bitget USDT-M
-SYMBOLS = [
-    "BTCUSDT_UMCBL","ETHUSDT_UMCBL","SOLUSDT_UMCBL","ADAUSDT_UMCBL","XRPUSDT_UMCBL",
-    "BNBUSDT_UMCBL","AVAXUSDT_UMCBL","LINKUSDT_UMCBL","DOTUSDT_UMCBL","MATICUSDT_UMCBL",
-    "DOGEUSDT_UMCBL","SHIBUSDT_UMCBL","ARBUSDT_UMCBL","OPUSDT_UMCBL","APTUSDT_UMCBL",
-    "ATOMUSDT_UMCBL","SUIUSDT_UMCBL","NEARUSDT_UMCBL","FILUSDT_UMCBL","ETCUSDT_UMCBL",
-    "ICPUSDT_UMCBL","GRTUSDT_UMCBL","AAVEUSDT_UMCBL","LDOUSDT_UMCBL","INJUSDT_UMCBL",
-    "UNIUSDT_UMCBL","MKRUSDT_UMCBL","CRVUSDT_UMCBL","SNXUSDT_UMCBL","EOSUSDT_UMCBL",
-    "XTZUSDT_UMCBL","SANDUSDT_UMCBL","MANAUSDT_UMCBL","THETAUSDT_UMCBL","RPLUSDT_UMCBL",
-    "DYDXUSDT_UMCBL","LTCUSDT_UMCBL","CELOUSDT_UMCBL","ROSEUSDT_UMCBL","STXUSDT_UMCBL",
-    "FLOWUSDT_UMCBL","FTMUSDT_UMCBL","WLDUSDT_UMCBL","XLMUSDT_UMCBL","XMRUSDT_UMCBL",
-    "ZECUSDT_UMCBL","COMPUSDT_UMCBL","BATUSDT_UMCBL","ENJUSDT_UMCBL","IMXUSDT_UMCBL",
-    "AGIXUSDT_UMCBL","LRCUSDT_UMCBL","1INCHUSDT_UMCBL","MASKUSDT_UMCBL","PEPEUSDT_UMCBL",
-    "BONKUSDT_UMCBL","JUPUSDT_UMCBL","SEIUSDT_UMCBL","PYTHUSDT_UMCBL","ACEUSDT_UMCBL",
-    "ONDOUSDT_UMCBL","YGGUSDT_UMCBL","GALUSDT_UMCBL","IDUSDT_UMCBL","BRISEUSDT_UMCBL",
-    "ZILUSDT_UMCBL","KAVAUSDT_UMCBL","SCUSDT_UMCBL","IOTAUSDT_UMCBL","GMTUSDT_UMCBL",
-    "MINAUSDT_UMCBL","HOTUSDT_UMCBL","BLURUSDT_UMCBL","TIAUSDT_UMCBL","STRKUSDT_UMCBL"
-]
+async def send_telegram(text: str):
+    try:
+        app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+        async with app:
+            await app.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text)
+    except Exception as e:
+        LOGGER.error(f"Telegram send error: {e}")
 
 
 # =====================================================================
-# LOAD KLINES
+# Récup dynamique des symboles Bitget USDT-M
 # =====================================================================
-async def load_klines(symbol: str, tf: str, limit: int = 200) -> pd.DataFrame:
+async def fetch_all_symbols_bitget():
+    client = await get_client(API_KEY, API_SECRET, API_PASSPHRASE)
+    data = await client._request("GET", "/api/mix/v1/market/contracts", auth=False)
+
+    syms = []
+    for c in data.get("data", []):
+        if c.get("quoteCoin") == "USDT":
+            syms.append(c["symbol"])
+
+    return syms
+
+
+# =====================================================================
+# Multi-timeframe (H1 + H4)
+# =====================================================================
+async def fetch_tf_ohlcv(symbol: str, tf: str, limit: int):
+    client = await get_client(API_KEY, API_SECRET, API_PASSPHRASE)
+    raw = await client.get_klines(symbol, granularity=tf, limit=limit)
+
+    # convert into DataFrame-like format (dict of lists)
+    ohlcv = {
+        "timestamp": [],
+        "open": [],
+        "high": [],
+        "low": [],
+        "close": [],
+        "volume": [],
+    }
+
+    try:
+        for r in raw:
+            ts, o, h, l, c, v = r
+            ohlcv["timestamp"].append(float(ts))
+            ohlcv["open"].append(float(o))
+            ohlcv["high"].append(float(h))
+            ohlcv["low"].append(float(l))
+            ohlcv["close"].append(float(c))
+            ohlcv["volume"].append(float(v))
+    except:
+        LOGGER.warning(f"Failed OHLCV format for {symbol}")
+
+    return ohlcv
+
+
+# =====================================================================
+# Cache macro BTC / TOTAL / TOTAL2
+# =====================================================================
+async def fetch_macro_data():
+    now = time.time()
+
+    if now - MACRO_CACHE["timestamp"] < MACRO_TTL:
+        return MACRO_CACHE
+
     client = await get_client(API_KEY, API_SECRET, API_PASSPHRASE)
 
-    candles = await client.get_klines(symbol, tf, limit)
-    if not candles:
-        return pd.DataFrame()
+    # BTCUSDT
+    btc = await client.get_klines("BTCUSDT_UMCBL", "1H", limit=200)
 
-    df = pd.DataFrame(candles, columns=["ts", "open", "high", "low", "close", "volume"])
-    df[["open", "high", "low", "close", "volume"]] = df[["open", "high", "low", "close", "volume"]].astype(float)
-    return df
+    # TOTAL et TOTAL2 n’existent pas sur Bitget → fallback Binance ou CoinGecko ?
+    # → Pour l’instant, neutre.
+    total = None
+    total2 = None
+
+    MACRO_CACHE.update({
+        "timestamp": now,
+        "BTC": btc,
+        "TOTAL": total,
+        "TOTAL2": total2,
+    })
+
+    return MACRO_CACHE
 
 
 # =====================================================================
-# SCAN LOGIC
+# Analyse d’un symbole
 # =====================================================================
-async def scan_symbol(
-    symbol: str,
-    analyzer: SignalAnalyzer,
-    trader: BitgetTrader,
-    risk: RiskManager,
-    dup: DuplicateGuard,
-):
+async def process_symbol(symbol: str, trader: BitgetTrader):
     try:
-        print(f"🔎 Scanning {symbol} ...")
+        # Multi-timeframe
+        h1 = await fetch_tf_ohlcv(symbol, "1H", 200)
+        h4 = await fetch_tf_ohlcv(symbol, "4H", 200)
 
-        # ---------------------------------------------------------
-        # KLINES
-        # ---------------------------------------------------------
-        df_h1 = await load_klines(symbol, "1h", 200)
-        df_h4 = await load_klines(symbol, "4h", 200)
+        if len(h1["close"]) < 50 or len(h4["close"]) < 50:
+            return None
 
-        if df_h1.empty or df_h4.empty:
-            print(f"⚠️ {symbol} — Impossible de charger H1/H4")
-            return
+        macro = await fetch_macro_data()
+        result = analyze_signal(symbol, h1, h4, macro)
 
-        # ---------------------------------------------------------
-        # CONTRACT INFO
-        # ---------------------------------------------------------
-        client = await get_client(API_KEY, API_SECRET, API_PASSPHRASE)
-        contract = await client.get_contract(symbol)
+        if not result or not result.get("signal"):
+            return None
 
-        if not contract:
-            print(f"⚠️ {symbol} — Pas d'info contrat.")
-            return
+        sig = result["signal"]
+        side = sig["side"]
+        entry = sig["entry"]
+        sl = sig["sl"]
+        tp1 = sig.get("tp1")
+        tp2 = sig.get("tp2")
+        qty = sig["qty"]
 
-        # ---------------------------------------------------------
-        # ANALYZE SIGNAL
-        # ---------------------------------------------------------
-        signal = await analyzer.analyze(symbol, df_h1, df_h4, contract)
-        if not signal:
-            return
+        LOGGER.info(f"➡️ SIGNAL {symbol}: {side} @ {entry}")
 
-        side = signal["side"]
-        entry = signal["entry"]
-        sl = signal["sl"]
-        tp1 = signal["tp1"]
-        rr = signal["rr"]
-
-        # Duplicate Guard
-        fp = f"{symbol}-{side}-{round(entry,5)}-{round(sl,5)}"
-        if dup.seen(fp):
-            return
-
-        # ---------------------------------------------------------
-        # RISK MANAGER
-        # ---------------------------------------------------------
-        allowed, reason = risk.can_trade(side)
-        if not allowed:
-            print(f"🚫 {symbol} — Trade refusé ({reason})")
-            return
-
-        # ---------------------------------------------------------
-        # SIZING
-        # ---------------------------------------------------------
-        multiplier = float(contract.get("size", 0.001))
-        lot_size = float(contract.get("size", 0.001))
-
-        qty = compute_position_size(
-            entry=entry,
-            stop=sl,
-            risk_usdt=risk.risk_for_this_trade(),
-            lot_multiplier=multiplier,
-            lot_size=lot_size,
+        # Télégram
+        await send_telegram(
+            f"🚀 *Signal détecté*\n"
+            f"• **{symbol}**\n"
+            f"• Direction: *{side}*\n"
+            f"• Entrée: `{entry}`\n"
+            f"• SL: `{sl}`\n"
+            f"• TP1: `{tp1}` | TP2: `{tp2}`\n"
+            f"• Qty: `{qty}`\n"
+            f"• Score: {result.get('score')}\n"
         )
 
-        if qty <= 0:
-            print(f"⚠️ {symbol} — qty <= 0, abort.")
-            return
+        # Exécution LIMIT Bitget Desk Lead
+        entry_res = await trader.place_limit(symbol, side, entry, qty)
 
-        # ---------------------------------------------------------
-        # PLACE LIMIT ORDER
-        # ---------------------------------------------------------
-        r_entry = await trader.place_limit(symbol, side, entry, qty)
+        if not entry_res.get("ok"):
+            LOGGER.error(f"Entry failed {symbol}: {entry_res}")
+            return None
 
-        if "error" in r_entry or r_entry.get("code") not in ["00000", 200, None]:
-            print(f"❌ {symbol} — Erreur entrée : {r_entry}")
-            return
-
-        risk.register_trade(side)
-
-        # ---------------------------------------------------------
-        # PLACE SL/TP
-        # ---------------------------------------------------------
+        # SL
         await trader.place_stop_loss(symbol, side, sl, qty)
-        await trader.place_take_profit(symbol, side, tp1, qty * 0.5)
 
-        # ---------------------------------------------------------
-        # TELEGRAM
-        # ---------------------------------------------------------
-        msg = (
-            f"📈 *Signal détecté*\n\n"
-            f"Symbol: `{symbol}`\n"
-            f"Side: *{side}*\n"
-            f"Entry: `{entry}`\n"
-            f"SL: `{sl}`\n"
-            f"TP1: `{tp1}`\n"
-            f"RR: `{round(rr,2)}`\n"
-            f"Qty: `{qty}`\n"
-            f"Inst Score: `{signal['institutional']['score']}`\n"
-            f"OTE: `{signal['ote']}`"
-        )
-        send_telegram_message(msg)
+        # TP1 / TP2
+        if tp1:
+            await trader.place_take_profit(symbol, side, tp1, qty * 0.5)
+        if tp2:
+            await trader.place_take_profit(symbol, side, tp2, qty * 0.5)
 
-        print(f"✅ Trade envoyé : {symbol} — {side} @ {entry}")
+        return True
 
     except Exception as e:
-        print(f"[ERROR] scan_symbol {symbol}: {e}")
+        LOGGER.error(f"process_symbol error {symbol}: {e}")
+        return None
 
 
 # =====================================================================
-# MAIN LOOP (SCAN EVERY 5 MINUTES)
+# SCAN LOOP
 # =====================================================================
-risk_manager = RiskManager()
-duplicate_guard = DuplicateGuard()
-
-SCAN_INTERVAL = 300  # 5 minutes
-
-
-async def run_scanner():
-    analyzer = SignalAnalyzer(API_KEY, API_SECRET, API_PASSPHRASE)
+async def scan_loop():
     trader = BitgetTrader(API_KEY, API_SECRET, API_PASSPHRASE)
 
-    print("🚀 Scanner Bitget démarré. Scan toutes les 5 minutes...")
-
     while True:
-        tasks = [scan_symbol(sym, analyzer, trader, risk_manager, duplicate_guard) for sym in SYMBOLS]
-        await asyncio.gather(*tasks)
+        try:
+            LOGGER.info("==== SCAN START ====")
 
-        print(f"⏳ Pause de {SCAN_INTERVAL} secondes...\n")
-        await asyncio.sleep(SCAN_INTERVAL)
+            symbols = await fetch_all_symbols_bitget()
+            LOGGER.info(f"{len(symbols)} symbols chargés pour analyse.")
+
+            tasks = [process_symbol(sym, trader) for sym in symbols]
+            await asyncio.gather(*tasks)
+
+            LOGGER.info("==== SCAN END ====")
+
+        except Exception as e:
+            LOGGER.error(f"Scan loop error: {e}")
+
+        await asyncio.sleep(SCAN_INTERVAL_MIN * 60)
+
+
+# =====================================================================
+# MAIN
+# =====================================================================
+def start_scanner():
+    asyncio.run(scan_loop())
 
 
 if __name__ == "__main__":
-    asyncio.run(run_scanner())
+    start_scanner()
