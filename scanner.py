@@ -1,12 +1,12 @@
 # =====================================================================
 # scanner.py — Bitget Desk Lead Scanner (Institutionnel H1+H4)
-# Analyse structurelle + institutionnelle + momentum HTF
-# Entrées LIMIT + SL/TP via BitgetTrader
 # =====================================================================
 
 import asyncio
 import logging
 import time
+import pandas as pd
+
 from datetime import datetime
 
 from settings import (
@@ -20,123 +20,125 @@ from bitget_trader import BitgetTrader
 from analyze_signal import analyze_signal
 from telegram.ext import Application
 
+
 LOGGER = logging.getLogger(__name__)
 
-# Cache macro pour éviter surcharge API
-MACRO_CACHE = {
-    "timestamp": 0,
-    "BTC": None,
-    "TOTAL": None,
-    "TOTAL2": None,
-}
-MACRO_TTL = 90  # 90 sec
+# ============================================================
+# TELEGRAM (une seule instance pour éviter les leaks)
+# ============================================================
 
+TELEGRAM_APP: Application | None = None
 
-# =====================================================================
-# TELEGRAM
-# =====================================================================
+async def init_telegram():
+    global TELEGRAM_APP
+    if TELEGRAM_APP is None:
+        TELEGRAM_APP = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+
 async def send_telegram(text: str):
     try:
-        app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-        async with app:
-            await app.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text)
+        await init_telegram()
+        async with TELEGRAM_APP:
+            await TELEGRAM_APP.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text, parse_mode="Markdown")
     except Exception as e:
-        LOGGER.error(f"Telegram send error: {e}")
+        LOGGER.error(f"Telegram error: {e}")
 
 
-# =====================================================================
-# Récup dynamique des symboles Bitget USDT-M
-# =====================================================================
-async def fetch_all_symbols_bitget():
-    client = await get_client(API_KEY, API_SECRET, API_PASSPHRASE)
+# ============================================================
+# OHLCV FORMAT → DATAFRAME
+# ============================================================
+
+def to_df(ohlcv_raw):
+    """
+    Bitget OHLCV format:
+        [["timestamp","open","high","low","close","volume"], ...]
+    Convertit en DataFrame exploitable.
+    """
+    if not ohlcv_raw:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(ohlcv_raw, columns=["timestamp", "open", "high", "low", "close", "volume"])
+    df = df.astype({
+        "timestamp": "float",
+        "open": "float",
+        "high": "float",
+        "low": "float",
+        "close": "float",
+        "volume": "float",
+    })
+    return df.sort_values("timestamp").reset_index(drop=True)
+
+
+# ============================================================
+# FETCH SYMBOLS BITGET
+# ============================================================
+
+async def fetch_all_symbols_bitget(client):
     data = await client._request("GET", "/api/mix/v1/market/contracts", auth=False)
 
     syms = []
     for c in data.get("data", []):
-        if c.get("quoteCoin") == "USDT":
+        if c.get("quoteCoin") == "USDT" and c.get("symbol", "").endswith("_UMCBL"):
             syms.append(c["symbol"])
 
     return syms
 
 
-# =====================================================================
-# Multi-timeframe (H1 + H4)
-# =====================================================================
-async def fetch_tf_ohlcv(symbol: str, tf: str, limit: int):
+# ============================================================
+# FETCH MULTI-TF OHLCV
+# ============================================================
+
+async def fetch_tf_df(symbol: str, tf: str, limit: int):
     client = await get_client(API_KEY, API_SECRET, API_PASSPHRASE)
-    raw = await client.get_klines(symbol, granularity=tf, limit=limit)
-
-    # convert into DataFrame-like format (dict of lists)
-    ohlcv = {
-        "timestamp": [],
-        "open": [],
-        "high": [],
-        "low": [],
-        "close": [],
-        "volume": [],
-    }
-
-    try:
-        for r in raw:
-            ts, o, h, l, c, v = r
-            ohlcv["timestamp"].append(float(ts))
-            ohlcv["open"].append(float(o))
-            ohlcv["high"].append(float(h))
-            ohlcv["low"].append(float(l))
-            ohlcv["close"].append(float(c))
-            ohlcv["volume"].append(float(v))
-    except:
-        LOGGER.warning(f"Failed OHLCV format for {symbol}")
-
-    return ohlcv
+    raw = await client.get_klines(symbol, tf, limit)
+    return to_df(raw)
 
 
-# =====================================================================
-# Cache macro BTC / TOTAL / TOTAL2
-# =====================================================================
+# ============================================================
+# MACRO DATA CACHE (BTC / TOTAL / TOTAL2)
+# ============================================================
+
+MACRO_CACHE = {"ts": 0, "BTC": None}
+MACRO_TTL = 120  # seconds
+
 async def fetch_macro_data():
     now = time.time()
-
-    if now - MACRO_CACHE["timestamp"] < MACRO_TTL:
+    if now - MACRO_CACHE["ts"] < MACRO_TTL:
         return MACRO_CACHE
 
     client = await get_client(API_KEY, API_SECRET, API_PASSPHRASE)
 
-    # BTCUSDT
-    btc = await client.get_klines("BTCUSDT_UMCBL", "1H", limit=200)
-
-    # TOTAL et TOTAL2 n’existent pas sur Bitget → fallback Binance ou CoinGecko ?
-    # → Pour l’instant, neutre.
-    total = None
-    total2 = None
+    raw_btc = await client.get_klines("BTCUSDT_UMCBL", "1H", limit=200)
+    df_btc = to_df(raw_btc)
 
     MACRO_CACHE.update({
-        "timestamp": now,
-        "BTC": btc,
-        "TOTAL": total,
-        "TOTAL2": total2,
+        "ts": now,
+        "BTC": df_btc,
+        "TOTAL": None,
+        "TOTAL2": None,
     })
 
     return MACRO_CACHE
 
 
-# =====================================================================
-# Analyse d’un symbole
-# =====================================================================
+# ============================================================
+# PROCESS SYMBOL
+# ============================================================
+
 async def process_symbol(symbol: str, trader: BitgetTrader):
     try:
-        # Multi-timeframe
-        h1 = await fetch_tf_ohlcv(symbol, "1H", 200)
-        h4 = await fetch_tf_ohlcv(symbol, "4H", 200)
+        df_h1 = await fetch_tf_df(symbol, "1H", 200)
+        df_h4 = await fetch_tf_df(symbol, "4H", 200)
 
-        if len(h1["close"]) < 50 or len(h4["close"]) < 50:
-            return None
+        if df_h1.empty or df_h4.empty or len(df_h1) < 80:
+            return
 
         macro = await fetch_macro_data()
-        result = analyze_signal(symbol, h1, h4, macro)
+
+        # --- IMPORTANT --- analyse_signal est ASYNC
+        result = await analyze_signal(symbol, df_h1, df_h4, macro)
 
         if not result or not result.get("signal"):
-            return None
+            return
 
         sig = result["signal"]
         side = sig["side"]
@@ -146,9 +148,9 @@ async def process_symbol(symbol: str, trader: BitgetTrader):
         tp2 = sig.get("tp2")
         qty = sig["qty"]
 
-        LOGGER.info(f"➡️ SIGNAL {symbol}: {side} @ {entry}")
+        LOGGER.warning(f"🎯 SIGNAL {symbol} → {side} @ {entry}")
 
-        # Télégram
+        # Telegram
         await send_telegram(
             f"🚀 *Signal détecté*\n"
             f"• **{symbol}**\n"
@@ -157,59 +159,53 @@ async def process_symbol(symbol: str, trader: BitgetTrader):
             f"• SL: `{sl}`\n"
             f"• TP1: `{tp1}` | TP2: `{tp2}`\n"
             f"• Qty: `{qty}`\n"
-            f"• Score: {result.get('score')}\n"
+            f"• Score: `{result.get('score')}`\n"
         )
 
-        # Exécution LIMIT Bitget Desk Lead
+        # EXECUTION LIMIT
         entry_res = await trader.place_limit(symbol, side, entry, qty)
+        if entry_res.get("code") != "00000":
+            LOGGER.error(f"Entry error {symbol}: {entry_res}")
+            return
 
-        if not entry_res.get("ok"):
-            LOGGER.error(f"Entry failed {symbol}: {entry_res}")
-            return None
-
-        # SL
+        # STOP LOSS
         await trader.place_stop_loss(symbol, side, sl, qty)
 
-        # TP1 / TP2
+        # TAKE PROFITS
         if tp1:
             await trader.place_take_profit(symbol, side, tp1, qty * 0.5)
         if tp2:
             await trader.place_take_profit(symbol, side, tp2, qty * 0.5)
 
-        return True
-
     except Exception as e:
-        LOGGER.error(f"process_symbol error {symbol}: {e}")
-        return None
+        LOGGER.error(f"[{symbol}] process_symbol error: {e}")
 
 
-# =====================================================================
-# SCAN LOOP
-# =====================================================================
+# ============================================================
+# MAIN LOOP
+# ============================================================
+
 async def scan_loop():
+    client = await get_client(API_KEY, API_SECRET, API_PASSPHRASE)
     trader = BitgetTrader(API_KEY, API_SECRET, API_PASSPHRASE)
 
     while True:
         try:
-            LOGGER.info("==== SCAN START ====")
+            LOGGER.info("=== START SCAN ===")
 
-            symbols = await fetch_all_symbols_bitget()
-            LOGGER.info(f"{len(symbols)} symbols chargés pour analyse.")
-
+            symbols = await fetch_all_symbols_bitget(client)
             tasks = [process_symbol(sym, trader) for sym in symbols]
+
             await asyncio.gather(*tasks)
 
-            LOGGER.info("==== SCAN END ====")
+            LOGGER.info("=== END SCAN ===")
 
         except Exception as e:
-            LOGGER.error(f"Scan loop error: {e}")
+            LOGGER.error(f"SCAN ERROR: {e}")
 
         await asyncio.sleep(SCAN_INTERVAL_MIN * 60)
 
 
-# =====================================================================
-# MAIN
-# =====================================================================
 def start_scanner():
     asyncio.run(scan_loop())
 
