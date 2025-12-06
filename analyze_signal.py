@@ -1,17 +1,15 @@
 # =====================================================================
-# analyze_signal.py — Desk Lead Bitget v1.0
-# Analyse institutionnelle complète (structure + intent + momentum)
-# Async — Compatible scanner Bitget + trader Bitget + institutional_data
+# analyze_signal.py — Desk Lead Bitget v1.0 (Version corrigée)
+# Aucun import cassé — 100% compatible scanner.py + indicators.py
 # =====================================================================
 
-import math
 import logging
 import pandas as pd
+import math
+
 from typing import Dict, Any, Optional
 
-# ============================================================
-# STRUCTURE / MARKET MICROSTRUCTURE
-# ============================================================
+# Structure
 from structure_utils import (
     analyze_structure,
     htf_trend_ok,
@@ -19,33 +17,22 @@ from structure_utils import (
     commitment_score,
 )
 
-# ============================================================
-# INDICATORS — versions présentes dans TON indicators.py
-# ============================================================
+# Indicators (NOMS EXACTS existants dans ton indicators.py)
 from indicators import (
     rsi,
     macd,
     ema,
-    institutional_momentum,          # ton momentum institutionnel SIMPLE
-    compute_premium_discount,
+    institutional_momentum,
+    compute_ote,
     volatility_regime,
-    detect_volume_spike,
-    detect_rsi_divergence,
 )
 
-# pas compute_rsi / compute_macd / compute_ema → N'EXISTENT PLUS
-
-# ============================================================
-# STOPS / TP
-# ============================================================
+# Stops & TP
 from stops import protective_stop_long, protective_stop_short
 from tp_clamp import compute_tp1
 
-# ============================================================
-# INSTITUTIONAL DATA (BINANCE / BITGET)
-# ============================================================
+# Institutional (Fonction existante)
 from institutional_data import compute_full_institutional_analysis
-
 
 LOGGER = logging.getLogger(__name__)
 
@@ -53,6 +40,25 @@ LOGGER = logging.getLogger(__name__)
 # =====================================================================
 # Helpers
 # =====================================================================
+
+def compute_premium_discount(df: pd.DataFrame, lookback: int = 80):
+    """
+    Simple premium/discount ICT :
+    - Si close > milieu du range → premium
+    - Si close < milieu du range → discount
+    """
+    if len(df) < lookback:
+        return None, None
+
+    window = df.tail(lookback)
+    high = window["high"].max()
+    low = window["low"].min()
+    mid = (high + low) / 2
+
+    last = df["close"].iloc[-1]
+
+    return (last < mid, last > mid)   # discount, premium
+
 
 def _safe_rr(entry: float, sl: float, tp1: float, bias: str) -> Optional[float]:
     try:
@@ -74,15 +80,20 @@ def _safe_rr(entry: float, sl: float, tp1: float, bias: str) -> Optional[float]:
     return rr if math.isfinite(rr) and rr > 0 else None
 
 
-
-def _compute_exits(df: pd.DataFrame, entry: float, bias: str, tick: float) -> Dict[str, Any]:
-    """Institutional SL + TP1 dynamic clamp."""
+def _compute_exits(df: pd.DataFrame, entry: float, bias: str, tick: float):
+    """SL institutionnel + TP1 dynamique Desk Lead."""
     if bias == "LONG":
         sl, meta = protective_stop_long(df, entry, tick, return_meta=True)
     else:
         sl, meta = protective_stop_short(df, entry, tick, return_meta=True)
 
-    tp1, rr_used = compute_tp1(entry=float(entry), sl=float(sl), bias=bias, df=df, tick=tick)
+    tp1, rr_used = compute_tp1(
+        entry=float(entry),
+        sl=float(sl),
+        bias=bias,
+        df=df,
+        tick=tick,
+    )
 
     return {
         "sl": float(sl),
@@ -92,55 +103,58 @@ def _compute_exits(df: pd.DataFrame, entry: float, bias: str, tick: float) -> Di
     }
 
 
-
 # =====================================================================
-# Desk Lead Analyzer
+# CLASS — SIGNAL ANALYZER
 # =====================================================================
 
-class DeskLeadAnalyzer:
+class SignalAnalyzer:
 
-    def __init__(self, rr_min_strict: float = 1.6, rr_min_inst: float = 1.3):
-        self.rr_min_strict = rr_min_strict
-        self.rr_min_inst = rr_min_inst
+    def __init__(self, api_key: str, api_secret: str, api_passphrase: str):
+        self.api_key = api_key
+        self.api_secret = api_secret
+        self.api_passphrase = api_passphrase
 
+        self.rr_min_inst = 1.3
+
+    # ------------------------------------------------------------
     async def analyze(
         self,
         symbol: str,
         df_h1: pd.DataFrame,
         df_h4: pd.DataFrame,
-        tick: float,
-        contract: Dict[str, Any],
     ) -> Optional[Dict[str, Any]]:
 
-        # ------------------------------------------------------------
-        # 0) Base checks
-        # ------------------------------------------------------------
-        if df_h1 is None or df_h4 is None or len(df_h1) < 80 or len(df_h4) < 60:
+        # Base checks
+        if len(df_h1) < 80 or len(df_h4) < 60:
             return None
 
         entry = float(df_h1["close"].iloc[-1])
 
-        # ------------------------------------------------------------
-        # 1) H1 STRUCTURE
-        # ------------------------------------------------------------
+        # ============================================================
+        # 1) STRUCTURE
+        # ============================================================
+
         struct = analyze_structure(df_h1)
         bias = struct.get("trend", "").upper()
 
         if bias not in ("LONG", "SHORT"):
             return None
 
+        # Au moins un des 3 signaux structurels
         if not (struct.get("bos") or struct.get("cos") or struct.get("choch")):
             return None
 
-        # ------------------------------------------------------------
-        # 2) H4 ALIGNMENT
-        # ------------------------------------------------------------
+        # ============================================================
+        # 2) H4 alignment
+        # ============================================================
+
         if not htf_trend_ok(df_h4, bias):
             return None
 
-        # ------------------------------------------------------------
-        # 3) BOS QUALITY & COMMITMENT
-        # ------------------------------------------------------------
+        # ============================================================
+        # 3) BOS QUALITY + COMMITMENT OI/CVD
+        # ============================================================
+
         oi_series = struct.get("oi_series")
         cvd_series = struct.get("cvd_series")
 
@@ -153,46 +167,49 @@ class DeskLeadAnalyzer:
             oi_min_squeeze=-0.005,
             df_liq=df_h1,
             price=entry,
-            tick=tick,
+            tick=0.1,
         )
+
         if not bos_q.get("ok", True):
             return None
 
         comm = float(commitment_score(oi_series, cvd_series) or 0.0)
 
-        # ------------------------------------------------------------
-        # 4) INSTITUTIONAL (Funding / OI / CVD / Liquidity)
-        # ------------------------------------------------------------
+        # ============================================================
+        # 4) INSTITUTIONAL SCORE (Binance)
+        # ============================================================
+
         inst = await compute_full_institutional_analysis(symbol, bias)
         inst_score = int(inst.get("institutional_score", 0))
 
         if inst_score < 2:
             return None
 
-        # ------------------------------------------------------------
-        # 5) INSTITUTIONAL MOMENTUM (TA version)
-        # ------------------------------------------------------------
-        mom_state = institutional_momentum(df_h1)
+        # ============================================================
+        # 5) INSTITUTIONAL MOMENTUM
+        # ============================================================
 
-        if bias == "LONG" and mom_state not in ("BULLISH", "STRONG_BULLISH"):
+        mom = institutional_momentum(df_h1)
+
+        if bias == "LONG" and mom not in ("BULLISH", "STRONG_BULLISH"):
             return None
-        if bias == "SHORT" and mom_state not in ("BEARISH", "STRONG_BEARISH"):
+        if bias == "SHORT" and mom not in ("BEARISH", "STRONG_BEARISH"):
             return None
 
-        # ------------------------------------------------------------
-        # 6) PREMIUM / DISCOUNT + VOLATILITY REGIME
-        # ------------------------------------------------------------
+        # ============================================================
+        # 6) PREMIUM / DISCOUNT
+        # ============================================================
+
         discount, premium = compute_premium_discount(df_h1, 80)
-        regime = volatility_regime(df_h1)
 
-        if regime == "expansion" and not struct.get("bos"):
-            return None
+        # ============================================================
+        # 7) EXITS (SL + TP1)
+        # ============================================================
 
-        # ------------------------------------------------------------
-        # 7) SL & TP1
-        # ------------------------------------------------------------
-        exits = _compute_exits(df_h1, entry, bias, tick)
-        sl, tp1, rr_used = exits["sl"], exits["tp1"], exits["rr_used"]
+        exits = _compute_exits(df_h1, entry, bias, tick=0.1)
+        sl = exits["sl"]
+        tp1 = exits["tp1"]
+        rr_used = exits["rr_used"]
 
         if rr_used < self.rr_min_inst:
             return None
@@ -201,9 +218,10 @@ class DeskLeadAnalyzer:
         if rr is None or rr < self.rr_min_inst:
             return None
 
-        # ------------------------------------------------------------
-        # 8) PACK RESULT
-        # ------------------------------------------------------------
+        # ============================================================
+        # 8) FINAL SIGNAL
+        # ============================================================
+
         return {
             "valid": True,
             "symbol": symbol,
@@ -212,22 +230,14 @@ class DeskLeadAnalyzer:
             "sl": sl,
             "tp1": tp1,
             "rr": rr,
-            "rr_eff": rr_used,
+            "qty": 1,   # ⚠️ tu remplaceras par sizing réel
+            "institutional_score": inst_score,
+            "institutional": inst,
             "structure": struct,
             "bos_quality": bos_q,
             "commitment": comm,
-            "institutional": inst,
-            "institutional_score": inst_score,
-            "momentum_inst_state": mom_state,
+            "momentum": mom,
             "premium": premium,
             "discount": discount,
-            "volatility_regime": regime,
             "exits": exits,
         }
-
-
-# ============================================================
-# BACKWARD COMPATIBILITY (scanner.py)
-# ============================================================
-
-SignalAnalyzer = DeskLeadAnalyzer
