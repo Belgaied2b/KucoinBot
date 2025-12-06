@@ -1,7 +1,7 @@
 # =====================================================================
-# analyze_signal.py — Desk Lead Bitget v1.0
-# Analyse institutionnelle complète (structure + intent + momentum)
-# Async — Compatible scanner Bitget + trader Bitget + institutional_data (Binance)
+# analyze_signal.py — Desk Lead Bitget v2.0
+# Analyse institutionnelle stricte (structure + intent + momentum)
+# Async — Compatible scanner Bitget + trader Bitget + institutional_data
 # =====================================================================
 
 import math
@@ -12,22 +12,26 @@ from typing import Dict, Any, Optional
 # Structure & technique
 from structure_utils import (
     analyze_structure,
-    htf_trend_ok,
+    htf_confirm,
     bos_quality_details,
     commitment_score,
 )
+
+# Indicators (version REMISE EN COHÉRENCE avec ton indicators.py)
 from indicators import (
-    compute_rsi,
-    compute_macd,
-    compute_ema,
-    institutional_momentum_score,
-    compute_premium_discount,
+    rsi,
+    macd,
+    ema,
+    institutional_momentum,
+    compute_ote,
     volatility_regime,
-    structural_momentum_flag,
-    is_momentum_ok,
 )
+
+# Stops / TP
 from stops import protective_stop_long, protective_stop_short
 from tp_clamp import compute_tp1
+
+# Institutional engine (Binance OI/Funding/Liq)
 from institutional_data import compute_full_institutional_analysis
 
 
@@ -41,7 +45,9 @@ LOGGER = logging.getLogger(__name__)
 def _safe_rr(entry: float, sl: float, tp1: float, bias: str) -> Optional[float]:
     """Compute RR safely and robustly."""
     try:
-        entry, sl, tp1 = float(entry), float(sl), float(tp1)
+        entry = float(entry)
+        sl = float(sl)
+        tp1 = float(tp1)
     except:
         return None
 
@@ -105,11 +111,11 @@ class DeskLeadAnalyzer:
         Analyse Desk Lead :
             - Structure H1 complète
             - BOS quality + commitment OI/CVD
-            - HTF alignment H4
-            - Institutional score (Binance OI / FUND / CVD / Liquidity)
-            - Institutional momentum
-            - Premium/Discount + Volatility regime
-            - SL/TP1 institutionnel
+            - HTF alignment (H4)
+            - Institutional analysis (OI, FUND, CVD, LIQ)
+            - Institutional momentum (MACD/RSI/volume)
+            - Premium/Discount + volatility regime
+            - SL/TP institutionnels
         """
 
         # =====================================================================
@@ -131,15 +137,15 @@ class DeskLeadAnalyzer:
         if bias not in ("LONG", "SHORT"):
             return None
 
-        # au moins 1 des 3 signaux structurels :
+        # Au moins un signal structurel
         if not (struct.get("bos") or struct.get("cos") or struct.get("choch")):
             return None
 
         # =====================================================================
-        # 2) H4 alignment
+        # 2) H4 ALIGNMENT
         # =====================================================================
 
-        if not htf_trend_ok(df_h4, bias):
+        if not htf_confirm(df_h4, bias):
             return None
 
         # =====================================================================
@@ -171,16 +177,12 @@ class DeskLeadAnalyzer:
         # =====================================================================
 
         inst = await compute_full_institutional_analysis(symbol, bias)
-        inst_score = int(inst.get("institutional_score", 0))
+        inst_score = float(inst.get("institutional_score", 0))
 
         try:
             LOGGER.info(
-                "[INST_RAW] %s %s score=%s pressure=%.2f details=%s",
-                symbol,
-                bias,
-                inst_score,
-                inst.get("pressure"),
-                inst.get("details"),
+                f"[INST_RAW] {symbol} {bias} score={inst_score} "
+                f"pressure={inst.get('pressure')} details={inst.get('details')}"
             )
         except:
             pass
@@ -192,26 +194,25 @@ class DeskLeadAnalyzer:
         # 5) INSTITUTIONAL MOMENTUM
         # =====================================================================
 
-        mom_score = institutional_momentum_score(df_h1["close"], df_h1["volume"])
+        mom = institutional_momentum(df_h1)
 
-        if bias == "LONG" and mom_score < 0.55:
+        if bias == "LONG" and mom not in ("BULLISH", "STRONG_BULLISH"):
             return None
-        if bias == "SHORT" and mom_score < 0.55:
+        if bias == "SHORT" and mom not in ("BEARISH", "STRONG_BEARISH"):
             return None
 
         # =====================================================================
-        # 6) PREMIUM / DISCOUNT + VOLATILITY REGIME
+        # 6) PREMIUM / DISCOUNT + VOLATILITY
         # =====================================================================
 
-        discount, premium = compute_premium_discount(df_h1, 80)
         regime = volatility_regime(df_h1)
 
-        # sanction si expansion violente non alignée
-        if regime == "expansion" and not struct.get("bos"):
+        # Sanction si expansion non soutenue par BOS validé
+        if regime == "HIGH" and not struct.get("bos"):
             return None
 
         # =====================================================================
-        # 7) EXITS (SL + TP1)
+        # 7) EXITS (SL + TP1 institutionnels)
         # =====================================================================
 
         exits = _compute_exits(df_h1, entry, bias, tick)
@@ -219,7 +220,7 @@ class DeskLeadAnalyzer:
         tp1 = exits["tp1"]
         rr_used = exits["rr_used"]
 
-        # validation RR
+        # Validation RR
         if rr_used < self.rr_min_inst:
             return None
 
@@ -248,20 +249,15 @@ class DeskLeadAnalyzer:
             "institutional": inst,
             "institutional_score": inst_score,
 
-            "momentum_inst": mom_score,
-            "premium": premium,
-            "discount": discount,
+            "momentum_inst": mom,
             "volatility_regime": regime,
 
             "exits": exits,
         }
 
-        try:
-            LOGGER.info(
-                "[EVAL] %s %s -> VALID RR=%.2f inst=%s comm=%.2f mom=%.2f",
-                symbol, bias, rr, inst_score, comm, mom_score
-            )
-        except:
-            pass
+        LOGGER.info(
+            f"[EVAL] {symbol} {bias} -> VALID "
+            f"RR={rr:.2f} inst={inst_score:.1f} comm={comm:.2f} mom={mom}"
+        )
 
         return signal
