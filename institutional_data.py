@@ -4,7 +4,7 @@
 import aiohttp
 import asyncio
 from typing import Dict, Optional, Any
-from .bitget_client import get_client
+from bitget_client import get_client
 import time
 import numpy as np
 
