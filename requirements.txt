@@ -1,3 +1,5 @@
 aiohttp
-python-dotenv
 requests
+pandas
+numpy
+python-dotenv
