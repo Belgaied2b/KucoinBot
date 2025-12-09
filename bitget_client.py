@@ -1,5 +1,5 @@
 # =====================================================================
-# bitget_client.py — Bitget API v2 (2025) — FINAL FULL FIX
+# bitget_client.py — Bitget API v2 (2025) — FINAL KLINES FIX
 # =====================================================================
 
 from __future__ import annotations
@@ -21,44 +21,36 @@ async def _async_backoff_retry(fn, *, retries=4, base_delay=0.3):
                 raise
             await asyncio.sleep(base_delay * (2 ** attempt))
 
-
 # =====================================================================
-# SYMBOL NORMALISATION (v2)
-# =====================================================================
-
-def normalize_symbol(sym: str) -> str:
-    if not sym:
-        return ""
-    s = sym.upper().replace("-", "")
-
-    # KuCoin style
-    s = s.replace("USDTM", "USDT").replace("USDTSWAP", "USDT")
-
-    # BitMEX-style
-    if s.startswith("XBT"):
-        s = s.replace("XBT", "BTC")
-
-    return s
-
-
-def format_symbol(sym: str) -> str:
-    return normalize_symbol(sym)
-
-
-# =====================================================================
-# TIMEFRAME MAP — Bitget requires seconds
+# TF MAP → Bitget V2 (candles)
 # =====================================================================
 
 TF_MAP = {
     "1H": 3600,
     "4H": 14400,
-    "1M": 60,
-    "5M": 300,
-    "15M": 900,
-    "30M": 1800,
+    "1m": 60,
+    "5m": 300,
+    "15m": 900,
+    "30m": 1800,
     "1D": 86400,
 }
 
+# =====================================================================
+# SYMBOL FORMAT
+# =====================================================================
+
+def normalize_symbol(sym: str) -> str:
+    if not sym:
+        return ""
+    s = (
+        sym.upper()
+        .replace("-", "")
+        .replace("USDTM", "USDT")
+        .replace("USDT-SWAP", "USDT")
+    )
+    if s.startswith("XBT"):
+        s = s.replace("XBT", "BTC")
+    return s
 
 # =====================================================================
 # CLIENT
@@ -71,26 +63,21 @@ class BitgetClient:
         self.api_key = key
         self.api_secret = secret.encode()
         self.api_passphrase = passphrase
-
         self.session: Optional[aiohttp.ClientSession] = None
 
-        # Cache des vrais contrats futures USDT perpétuels
-        self._contracts_cache: Optional[List[str]] = None
+        self._contracts_cache = None
         self._contracts_ts = 0
 
-    # ---------------------------------------------------------------
     async def _ensure_session(self):
         if self.session is None or self.session.closed:
-            timeout = aiohttp.ClientTimeout(total=30)
+            timeout = aiohttp.ClientTimeout(total=25)
             self.session = aiohttp.ClientSession(timeout=timeout)
 
-    # ---------------------------------------------------------------
     def _sign(self, ts, method, path, query, body):
         msg = f"{ts}{method}{path}{query}{body}"
         mac = hmac.new(self.api_secret, msg.encode(), hashlib.sha256).digest()
         return base64.b64encode(mac).decode()
 
-    # ---------------------------------------------------------------
     async def _request(self, method, path, *, params=None, data=None, auth=True):
         await self._ensure_session()
         params = params or {}
@@ -101,12 +88,11 @@ class BitgetClient:
             query = "?" + "&".join(f"{k}={v}" for k, v in params.items())
 
         url = self.BASE + path + query
-        body = json.dumps(data, separators=(",", ":")) if data else ""
+        body = json.dumps(data) if data else ""
 
         async def _do():
             ts = str(int(time.time() * 1000))
             headers = {}
-
             if auth:
                 sig = self._sign(ts, method.upper(), path, query, body)
                 headers = {
@@ -117,9 +103,7 @@ class BitgetClient:
                     "Content-Type": "application/json",
                 }
 
-            async with self.session.request(
-                method.upper(), url, headers=headers, data=body or None
-            ) as resp:
+            async with self.session.request(method.upper(), url, headers=headers, data=body or None) as resp:
                 txt = await resp.text()
                 try:
                     return json.loads(txt)
@@ -129,16 +113,13 @@ class BitgetClient:
 
         return await _async_backoff_retry(_do)
 
-
     # =====================================================================
-    # CONTRATS (v2) — FINAL FIX
-    # Filtre : ONLY PERPETUAL + USDT (sinon klines = vide)
+    # CONTRACTS (v2)
     # =====================================================================
 
     async def get_contracts_list(self) -> List[str]:
         now = time.time()
 
-        # use cached list
         if self._contracts_cache and now - self._contracts_ts < 300:
             return self._contracts_cache
 
@@ -149,44 +130,44 @@ class BitgetClient:
             auth=False,
         )
 
-        if "data" not in r or not isinstance(r["data"], list):
-            LOGGER.error(f"📡 CONTRACT ERROR: {r}")
+        if "data" not in r:
+            LOGGER.error(f"CONTRACT ERROR: {r}")
             return []
 
-        filtered = []
+        symbols = []
         for c in r["data"]:
-            # CRUCIAL FIX : Bitget renvoie des tokens spot et indexes !
-            if c.get("symbolType") != "perpetual":
-                continue
-            if c.get("quoteCoin") != "USDT":
-                continue
+            sym = normalize_symbol(c.get("symbol", ""))
+            if sym:
+                symbols.append(sym)
 
-            sym = format_symbol(c["symbol"])
-            filtered.append(sym)
+        LOGGER.info(f"📈 FINAL PERPETUAL FUTURES LOADED: {len(symbols)}")
 
-        LOGGER.info(f"📈 FINAL PERPETUAL FUTURES LOADED: {len(filtered)} symbols")
-
-        self._contracts_cache = filtered
+        self._contracts_cache = symbols
         self._contracts_ts = now
-        return filtered
-
+        return symbols
 
     # =====================================================================
-    # KLINES (v2) — FINAL FIX + GRANULARITY MAP
+    # FIXED KLINES ENDPOINT (v2 — WORKING)
     # =====================================================================
 
     async def get_klines_df(self, symbol: str, tf="1H", limit=200):
-        sym = format_symbol(symbol)
-
+        sym = normalize_symbol(symbol)
         gran = TF_MAP.get(tf.upper())
+
         if gran is None:
-            LOGGER.error(f"❌ Unknown timeframe {tf}. Valid: {list(TF_MAP.keys())}")
+            LOGGER.error(f"❌ UNKNOWN TF {tf}")
             return pd.DataFrame()
 
+        # ⚠️ LE BON ENDPOINT POUR LES PERP
         r = await self._request(
             "GET",
-            "/api/v2/mix/market/candles",
-            params={"symbol": sym, "granularity": gran, "limit": limit},
+            "/api/v2/market/candles",
+            params={
+                "symbol": sym,
+                "productType": "USDT-FUTURES",
+                "granularity": gran,
+                "limit": limit,
+            },
             auth=False,
         )
 
@@ -204,7 +185,7 @@ class BitgetClient:
             return df.reset_index(drop=True)
 
         except Exception as e:
-            LOGGER.exception(f"❌ PARSE ERROR {symbol}: {e}")
+            LOGGER.exception(f"❌ PARSE ERROR for {symbol}: {e}")
             return pd.DataFrame()
 
 
