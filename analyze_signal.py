@@ -1,3 +1,4 @@
+print("🔥 analyze_signal.py LOADED (VERSION DEBUG)")
 # =====================================================================
 # analyze_signal.py — VERSION DIAGNOSTIC (2025)
 # Ajout de logs pour comprendre où le signal est rejeté.
