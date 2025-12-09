@@ -6,6 +6,7 @@
 #   ✔ KuCoin → Bitget symbol mapping
 #   ✔ Contract / OI / Funding caching
 #   ✔ get_klines_df() → clean OHLCV DataFrame
+#   ✔ get_klines()  → KuCoin-style raw OHLCV
 #   ✔ Proper Bitget signature
 #   ✔ Async-safe, scanner-compatible
 # =====================================================================
@@ -21,7 +22,7 @@ import hashlib
 import json
 import logging
 import pandas as pd
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List
 
 LOGGER = logging.getLogger(__name__)
 
@@ -34,7 +35,7 @@ async def _async_backoff_retry(fn, retries=4, base_delay=0.35, exc=(Exception,))
     for attempt in range(retries + 1):
         try:
             return await fn()
-        except exc as e:
+        except exc:
             if attempt >= retries:
                 raise
             await asyncio.sleep(base_delay * (2 ** attempt))
@@ -61,7 +62,7 @@ def map_symbol_kucoin_to_bitget(sym: str) -> Optional[str]:
 
 
 # =====================================================================
-# BitgetClient Core
+# CLIENT
 # =====================================================================
 
 class BitgetClient:
@@ -77,7 +78,6 @@ class BitgetClient:
         # Caches
         self._contract_cache = {}
         self._contract_ts = 0
-
         self._cache_oi = {}
         self._cache_funding = {}
 
@@ -110,7 +110,7 @@ class BitgetClient:
         params = params or {}
         data = data or {}
 
-        # Query string
+        # Build query
         query = ""
         if params:
             qs = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
@@ -124,33 +124,29 @@ class BitgetClient:
             headers = {}
 
             if auth:
-                sig = self._sign(ts, method.upper(), path, query, body)
+                signature = self._sign(ts, method.upper(), path, query, body)
                 headers = {
                     "ACCESS-KEY": self.api_key,
-                    "ACCESS-SIGN": sig,
+                    "ACCESS-SIGN": signature,
                     "ACCESS-TIMESTAMP": ts,
                     "ACCESS-PASSPHRASE": self.api_passphrase,
                     "Content-Type": "application/json",
                 }
 
-            async with self.session.request(
-                method.upper(), url, headers=headers, data=body if data else None
-            ) as resp:
-
+            async with self.session.request(method.upper(), url, headers=headers, data=body if data else None) as resp:
                 txt = await resp.text()
 
-                # Retry conditions
+                # Retryable responses
                 if resp.status == 429 or 500 <= resp.status < 600:
-                    raise ConnectionError(f"Retryable error {resp.status}: {txt}")
+                    raise ConnectionError(f"Retryable {resp.status}: {txt}")
 
                 try:
                     js = json.loads(txt)
                 except:
                     return {"ok": False, "status": resp.status, "raw": txt}
 
-                ok = js.get("code") == "00000"
                 return {
-                    "ok": ok,
+                    "ok": js.get("code") == "00000",
                     "status": resp.status,
                     "data": js.get("data"),
                     "raw": js,
@@ -163,11 +159,7 @@ class BitgetClient:
     # =====================================================================
 
     async def get_klines_df(self, symbol: str, tf: str = "1H", limit: int = 200) -> pd.DataFrame:
-        """
-        Return OHLCV DataFrame for Bitget Futures.
-        Compatible with KuCoin format:
-            columns = time, open, high, low, close, volume
-        """
+        """Return OHLCV as a clean DataFrame."""
         mapped = map_symbol_kucoin_to_bitget(symbol)
         if not mapped:
             return pd.DataFrame()
@@ -185,13 +177,41 @@ class BitgetClient:
 
         try:
             df = pd.DataFrame(raw, columns=["time", "open", "high", "low", "close", "volume"])
-            for c in df.columns:
-                df[c] = df[c].astype(float)
-
+            df = df.astype(float)
             return df.sort_values("time").reset_index(drop=True)
         except Exception:
-            LOGGER.exception(f"Failed to parse klines: {symbol}")
+            LOGGER.exception("Failed klines parse for %s", symbol)
             return pd.DataFrame()
+
+    # =====================================================================
+    # LEGACY COMPATIBILITY — get_klines()
+    # =====================================================================
+
+    async def get_klines(self, symbol: str, tf: str = "1H", limit: int = 200):
+        """
+        Legacy wrapper → returns KuCoin-style OHLCV list:
+        [
+            [timestamp, open, high, low, close, volume],
+            ...
+        ]
+        Required by scanner.py + analyze_signal
+        """
+        df = await self.get_klines_df(symbol, tf, limit)
+
+        if df.empty:
+            return []
+
+        out = []
+        for _, row in df.iterrows():
+            out.append([
+                row["time"],
+                row["open"],
+                row["high"],
+                row["low"],
+                row["close"],
+                row["volume"],
+            ])
+        return out
 
     # =====================================================================
     # CONTRACT METADATA
@@ -231,7 +251,6 @@ class BitgetClient:
             "/api/mix/v1/position/singlePosition",
             params={"symbol": mapped, "marginCoin": "USDT"},
         )
-
         return r.get("data") or {}
 
     # =====================================================================
@@ -244,6 +263,7 @@ class BitgetClient:
             return None
 
         now = time.time()
+
         if symbol in self._cache_oi and now - self._cache_oi[symbol]["ts"] < 3:
             return self._cache_oi[symbol]["val"]
 
@@ -255,12 +275,12 @@ class BitgetClient:
         )
 
         try:
-            oi = float(r.get("data", {}).get("openInterest", 0))
+            val = float(r.get("data", {}).get("openInterest", 0))
         except:
-            oi = None
+            val = None
 
-        self._cache_oi[symbol] = {"ts": now, "val": oi}
-        return oi
+        self._cache_oi[symbol] = {"ts": now, "val": val}
+        return val
 
     # =====================================================================
     # FUNDING RATE
@@ -272,6 +292,7 @@ class BitgetClient:
             return None
 
         now = time.time()
+
         if symbol in self._cache_funding and now - self._cache_funding[symbol]["ts"] < 3:
             return self._cache_funding[symbol]["val"]
 
@@ -283,12 +304,12 @@ class BitgetClient:
         )
 
         try:
-            rate = float(r.get("data", {}).get("rate", 0))
+            val = float(r.get("data", {}).get("rate", 0))
         except:
-            rate = None
+            val = None
 
-        self._cache_funding[symbol] = {"ts": now, "val": rate}
-        return rate
+        self._cache_funding[symbol] = {"ts": now, "val": val}
+        return val
 
     # =====================================================================
     # MARK PRICE
@@ -318,7 +339,7 @@ class BitgetClient:
 
 
 # =====================================================================
-# Singleton client
+# SINGLETON
 # =====================================================================
 
 _client_cache: Optional[BitgetClient] = None
