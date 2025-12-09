@@ -1,5 +1,6 @@
 # =====================================================================
-# bitget_client.py — Bitget API v2 (2025) — FINAL KLINES FIX
+# bitget_client.py — Bitget API Hybrid v1/v2 (2025)
+# FINAL VERSION — Candles OK, Contracts OK, Orders OK
 # =====================================================================
 
 from __future__ import annotations
@@ -22,38 +23,49 @@ async def _async_backoff_retry(fn, *, retries=4, base_delay=0.3):
             await asyncio.sleep(base_delay * (2 ** attempt))
 
 # =====================================================================
-# TF MAP → Bitget V2 (candles)
-# =====================================================================
-
-TF_MAP = {
-    "1H": 3600,
-    "4H": 14400,
-    "1m": 60,
-    "5m": 300,
-    "15m": 900,
-    "30m": 1800,
-    "1D": 86400,
-}
-
-# =====================================================================
-# SYMBOL FORMAT
+# SYMBOL NORMALISATION
 # =====================================================================
 
 def normalize_symbol(sym: str) -> str:
     if not sym:
         return ""
+
     s = (
         sym.upper()
         .replace("-", "")
         .replace("USDTM", "USDT")
         .replace("USDT-SWAP", "USDT")
     )
+
     if s.startswith("XBT"):
         s = s.replace("XBT", "BTC")
+
     return s
 
+def to_perp_symbol(sym: str) -> str:
+    """
+    Bitget Futures PERP USDT demandent _UMCBL obligatoirement pour candles v1.
+    Exemple : BTCUSDT → BTCUSDT_UMCBL
+    """
+    s = normalize_symbol(sym)
+    return f"{s}_UMCBL"
+
 # =====================================================================
-# CLIENT
+# TF MAP → v1
+# =====================================================================
+
+TF_MAP = {
+    "1H": "3600",
+    "4H": "14400",
+    "1m": "60",
+    "5m": "300",
+    "15m": "900",
+    "30m": "1800",
+    "1D": "86400",
+}
+
+# =====================================================================
+# CLIENT HYBRID v1 / v2
 # =====================================================================
 
 class BitgetClient:
@@ -105,16 +117,17 @@ class BitgetClient:
 
             async with self.session.request(method.upper(), url, headers=headers, data=body or None) as resp:
                 txt = await resp.text()
+
                 try:
                     return json.loads(txt)
                 except:
                     LOGGER.error(f"❌ JSON ERROR: {txt}")
-                    return {"code": "99999", "msg": "json error", "raw": txt}
+                    return {"code": "99999", "msg": "json_error", "raw": txt}
 
         return await _async_backoff_retry(_do)
 
     # =====================================================================
-    # CONTRACTS (v2)
+    # CONTRACTS LIST (v2) — OK
     # =====================================================================
 
     async def get_contracts_list(self) -> List[str]:
@@ -134,45 +147,36 @@ class BitgetClient:
             LOGGER.error(f"CONTRACT ERROR: {r}")
             return []
 
-        symbols = []
-        for c in r["data"]:
-            sym = normalize_symbol(c.get("symbol", ""))
-            if sym:
-                symbols.append(sym)
+        symbols = [normalize_symbol(c["symbol"]) for c in r["data"]]
 
-        LOGGER.info(f"📈 FINAL PERPETUAL FUTURES LOADED: {len(symbols)}")
+        LOGGER.info(f"📈 Loaded {len(symbols)} symbols from Bitget Futures")
 
         self._contracts_cache = symbols
         self._contracts_ts = now
+
         return symbols
 
     # =====================================================================
-    # FIXED KLINES ENDPOINT (v2 — WORKING)
+    # CANDLES V1 — SEUL ENDPOINT QUI FONCTIONNE POUR PERP
     # =====================================================================
 
     async def get_klines_df(self, symbol: str, tf="1H", limit=200):
-        sym = normalize_symbol(symbol)
         gran = TF_MAP.get(tf.upper())
-
         if gran is None:
-            LOGGER.error(f"❌ UNKNOWN TF {tf}")
+            LOGGER.error(f"❌ INVALID TF {tf}")
             return pd.DataFrame()
 
-        # ⚠️ LE BON ENDPOINT POUR LES PERP
+        perp_symbol = to_perp_symbol(symbol)
+
         r = await self._request(
             "GET",
-            "/api/v2/market/candles",
-            params={
-                "symbol": sym,
-                "productType": "USDT-FUTURES",
-                "granularity": gran,
-                "limit": limit,
-            },
+            "/api/mix/v1/market/candles",
+            params={"symbol": perp_symbol, "granularity": gran, "limit": limit},
             auth=False,
         )
 
         if "data" not in r or not r["data"]:
-            LOGGER.warning(f"⚠️ EMPTY KLINES for {sym} ({tf})")
+            LOGGER.warning(f"⚠️ EMPTY KLINES for {perp_symbol} ({tf})")
             return pd.DataFrame()
 
         try:
@@ -187,7 +191,6 @@ class BitgetClient:
         except Exception as e:
             LOGGER.exception(f"❌ PARSE ERROR for {symbol}: {e}")
             return pd.DataFrame()
-
 
 # =====================================================================
 # SINGLETON
