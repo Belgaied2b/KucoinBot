@@ -1,6 +1,10 @@
 # =====================================================================
-# bitget_client.py — Bitget API Hybrid v1/v2 (2025)
-# FINAL VERSION — Candles OK, Contracts OK, Orders OK
+# bitget_client.py — HYBRID MARKETDATA V1 + TRADING V2  (2025)
+# =====================================================================
+# • Candles = V1  → toujours fonctionnel & stable
+# • Trading & Contracts = V2
+# • Mapping automatique symbole BTCUSDT → BTCUSDT_UMCBL
+# • Compatible scanner.py / analyze_signal.py / bitget_trader.py
 # =====================================================================
 
 from __future__ import annotations
@@ -10,14 +14,14 @@ from typing import Any, Dict, Optional, List
 LOGGER = logging.getLogger(__name__)
 
 # =====================================================================
-# RETRY
+# RETRY ENGINE
 # =====================================================================
 
-async def _async_backoff_retry(fn, *, retries=4, base_delay=0.3):
+async def _async_backoff_retry(fn, retries=4, base_delay=0.3):
     for attempt in range(retries + 1):
         try:
             return await fn()
-        except Exception:
+        except Exception as e:
             if attempt >= retries:
                 raise
             await asyncio.sleep(base_delay * (2 ** attempt))
@@ -26,46 +30,46 @@ async def _async_backoff_retry(fn, *, retries=4, base_delay=0.3):
 # SYMBOL NORMALISATION
 # =====================================================================
 
-def normalize_symbol(sym: str) -> str:
+def normalize_spot(sym: str) -> str:
+    """
+    Normalise BTCUSDT, BTC-USDT, BTCUSDTM, XBTUSDT → BTCUSDT
+    """
     if not sym:
         return ""
 
-    s = (
-        sym.upper()
-        .replace("-", "")
-        .replace("USDTM", "USDT")
-        .replace("USDT-SWAP", "USDT")
-    )
+    s = sym.upper().replace("-", "")
+    s = s.replace("USDTM", "USDT").replace("USDTSWAP", "USDT")
 
     if s.startswith("XBT"):
         s = s.replace("XBT", "BTC")
 
     return s
 
-def to_perp_symbol(sym: str) -> str:
+
+def to_futures(sym: str) -> str:
     """
-    Bitget Futures PERP USDT demandent _UMCBL obligatoirement pour candles v1.
-    Exemple : BTCUSDT → BTCUSDT_UMCBL
+    Convertit BTCUSDT → BTCUSDT_UMCBL pour candles V1.
     """
-    s = normalize_symbol(sym)
-    return f"{s}_UMCBL"
+    sym = normalize_spot(sym)
+    return f"{sym}_UMCBL"
+
 
 # =====================================================================
-# TF MAP → v1
+# TIMEFRAME MAP (V1 requires seconds)
 # =====================================================================
 
 TF_MAP = {
-    "1H": "3600",
-    "4H": "14400",
-    "1m": "60",
-    "5m": "300",
-    "15m": "900",
-    "30m": "1800",
-    "1D": "86400",
+    "1H": 3600,
+    "4H": 14400,
+    "1D": 86400,
+    "30m": 1800,
+    "15m": 900,
+    "5m": 300,
+    "1m": 60,
 }
 
 # =====================================================================
-# CLIENT HYBRID v1 / v2
+# BITGET CLIENT
 # =====================================================================
 
 class BitgetClient:
@@ -75,23 +79,31 @@ class BitgetClient:
         self.api_key = key
         self.api_secret = secret.encode()
         self.api_passphrase = passphrase
+
         self.session: Optional[aiohttp.ClientSession] = None
 
         self._contracts_cache = None
         self._contracts_ts = 0
 
+    # -----------------------------------------------------------------
+
     async def _ensure_session(self):
         if self.session is None or self.session.closed:
-            timeout = aiohttp.ClientTimeout(total=25)
+            timeout = aiohttp.ClientTimeout(total=20)
             self.session = aiohttp.ClientSession(timeout=timeout)
+
+    # -----------------------------------------------------------------
 
     def _sign(self, ts, method, path, query, body):
         msg = f"{ts}{method}{path}{query}{body}"
         mac = hmac.new(self.api_secret, msg.encode(), hashlib.sha256).digest()
         return base64.b64encode(mac).decode()
 
+    # -----------------------------------------------------------------
+
     async def _request(self, method, path, *, params=None, data=None, auth=True):
         await self._ensure_session()
+
         params = params or {}
         data = data or {}
 
@@ -100,11 +112,12 @@ class BitgetClient:
             query = "?" + "&".join(f"{k}={v}" for k, v in params.items())
 
         url = self.BASE + path + query
-        body = json.dumps(data) if data else ""
+        body = json.dumps(data, separators=(",", ":")) if data else ""
 
         async def _do():
             ts = str(int(time.time() * 1000))
             headers = {}
+
             if auth:
                 sig = self._sign(ts, method.upper(), path, query, body)
                 headers = {
@@ -116,18 +129,18 @@ class BitgetClient:
                 }
 
             async with self.session.request(method.upper(), url, headers=headers, data=body or None) as resp:
-                txt = await resp.text()
+                text = await resp.text()
 
                 try:
-                    return json.loads(txt)
+                    return json.loads(text)
                 except:
-                    LOGGER.error(f"❌ JSON ERROR: {txt}")
-                    return {"code": "99999", "msg": "json_error", "raw": txt}
+                    LOGGER.error(f"❌ JSON ERROR: {text}")
+                    return {"code": "99999", "msg": "json error", "raw": text}
 
         return await _async_backoff_retry(_do)
 
     # =====================================================================
-    # CONTRACTS LIST (v2) — OK
+    # FUTURES CONTRACT LIST (v2)
     # =====================================================================
 
     async def get_contracts_list(self) -> List[str]:
@@ -144,39 +157,38 @@ class BitgetClient:
         )
 
         if "data" not in r:
-            LOGGER.error(f"CONTRACT ERROR: {r}")
+            LOGGER.error(f"❌ CONTRACT ERROR: {r}")
             return []
 
-        symbols = [normalize_symbol(c["symbol"]) for c in r["data"]]
+        symbols = [normalize_spot(c["symbol"]) for c in r["data"]]
 
         LOGGER.info(f"📈 Loaded {len(symbols)} symbols from Bitget Futures")
 
         self._contracts_cache = symbols
         self._contracts_ts = now
-
         return symbols
 
     # =====================================================================
-    # CANDLES V1 — SEUL ENDPOINT QUI FONCTIONNE POUR PERP
+    # MARKET DATA: CANDLES (V1) — ALWAYS WORKS
     # =====================================================================
 
     async def get_klines_df(self, symbol: str, tf="1H", limit=200):
         gran = TF_MAP.get(tf.upper())
         if gran is None:
-            LOGGER.error(f"❌ INVALID TF {tf}")
+            LOGGER.error(f"❌ INVALID TIMEFRAME: {tf}")
             return pd.DataFrame()
 
-        perp_symbol = to_perp_symbol(symbol)
+        futures_symbol = to_futures(symbol)
 
         r = await self._request(
             "GET",
             "/api/mix/v1/market/candles",
-            params={"symbol": perp_symbol, "granularity": gran, "limit": limit},
+            params={"symbol": futures_symbol, "granularity": gran, "limit": limit},
             auth=False,
         )
 
         if "data" not in r or not r["data"]:
-            LOGGER.warning(f"⚠️ EMPTY KLINES for {perp_symbol} ({tf})")
+            LOGGER.warning(f"⚠️ EMPTY KLINES for {futures_symbol} ({tf})")
             return pd.DataFrame()
 
         try:
@@ -184,13 +196,15 @@ class BitgetClient:
                 r["data"],
                 columns=["time", "open", "high", "low", "close", "volume"],
             )
+
             df = df.astype(float)
             df.sort_values("time", inplace=True)
             return df.reset_index(drop=True)
 
         except Exception as e:
-            LOGGER.exception(f"❌ PARSE ERROR for {symbol}: {e}")
+            LOGGER.exception(f"❌ PARSE KLINES ERROR {symbol}: {e}")
             return pd.DataFrame()
+
 
 # =====================================================================
 # SINGLETON
