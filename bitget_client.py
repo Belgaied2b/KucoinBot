@@ -1,16 +1,13 @@
 # =====================================================================
 # bitget_client.py — Desk Lead Edition (2025)
-#
-# Client REST Bitget Futures (USDT-M) ultra robuste :
-#   ✔ Retry exponentiel intelligent
-#   ✔ Mapping symbol KuCoin → Bitget
-#   ✔ Cache contract / OI / funding
-#   ✔ get_klines_df() → DataFrame OHLCV propre
-#   ✔ get_mark_price() fiable (fallback depth)
-#   ✔ Normalisation complète des réponses Bitget
-#   ✔ Auto-reconnect session
-#
-# Compatible analyze_signal / scanner / bitget_trader
+# =====================================================================
+# Ultra-robust Bitget REST Client:
+#   ✔ Auto-retry exponential
+#   ✔ KuCoin → Bitget symbol mapping
+#   ✔ Contract / OI / Funding caching
+#   ✔ get_klines_df() → clean OHLCV DataFrame
+#   ✔ Proper Bitget signature
+#   ✔ Async-safe, scanner-compatible
 # =====================================================================
 
 from __future__ import annotations
@@ -24,16 +21,16 @@ import hashlib
 import json
 import logging
 import pandas as pd
-from typing import Any, Dict, Optional, List
+from typing import Any, Dict, Optional
 
 LOGGER = logging.getLogger(__name__)
 
 
 # =====================================================================
-# Utility — retry backoff intelligent
+# RETRY ENGINE
 # =====================================================================
 
-async def _async_backoff_retry(fn, *, retries=4, base_delay=0.35, exc=(Exception,)):
+async def _async_backoff_retry(fn, retries=4, base_delay=0.35, exc=(Exception,)):
     for attempt in range(retries + 1):
         try:
             return await fn()
@@ -44,26 +41,27 @@ async def _async_backoff_retry(fn, *, retries=4, base_delay=0.35, exc=(Exception
 
 
 # =====================================================================
-# Bitget symbol mapping (KuCoin → Bitget)
+# KUCOIN → BITGET SYMBOL MAPPING
 # =====================================================================
 
 def map_symbol_kucoin_to_bitget(sym: str) -> Optional[str]:
     """
-    KuCoin:   BTCUSDTM, ETHUSDTM, XBTUSDTM
-    Bitget:   BTCUSDT_UMCBL, ETHUSDT_UMCBL
+    KuCoin: BTCUSDTM, ETHUSDTM, XBTUSDTM
+    Bitget: BTCUSDT_UMCBL, ETHUSDT_UMCBL
     """
     if not sym:
         return None
 
     s = sym.upper().replace("USDTM", "").replace("USDM", "").replace("-USDTM", "")
-    if s == "XBT":  # alias
+
+    if s == "XBT":
         s = "BTC"
 
     return f"{s}USDT_UMCBL"
 
 
 # =====================================================================
-# Desk Lead Bitget Client
+# BitgetClient Core
 # =====================================================================
 
 class BitgetClient:
@@ -73,32 +71,29 @@ class BitgetClient:
         self.api_key = api_key
         self.api_secret = api_secret.encode()
         self.api_passphrase = api_passphrase
+
         self.session: Optional[aiohttp.ClientSession] = None
 
         # Caches
-        self._contract_cache: Dict[str, Dict[str, Any]] = {}
+        self._contract_cache = {}
         self._contract_ts = 0
 
         self._cache_oi = {}
         self._cache_funding = {}
 
-    # ------------------------------------------------------------
+    # -----------------------------------------------------------------
     async def _ensure_session(self):
         if self.session is None or self.session.closed:
             timeout = aiohttp.ClientTimeout(total=25)
             self.session = aiohttp.ClientSession(timeout=timeout)
 
-    # ------------------------------------------------------------
-    # === SIGNATURE BITGET (OFFICIELLE) ===
-    # ------------------------------------------------------------
+    # -----------------------------------------------------------------
     def _sign(self, ts: str, method: str, path: str, query: str = "", body: str = "") -> str:
         msg = f"{ts}{method}{path}{query}{body}"
         mac = hmac.new(self.api_secret, msg.encode(), hashlib.sha256).digest()
         return base64.b64encode(mac).decode()
 
-    # ------------------------------------------------------------
-    # === HTTP REQUEST (robuste + uniformisé) ===
-    # ------------------------------------------------------------
+    # -----------------------------------------------------------------
     async def _request(
         self,
         method: str,
@@ -114,8 +109,9 @@ class BitgetClient:
 
         params = params or {}
         data = data or {}
-        query = ""
 
+        # Query string
+        query = ""
         if params:
             qs = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
             query = f"?{qs}"
@@ -128,10 +124,10 @@ class BitgetClient:
             headers = {}
 
             if auth:
-                signature = self._sign(ts, method.upper(), path, query, body)
+                sig = self._sign(ts, method.upper(), path, query, body)
                 headers = {
                     "ACCESS-KEY": self.api_key,
-                    "ACCESS-SIGN": signature,
+                    "ACCESS-SIGN": sig,
                     "ACCESS-TIMESTAMP": ts,
                     "ACCESS-PASSPHRASE": self.api_passphrase,
                     "Content-Type": "application/json",
@@ -143,20 +139,22 @@ class BitgetClient:
 
                 txt = await resp.text()
 
-                # Retry on 429 + 5xx
+                # Retry conditions
                 if resp.status == 429 or 500 <= resp.status < 600:
-                    raise ConnectionError(f"Retryable {resp.status}: {txt}")
+                    raise ConnectionError(f"Retryable error {resp.status}: {txt}")
 
                 try:
                     js = json.loads(txt)
                 except:
                     return {"ok": False, "status": resp.status, "raw": txt}
 
-                # Normalisation Bitget (toujours renvoyer "ok": bool)
-                code = js.get("code")
-                ok = (code == "00000")
-
-                return {"ok": ok, "status": resp.status, "data": js.get("data"), "raw": js}
+                ok = js.get("code") == "00000"
+                return {
+                    "ok": ok,
+                    "status": resp.status,
+                    "data": js.get("data"),
+                    "raw": js,
+                }
 
         return await _async_backoff_retry(_do, retries=retries)
 
@@ -166,7 +164,9 @@ class BitgetClient:
 
     async def get_klines_df(self, symbol: str, tf: str = "1H", limit: int = 200) -> pd.DataFrame:
         """
-        Retourne un DataFrame OHLCV propre comme KuCoin.
+        Return OHLCV DataFrame for Bitget Futures.
+        Compatible with KuCoin format:
+            columns = time, open, high, low, close, volume
         """
         mapped = map_symbol_kucoin_to_bitget(symbol)
         if not mapped:
@@ -184,15 +184,13 @@ class BitgetClient:
             return pd.DataFrame()
 
         try:
-            # Format Bitget: [timestamp, open, high, low, close, volume]
             df = pd.DataFrame(raw, columns=["time", "open", "high", "low", "close", "volume"])
-            for c in ["time", "open", "high", "low", "close", "volume"]:
+            for c in df.columns:
                 df[c] = df[c].astype(float)
 
-            df = df.sort_values("time").reset_index(drop=True)
-            return df
+            return df.sort_values("time").reset_index(drop=True)
         except Exception:
-            LOGGER.exception("Failed klines parse for %s", symbol)
+            LOGGER.exception(f"Failed to parse klines: {symbol}")
             return pd.DataFrame()
 
     # =====================================================================
@@ -201,6 +199,7 @@ class BitgetClient:
 
     async def get_contract(self, symbol: str) -> Dict[str, Any]:
         now = time.time()
+
         if symbol in self._contract_cache and now - self._contract_ts < 300:
             return self._contract_cache[symbol]
 
@@ -215,10 +214,11 @@ class BitgetClient:
                 self._contract_cache[symbol] = c
                 self._contract_ts = now
                 return c
+
         return {}
 
     # =====================================================================
-    # POSITIONS
+    # POSITION
     # =====================================================================
 
     async def get_position(self, symbol: str) -> Dict[str, Any]:
@@ -231,10 +231,11 @@ class BitgetClient:
             "/api/mix/v1/position/singlePosition",
             params={"symbol": mapped, "marginCoin": "USDT"},
         )
+
         return r.get("data") or {}
 
     # =====================================================================
-    # INSTITUTIONAL METRICS
+    # OPEN INTEREST
     # =====================================================================
 
     async def get_open_interest(self, symbol: str) -> Optional[float]:
@@ -243,7 +244,7 @@ class BitgetClient:
             return None
 
         now = time.time()
-        if symbol in self._cache_oi and now - self._cache_oi[symbol]["ts"] < 5:
+        if symbol in self._cache_oi and now - self._cache_oi[symbol]["ts"] < 3:
             return self._cache_oi[symbol]["val"]
 
         r = await self._request(
@@ -261,13 +262,17 @@ class BitgetClient:
         self._cache_oi[symbol] = {"ts": now, "val": oi}
         return oi
 
+    # =====================================================================
+    # FUNDING RATE
+    # =====================================================================
+
     async def get_funding_rate(self, symbol: str) -> Optional[float]:
         mapped = map_symbol_kucoin_to_bitget(symbol)
         if not mapped:
             return None
 
         now = time.time()
-        if symbol in self._cache_funding and now - self._cache_funding[symbol]["ts"] < 5:
+        if symbol in self._cache_funding and now - self._cache_funding[symbol]["ts"] < 3:
             return self._cache_funding[symbol]["val"]
 
         r = await self._request(
@@ -286,7 +291,7 @@ class BitgetClient:
         return rate
 
     # =====================================================================
-    # MARK PRICE (robuste)
+    # MARK PRICE
     # =====================================================================
 
     async def get_mark_price(self, symbol: str) -> Optional[float]:
@@ -313,13 +318,15 @@ class BitgetClient:
 
 
 # =====================================================================
-# Client unique (singleton)
+# Singleton client
 # =====================================================================
 
 _client_cache: Optional[BitgetClient] = None
 
 async def get_client(api_key: str, api_secret: str, api_passphrase: str) -> BitgetClient:
     global _client_cache
+
     if _client_cache is None:
         _client_cache = BitgetClient(api_key, api_secret, api_passphrase)
+
     return _client_cache
