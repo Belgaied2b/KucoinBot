@@ -1,6 +1,12 @@
 # =====================================================================
-# bitget_client.py — Bitget API v2 (2025) FULLY FIXED
-# Compatible scanner.py / analyze_signal.py / trader v2
+# bitget_client.py — Bitget API v2 (2025) FINAL FIXED
+# Full support for:
+#   • /contracts v2
+#   • /candles v2
+#   • Symbol normalization (NO SUFFIX)
+#   • Retry engine + stable parsing
+# Compatible with:
+#   scanner.py / analyze_signal.py / bitget_trader.py
 # =====================================================================
 
 from __future__ import annotations
@@ -27,46 +33,46 @@ async def _async_backoff_retry(fn, *, retries=4, base_delay=0.3):
     for attempt in range(retries + 1):
         try:
             return await fn()
-        except Exception:
+        except Exception as e:
             if attempt >= retries:
                 raise
             await asyncio.sleep(base_delay * (2 ** attempt))
 
 
 # =====================================================================
-# SYMBOL NORMALIZATION — v2 (NO UMCBL ANYMORE)
+# SYMBOL NORMALISATION (v2)
 # =====================================================================
 
 def normalize_symbol(sym: str) -> str:
     """
-    Convertit tout symbole en format Bitget v2
-    EX :
-        BTCUSDTM → BTCUSDT
-        BTC-USDT → BTCUSDT
-        BTCUSDT  → BTCUSDT
-        XBTUSDT  → BTCUSDT
+    Convertit tout format KuCoin, Bybit, ancien Bitget, etc.
+    vers le format Bitget 2025 : BTCUSDT / ETHUSDT / SOLUSDT…
     """
     if not sym:
         return ""
 
-    s = sym.replace("-", "").replace("USDTM", "USDT").upper()
+    s = sym.upper().replace("-", "")
 
+    # Remove margin suffixes KuCoin-style
+    s = s.replace("USDTM", "USDT").replace("USDTSWAP", "USDT")
+
+    # Convertir XBT → BTC
     if s.startswith("XBT"):
         s = s.replace("XBT", "BTC")
 
     return s
 
 
-def add_suffix(sym: str) -> str:
+def format_symbol(sym: str) -> str:
     """
-    Depuis 2024 → Bitget utilise *UNIQUEMENT* BTCUSDT
-    AUCUN suffixe _UMCBL ou _UMCBL
+    Dans la version 2025 → Bitget Futures ne nécessite plus aucun suffixe.
+    BTCUSDT est le format final.
     """
-    return sym  # FINAL : aucun suffixe
+    return normalize_symbol(sym)
 
 
 # =====================================================================
-# CLIENT
+# CLIENT REST
 # =====================================================================
 
 class BitgetClient:
@@ -78,13 +84,15 @@ class BitgetClient:
         self.api_passphrase = api_passphrase
         self.session: Optional[aiohttp.ClientSession] = None
 
+        # Cache symboles
         self._contracts_cache = None
         self._contracts_ts = 0
 
     # ---------------------------------------------------------------
     async def _ensure_session(self):
         if self.session is None or self.session.closed:
-            self.session = aiohttp.ClientSession()
+            timeout = aiohttp.ClientTimeout(total=25)
+            self.session = aiohttp.ClientSession(timeout=timeout)
 
     # ---------------------------------------------------------------
     def _sign(self, ts: str, method: str, path: str, query: str, body: str):
@@ -107,6 +115,7 @@ class BitgetClient:
         params = params or {}
         data = data or {}
 
+        # Build query string
         query = ""
         if params:
             query = "?" + "&".join(f"{k}={v}" for k, v in params.items())
@@ -129,29 +138,28 @@ class BitgetClient:
                 }
 
             async with self.session.request(
-                method.upper(),
-                url,
-                headers=headers,
-                data=body if data else None,
+                method.upper(), url, headers=headers, data=body if data else None
             ) as resp:
 
                 txt = await resp.text()
+
                 try:
                     js = json.loads(txt)
                 except:
-                    return {"ok": False, "status": resp.status, "raw": txt}
+                    LOGGER.error(f"❌ JSON parse error: {txt}")
+                    return {"code": "99999", "msg": "json error", "raw": txt}
 
                 return js
 
         return await _async_backoff_retry(_do)
 
     # =====================================================================
-    # CONTRACT LIST : API v2
+    # CONTRACT LIST (v2)
     # =====================================================================
+
     async def get_contracts_list(self) -> List[str]:
         """
-        Nouveau endpoint v2 :
-        /api/v2/mix/market/contracts?productType=USDT-FUTURES
+        Renvoie la liste des symboles Bitget Futures USDT (sans suffixe).
         """
         now = time.time()
 
@@ -169,20 +177,26 @@ class BitgetClient:
             LOGGER.error(f"📡 CONTRACT LIST ERROR: {r}")
             return []
 
-        symbols = [c["symbol"] for c in r["data"] if "symbol" in c]
+        symbols = []
+        for c in r["data"]:
+            sym = c.get("symbol")
+            if not sym:
+                continue
+            symbols.append(format_symbol(sym))
+
+        LOGGER.info(f"📈 Loaded {len(symbols)} symbols from Bitget v2")
 
         self._contracts_cache = symbols
         self._contracts_ts = now
 
-        LOGGER.info(f"📈 Loaded {len(symbols)} symbols from Bitget v2")
-
         return symbols
 
     # =====================================================================
-    # KLINES
+    # KLINES (v2)
     # =====================================================================
+
     async def get_klines_df(self, symbol: str, tf: str = "1H", limit: int = 200):
-        sym = add_suffix(normalize_symbol(symbol))
+        sym = format_symbol(symbol)
 
         r = await self._request(
             "GET",
@@ -192,6 +206,7 @@ class BitgetClient:
         )
 
         if "data" not in r or not r["data"]:
+            LOGGER.warning(f"⚠️ Empty klines for {sym} ({tf})")
             return pd.DataFrame()
 
         try:
@@ -199,12 +214,17 @@ class BitgetClient:
                 r["data"],
                 columns=["ts", "open", "high", "low", "close", "volume"]
             )
+
             df = df.astype(float)
             df.rename(columns={"ts": "time"}, inplace=True)
+
+            # IMPORTANT : Bitget renvoie les chandeliers newest → oldest
             df.sort_values("time", inplace=True)
+
             return df.reset_index(drop=True)
-        except Exception:
-            LOGGER.exception(f"Error parsing klines for {symbol}")
+
+        except Exception as e:
+            LOGGER.exception(f"❌ Error parsing klines for {symbol}: {e}")
             return pd.DataFrame()
 
 
