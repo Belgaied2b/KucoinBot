@@ -1,147 +1,111 @@
 # =====================================================================
-# bitget_trader.py — Desk Lead Execution Engine (2025, API v2)
+# bitget_trader.py — Desk Lead Execution Engine (Bitget v2 2025)
 # =====================================================================
-# Exécute :
-#   ✔ LIMIT ORDER (entry)
-#   ✔ STOP LOSS (plan-order)
-#   ✔ TAKE PROFIT (plan-order)
-#   ✔ Qty en "size" (USDT-M futures)
-#
-# Totalement compatible :
-#   - scanner.py
-#   - analyze_signal.py
-#   - bitget_client.py v2 (2025)
+# 100% NATIF BITGET :
+#   ✔ LIMIT
+#   ✔ STOP LOSS (plan order)
+#   ✔ TAKE PROFIT (plan order)
+#   ✔ Qty en contrat (size)
 # =====================================================================
 
+import time
 import hmac
 import base64
 import hashlib
 import json
-from typing import Dict, Any, Optional
+from typing import Dict, Any
 
-from bitget_client import (
-    get_client,
-    normalize_symbol,
-    add_suffix
-)
+from bitget_client import get_client   # plus aucun import supprimé
 
 
 class BitgetTrader:
 
     def __init__(self, api_key: str, api_secret: str, api_passphrase: str):
         self.api_key = api_key
-        self.api_secret = api_secret
+        self.api_secret = api_secret.encode()
         self.api_passphrase = api_passphrase
 
-    # ------------------------------------------------------------------
-    # INTERNAL REQUEST HANDLER (uses bitget_client session + signature)
-    # ------------------------------------------------------------------
-    async def _signed(self, method: str, path: str, *, params=None, data=None):
+    # ------------------------------------------------------------
+    # SIGNATURE
+    # ------------------------------------------------------------
+    def _sign(self, ts: str, method: str, path: str, query: str, body: str) -> str:
+        msg = f"{ts}{method}{path}{query}{body}"
+        mac = hmac.new(self.api_secret, msg.encode(), hashlib.sha256).digest()
+        return base64.b64encode(mac).decode()
+
+    # ------------------------------------------------------------
+    async def _request(self, method: str, path: str, *, params=None, data=None) -> Dict[str, Any]:
         """
-        On utilise directement _request() du client Bitget central.
-        Cela garantit :
-            ✔ signature correcte
-            ✔ rate limit partagé
-            ✔ session unique
+        On délègue à bitget_client (gestion session + retry)
         """
-        client = await get_client(self.api_key, self.api_secret, self.api_passphrase)
+        client = await get_client(self.api_key, self.api_secret.decode(), self.api_passphrase)
         return await client._request(method, path, params=params, data=data, auth=True)
 
-    # ------------------------------------------------------------------
-    # NORMALISATION SYMBOLS
-    # ------------------------------------------------------------------
-    def _resolve_symbol(self, symbol: str) -> str:
-        """
-        Exemples :
-        Entrée : BTCUSDT_UMCBL, BTCUSDTM, BTCUSDT
-        Sortie : BTCUSDT_UMCBL
-        """
-        base = normalize_symbol(symbol)       # ex : BTCUSDT
-        final = add_suffix(base)             # ex : BTCUSDT_UMCBL
-        return final
-
-    # ------------------------------------------------------------------
-    # LIMIT ORDER (ENTRY)
-    # ------------------------------------------------------------------
+    # ------------------------------------------------------------
+    # LIMIT ORDER
+    # ------------------------------------------------------------
     async def place_limit(self, symbol: str, side: str, price: float, qty: float):
-        mapped = self._resolve_symbol(symbol)
-
+        """
+        Bitget v2 limit order — symbol ex: BTCUSDT
+        """
         side_final = "buy" if side.lower() in ("long", "buy") else "sell"
 
         data = {
-            "symbol": mapped,
+            "symbol": symbol,
             "marginCoin": "USDT",
-            "orderType": "limit",
-            "side": side_final,
-            "price": str(price),
             "size": str(qty),
+            "price": str(price),
+            "orderType": "limit",
+            "side": side_final
         }
 
-        return await self._signed(
+        return await self._request(
             "POST",
             "/api/v2/mix/order/place-order",
             data=data
         )
 
-    # ------------------------------------------------------------------
-    # STOP LOSS (PLAN ORDER)
-    # ------------------------------------------------------------------
+    # ------------------------------------------------------------
+    # STOP LOSS
+    # ------------------------------------------------------------
     async def place_stop_loss(self, symbol: str, side: str, sl: float, qty: float):
-        mapped = self._resolve_symbol(symbol)
-
-        # Pour SL :
-        # LONG → stop = SELL
-        # SHORT → stop = BUY
-        side_final = "sell" if side.lower() in ("long", "buy") else "buy"
+        trigger_side = "sell" if side.lower() == "long" else "buy"
 
         data = {
-            "symbol": mapped,
+            "symbol": symbol,
             "marginCoin": "USDT",
             "size": str(qty),
-
-            # Trigger SL
-            "triggerType": "mark_price",
             "triggerPrice": str(sl),
-
-            # Exécution au même prix
+            "triggerType": "mark_price",
             "executePrice": str(sl),
             "orderType": "limit",
-
-            "side": side_final
+            "side": trigger_side
         }
 
-        return await self._signed(
+        return await self._request(
             "POST",
             "/api/v2/mix/order/place-plan-order",
             data=data
         )
 
-    # ------------------------------------------------------------------
-    # TAKE PROFIT (PLAN ORDER)
-    # ------------------------------------------------------------------
+    # ------------------------------------------------------------
+    # TAKE PROFIT
+    # ------------------------------------------------------------
     async def place_take_profit(self, symbol: str, side: str, tp: float, qty: float):
-        mapped = self._resolve_symbol(symbol)
-
-        # Pour TP :
-        # LONG → vend TP → SELL
-        # SHORT → achète TP → BUY
-        side_final = "sell" if side.lower() in ("long", "buy") else "buy"
+        trigger_side = "sell" if side.lower() == "long" else "buy"
 
         data = {
-            "symbol": mapped,
+            "symbol": symbol,
             "marginCoin": "USDT",
             "size": str(qty),
-
-            "triggerType": "mark_price",
             "triggerPrice": str(tp),
-
+            "triggerType": "mark_price",
             "executePrice": str(tp),
             "orderType": "limit",
-
-            "side": side_final
+            "side": trigger_side
         }
 
-        return await self._signed(
+        return await self._request(
             "POST",
             "/api/v2/mix/order/place-plan-order",
             data=data
