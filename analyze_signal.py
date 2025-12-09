@@ -1,15 +1,13 @@
 # =====================================================================
-# analyze_signal.py — Desk Lead Bitget v1.0 (Version corrigée 2025)
-# Compatible scanner.py / indicators.py / institutional_data.py
+# analyze_signal.py — VERSION DIAGNOSTIC (2025)
+# Ajout de logs pour comprendre où le signal est rejeté.
 # =====================================================================
 
 import logging
 import pandas as pd
 import math
-
 from typing import Dict, Any, Optional
 
-# STRUCTURE
 from structure_utils import (
     analyze_structure,
     htf_trend_ok,
@@ -17,7 +15,6 @@ from structure_utils import (
     commitment_score,
 )
 
-# INDICATEURS (exactement ceux dans indicators.py)
 from indicators import (
     rsi,
     macd,
@@ -27,144 +24,84 @@ from indicators import (
     volatility_regime,
 )
 
-# STOPS & TAKE PROFIT
 from stops import protective_stop_long, protective_stop_short
 from tp_clamp import compute_tp1
 
-# INSTITUTIONAL DATA (déjà existant)
 from institutional_data import compute_full_institutional_analysis
 
 LOGGER = logging.getLogger(__name__)
 
-
-# =====================================================================
-# HELPERS
-# =====================================================================
-
-def compute_premium_discount(df: pd.DataFrame, lookback: int = 80):
-    """
-    ICT premium/discount simple :
-        - close > mid → premium
-        - close < mid → discount
-    """
+def compute_premium_discount(df, lookback=80):
     if len(df) < lookback:
         return False, False
-
-    window = df.tail(lookback)
-    high = window["high"].max()
-    low = window["low"].min()
+    w = df.tail(lookback)
+    high, low = w["high"].max(), w["low"].min()
     mid = (high + low) / 2
-
     last = df["close"].iloc[-1]
-
-    discount = last < mid
-    premium = last > mid
-
-    return discount, premium
+    return last < mid, last > mid
 
 
-def _safe_rr(entry: float, sl: float, tp1: float, bias: str) -> Optional[float]:
-    try:
-        entry, sl, tp1 = float(entry), float(sl), float(tp1)
-    except:
-        return None
-
+def _safe_rr(entry, sl, tp1, bias):
+    entry, sl, tp1 = float(entry), float(sl), float(tp1)
     if bias == "LONG":
         risk = entry - sl
         reward = tp1 - entry
-    else:  # SHORT
+    else:
         risk = sl - entry
         reward = entry - tp1
 
     if risk <= 0 or reward <= 0:
         return None
 
-    rr = reward / risk
-    return rr if math.isfinite(rr) and rr > 0 else None
+    return reward / risk
 
 
-def _compute_exits(df: pd.DataFrame, entry: float, bias: str, tick: float):
-    """SL institutionnel + TP1 dynamique Desk Lead."""
+def _compute_exits(df, entry, bias, tick):
     if bias == "LONG":
         sl, meta = protective_stop_long(df, entry, tick, return_meta=True)
     else:
         sl, meta = protective_stop_short(df, entry, tick, return_meta=True)
 
-    tp1, rr_used = compute_tp1(
-        entry=float(entry),
-        sl=float(sl),
-        bias=bias,
-        df=df,
-        tick=tick,
-    )
-
-    return {
-        "sl": float(sl),
-        "tp1": float(tp1),
-        "rr_used": float(rr_used),
-        "sl_meta": meta,
-    }
+    tp1, rr_used = compute_tp1(entry, sl, bias, df=df, tick=tick)
+    return {"sl": sl, "tp1": tp1, "rr_used": rr_used, "sl_meta": meta}
 
 
 # =====================================================================
-# CLASS — SIGNAL ANALYZER
+# CLASS ANALYZER AVEC LOGGAGE COMPLET
 # =====================================================================
 
 class SignalAnalyzer:
 
-    def __init__(self, api_key: str, api_secret: str, api_passphrase: str):
-        self.api_key = api_key
-        self.api_secret = api_secret
-        self.api_passphrase = api_passphrase
-
-        # RR min institutionnel
+    def __init__(self, api_key, api_secret, api_passphrase):
         self.rr_min_inst = 1.3
 
-    # ------------------------------------------------------------
-    async def analyze(
-        self,
-        symbol: str,
-        df_h1: pd.DataFrame,
-        df_h4: pd.DataFrame,
-        macro: Dict[str, Any] = None,   # <== IMPORTANT : pour scanner.py
-    ) -> Optional[Dict[str, Any]]:
-
-        # ------------------------------------------------------------
-        # 0) Base checks
-        # ------------------------------------------------------------
-        if len(df_h1) < 80 or len(df_h4) < 60:
-            return None
+    async def analyze(self, symbol, df_h1, df_h4, macro=None):
+        LOGGER.info(f"[EVAL] ▶ START {symbol}")
 
         entry = float(df_h1["close"].iloc[-1])
 
-        # ------------------------------------------------------------
-        # 1) STRUCTURE H1
-        # ------------------------------------------------------------
+        # 1 — STRUCTURE
         struct = analyze_structure(df_h1)
         bias = struct.get("trend", "").upper()
+        LOGGER.info(f"[EVAL_PRE] STRUCT={struct}")
 
         if bias not in ("LONG", "SHORT"):
+            LOGGER.info("[EVAL_REJECT] No trend detected")
             return None
 
-        # Au moins un signal structurel
         if not (struct.get("bos") or struct.get("cos") or struct.get("choch")):
+            LOGGER.info("[EVAL_REJECT] No BOS/COS/CHoCH")
             return None
 
-        # ------------------------------------------------------------
-        # 2) H4 ALIGNMENT
-        # ------------------------------------------------------------
+        # 2 — H4 alignement
         if not htf_trend_ok(df_h4, bias):
+            LOGGER.info("[EVAL_REJECT] H4 alignment failed")
             return None
 
-        # ------------------------------------------------------------
-        # 3) BOS QUALITY + COMMITMENT
-        # ------------------------------------------------------------
-        oi_series = struct.get("oi_series")
-        cvd_series = struct.get("cvd_series")
-
+        # 3 — BOS QUALITY
         bos_q = bos_quality_details(
             df=df_h1,
-            oi_series=oi_series,
+            oi_series=struct.get("oi_series"),
             vol_lookback=60,
             vol_pct=0.8,
             oi_min_trend=0.003,
@@ -173,74 +110,64 @@ class SignalAnalyzer:
             price=entry,
             tick=0.1,
         )
+        LOGGER.info(f"[EVAL_PRE] BOS_QUALITY={bos_q}")
 
         if not bos_q.get("ok", True):
+            LOGGER.info("[EVAL_REJECT] BOS quality rejected")
             return None
 
-        comm = float(commitment_score(oi_series, cvd_series) or 0.0)
-
-        # ------------------------------------------------------------
-        # 4) INSTITUTIONAL SCORE (Binance)
-        # ------------------------------------------------------------
+        # 4 — INSTITUTIONAL
         inst = await compute_full_institutional_analysis(symbol, bias)
-        inst_score = int(inst.get("institutional_score", 0))
+        inst_score = inst.get("institutional_score", 0)
+        LOGGER.info(f"[INST_RAW] score={inst_score} details={inst}")
 
         if inst_score < 2:
+            LOGGER.info("[EVAL_REJECT] Institutional score < 2")
             return None
 
-        # ------------------------------------------------------------
-        # 5) INSTITUTIONAL MOMENTUM
-        # ------------------------------------------------------------
+        # 5 — MOMENTUM
         mom = institutional_momentum(df_h1)
+        LOGGER.info(f"[EVAL_PRE] MOMENTUM={mom}")
 
         if bias == "LONG" and mom not in ("BULLISH", "STRONG_BULLISH"):
+            LOGGER.info("[EVAL_REJECT] Momentum not bullish for LONG")
             return None
         if bias == "SHORT" and mom not in ("BEARISH", "STRONG_BEARISH"):
+            LOGGER.info("[EVAL_REJECT] Momentum not bearish for SHORT")
             return None
 
-        # ------------------------------------------------------------
-        # 6) PREMIUM / DISCOUNT
-        # ------------------------------------------------------------
-        discount, premium = compute_premium_discount(df_h1, 80)
+        # 6 — PREMIUM / DISCOUNT
+        discount, premium = compute_premium_discount(df_h1)
+        LOGGER.info(f"[EVAL_PRE] PREMIUM={premium} DISCOUNT={discount}")
 
-        # ------------------------------------------------------------
-        # 7) EXITS
-        # ------------------------------------------------------------
+        # 7 — RR / SL / TP
         exits = _compute_exits(df_h1, entry, bias, tick=0.1)
-        sl = exits["sl"]
-        tp1 = exits["tp1"]
-        rr_used = exits["rr_used"]
+        rr = _safe_rr(entry, exits["sl"], exits["tp1"], bias)
+        LOGGER.info(f"[EVAL_PRE] RR={rr} raw_rr={exits['rr_used']} sl={exits['sl']} tp1={exits['tp1']}")
 
-        if rr_used < self.rr_min_inst:
-            return None
-
-        rr = _safe_rr(entry, sl, tp1, bias)
         if rr is None or rr < self.rr_min_inst:
+            LOGGER.info("[EVAL_REJECT] RR < minimum")
             return None
 
-        # ------------------------------------------------------------
-        # 8) RETURN FINAL SIGNAL
-        # ------------------------------------------------------------
+        # 8 — VALIDATION FINALE
+        LOGGER.info(f"[EVAL] VALID {symbol} RR={rr}")
+
         return {
             "valid": True,
             "symbol": symbol,
             "side": "BUY" if bias == "LONG" else "SELL",
             "bias": bias,
             "entry": entry,
-            "sl": sl,
-            "tp1": tp1,
+            "sl": exits["sl"],
+            "tp1": exits["tp1"],
             "tp2": None,
             "rr": rr,
-            "qty": 1,  # tu mettras ton sizing réel
+            "qty": 1,
 
-            # Debug & contexte
-            "institutional_score": inst_score,
-            "institutional": inst,
             "structure": struct,
             "bos_quality": bos_q,
-            "commitment": comm,
+            "institutional": inst,
             "momentum": mom,
             "premium": premium,
             "discount": discount,
-            "exits": exits,
         }
