@@ -1,5 +1,5 @@
 # =====================================================================
-# bitget_client.py — Bitget API v2 (2025) — FINAL GRANULARITY FIX
+# bitget_client.py — Bitget API v2 (2025) — FINAL FULL FIX
 # =====================================================================
 
 from __future__ import annotations
@@ -21,35 +21,44 @@ async def _async_backoff_retry(fn, *, retries=4, base_delay=0.3):
                 raise
             await asyncio.sleep(base_delay * (2 ** attempt))
 
+
 # =====================================================================
-# SYMBOL NORMALISATION
+# SYMBOL NORMALISATION (v2)
 # =====================================================================
 
 def normalize_symbol(sym: str) -> str:
     if not sym:
         return ""
     s = sym.upper().replace("-", "")
+
+    # KuCoin style
     s = s.replace("USDTM", "USDT").replace("USDTSWAP", "USDT")
+
+    # BitMEX-style
     if s.startswith("XBT"):
         s = s.replace("XBT", "BTC")
+
     return s
+
 
 def format_symbol(sym: str) -> str:
     return normalize_symbol(sym)
 
+
 # =====================================================================
-# TIMEFRAME MAP — OBLIGATOIRE POUR BITGET
+# TIMEFRAME MAP — Bitget requires seconds
 # =====================================================================
 
 TF_MAP = {
     "1H": 3600,
     "4H": 14400,
-    "1m": 60,
-    "5m": 300,
-    "15m": 900,
-    "30m": 1800,
+    "1M": 60,
+    "5M": 300,
+    "15M": 900,
+    "30M": 1800,
     "1D": 86400,
 }
+
 
 # =====================================================================
 # CLIENT
@@ -62,21 +71,26 @@ class BitgetClient:
         self.api_key = key
         self.api_secret = secret.encode()
         self.api_passphrase = passphrase
+
         self.session: Optional[aiohttp.ClientSession] = None
-        
-        self._contracts_cache = None
+
+        # Cache des vrais contrats futures USDT perpétuels
+        self._contracts_cache: Optional[List[str]] = None
         self._contracts_ts = 0
 
+    # ---------------------------------------------------------------
     async def _ensure_session(self):
         if self.session is None or self.session.closed:
             timeout = aiohttp.ClientTimeout(total=30)
             self.session = aiohttp.ClientSession(timeout=timeout)
 
+    # ---------------------------------------------------------------
     def _sign(self, ts, method, path, query, body):
         msg = f"{ts}{method}{path}{query}{body}"
         mac = hmac.new(self.api_secret, msg.encode(), hashlib.sha256).digest()
         return base64.b64encode(mac).decode()
 
+    # ---------------------------------------------------------------
     async def _request(self, method, path, *, params=None, data=None, auth=True):
         await self._ensure_session()
         params = params or {}
@@ -103,22 +117,28 @@ class BitgetClient:
                     "Content-Type": "application/json",
                 }
 
-            async with self.session.request(method.upper(), url, headers=headers, data=body or None) as resp:
+            async with self.session.request(
+                method.upper(), url, headers=headers, data=body or None
+            ) as resp:
                 txt = await resp.text()
                 try:
                     return json.loads(txt)
                 except:
-                    LOGGER.error(f"JSON ERROR: {txt}")
+                    LOGGER.error(f"❌ JSON ERROR: {txt}")
                     return {"code": "99999", "msg": "json error", "raw": txt}
 
         return await _async_backoff_retry(_do)
 
+
     # =====================================================================
-    # CONTRATS (v2)
+    # CONTRATS (v2) — FINAL FIX
+    # Filtre : ONLY PERPETUAL + USDT (sinon klines = vide)
     # =====================================================================
 
     async def get_contracts_list(self) -> List[str]:
         now = time.time()
+
+        # use cached list
         if self._contracts_cache and now - self._contracts_ts < 300:
             return self._contracts_cache
 
@@ -129,20 +149,30 @@ class BitgetClient:
             auth=False,
         )
 
-        if "data" not in r:
-            LOGGER.error(f"CONTRACT ERROR: {r}")
+        if "data" not in r or not isinstance(r["data"], list):
+            LOGGER.error(f"📡 CONTRACT ERROR: {r}")
             return []
 
-        symbols = [format_symbol(c["symbol"]) for c in r["data"]]
+        filtered = []
+        for c in r["data"]:
+            # CRUCIAL FIX : Bitget renvoie des tokens spot et indexes !
+            if c.get("symbolType") != "perpetual":
+                continue
+            if c.get("quoteCoin") != "USDT":
+                continue
 
-        LOGGER.info(f"📈 Loaded {len(symbols)} symbols from Bitget v2")
+            sym = format_symbol(c["symbol"])
+            filtered.append(sym)
 
-        self._contracts_cache = symbols
+        LOGGER.info(f"📈 FINAL PERPETUAL FUTURES LOADED: {len(filtered)} symbols")
+
+        self._contracts_cache = filtered
         self._contracts_ts = now
-        return symbols
+        return filtered
+
 
     # =====================================================================
-    # KLNIES (v2) — FIX GRANULARITY
+    # KLINES (v2) — FINAL FIX + GRANULARITY MAP
     # =====================================================================
 
     async def get_klines_df(self, symbol: str, tf="1H", limit=200):
@@ -150,7 +180,7 @@ class BitgetClient:
 
         gran = TF_MAP.get(tf.upper())
         if gran is None:
-            LOGGER.error(f"❌ UNKNOWN TF {tf} — valid: {list(TF_MAP.keys())}")
+            LOGGER.error(f"❌ Unknown timeframe {tf}. Valid: {list(TF_MAP.keys())}")
             return pd.DataFrame()
 
         r = await self._request(
@@ -161,20 +191,20 @@ class BitgetClient:
         )
 
         if "data" not in r or not r["data"]:
-            LOGGER.warning(f"⚠️ EMPTY KLNIES for {sym} ({tf})")
+            LOGGER.warning(f"⚠️ EMPTY KLINES for {sym} ({tf})")
             return pd.DataFrame()
 
         try:
             df = pd.DataFrame(
                 r["data"],
-                columns=["time", "open", "high", "low", "close", "volume"]
+                columns=["time", "open", "high", "low", "close", "volume"],
             )
             df = df.astype(float)
             df.sort_values("time", inplace=True)
             return df.reset_index(drop=True)
 
         except Exception as e:
-            LOGGER.exception(f"PARSE ERROR {symbol} → {e}")
+            LOGGER.exception(f"❌ PARSE ERROR {symbol}: {e}")
             return pd.DataFrame()
 
 
