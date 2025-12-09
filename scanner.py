@@ -1,5 +1,5 @@
 # =====================================================================
-# scanner.py — Bitget Desk Lead Scanner (Institutionnel H1 + H4, API V2)
+# scanner.py — Bitget Desk Lead Scanner (Institutionnel H1+H4, API V2)
 # =====================================================================
 
 import asyncio
@@ -52,7 +52,6 @@ async def send_telegram(text: str):
 # ============================================================
 
 def to_df(raw):
-    """Convertit en DF propre et évite l'erreur ambiguous truth value."""
     if raw is None or len(raw) == 0:
         return pd.DataFrame()
 
@@ -75,14 +74,18 @@ def to_df(raw):
 
 
 # ============================================================
-# FETCH SYMBOLS — **V2 API**
+# FETCH SYMBOLS BITGET (API V2)
 # ============================================================
 
 async def fetch_all_symbols_bitget(client):
+    """
+    Nouvelle API Bitget V2 :
+    productType attendu = "USDT-FUTURES"
+    """
     r = await client._request(
         "GET",
         "/api/v2/mix/market/contracts",
-        params={"productType": "umcbl"},
+        params={"productType": "USDT-FUTURES"},
         auth=False
     )
 
@@ -141,16 +144,13 @@ async def process_symbol(symbol: str, analyzer: SignalAnalyzer, trader: BitgetTr
         df_h1 = await fetch_tf_df(symbol, "1H")
         df_h4 = await fetch_tf_df(symbol, "4H")
 
-        # FIX: empêcher erreur truth value ambiguous
-        if df_h1 is None or df_h4 is None or df_h1.empty or df_h4.empty:
-            return
-
-        if len(df_h1) < 80 or len(df_h4) < 50:
+        if df_h1.empty or df_h4.empty or len(df_h1) < 80:
             return
 
         macro = await fetch_macro_data()
 
         result = await analyzer.analyze(symbol, df_h1, df_h4, macro)
+
         if not result or "signal" not in result:
             return
 
@@ -174,7 +174,6 @@ async def process_symbol(symbol: str, analyzer: SignalAnalyzer, trader: BitgetTr
             f"• Qty:`{qty}`\n"
         )
 
-        # EXECUTION
         entry_res = await trader.place_limit(symbol, side, entry, qty)
         if entry_res.get("code") != "00000":
             LOGGER.error(f"[ERROR ENTRY] {symbol}: {entry_res}")
