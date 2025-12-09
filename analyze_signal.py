@@ -1,6 +1,6 @@
 # =====================================================================
-# analyze_signal.py — Desk Lead Bitget v1.0 (Version corrigée)
-# Aucun import cassé — 100% compatible scanner.py + indicators.py
+# analyze_signal.py — Desk Lead Bitget v1.0 (Version corrigée 2025)
+# Compatible scanner.py / indicators.py / institutional_data.py
 # =====================================================================
 
 import logging
@@ -9,7 +9,7 @@ import math
 
 from typing import Dict, Any, Optional
 
-# Structure
+# STRUCTURE
 from structure_utils import (
     analyze_structure,
     htf_trend_ok,
@@ -17,7 +17,7 @@ from structure_utils import (
     commitment_score,
 )
 
-# Indicators (NOMS EXACTS existants dans ton indicators.py)
+# INDICATEURS (exactement ceux dans indicators.py)
 from indicators import (
     rsi,
     macd,
@@ -27,28 +27,28 @@ from indicators import (
     volatility_regime,
 )
 
-# Stops & TP
+# STOPS & TAKE PROFIT
 from stops import protective_stop_long, protective_stop_short
 from tp_clamp import compute_tp1
 
-# Institutional (Fonction existante)
+# INSTITUTIONAL DATA (déjà existant)
 from institutional_data import compute_full_institutional_analysis
 
 LOGGER = logging.getLogger(__name__)
 
 
 # =====================================================================
-# Helpers
+# HELPERS
 # =====================================================================
 
 def compute_premium_discount(df: pd.DataFrame, lookback: int = 80):
     """
-    Simple premium/discount ICT :
-    - Si close > milieu du range → premium
-    - Si close < milieu du range → discount
+    ICT premium/discount simple :
+        - close > mid → premium
+        - close < mid → discount
     """
     if len(df) < lookback:
-        return None, None
+        return False, False
 
     window = df.tail(lookback)
     high = window["high"].max()
@@ -57,7 +57,10 @@ def compute_premium_discount(df: pd.DataFrame, lookback: int = 80):
 
     last = df["close"].iloc[-1]
 
-    return (last < mid, last > mid)   # discount, premium
+    discount = last < mid
+    premium = last > mid
+
+    return discount, premium
 
 
 def _safe_rr(entry: float, sl: float, tp1: float, bias: str) -> Optional[float]:
@@ -69,7 +72,7 @@ def _safe_rr(entry: float, sl: float, tp1: float, bias: str) -> Optional[float]:
     if bias == "LONG":
         risk = entry - sl
         reward = tp1 - entry
-    else:
+    else:  # SHORT
         risk = sl - entry
         reward = entry - tp1
 
@@ -114,6 +117,7 @@ class SignalAnalyzer:
         self.api_secret = api_secret
         self.api_passphrase = api_passphrase
 
+        # RR min institutionnel
         self.rr_min_inst = 1.3
 
     # ------------------------------------------------------------
@@ -122,39 +126,39 @@ class SignalAnalyzer:
         symbol: str,
         df_h1: pd.DataFrame,
         df_h4: pd.DataFrame,
+        macro: Dict[str, Any] = None,   # <== IMPORTANT : pour scanner.py
     ) -> Optional[Dict[str, Any]]:
 
-        # Base checks
+        # ------------------------------------------------------------
+        # 0) Base checks
+        # ------------------------------------------------------------
         if len(df_h1) < 80 or len(df_h4) < 60:
             return None
 
         entry = float(df_h1["close"].iloc[-1])
 
-        # ============================================================
-        # 1) STRUCTURE
-        # ============================================================
-
+        # ------------------------------------------------------------
+        # 1) STRUCTURE H1
+        # ------------------------------------------------------------
         struct = analyze_structure(df_h1)
         bias = struct.get("trend", "").upper()
 
         if bias not in ("LONG", "SHORT"):
             return None
 
-        # Au moins un des 3 signaux structurels
+        # Au moins un signal structurel
         if not (struct.get("bos") or struct.get("cos") or struct.get("choch")):
             return None
 
-        # ============================================================
-        # 2) H4 alignment
-        # ============================================================
-
+        # ------------------------------------------------------------
+        # 2) H4 ALIGNMENT
+        # ------------------------------------------------------------
         if not htf_trend_ok(df_h4, bias):
             return None
 
-        # ============================================================
-        # 3) BOS QUALITY + COMMITMENT OI/CVD
-        # ============================================================
-
+        # ------------------------------------------------------------
+        # 3) BOS QUALITY + COMMITMENT
+        # ------------------------------------------------------------
         oi_series = struct.get("oi_series")
         cvd_series = struct.get("cvd_series")
 
@@ -175,20 +179,18 @@ class SignalAnalyzer:
 
         comm = float(commitment_score(oi_series, cvd_series) or 0.0)
 
-        # ============================================================
+        # ------------------------------------------------------------
         # 4) INSTITUTIONAL SCORE (Binance)
-        # ============================================================
-
+        # ------------------------------------------------------------
         inst = await compute_full_institutional_analysis(symbol, bias)
         inst_score = int(inst.get("institutional_score", 0))
 
         if inst_score < 2:
             return None
 
-        # ============================================================
+        # ------------------------------------------------------------
         # 5) INSTITUTIONAL MOMENTUM
-        # ============================================================
-
+        # ------------------------------------------------------------
         mom = institutional_momentum(df_h1)
 
         if bias == "LONG" and mom not in ("BULLISH", "STRONG_BULLISH"):
@@ -196,16 +198,14 @@ class SignalAnalyzer:
         if bias == "SHORT" and mom not in ("BEARISH", "STRONG_BEARISH"):
             return None
 
-        # ============================================================
+        # ------------------------------------------------------------
         # 6) PREMIUM / DISCOUNT
-        # ============================================================
-
+        # ------------------------------------------------------------
         discount, premium = compute_premium_discount(df_h1, 80)
 
-        # ============================================================
-        # 7) EXITS (SL + TP1)
-        # ============================================================
-
+        # ------------------------------------------------------------
+        # 7) EXITS
+        # ------------------------------------------------------------
         exits = _compute_exits(df_h1, entry, bias, tick=0.1)
         sl = exits["sl"]
         tp1 = exits["tp1"]
@@ -218,19 +218,22 @@ class SignalAnalyzer:
         if rr is None or rr < self.rr_min_inst:
             return None
 
-        # ============================================================
-        # 8) FINAL SIGNAL
-        # ============================================================
-
+        # ------------------------------------------------------------
+        # 8) RETURN FINAL SIGNAL
+        # ------------------------------------------------------------
         return {
             "valid": True,
             "symbol": symbol,
+            "side": "BUY" if bias == "LONG" else "SELL",
             "bias": bias,
             "entry": entry,
             "sl": sl,
             "tp1": tp1,
+            "tp2": None,
             "rr": rr,
-            "qty": 1,   # ⚠️ tu remplaceras par sizing réel
+            "qty": 1,  # tu mettras ton sizing réel
+
+            # Debug & contexte
             "institutional_score": inst_score,
             "institutional": inst,
             "structure": struct,
