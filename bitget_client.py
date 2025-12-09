@@ -1,15 +1,16 @@
 # =====================================================================
-# bitget_client.py — Desk Lead Edition (2025, API v2)
-# Ultra-compatible with scanner.py, analyze_signal.py, bitget_trader.py
+# bitget_client.py — Bitget API v2 (2025) FULLY FIXED
+# Compatible scanner.py / analyze_signal.py / trader v2
 # =====================================================================
 
 from __future__ import annotations
+
 import aiohttp
 import asyncio
 import time
 import hmac
-import hashlib
 import base64
+import hashlib
 import json
 import logging
 import pandas as pd
@@ -19,80 +20,89 @@ LOGGER = logging.getLogger(__name__)
 
 
 # =====================================================================
-# BACKOFF RETRY
+# RETRY ENGINE
 # =====================================================================
 
-async def _retry(fn, retries=4, base=0.25):
-    for i in range(retries + 1):
+async def _async_backoff_retry(fn, *, retries=4, base_delay=0.3):
+    for attempt in range(retries + 1):
         try:
             return await fn()
-        except Exception as e:
-            if i >= retries:
+        except Exception:
+            if attempt >= retries:
                 raise
-            await asyncio.sleep(base * (2 ** i))
+            await asyncio.sleep(base_delay * (2 ** attempt))
 
 
 # =====================================================================
-# KUCOIN → BITGET SYMBOL NORMALISATION
+# SYMBOL NORMALIZATION — v2 (NO UMCBL ANYMORE)
 # =====================================================================
 
 def normalize_symbol(sym: str) -> str:
     """
-    Ton bot utilise des symboles type:
-        BTCUSDT_UMCBL
-    Bitget V2 renvoie:
-        BTCUSDT
-    Donc on génère automatiquement le suffixe perp:
+    Convertit tout symbole en format Bitget v2
+    EX :
+        BTCUSDTM → BTCUSDT
+        BTC-USDT → BTCUSDT
+        BTCUSDT  → BTCUSDT
+        XBTUSDT  → BTCUSDT
     """
-    s = sym.upper()
-    s = s.replace("USDTM", "").replace("-USDTM", "")
-    if s.endswith("_UMCBL"):
-        return s.replace("_UMCBL", "")  # BTCUSDT
-    if s.endswith("_DMCBL"):
-        return s.replace("_DMCBL", "")
-    return s.replace("_UMCBL", "")
+    if not sym:
+        return ""
 
+    s = sym.replace("-", "").replace("USDTM", "USDT").upper()
 
-def add_suffix(sym: str) -> str:
-    """Ajoute le suffixe perp correct si absent."""
-    s = sym.upper()
-    if not s.endswith("USDT_UMCBL"):
-        if s.endswith("USDT"):
-            return s + "_UMCBL"
+    if s.startswith("XBT"):
+        s = s.replace("XBT", "BTC")
+
     return s
 
 
+def add_suffix(sym: str) -> str:
+    """
+    Depuis 2024 → Bitget utilise *UNIQUEMENT* BTCUSDT
+    AUCUN suffixe _UMCBL ou _UMCBL
+    """
+    return sym  # FINAL : aucun suffixe
+
+
 # =====================================================================
-# BITGET CLIENT (API v2)
+# CLIENT
 # =====================================================================
 
 class BitgetClient:
-
     BASE = "https://api.bitget.com"
 
-    def __init__(self, api_key: str, api_secret: str, passphrase: str):
-        self.key = api_key
-        self.secret = api_secret.encode()
-        self.passphrase = passphrase
+    def __init__(self, api_key: str, api_secret: str, api_passphrase: str):
+        self.api_key = api_key
+        self.api_secret = api_secret.encode()
+        self.api_passphrase = api_passphrase
         self.session: Optional[aiohttp.ClientSession] = None
 
-        self.contracts_cache = {"ts": 0, "list": []}
+        self._contracts_cache = None
+        self._contracts_ts = 0
 
-    # --------------------------------------------------------------
-    async def _ensure(self):
+    # ---------------------------------------------------------------
+    async def _ensure_session(self):
         if self.session is None or self.session.closed:
-            timeout = aiohttp.ClientTimeout(total=20)
-            self.session = aiohttp.ClientSession(timeout=timeout)
+            self.session = aiohttp.ClientSession()
 
-    # --------------------------------------------------------------
-    def _sign(self, ts: str, method: str, path: str, body: str = ""):
-        pre = ts + method.upper() + path + body
-        mac = hmac.new(self.secret, pre.encode(), hashlib.sha256).digest()
+    # ---------------------------------------------------------------
+    def _sign(self, ts: str, method: str, path: str, query: str, body: str):
+        msg = f"{ts}{method}{path}{query}{body}"
+        mac = hmac.new(self.api_secret, msg.encode(), hashlib.sha256).digest()
         return base64.b64encode(mac).decode()
 
-    # --------------------------------------------------------------
-    async def _request(self, method: str, path: str, *, params=None, data=None, auth=True):
-        await self._ensure()
+    # ---------------------------------------------------------------
+    async def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        params=None,
+        data=None,
+        auth=True,
+    ):
+        await self._ensure_session()
 
         params = params or {}
         data = data or {}
@@ -102,140 +112,110 @@ class BitgetClient:
             query = "?" + "&".join(f"{k}={v}" for k, v in params.items())
 
         url = self.BASE + path + query
-        body = json.dumps(data) if data else ""
+        body = json.dumps(data, separators=(",", ":")) if data else ""
 
         async def _do():
             ts = str(int(time.time() * 1000))
-            headers = {"Content-Type": "application/json"}
+            headers = {}
 
             if auth:
-                sig = self._sign(ts, method, path, body)
-                headers.update({
-                    "ACCESS-KEY": self.key,
+                sig = self._sign(ts, method.upper(), path, query, body)
+                headers = {
+                    "ACCESS-KEY": self.api_key,
                     "ACCESS-SIGN": sig,
                     "ACCESS-TIMESTAMP": ts,
-                    "ACCESS-PASSPHRASE": self.passphrase,
-                })
+                    "ACCESS-PASSPHRASE": self.api_passphrase,
+                    "Content-Type": "application/json"
+                }
 
-            async with self.session.request(method, url, headers=headers, data=body or None) as r:
-                txt = await r.text()
+            async with self.session.request(
+                method.upper(),
+                url,
+                headers=headers,
+                data=body if data else None,
+            ) as resp:
 
-                if r.status in (429, 500, 502, 503, 504):
-                    raise ConnectionError(f"Retryable: {r.status} {txt}")
-
+                txt = await resp.text()
                 try:
                     js = json.loads(txt)
                 except:
-                    return {"ok": False, "raw": txt}
+                    return {"ok": False, "status": resp.status, "raw": txt}
 
-                return {
-                    "ok": js.get("code") == "00000",
-                    "data": js.get("data"),
-                    "raw": js,
-                    "status": r.status
-                }
+                return js
 
-        return await _retry(_do)
+        return await _async_backoff_retry(_do)
 
     # =====================================================================
-    # GET CONTRACT LIST (API v2)
+    # CONTRACT LIST : API v2
     # =====================================================================
-
     async def get_contracts_list(self) -> List[str]:
         """
-        API V2 OFFICIELLE :
-        GET /api/v2/mix/market/contracts?productType=umcbl
+        Nouveau endpoint v2 :
+        /api/v2/mix/market/contracts?productType=USDT-FUTURES
         """
         now = time.time()
-        if now - self.contracts_cache["ts"] < 300 and self.contracts_cache["list"]:
-            return self.contracts_cache["list"]
+
+        if self._contracts_cache and now - self._contracts_ts < 300:
+            return self._contracts_cache
 
         r = await self._request(
             "GET",
             "/api/v2/mix/market/contracts",
-            params={"productType": "umcbl"},
-            auth=False
+            params={"productType": "USDT-FUTURES"},
+            auth=False,
         )
 
-        if not r["ok"]:
-            LOGGER.error(f"📡 CONTRACT LIST ERROR: {r['raw']}")
+        if not isinstance(r, dict) or "data" not in r:
+            LOGGER.error(f"📡 CONTRACT LIST ERROR: {r}")
             return []
 
-        symbols = []
-        for c in r["data"]:
-            s = c.get("symbol")
-            if not s:
-                continue
-            # Bitget returns "BTCUSDT" → add suffix
-            symbols.append(add_suffix(s))
+        symbols = [c["symbol"] for c in r["data"] if "symbol" in c]
 
-        LOGGER.info(f"🟢 {len(symbols)} contracts loaded (v2)")
+        self._contracts_cache = symbols
+        self._contracts_ts = now
 
-        self.contracts_cache = {"ts": now, "list": symbols}
+        LOGGER.info(f"📈 Loaded {len(symbols)} symbols from Bitget v2")
+
         return symbols
 
     # =====================================================================
-    # KLINES (OHLCV)
+    # KLINES
     # =====================================================================
+    async def get_klines_df(self, symbol: str, tf: str = "1H", limit: int = 200):
+        sym = add_suffix(normalize_symbol(symbol))
 
-    async def get_klines_df(self, symbol: str, tf: str = "1H", limit: int = 200) -> pd.DataFrame:
-        """
-        Format Bitget v2:
-            /api/v2/mix/market/candles?symbol=BTCUSDT&granularity=1h
-        """
-        base_symbol = normalize_symbol(symbol)  # BTCUSDT
-        suffix_symbol = add_suffix(base_symbol)  # BTCUSDT_UMCBL
-
-        tf_map = {
-            "1H": "1h",
-            "4H": "4h",
-            "5M": "5m",
-            "15M": "15m"
-        }
-
-        gran = tf_map.get(tf, "1h")
-
-        r = await _retry(lambda: self._request(
+        r = await self._request(
             "GET",
             "/api/v2/mix/market/candles",
-            params={
-                "symbol": base_symbol,
-                "granularity": gran,
-                "limit": limit
-            },
-            auth=False
-        ))
+            params={"symbol": sym, "granularity": tf, "limit": limit},
+            auth=False,
+        )
 
-        raw = r.get("data")
-        if not raw:
+        if "data" not in r or not r["data"]:
             return pd.DataFrame()
 
-        # Bitget returns list of arrays:
-        # [timestamp, open, high, low, close, volume]
         try:
             df = pd.DataFrame(
-                raw,
-                columns=["time", "open", "high", "low", "close", "volume"]
-            ).astype(float)
-            return df.sort_values("time").reset_index(drop=True)
+                r["data"],
+                columns=["ts", "open", "high", "low", "close", "volume"]
+            )
+            df = df.astype(float)
+            df.rename(columns={"ts": "time"}, inplace=True)
+            df.sort_values("time", inplace=True)
+            return df.reset_index(drop=True)
         except Exception:
-            LOGGER.error(f"Failed parse OHLCV for {symbol}: {r}")
+            LOGGER.exception(f"Error parsing klines for {symbol}")
             return pd.DataFrame()
 
-    # =====================================================================
-    async def close(self):
-        if self.session and not self.session.closed:
-            await self.session.close()
-
 
 # =====================================================================
-# SINGLETON CLIENT
+# SINGLETON
 # =====================================================================
 
-_client = None
+_client_instance: Optional[BitgetClient] = None
 
-async def get_client(api_key, api_secret, passphrase) -> BitgetClient:
-    global _client
-    if _client is None:
-        _client = BitgetClient(api_key, api_secret, passphrase)
-    return _client
+async def get_client(api_key: str, api_secret: str, api_passphrase: str):
+    global _client_instance
+    if _client_instance is None:
+        _client_instance = BitgetClient(api_key, api_secret, api_passphrase)
+    return _client_instance
