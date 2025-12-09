@@ -1,12 +1,11 @@
 # =====================================================================
 # bitget_client.py — Bitget API v2 (2025) FINAL FIXED
-# Full support for:
+# FULL support:
+#   • Symbol normalization
 #   • /contracts v2
-#   • /candles v2
-#   • Symbol normalization (NO SUFFIX)
-#   • Retry engine + stable parsing
-# Compatible with:
-#   scanner.py / analyze_signal.py / bitget_trader.py
+#   • /candles v2 with correct granularity mapping
+#   • Retry engine
+#   • DataFrame parser
 # =====================================================================
 
 from __future__ import annotations
@@ -24,7 +23,6 @@ from typing import Any, Dict, Optional, List
 
 LOGGER = logging.getLogger(__name__)
 
-
 # =====================================================================
 # RETRY ENGINE
 # =====================================================================
@@ -33,30 +31,23 @@ async def _async_backoff_retry(fn, *, retries=4, base_delay=0.3):
     for attempt in range(retries + 1):
         try:
             return await fn()
-        except Exception as e:
+        except Exception:
             if attempt >= retries:
                 raise
             await asyncio.sleep(base_delay * (2 ** attempt))
 
 
 # =====================================================================
-# SYMBOL NORMALISATION (v2)
+# SYMBOL NORMALISATION
 # =====================================================================
 
 def normalize_symbol(sym: str) -> str:
-    """
-    Convertit tout format KuCoin, Bybit, ancien Bitget, etc.
-    vers le format Bitget 2025 : BTCUSDT / ETHUSDT / SOLUSDT…
-    """
     if not sym:
         return ""
 
     s = sym.upper().replace("-", "")
-
-    # Remove margin suffixes KuCoin-style
     s = s.replace("USDTM", "USDT").replace("USDTSWAP", "USDT")
 
-    # Convertir XBT → BTC
     if s.startswith("XBT"):
         s = s.replace("XBT", "BTC")
 
@@ -64,11 +55,22 @@ def normalize_symbol(sym: str) -> str:
 
 
 def format_symbol(sym: str) -> str:
-    """
-    Dans la version 2025 → Bitget Futures ne nécessite plus aucun suffixe.
-    BTCUSDT est le format final.
-    """
     return normalize_symbol(sym)
+
+
+# =====================================================================
+# TF MAPPING — CRITICAL FIX
+# =====================================================================
+
+TF_MAP = {
+    "1M": 60,
+    "5M": 300,
+    "15M": 900,
+    "30M": 1800,
+    "1H": 3600,
+    "4H": 14400,
+    "1D": 86400,
+}
 
 
 # =====================================================================
@@ -82,6 +84,7 @@ class BitgetClient:
         self.api_key = api_key
         self.api_secret = api_secret.encode()
         self.api_passphrase = api_passphrase
+
         self.session: Optional[aiohttp.ClientSession] = None
 
         # Cache symboles
@@ -101,21 +104,12 @@ class BitgetClient:
         return base64.b64encode(mac).decode()
 
     # ---------------------------------------------------------------
-    async def _request(
-        self,
-        method: str,
-        path: str,
-        *,
-        params=None,
-        data=None,
-        auth=True,
-    ):
+    async def _request(self, method: str, path: str, *, params=None, data=None, auth=True):
         await self._ensure_session()
 
         params = params or {}
         data = data or {}
 
-        # Build query string
         query = ""
         if params:
             query = "?" + "&".join(f"{k}={v}" for k, v in params.items())
@@ -154,13 +148,10 @@ class BitgetClient:
         return await _async_backoff_retry(_do)
 
     # =====================================================================
-    # CONTRACT LIST (v2)
+    # CONTRACT LIST
     # =====================================================================
 
     async def get_contracts_list(self) -> List[str]:
-        """
-        Renvoie la liste des symboles Bitget Futures USDT (sans suffixe).
-        """
         now = time.time()
 
         if self._contracts_cache and now - self._contracts_ts < 300:
@@ -177,18 +168,12 @@ class BitgetClient:
             LOGGER.error(f"📡 CONTRACT LIST ERROR: {r}")
             return []
 
-        symbols = []
-        for c in r["data"]:
-            sym = c.get("symbol")
-            if not sym:
-                continue
-            symbols.append(format_symbol(sym))
+        symbols = [format_symbol(c["symbol"]) for c in r["data"] if "symbol" in c]
 
         LOGGER.info(f"📈 Loaded {len(symbols)} symbols from Bitget v2")
 
         self._contracts_cache = symbols
         self._contracts_ts = now
-
         return symbols
 
     # =====================================================================
@@ -198,27 +183,28 @@ class BitgetClient:
     async def get_klines_df(self, symbol: str, tf: str = "1H", limit: int = 200):
         sym = format_symbol(symbol)
 
+        gran = TF_MAP.get(tf.upper(), 3600)  # Default 1H
+
         r = await self._request(
             "GET",
             "/api/v2/mix/market/candles",
-            params={"symbol": sym, "granularity": tf, "limit": limit},
+            params={"symbol": sym, "granularity": gran, "limit": limit},
             auth=False,
         )
 
-        if "data" not in r or not r["data"]:
+        data = r.get("data", [])
+
+        if not data:
             LOGGER.warning(f"⚠️ Empty klines for {sym} ({tf})")
             return pd.DataFrame()
 
         try:
             df = pd.DataFrame(
-                r["data"],
-                columns=["ts", "open", "high", "low", "close", "volume"]
+                data,
+                columns=["time", "open", "high", "low", "close", "volume"]
             )
 
             df = df.astype(float)
-            df.rename(columns={"ts": "time"}, inplace=True)
-
-            # IMPORTANT : Bitget renvoie les chandeliers newest → oldest
             df.sort_values("time", inplace=True)
 
             return df.reset_index(drop=True)
