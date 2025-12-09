@@ -21,13 +21,12 @@ from telegram.ext import Application
 LOGGER = logging.getLogger(__name__)
 
 # =====================================================================
-# TELEGRAM (instance unique)
+# TELEGRAM (singleton)
 # =====================================================================
 
 TELEGRAM_APP: Application | None = None
 
 async def init_telegram():
-    """Initialise Telegram une seule fois."""
     global TELEGRAM_APP
     if TELEGRAM_APP is None:
         TELEGRAM_APP = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
@@ -47,7 +46,7 @@ async def send_telegram(text: str):
 
 
 # =====================================================================
-# OHLCV → DataFrame
+# OHLCV normalisation
 # =====================================================================
 
 def to_df(raw):
@@ -62,36 +61,37 @@ def to_df(raw):
 
 
 # =====================================================================
-# PROCESS SYMBOL
+# PROCESSING SYMBOL
 # =====================================================================
 
 async def process_symbol(symbol: str, analyzer: SignalAnalyzer, trader: BitgetTrader, client):
     try:
-        # Fetch H1 + H4 via Bitget v2
+        # Fetch TF
         df_h1 = await client.get_klines_df(symbol, "1H", 200)
         df_h4 = await client.get_klines_df(symbol, "4H", 200)
 
         if df_h1.empty or df_h4.empty or len(df_h1) < 80:
             return
 
-        macro = {}  # plus tard : BTC / TOTAL…
+        macro = {}  # futur BTC TOTAL
 
-        # Analyse principale
+        # === Analyse principale ===
         result = await analyzer.analyze(symbol, df_h1, df_h4, macro)
-        if not result or not result.get("signal"):
+
+        # IMPORTANT : analyze_signal 2025 renvoie DIRECTEMENT un signal
+        if not result or not result.get("valid"):
             return
 
-        sig = result["signal"]
-        side = sig["side"]
-        entry = sig["entry"]
-        sl = sig["sl"]
-        tp1 = sig.get("tp1")
-        tp2 = sig.get("tp2")
-        qty = sig["qty"]
+        side = result["side"]
+        entry = result["entry"]
+        sl = result["sl"]
+        tp1 = result.get("tp1")
+        tp2 = result.get("tp2")
+        qty = result["qty"]
 
         LOGGER.warning(f"🎯 SIGNAL {symbol} → {side} @ {entry}")
 
-        # Telegram
+        # === Telegram ===
         await send_telegram(
             f"🚀 *Signal détecté*\n"
             f"• **{symbol}**\n"
@@ -100,12 +100,12 @@ async def process_symbol(symbol: str, analyzer: SignalAnalyzer, trader: BitgetTr
             f"• SL: `{sl}`\n"
             f"• TP1: `{tp1}` | TP2: `{tp2}`\n"
             f"• Qty: `{qty}`\n"
-            f"• Score core: `{result.get('score')}`\n"
+            f"• Inst Score: `{result.get('institutional_score')}`\n"
         )
 
-        # Execution
+        # === EXECUTION ===
         entry_res = await trader.place_limit(symbol, side, entry, qty)
-        if entry_res.get("code") != "00000":
+        if not entry_res.get("ok", False):
             LOGGER.error(f"Entry error {symbol}: {entry_res}")
             return
 
@@ -113,6 +113,7 @@ async def process_symbol(symbol: str, analyzer: SignalAnalyzer, trader: BitgetTr
 
         if tp1:
             await trader.place_take_profit(symbol, side, tp1, qty * 0.5)
+
         if tp2:
             await trader.place_take_profit(symbol, side, tp2, qty * 0.5)
 
@@ -133,7 +134,6 @@ async def run_scanner():
         try:
             LOGGER.info("=== START SCAN ===")
 
-            # NOUVEAU : récupération v2
             symbols = await client.get_contracts_list()
 
             if not symbols:
@@ -145,6 +145,7 @@ async def run_scanner():
                 process_symbol(sym, analyzer, trader, client)
                 for sym in symbols
             ]
+
             await asyncio.gather(*tasks)
 
             LOGGER.info("=== END SCAN ===")
@@ -156,7 +157,7 @@ async def run_scanner():
 
 
 # =====================================================================
-# EXPORT POUR main.py
+# EXPORT MAIN
 # =====================================================================
 
 async def start_scanner():
