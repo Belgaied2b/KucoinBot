@@ -1,21 +1,15 @@
 # =====================================================================
-# bitget_client.py — Desk Lead Edition (2025)
-# =====================================================================
-# Client REST Bitget Futures (USDT-M) v2
-#   ✔ get_contracts_list() — récupère tous les contrats PERP
-#   ✔ get_klines_df() — OHLCV propre
-#   ✔ Contract cache / OI / Funding
-#   ✔ API v2 officielle
+# bitget_client.py — Desk Lead Edition (2025, API v2)
+# Ultra-compatible with scanner.py, analyze_signal.py, bitget_trader.py
 # =====================================================================
 
 from __future__ import annotations
-
 import aiohttp
 import asyncio
 import time
 import hmac
-import base64
 import hashlib
+import base64
 import json
 import logging
 import pandas as pd
@@ -23,171 +17,225 @@ from typing import Any, Dict, Optional, List
 
 LOGGER = logging.getLogger(__name__)
 
+
 # =====================================================================
-# RETRY ENGINE
+# BACKOFF RETRY
 # =====================================================================
 
-async def _async_backoff_retry(fn, retries=4, base_delay=0.35, exc=(Exception,)):
-    for attempt in range(retries + 1):
+async def _retry(fn, retries=4, base=0.25):
+    for i in range(retries + 1):
         try:
             return await fn()
-        except exc:
-            if attempt >= retries:
+        except Exception as e:
+            if i >= retries:
                 raise
-            await asyncio.sleep(base_delay * (2 ** attempt))
+            await asyncio.sleep(base * (2 ** i))
+
 
 # =====================================================================
-# KUCOIN → BITGET SYMBOL MAPPING
+# KUCOIN → BITGET SYMBOL NORMALISATION
 # =====================================================================
 
-def map_symbol_kucoin_to_bitget(sym: str) -> Optional[str]:
-    if not sym:
-        return None
-    s = sym.upper().replace("USDTM", "").replace("USDM", "").replace("-USDTM", "")
-    if s == "XBT":
-        s = "BTC"
-    return f"{s}USDT"
+def normalize_symbol(sym: str) -> str:
+    """
+    Ton bot utilise des symboles type:
+        BTCUSDT_UMCBL
+    Bitget V2 renvoie:
+        BTCUSDT
+    Donc on génère automatiquement le suffixe perp:
+    """
+    s = sym.upper()
+    s = s.replace("USDTM", "").replace("-USDTM", "")
+    if s.endswith("_UMCBL"):
+        return s.replace("_UMCBL", "")  # BTCUSDT
+    if s.endswith("_DMCBL"):
+        return s.replace("_DMCBL", "")
+    return s.replace("_UMCBL", "")
+
+
+def add_suffix(sym: str) -> str:
+    """Ajoute le suffixe perp correct si absent."""
+    s = sym.upper()
+    if not s.endswith("USDT_UMCBL"):
+        if s.endswith("USDT"):
+            return s + "_UMCBL"
+    return s
+
 
 # =====================================================================
-# BitgetClient v2
+# BITGET CLIENT (API v2)
 # =====================================================================
 
 class BitgetClient:
+
     BASE = "https://api.bitget.com"
 
-    def __init__(self, api_key: str, api_secret: str, api_passphrase: str):
-        self.api_key = api_key
-        self.api_secret = api_secret.encode()
-        self.api_passphrase = api_passphrase
-
+    def __init__(self, api_key: str, api_secret: str, passphrase: str):
+        self.key = api_key
+        self.secret = api_secret.encode()
+        self.passphrase = passphrase
         self.session: Optional[aiohttp.ClientSession] = None
 
-        # Caches
-        self._contracts_cache: Optional[List[dict]] = None
-        self._contracts_ts = 0
+        self.contracts_cache = {"ts": 0, "list": []}
 
-    # ------------------------------------------------------------
-    async def _ensure_session(self):
+    # --------------------------------------------------------------
+    async def _ensure(self):
         if self.session is None or self.session.closed:
             timeout = aiohttp.ClientTimeout(total=20)
             self.session = aiohttp.ClientSession(timeout=timeout)
 
-    # ------------------------------------------------------------
-    def _sign(self, ts: str, method: str, path: str, query: str, body: str) -> str:
-        msg = f"{ts}{method}{path}{query}{body}"
-        mac = hmac.new(self.api_secret, msg.encode(), hashlib.sha256).digest()
+    # --------------------------------------------------------------
+    def _sign(self, ts: str, method: str, path: str, body: str = ""):
+        pre = ts + method.upper() + path + body
+        mac = hmac.new(self.secret, pre.encode(), hashlib.sha256).digest()
         return base64.b64encode(mac).decode()
 
-    # ------------------------------------------------------------
+    # --------------------------------------------------------------
     async def _request(self, method: str, path: str, *, params=None, data=None, auth=True):
-        await self._ensure_session()
+        await self._ensure()
 
         params = params or {}
         data = data or {}
 
         query = ""
         if params:
-            qs = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
-            query = f"?{qs}"
+            query = "?" + "&".join(f"{k}={v}" for k, v in params.items())
 
         url = self.BASE + path + query
-        body = json.dumps(data, separators=(",", ":")) if data else ""
+        body = json.dumps(data) if data else ""
 
         async def _do():
             ts = str(int(time.time() * 1000))
-            headers = {}
+            headers = {"Content-Type": "application/json"}
 
             if auth:
-                sig = self._sign(ts, method.upper(), path, query, body)
-                headers = {
-                    "ACCESS-KEY": self.api_key,
+                sig = self._sign(ts, method, path, body)
+                headers.update({
+                    "ACCESS-KEY": self.key,
                     "ACCESS-SIGN": sig,
                     "ACCESS-TIMESTAMP": ts,
-                    "ACCESS-PASSPHRASE": self.api_passphrase,
-                    "Content-Type": "application/json",
-                }
+                    "ACCESS-PASSPHRASE": self.passphrase,
+                })
 
-            async with self.session.request(method.upper(), url, headers=headers, data=body) as resp:
-                txt = await resp.text()
+            async with self.session.request(method, url, headers=headers, data=body or None) as r:
+                txt = await r.text()
 
-                # retry
-                if resp.status in (429,) or 500 <= resp.status < 600:
-                    raise ConnectionError(f"Retryable HTTP {resp.status}: {txt}")
+                if r.status in (429, 500, 502, 503, 504):
+                    raise ConnectionError(f"Retryable: {r.status} {txt}")
 
                 try:
                     js = json.loads(txt)
                 except:
-                    return {"ok": False, "status": resp.status, "raw": txt}
+                    return {"ok": False, "raw": txt}
 
-                ok = js.get("code") == "00000"
                 return {
-                    "ok": ok,
-                    "status": resp.status,
-                    "raw": js,
+                    "ok": js.get("code") == "00000",
                     "data": js.get("data"),
+                    "raw": js,
+                    "status": r.status
                 }
 
-        return await _async_backoff_retry(_do)
+        return await _retry(_do)
 
     # =====================================================================
-    # GET ALL CONTRACTS (PERPETUAL)
+    # GET CONTRACT LIST (API v2)
     # =====================================================================
 
     async def get_contracts_list(self) -> List[str]:
         """
-        Retourne une liste de symboles Bitget perpétuels (BTCUSDT, ETHUSDT, etc.)
+        API V2 OFFICIELLE :
+        GET /api/v2/mix/market/contracts?productType=umcbl
         """
         now = time.time()
-        if self._contracts_cache and now - self._contracts_ts < 300:
-            return self._contracts_cache
+        if now - self.contracts_cache["ts"] < 300 and self.contracts_cache["list"]:
+            return self.contracts_cache["list"]
 
         r = await self._request(
             "GET",
             "/api/v2/mix/market/contracts",
-            params={"productType": "USDT-FUTURES"},
-            auth=False,
+            params={"productType": "umcbl"},
+            auth=False
         )
 
-        data = r.get("data") or []
+        if not r["ok"]:
+            LOGGER.error(f"📡 CONTRACT LIST ERROR: {r['raw']}")
+            return []
 
-        symbols = [c["symbol"] for c in data if c.get("symbolStatus") == "normal"]
+        symbols = []
+        for c in r["data"]:
+            s = c.get("symbol")
+            if not s:
+                continue
+            # Bitget returns "BTCUSDT" → add suffix
+            symbols.append(add_suffix(s))
 
-        self._contracts_cache = symbols
-        self._contracts_ts = now
+        LOGGER.info(f"🟢 {len(symbols)} contracts loaded (v2)")
 
+        self.contracts_cache = {"ts": now, "list": symbols}
         return symbols
 
     # =====================================================================
-    # OHLCV
+    # KLINES (OHLCV)
     # =====================================================================
 
     async def get_klines_df(self, symbol: str, tf: str = "1H", limit: int = 200) -> pd.DataFrame:
-        r = await self._request(
+        """
+        Format Bitget v2:
+            /api/v2/mix/market/candles?symbol=BTCUSDT&granularity=1h
+        """
+        base_symbol = normalize_symbol(symbol)  # BTCUSDT
+        suffix_symbol = add_suffix(base_symbol)  # BTCUSDT_UMCBL
+
+        tf_map = {
+            "1H": "1h",
+            "4H": "4h",
+            "5M": "5m",
+            "15M": "15m"
+        }
+
+        gran = tf_map.get(tf, "1h")
+
+        r = await _retry(lambda: self._request(
             "GET",
             "/api/v2/mix/market/candles",
-            params={"symbol": symbol, "granularity": tf, "limit": limit},
-            auth=False,
-        )
+            params={
+                "symbol": base_symbol,
+                "granularity": gran,
+                "limit": limit
+            },
+            auth=False
+        ))
 
-        raw = r.get("data") or []
+        raw = r.get("data")
         if not raw:
             return pd.DataFrame()
 
+        # Bitget returns list of arrays:
+        # [timestamp, open, high, low, close, volume]
         try:
-            df = pd.DataFrame(raw, columns=["time", "open", "high", "low", "close", "volume"])
-            df = df.astype(float)
+            df = pd.DataFrame(
+                raw,
+                columns=["time", "open", "high", "low", "close", "volume"]
+            ).astype(float)
             return df.sort_values("time").reset_index(drop=True)
-        except:
+        except Exception:
+            LOGGER.error(f"Failed parse OHLCV for {symbol}: {r}")
             return pd.DataFrame()
 
+    # =====================================================================
+    async def close(self):
+        if self.session and not self.session.closed:
+            await self.session.close()
+
+
 # =====================================================================
-# SINGLETON
+# SINGLETON CLIENT
 # =====================================================================
 
-_client_cache: Optional[BitgetClient] = None
+_client = None
 
-async def get_client(api_key: str, api_secret: str, api_passphrase: str) -> BitgetClient:
-    global _client_cache
-    if _client_cache is None:
-        _client_cache = BitgetClient(api_key, api_secret, api_passphrase)
-    return _client_cache
+async def get_client(api_key, api_secret, passphrase) -> BitgetClient:
+    global _client
+    if _client is None:
+        _client = BitgetClient(api_key, api_secret, passphrase)
+    return _client
