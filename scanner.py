@@ -21,13 +21,12 @@ from telegram.ext import Application
 LOGGER = logging.getLogger(__name__)
 
 # ============================================================
-# TELEGRAM (instance unique)
+# TELEGRAM
 # ============================================================
 
 TELEGRAM_APP: Application | None = None
 
 async def init_telegram():
-    """Initialise Telegram une seule fois"""
     global TELEGRAM_APP
     if TELEGRAM_APP is None:
         TELEGRAM_APP = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
@@ -47,75 +46,67 @@ async def send_telegram(text: str):
 
 
 # ============================================================
-# OHLCV → DataFrame
+# DATAFRAME NORMALIZER
 # ============================================================
 
-def to_df(ohlcv_raw):
-    if not ohlcv_raw:
+def to_df(raw):
+    if not raw:
         return pd.DataFrame()
 
-    df = pd.DataFrame(
-        ohlcv_raw,
-        columns=["timestamp", "open", "high", "low", "close", "volume"]
-    )
+    df = pd.DataFrame(raw, columns=[
+        "timestamp", "open", "high", "low", "close", "volume"
+    ])
 
-    df = df.astype({
-        "timestamp": "float",
-        "open": "float",
-        "high": "float",
-        "low": "float",
-        "close": "float",
-        "volume": "float",
-    })
-
-    return df.sort_values("timestamp").reset_index(drop=True)
+    return df.astype(float).sort_values("timestamp").reset_index(drop=True)
 
 
 # ============================================================
-# FETCH SYMBOLS BITGET — VERSION 100% SAFE (NE PEUT PAS RENVOYER None)
+# FETCH SYMBOLS BITGET (CORRIGÉ)
 # ============================================================
 
 async def fetch_all_symbols_bitget(client):
-    try:
-        data = await client._request("GET", "/api/mix/v1/market/contracts", auth=False)
+    """
+    CORRECTION IMPORTANTE :
+    On doit ajouter productType=umcbl pour obtenir les USDT-M Futures.
+    """
 
-        # Toujours récupérer une liste, même si data["data"] = None
-        items = data.get("data") or []
+    r = await client._request(
+        "GET",
+        "/api/mix/v1/market/contracts",
+        params={"productType": "umcbl"},
+        auth=False
+    )
 
-        syms = []
-        for c in items:
-            if (
-                isinstance(c, dict)
-                and c.get("quoteCoin") == "USDT"
-                and str(c.get("symbol", "")).endswith("_UMCBL")
-            ):
-                syms.append(c["symbol"])
+    data = r.get("data")
+    if not data:
+        LOGGER.warning("⚠️ Bitget returned empty symbol list — fallback BTC/ETH")
+        return ["BTCUSDT_UMCBL", "ETHUSDT_UMCBL"]
 
-        # Fallback si Bitget retourne vide → au moins BTC & ETH
-        if not syms:
-            LOGGER.warning("⚠️ Bitget returned empty symbol list — fallback BTC/ETH")
-            return ["BTCUSDT_UMCBL", "ETHUSDT_UMCBL"]
+    syms = []
+    for c in data:
+        sym = c.get("symbol")
+        if sym and sym.endswith("_UMCBL"):
+            syms.append(sym)
 
-        return syms
+    if not syms:
+        LOGGER.warning("⚠️ No valid UMCBL symbols found — fallback BTC/ETH")
+        return ["BTCUSDT_UMCBL", "ETHUSDT_UMCBL"]
 
-    except Exception as e:
-        LOGGER.error(f"fetch_all_symbols_bitget ERROR: {e}")
-        # Fallback ultime
-        return ["BTCUSDT_UMCBL"]
+    return syms
 
 
 # ============================================================
 # FETCH MULTI-TF OHLCV
 # ============================================================
 
-async def fetch_tf_df(symbol: str, tf: str, limit: int = 200):
+async def fetch_tf_df(symbol: str, tf: str = "1H", limit: int = 200):
     client = await get_client(API_KEY, API_SECRET, API_PASSPHRASE)
     raw = await client.get_klines(symbol, tf, limit)
     return to_df(raw)
 
 
 # ============================================================
-# MACRO CACHE
+# MACRO CACHE (simple)
 # ============================================================
 
 MACRO_CACHE = {"ts": 0, "BTC": None}
@@ -127,15 +118,10 @@ async def fetch_macro_data():
         return MACRO_CACHE
 
     client = await get_client(API_KEY, API_SECRET, API_PASSPHRASE)
-
-    raw_btc = await client.get_klines("BTCUSDT_UMCBL", "1H", limit=200)
-    df_btc = to_df(raw_btc)
-
+    raw_btc = await client.get_klines("BTCUSDT_UMCBL", "1H", 200)
     MACRO_CACHE.update({
         "ts": now,
-        "BTC": df_btc,
-        "TOTAL": None,
-        "TOTAL2": None,
+        "BTC": to_df(raw_btc),
     })
 
     return MACRO_CACHE
@@ -155,7 +141,6 @@ async def process_symbol(symbol: str, analyzer: SignalAnalyzer, trader: BitgetTr
 
         macro = await fetch_macro_data()
 
-        # Analyse principale
         result = await analyzer.analyze(symbol, df_h1, df_h4, macro)
 
         if not result or not result.get("signal"):
@@ -179,17 +164,14 @@ async def process_symbol(symbol: str, analyzer: SignalAnalyzer, trader: BitgetTr
             f"• SL: `{sl}`\n"
             f"• TP1: `{tp1}` | TP2: `{tp2}`\n"
             f"• Qty: `{qty}`\n"
-            f"• Score core: `{result.get('score')}`\n"
         )
 
-        # Exécution
         entry_res = await trader.place_limit(symbol, side, entry, qty)
         if entry_res.get("code") != "00000":
             LOGGER.error(f"Entry error {symbol}: {entry_res}")
             return
 
         await trader.place_stop_loss(symbol, side, sl, qty)
-
         if tp1:
             await trader.place_take_profit(symbol, side, tp1, qty * 0.5)
         if tp2:
@@ -200,11 +182,10 @@ async def process_symbol(symbol: str, analyzer: SignalAnalyzer, trader: BitgetTr
 
 
 # ============================================================
-# MAIN ASYNC LOOPS
+# MAIN LOOP
 # ============================================================
 
 async def run_scanner():
-    """Démarre le scanner en boucle"""
     client = await get_client(API_KEY, API_SECRET, API_PASSPHRASE)
     trader = BitgetTrader(API_KEY, API_SECRET, API_PASSPHRASE)
     analyzer = SignalAnalyzer(API_KEY, API_SECRET, API_PASSPHRASE)
@@ -226,19 +207,9 @@ async def run_scanner():
         await asyncio.sleep(SCAN_INTERVAL_MIN * 60)
 
 
-# ============================================================
-# EXPORTÉ POUR MAIN.PY
-# ============================================================
-
 async def start_scanner():
     await run_scanner()
 
 
-# Exécutable en local
 if __name__ == "__main__":
-    try:
-        asyncio.run(start_scanner())
-    except RuntimeError:
-        loop = asyncio.get_event_loop()
-        loop.create_task(start_scanner())
-        loop.run_forever()
+    asyncio.run(start_scanner())
