@@ -1,44 +1,35 @@
 # =====================================================================
-# bitget_client.py — INSTITUTIONAL MARKET CLIENT (2025)
-# Production version used by automated desks (stable hybrid mode)
+# bitget_client.py — Bitget API FIXED (2025)
+# Candles V1 (symbol = BTCUSDT, no suffix)
+# Contracts V2
 # =====================================================================
 
 from __future__ import annotations
-import aiohttp
-import asyncio
-import time
-import hmac
-import base64
-import hashlib
-import json
-import logging
-import pandas as pd
+import aiohttp, asyncio, time, hmac, base64, hashlib, json, logging, pandas as pd
 from typing import Any, Dict, Optional, List
 
 LOGGER = logging.getLogger(__name__)
 
-
 # =====================================================================
-# RETRY ENGINE (institution-grade)
+# RETRY ENGINE
 # =====================================================================
 
 async def _async_retry(fn, retries=5, delay=0.35):
     for attempt in range(retries + 1):
         try:
             return await fn()
-        except Exception as exc:
+        except Exception:
             if attempt >= retries:
                 raise
             await asyncio.sleep(delay * (1.7 ** attempt))
 
-
 # =====================================================================
-# SYMBOL NORMALISATION
+# SYMBOL NORMALIZATION
 # =====================================================================
 
-def normalize_spot(sym: str) -> str:
+def normalize_symbol(sym: str) -> str:
     """
-    Standardise BTC-USDT, BTCUSDTM, BTCUSDT → BTCUSDT
+    Convert every format → BTCUSDT
     """
     if not sym:
         return ""
@@ -49,17 +40,7 @@ def normalize_spot(sym: str) -> str:
     if s.startswith("XBT"):
         s = s.replace("XBT", "BTC")
 
-    return s
-
-
-def to_futures_symbol(sym: str) -> str:
-    """
-    Convert every normalized symbol → Bitget perpetual V1 symbol.
-    Ex: BTCUSDT → BTCUSDT_UMCBL
-    """
-    base = normalize_spot(sym)
-    return f"{base}_UMCBL"  # VERIFIED: Perpetual USDT-M futures
-
+    return s  # <- FINAL correct symbol for both V1 & V2
 
 # =====================================================================
 # TIMEFRAME MAP (V1)
@@ -75,9 +56,8 @@ TF_MAP = {
     "1M": 60,
 }
 
-
 # =====================================================================
-# CORE CLIENT
+# CLIENT
 # =====================================================================
 
 class BitgetClient:
@@ -87,25 +67,21 @@ class BitgetClient:
         self.api_key = api_key
         self.api_secret = api_secret.encode()
         self.api_passphrase = passphrase
-
         self.session: Optional[aiohttp.ClientSession] = None
 
         self._contracts_cache = None
         self._contracts_ts = 0
 
-    # ---------------------------------------------------------------
     async def _ensure_session(self):
         if self.session is None or self.session.closed:
             timeout = aiohttp.ClientTimeout(total=25)
             self.session = aiohttp.ClientSession(timeout=timeout)
 
-    # ---------------------------------------------------------------
     def _sign(self, ts, method, path, query, body):
         msg = f"{ts}{method}{path}{query}{body}"
         mac = hmac.new(self.api_secret, msg.encode(), hashlib.sha256).digest()
         return base64.b64encode(mac).decode()
 
-    # ---------------------------------------------------------------
     async def _request(self, method, path, *, params=None, data=None, auth=True):
         await self._ensure_session()
 
@@ -133,13 +109,9 @@ class BitgetClient:
                     "Content-Type": "application/json",
                 }
 
-            async with self.session.request(
-                method.upper(), url, headers=headers, data=body or None
-            ) as resp:
-
+            async with self.session.request(method.upper(), url, headers=headers, data=body or None) as resp:
                 txt = await resp.text()
 
-                # sometimes bitget returns raw text before valid json
                 try:
                     return json.loads(txt)
                 except:
@@ -149,13 +121,12 @@ class BitgetClient:
         return await _async_retry(_do)
 
     # =====================================================================
-    # CONTRACT LIST (API V2) — verified stable
+    # CONTRACTS (V2)
     # =====================================================================
 
     async def get_contracts_list(self) -> List[str]:
         now = time.time()
 
-        # Cache 5 min
         if self._contracts_cache and now - self._contracts_ts < 300:
             return self._contracts_cache
 
@@ -170,7 +141,7 @@ class BitgetClient:
             LOGGER.error(f"❌ CONTRACT ERROR: {r}")
             return []
 
-        symbols = [normalize_spot(c["symbol"]) for c in r["data"]]
+        symbols = [normalize_symbol(c["symbol"]) for c in r["data"]]
 
         LOGGER.info(f"📈 Loaded {len(symbols)} symbols from Bitget Futures")
 
@@ -179,29 +150,26 @@ class BitgetClient:
         return symbols
 
     # =====================================================================
-    # CANDLES (API V1) — rock-solid since 2021
+    # CANDLES (V1) — FINAL FIX (NO SUFFIX)
     # =====================================================================
 
     async def get_klines_df(self, symbol: str, tf="1H", limit=200):
-        tf_key = tf.upper()
-        granularity = TF_MAP.get(tf_key)
-
-        if granularity is None:
+        gran = TF_MAP.get(tf.upper())
+        if gran is None:
             LOGGER.error(f"❌ INVALID TF {tf}")
             return pd.DataFrame()
 
-        fut = to_futures_symbol(symbol)
+        sym = normalize_symbol(symbol)  # <- correct
 
         r = await self._request(
             "GET",
             "/api/mix/v1/market/candles",
-            params={"symbol": fut, "granularity": granularity, "limit": limit},
+            params={"symbol": sym, "granularity": gran, "limit": limit},
             auth=False,
         )
 
-        # No candlesticks returned
         if "data" not in r or not r["data"]:
-            LOGGER.warning(f"⚠️ EMPTY KLINES for {fut} ({tf})")
+            LOGGER.warning(f"⚠️ EMPTY KLINES for {sym} ({tf})")
             return pd.DataFrame()
 
         try:
@@ -209,7 +177,6 @@ class BitgetClient:
                 r["data"],
                 columns=["time", "open", "high", "low", "close", "volume"],
             )
-
             df = df.astype(float)
             df.sort_values("time", inplace=True)
             return df.reset_index(drop=True)
@@ -218,9 +185,8 @@ class BitgetClient:
             LOGGER.exception(f"❌ PARSE ERROR for {symbol}: {e}")
             return pd.DataFrame()
 
-
 # =====================================================================
-# SINGLETON INSTANCE
+# SINGLETON
 # =====================================================================
 
 _client_instance: Optional[BitgetClient] = None
