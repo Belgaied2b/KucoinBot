@@ -1,5 +1,5 @@
 # =====================================================================
-# bitget_client.py — DIAGNOSTIC MODE (PRINT RAW API RESPONSES)
+# bitget_client.py — FULL V2 MARKETDATA (2025)
 # =====================================================================
 
 from __future__ import annotations
@@ -19,23 +19,10 @@ async def _async_retry(fn, retries=4, delay=0.25):
         except Exception:
             if attempt >= retries:
                 raise
-            await asyncio.sleep(delay * (1.7 ** attempt))
+            await asyncio.sleep(delay * (1.6 ** attempt))
 
 # =====================================================================
-# SYMBOL NORMALIZATION
-# =====================================================================
-
-def normalize_symbol(sym: str) -> str:
-    if not sym:
-        return ""
-    s = sym.upper().replace("-", "")
-    s = s.replace("USDTM", "USDT").replace("USDTSWAP", "USDT")
-    if s.startswith("XBT"):
-        s = s.replace("XBT", "BTC")
-    return s
-
-# =====================================================================
-# TIMEFRAME MAP
+# TIMEFRAMES
 # =====================================================================
 
 TF_MAP = {
@@ -55,32 +42,38 @@ TF_MAP = {
 class BitgetClient:
     BASE = "https://api.bitget.com"
 
-    def __init__(self, key: str, secret: str, passphrase: str):
-        self.api_key = key
-        self.api_secret = secret.encode()
-        self.api_passphrase = passphrase
-        self.session: Optional[aiohttp.ClientSession] = None
+    def __init__(self, key, secret, passphrase):
+        self.key = key
+        self.secret = secret.encode()
+        self.passphrase = passphrase
+        self.session: aiohttp.ClientSession | None = None
 
         self._contracts_cache = None
         self._contracts_ts = 0
 
+    # ---------------------------------------------------------------
     async def _ensure_session(self):
         if self.session is None or self.session.closed:
-            self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20))
+            self.session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=20)
+            )
 
+    # ---------------------------------------------------------------
     def _sign(self, ts, method, path, query, body):
         msg = f"{ts}{method}{path}{query}{body}"
-        mac = hmac.new(self.api_secret, msg.encode(), hashlib.sha256).digest()
+        mac = hmac.new(self.secret, msg.encode(), hashlib.sha256).digest()
         return base64.b64encode(mac).decode()
 
-    async def _request(self, method, path, *, params=None, data=None, auth=True):
+    # ---------------------------------------------------------------
+    async def _request(self, method, path, *, params=None, data=None, auth=False):
         await self._ensure_session()
+
         params = params or {}
         data = data or {}
 
         query = ""
         if params:
-            query = "?" + "&".join([f"{k}={v}" for k, v in params.items()])
+            query = "?" + "&".join(f"{k}={v}" for k, v in params.items())
 
         body = json.dumps(data) if data else ""
         url = self.BASE + path + query
@@ -90,32 +83,35 @@ class BitgetClient:
             headers = {}
 
             if auth:
-                sig = self._sign(ts, method, path, query, body)
+                sig = self._sign(ts, method.upper(), path, query, body)
                 headers = {
-                    "ACCESS-KEY": self.api_key,
+                    "ACCESS-KEY": self.key,
                     "ACCESS-SIGN": sig,
                     "ACCESS-TIMESTAMP": ts,
-                    "ACCESS-PASSPHRASE": self.api_passphrase,
-                    "Content-Type": "application/json"
+                    "ACCESS-PASSPHRASE": self.passphrase,
+                    "Content-Type": "application/json",
                 }
 
             async with self.session.request(method, url, headers=headers, data=body or None) as resp:
                 txt = await resp.text()
                 try:
-                    js = json.loads(txt)
+                    return json.loads(txt)
                 except:
-                    LOGGER.error(f"❌ JSON PARSE ERROR RAW={txt}")
-                    return {"raw": txt, "error": "json_parse"}
-
-                return js
+                    LOGGER.error(f"JSON ERROR RAW={txt}")
+                    return {"error": "json"}
 
         return await _async_retry(_do)
 
     # =====================================================================
-    # CONTRACT LIST (OK)
+    # CONTRACT LIST (v2)
     # =====================================================================
 
     async def get_contracts_list(self) -> List[str]:
+        now = time.time()
+
+        if self._contracts_cache and now - self._contracts_ts < 300:
+            return self._contracts_cache
+
         r = await self._request(
             "GET",
             "/api/v2/mix/market/contracts",
@@ -124,54 +120,48 @@ class BitgetClient:
         )
 
         if "data" not in r:
-            LOGGER.error(f"❌ CONTRACT ERROR RAW={r}")
+            LOGGER.error(f"CONTRACT ERROR {r}")
             return []
 
-        symbols = [normalize_symbol(c["symbol"]) for c in r["data"]]
+        symbols = [c["symbol"] for c in r["data"]]
+
         LOGGER.info(f"📈 Loaded {len(symbols)} symbols from Bitget Futures")
+
+        self._contracts_cache = symbols
+        self._contracts_ts = now
         return symbols
 
     # =====================================================================
-    # KLINES (DIAGNOSTIC MODE)
+    # CANDLES (v2) — NEW WORKING API
     # =====================================================================
 
     async def get_klines_df(self, symbol: str, tf="1H", limit=200):
         gran = TF_MAP.get(tf.upper())
         if gran is None:
-            LOGGER.error(f"❌ INVALID TF {tf}")
+            LOGGER.error(f"Invalid TF {tf}")
             return pd.DataFrame()
-
-        sym = normalize_symbol(symbol)
 
         r = await self._request(
             "GET",
-            "/api/mix/v1/market/candles",
-            params={
-                "symbol": sym,
-                "granularity": gran,
-                "limit": limit,
-            },
-            auth=False
+            "/api/v2/mix/market/candles",
+            params={"symbol": symbol, "granularity": gran, "limit": limit},
+            auth=False,
         )
 
-        # 🔥 NOUVEAU : LOG COMPLET DE LA RÉPONSE
-        LOGGER.error(f"🔍 RAW_CANDLES_RESPONSE {sym}({tf}) → {r}")
-
         if "data" not in r or not r["data"]:
-            LOGGER.warning(f"⚠️ EMPTY KLINES for {sym} ({tf})")
+            LOGGER.warning(f"⚠️ EMPTY KLINES for {symbol} ({tf}) → RAW={r}")
             return pd.DataFrame()
 
         try:
             df = pd.DataFrame(
                 r["data"],
-                columns=["time", "open", "high", "low", "close", "volume"]
+                columns=["time", "open", "high", "low", "close", "volume"],
             )
             df = df.astype(float)
             df.sort_values("time", inplace=True)
             return df.reset_index(drop=True)
-
         except Exception as e:
-            LOGGER.exception(f"❌ PARSE ERROR {symbol}: {e}")
+            LOGGER.exception(f"PARSE ERROR {symbol}: {e}")
             return pd.DataFrame()
 
 
