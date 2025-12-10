@@ -4,7 +4,6 @@
 
 import asyncio
 import logging
-import time
 import pandas as pd
 
 from settings import (
@@ -19,6 +18,9 @@ from analyze_signal import SignalAnalyzer
 from telegram.ext import Application
 
 LOGGER = logging.getLogger(__name__)
+
+# Combien de symboles on scanne par cycle
+MAX_SYMBOLS_PER_SCAN = 80  # tu peux monter/descendre si besoin
 
 # =====================================================================
 # TELEGRAM (singleton)
@@ -73,12 +75,11 @@ async def process_symbol(symbol: str, analyzer: SignalAnalyzer, trader: BitgetTr
         if df_h1.empty or df_h4.empty or len(df_h1) < 80:
             return
 
-        macro = {}  # futur BTC TOTAL
+        macro = {}  # futur BTC / TOTAL / etc.
 
         # === Analyse principale ===
         result = await analyzer.analyze(symbol, df_h1, df_h4, macro)
 
-        # IMPORTANT : analyze_signal 2025 renvoie DIRECTEMENT un signal
         if not result or not result.get("valid"):
             return
 
@@ -105,7 +106,7 @@ async def process_symbol(symbol: str, analyzer: SignalAnalyzer, trader: BitgetTr
 
         # === EXECUTION ===
         entry_res = await trader.place_limit(symbol, side, entry, qty)
-        if not entry_res.get("ok", False):
+        if entry_res.get("code") != "00000":
             LOGGER.error(f"Entry error {symbol}: {entry_res}")
             return
 
@@ -113,7 +114,6 @@ async def process_symbol(symbol: str, analyzer: SignalAnalyzer, trader: BitgetTr
 
         if tp1:
             await trader.place_take_profit(symbol, side, tp1, qty * 0.5)
-
         if tp2:
             await trader.place_take_profit(symbol, side, tp2, qty * 0.5)
 
@@ -130,20 +130,35 @@ async def run_scanner():
     trader = BitgetTrader(API_KEY, API_SECRET, API_PASSPHRASE)
     analyzer = SignalAnalyzer(API_KEY, API_SECRET, API_PASSPHRASE)
 
+    batch_start = 0  # index de départ dans la liste globale
+
     while True:
         try:
             LOGGER.info("=== START SCAN ===")
 
             symbols = await client.get_contracts_list()
-
             if not symbols:
-                LOGGER.warning("⚠️ Aucun symbole récupéré → arrêt temporaire")
+                LOGGER.warning("⚠️ Aucun symbole récupéré → pause")
                 await asyncio.sleep(60)
                 continue
 
+            total = len(symbols)
+
+            # On boucle si on a atteint la fin
+            if batch_start >= total:
+                batch_start = 0
+
+            batch_end = min(batch_start + MAX_SYMBOLS_PER_SCAN, total)
+            batch = symbols[batch_start:batch_end]
+            LOGGER.info(
+                f"🔎 SCAN BATCH {batch_start}-{batch_end} / {total} (size={len(batch)})"
+            )
+
+            batch_start = batch_end  # prochain batch au scan suivant
+
             tasks = [
                 process_symbol(sym, analyzer, trader, client)
-                for sym in symbols
+                for sym in batch
             ]
 
             await asyncio.gather(*tasks)
