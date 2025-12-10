@@ -1,7 +1,5 @@
 # =====================================================================
-# bitget_client.py — Bitget API FIXED (2025)
-# Candles V1 (symbol = BTCUSDT, no suffix)
-# Contracts V2
+# bitget_client.py — DIAGNOSTIC MODE (PRINT RAW API RESPONSES)
 # =====================================================================
 
 from __future__ import annotations
@@ -14,7 +12,7 @@ LOGGER = logging.getLogger(__name__)
 # RETRY ENGINE
 # =====================================================================
 
-async def _async_retry(fn, retries=5, delay=0.35):
+async def _async_retry(fn, retries=4, delay=0.25):
     for attempt in range(retries + 1):
         try:
             return await fn()
@@ -28,22 +26,16 @@ async def _async_retry(fn, retries=5, delay=0.35):
 # =====================================================================
 
 def normalize_symbol(sym: str) -> str:
-    """
-    Convert every format → BTCUSDT
-    """
     if not sym:
         return ""
-
     s = sym.upper().replace("-", "")
     s = s.replace("USDTM", "USDT").replace("USDTSWAP", "USDT")
-
     if s.startswith("XBT"):
         s = s.replace("XBT", "BTC")
-
-    return s  # <- FINAL correct symbol for both V1 & V2
+    return s
 
 # =====================================================================
-# TIMEFRAME MAP (V1)
+# TIMEFRAME MAP
 # =====================================================================
 
 TF_MAP = {
@@ -63,9 +55,9 @@ TF_MAP = {
 class BitgetClient:
     BASE = "https://api.bitget.com"
 
-    def __init__(self, api_key: str, api_secret: str, passphrase: str):
-        self.api_key = api_key
-        self.api_secret = api_secret.encode()
+    def __init__(self, key: str, secret: str, passphrase: str):
+        self.api_key = key
+        self.api_secret = secret.encode()
         self.api_passphrase = passphrase
         self.session: Optional[aiohttp.ClientSession] = None
 
@@ -74,8 +66,7 @@ class BitgetClient:
 
     async def _ensure_session(self):
         if self.session is None or self.session.closed:
-            timeout = aiohttp.ClientTimeout(total=25)
-            self.session = aiohttp.ClientSession(timeout=timeout)
+            self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20))
 
     def _sign(self, ts, method, path, query, body):
         msg = f"{ts}{method}{path}{query}{body}"
@@ -84,15 +75,14 @@ class BitgetClient:
 
     async def _request(self, method, path, *, params=None, data=None, auth=True):
         await self._ensure_session()
-
         params = params or {}
         data = data or {}
 
         query = ""
         if params:
-            query = "?" + "&".join(f"{k}={v}" for k, v in params.items())
+            query = "?" + "&".join([f"{k}={v}" for k, v in params.items()])
 
-        body = json.dumps(data, separators=(",", ":")) if data else ""
+        body = json.dumps(data) if data else ""
         url = self.BASE + path + query
 
         async def _do():
@@ -100,36 +90,32 @@ class BitgetClient:
             headers = {}
 
             if auth:
-                sig = self._sign(ts, method.upper(), path, query, body)
+                sig = self._sign(ts, method, path, query, body)
                 headers = {
                     "ACCESS-KEY": self.api_key,
                     "ACCESS-SIGN": sig,
                     "ACCESS-TIMESTAMP": ts,
                     "ACCESS-PASSPHRASE": self.api_passphrase,
-                    "Content-Type": "application/json",
+                    "Content-Type": "application/json"
                 }
 
-            async with self.session.request(method.upper(), url, headers=headers, data=body or None) as resp:
+            async with self.session.request(method, url, headers=headers, data=body or None) as resp:
                 txt = await resp.text()
-
                 try:
-                    return json.loads(txt)
+                    js = json.loads(txt)
                 except:
-                    LOGGER.error(f"❌ JSON ERROR: {txt}")
-                    return {"code": "99999", "msg": "json_error", "raw": txt}
+                    LOGGER.error(f"❌ JSON PARSE ERROR RAW={txt}")
+                    return {"raw": txt, "error": "json_parse"}
+
+                return js
 
         return await _async_retry(_do)
 
     # =====================================================================
-    # CONTRACTS (V2)
+    # CONTRACT LIST (OK)
     # =====================================================================
 
     async def get_contracts_list(self) -> List[str]:
-        now = time.time()
-
-        if self._contracts_cache and now - self._contracts_ts < 300:
-            return self._contracts_cache
-
         r = await self._request(
             "GET",
             "/api/v2/mix/market/contracts",
@@ -138,19 +124,15 @@ class BitgetClient:
         )
 
         if "data" not in r:
-            LOGGER.error(f"❌ CONTRACT ERROR: {r}")
+            LOGGER.error(f"❌ CONTRACT ERROR RAW={r}")
             return []
 
         symbols = [normalize_symbol(c["symbol"]) for c in r["data"]]
-
         LOGGER.info(f"📈 Loaded {len(symbols)} symbols from Bitget Futures")
-
-        self._contracts_cache = symbols
-        self._contracts_ts = now
         return symbols
 
     # =====================================================================
-    # CANDLES (V1) — FINAL FIX (NO SUFFIX)
+    # KLINES (DIAGNOSTIC MODE)
     # =====================================================================
 
     async def get_klines_df(self, symbol: str, tf="1H", limit=200):
@@ -159,14 +141,21 @@ class BitgetClient:
             LOGGER.error(f"❌ INVALID TF {tf}")
             return pd.DataFrame()
 
-        sym = normalize_symbol(symbol)  # <- correct
+        sym = normalize_symbol(symbol)
 
         r = await self._request(
             "GET",
             "/api/mix/v1/market/candles",
-            params={"symbol": sym, "granularity": gran, "limit": limit},
-            auth=False,
+            params={
+                "symbol": sym,
+                "granularity": gran,
+                "limit": limit,
+            },
+            auth=False
         )
+
+        # 🔥 NOUVEAU : LOG COMPLET DE LA RÉPONSE
+        LOGGER.error(f"🔍 RAW_CANDLES_RESPONSE {sym}({tf}) → {r}")
 
         if "data" not in r or not r["data"]:
             LOGGER.warning(f"⚠️ EMPTY KLINES for {sym} ({tf})")
@@ -175,21 +164,22 @@ class BitgetClient:
         try:
             df = pd.DataFrame(
                 r["data"],
-                columns=["time", "open", "high", "low", "close", "volume"],
+                columns=["time", "open", "high", "low", "close", "volume"]
             )
             df = df.astype(float)
             df.sort_values("time", inplace=True)
             return df.reset_index(drop=True)
 
         except Exception as e:
-            LOGGER.exception(f"❌ PARSE ERROR for {symbol}: {e}")
+            LOGGER.exception(f"❌ PARSE ERROR {symbol}: {e}")
             return pd.DataFrame()
+
 
 # =====================================================================
 # SINGLETON
 # =====================================================================
 
-_client_instance: Optional[BitgetClient] = None
+_client_instance = None
 
 async def get_client(key, secret, passphrase):
     global _client_instance
