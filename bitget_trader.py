@@ -25,7 +25,7 @@ PRODUCT_TYPE = "USDT-FUTURES"
 MARGIN_COIN = "USDT"
 
 # Sur Bitget, "fixed" = isolated, "crossed" = cross
-MARGIN_MODE = "fixed"          # <--- ISOLÉ
+MARGIN_MODE = "isolated"          # <--- ISOLÉ
 
 TARGET_MARGIN_USDT = 20.0      # marge désirée
 TARGET_LEVERAGE = 10.0         # levier désiré
