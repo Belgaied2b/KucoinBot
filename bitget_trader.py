@@ -1,16 +1,16 @@
 # =====================================================================
 # bitget_trader.py — Desk Lead Execution Engine (Bitget v2 2025)
 # =====================================================================
-# 100% NATIF BITGET FUTURES V2 :
-#   ✔ LIMIT (place-order)
-#   ✔ STOP LOSS (place-plan-order)
-#   ✔ TAKE PROFIT (place-plan-order)
-#   ✔ Qty en contrat (size)
-#   ✔ Cross margin, USDT-FUTURES
+# Règles :
+#   - Produit : USDT-FUTURES
+#   - Marge cible : ~20 USDT par trade
+#   - Levier cible : 10x  ⇒ notionnel ≈ 200 USDT
+#   - Mode : isolé (marginMode = fixed)
+#   - Entrée : LIMIT
+#   - SL / TP : plan orders (place-plan-order)
 # =====================================================================
 
 import time
-import json
 import logging
 from typing import Dict, Any
 
@@ -18,169 +18,260 @@ from bitget_client import get_client
 
 LOGGER = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------
+# CONFIG GLOBALE
+# ---------------------------------------------------------------------
+PRODUCT_TYPE = "USDT-FUTURES"
+MARGIN_COIN = "USDT"
+
+# Sur Bitget, "fixed" = isolated, "crossed" = cross
+MARGIN_MODE = "fixed"          # <--- ISOLÉ
+
+TARGET_MARGIN_USDT = 20.0      # marge désirée
+TARGET_LEVERAGE = 10.0         # levier désiré
+TIME_IN_FORCE = "gtc"          # validité de l'ordre
+
 
 class BitgetTrader:
     """
-    Exécution dérivés Bitget (USDT-FUTURES, cross margin, v2)
+    Trader institutionnel Bitget :
+      - calcule la taille à partir du prix pour viser ~20 USDT de marge (levier 10x)
+      - conserve la même interface que le bot KuCoin côté scanner
     """
-
-    PRODUCT_TYPE = "USDT-FUTURES"
-    MARGIN_MODE = "crossed"
-    MARGIN_COIN = "USDT"
 
     def __init__(self, api_key: str, api_secret: str, api_passphrase: str):
         self.api_key = api_key
         self.api_secret = api_secret
         self.api_passphrase = api_passphrase
 
+        self._client = None
+
+        # On mémorise la taille "de base" envoyée à l'entrée pour ce symbole
+        # afin de pouvoir poser SL / TP cohérents (et fractions pour les TP).
+        self._entry_size: Dict[str, float] = {}
+        self._entry_price: Dict[str, float] = {}
+
     # ------------------------------------------------------------------
+    async def _ensure_client(self):
+        if self._client is None:
+            self._client = await get_client(
+                self.api_key,
+                self.api_secret,
+                self.api_passphrase,
+            )
+        return self._client
+
     async def _request(self, method: str, path: str, *, params=None, data=None) -> Dict[str, Any]:
-        """
-        Délégation à BitgetClient (signature + retry + logs).
-        On ne refait PAS la signature ici.
-        """
-        client = await get_client(self.api_key, self.api_secret, self.api_passphrase)
+        client = await self._ensure_client()
         return await client._request(method, path, params=params, data=data, auth=True)
 
-    # ==================================================================
-    # LIMIT ORDER (ENTRY)
-    # ==================================================================
+    # ------------------------------------------------------------------
+    # CALCUL DE LA TAILLE : ~20 USDT de marge (notionnel ≈ 200 USDT)
+    # ------------------------------------------------------------------
+    def _compute_base_size(self, price: float) -> float:
+        """
+        Calcule la taille en COIN (pas en USDT) pour viser :
+          notionnel ≈ 200 USDT = TARGET_MARGIN_USDT * TARGET_LEVERAGE
+        size = notionnel / prix
+        """
+        try:
+            p = float(price)
+        except Exception:
+            return 0.0
+
+        if p <= 0:
+            return 0.0
+
+        notional_target = TARGET_MARGIN_USDT * TARGET_LEVERAGE  # 20 * 10 = 200
+        size = notional_target / p
+        return max(size, 0.0)
+
+    # ------------------------------------------------------------------
+    # ORDRE LIMIT D'ENTRÉE
+    # ------------------------------------------------------------------
     async def place_limit(self, symbol: str, side: str, price: float, qty: float) -> Dict[str, Any]:
         """
-        Place un ordre LIMIT sur USDT-FUTURES.
+        place_limit(symbol, side, price, qty)
 
-        - symbol: "BTCUSDT", "PENDLEUSDT", etc.
-        - side: "long" / "buy" / "short" / "sell"
-        - price: prix limite
-        - qty: taille en contrats (size)
+        - `qty` est gardé pour compat mais utilisé comme *multiplicateur* de taille.
+        - La taille de base est calculée à partir du prix pour viser ~20 USDT de marge.
         """
+        base_size = self._compute_base_size(price)
 
-        s = side.lower()
-        if s in ("long", "buy"):
-            side_final = "buy"
-        elif s in ("short", "sell"):
-            side_final = "sell"
-        else:
-            raise ValueError(f"Invalid side: {side}")
+        # qty joue le rôle de multiplicateur (par défaut 1.0 dans ton bot)
+        try:
+            multiple = float(qty)
+        except Exception:
+            multiple = 1.0
 
-        client_oid = f"entry-{symbol}-{int(time.time() * 1000)}"
+        size = base_size * multiple
 
-        data = {
-            "productType": self.PRODUCT_TYPE,      # USDT-FUTURES
+        # On mémorise la taille de base (avant fractions TP) pour ce symbole
+        self._entry_size[symbol] = base_size
+        self._entry_price[symbol] = float(price)
+
+        side_final = "buy" if side.lower() in ("buy", "long") else "sell"
+
+        body = {
+            "productType": PRODUCT_TYPE,
             "symbol": symbol,
-            "marginMode": self.MARGIN_MODE,        # crossed
-            "marginCoin": self.MARGIN_COIN,       # USDT
-            "size": str(qty),
+            "marginMode": MARGIN_MODE,
+            "marginCoin": MARGIN_COIN,
+            "size": str(size),
             "price": str(price),
             "orderType": "limit",
-            "side": side_final,                   # buy / sell
-            "tradeSide": "open",                  # ouverture de position
-            # ⚠️ IMPORTANT : time-in-force pour v2
-            # gtc = good-till-cancelled
-            "force": "gtc",
+            "side": side_final,       # buy / sell
+            "tradeSide": "open",      # open position
+            "force": TIME_IN_FORCE,   # gtc / ioc / fok / post_only
             "reduceOnly": "NO",
-            "clientOid": client_oid,
+            "clientOid": f"entry-{symbol}-{int(time.time() * 1000)}",
         }
 
-        LOGGER.info(f"[TRADER] place_limit {symbol} {side_final} {price} size={qty}")
-        res = await self._request("POST", "/api/v2/mix/order/place-order", data=data)
+        notional = size * float(price)
+        approx_margin = notional / TARGET_LEVERAGE if TARGET_LEVERAGE > 0 else 0.0
 
-        ok = res.get("code") == "00000"
+        LOGGER.info(
+            "[TRADER] place_limit %s %s price=%s size=%.8f  "
+            "(notional≈%.2f USDT, marge≈%.2f USDT, levier=%sx)",
+            symbol,
+            side_final,
+            price,
+            size,
+            notional,
+            approx_margin,
+            TARGET_LEVERAGE,
+        )
+
+        res = await self._request("POST", "/api/v2/mix/order/place-order", data=body)
+        ok = isinstance(res, dict) and res.get("code") == "00000"
+
         if not ok:
-            LOGGER.error(f"[TRADER] LIMIT ERROR {symbol} → {json.dumps(res)}")
+            LOGGER.error("[TRADER] ❌ place_limit FAILED %s → %s", symbol, res)
 
-        return {"ok": ok, "raw": res, "clientOid": client_oid}
+        return {
+            "ok": ok,
+            "raw": res,
+            "symbol": symbol,
+            "side": side_final,
+            "price": price,
+            "size": size,
+            "base_size": base_size,
+        }
 
-    # ==================================================================
+    # ------------------------------------------------------------------
     # STOP LOSS (PLAN ORDER)
-    # ==================================================================
+    # ------------------------------------------------------------------
     async def place_stop_loss(self, symbol: str, side: str, sl: float, qty: float) -> Dict[str, Any]:
         """
-        Place un STOP LOSS via plan order v2.
+        place_stop_loss(symbol, side, sl, qty)
 
-        - Pour un LONG → SL = SELL / close / reduceOnly
-        - Pour un SHORT → SL = BUY / close / reduceOnly
+        - On utilise la taille de base mémorisée à l'entrée.
+        - `qty` est traité comme fraction de cette taille (1.0 = 100%, 0.5 = 50%, etc.).
+        Dans ton scanner actuel, tu envoies 1.0 pour le SL => taille complète.
         """
+        base_size = self._entry_size.get(symbol)
+        if base_size is None:
+            # fallback improbable, mais on recalcule une taille de base
+            base_size = self._compute_base_size(sl)
 
-        s = side.lower()
-        if s in ("long", "buy"):
-            order_side = "sell"
-        elif s in ("short", "sell"):
-            order_side = "buy"
-        else:
-            raise ValueError(f"Invalid side: {side}")
+        try:
+            fraction = float(qty)
+        except Exception:
+            fraction = 1.0
 
-        client_oid = f"sl-{symbol}-{int(time.time() * 1000)}"
+        size = max(base_size * fraction, 0.0)
 
-        data = {
-            "planType": "normal_plan",            # simple trigger
-            "productType": self.PRODUCT_TYPE,
+        # Pour un long on vend au SL, pour un short on achète au SL
+        trigger_side = "sell" if side.lower() in ("buy", "long") else "buy"
+
+        body = {
+            "productType": PRODUCT_TYPE,
             "symbol": symbol,
-            "marginMode": self.MARGIN_MODE,
-            "marginCoin": self.MARGIN_COIN,
-            "size": str(qty),
-            "price": str(sl),                     # prix d'exécution
-            "triggerPrice": str(sl),              # prix de déclenchement
-            "triggerType": "mark_price",          # mark price pour SL propre
-            "side": order_side,                   # direction de l'ordre
-            "tradeSide": "close",                 # fermeture de position
+            "marginMode": MARGIN_MODE,
+            "marginCoin": MARGIN_COIN,
+            "size": str(size),
             "orderType": "limit",
+            "side": trigger_side,
+            "tradeSide": "close",
+            "triggerType": "mark_price",
+            "triggerPrice": str(sl),
+            "executePrice": str(sl),
             "reduceOnly": "YES",
-            "clientOid": client_oid,
+            "clientOid": f"sl-{symbol}-{int(time.time() * 1000)}",
         }
 
-        LOGGER.info(f"[TRADER] place_stop_loss {symbol} side={order_side} sl={sl} size={qty}")
-        res = await self._request("POST", "/api/v2/mix/order/place-plan-order", data=data)
+        LOGGER.info(
+            "[TRADER] place_stop_loss %s side=%s sl=%s size=%.8f",
+            symbol,
+            trigger_side,
+            sl,
+            size,
+        )
 
-        ok = res.get("code") == "00000"
+        res = await self._request("POST", "/api/v2/mix/order/place-plan-order", data=body)
+        ok = isinstance(res, dict) and res.get("code") == "00000"
+
         if not ok:
-            LOGGER.error(f"[TRADER] SL ERROR {symbol} → {json.dumps(res)}")
+            LOGGER.error("[TRADER] ❌ place_stop_loss FAILED %s → %s", symbol, res)
 
-        return {"ok": ok, "raw": res, "clientOid": client_oid}
+        return {"ok": ok, "raw": res, "size": size}
 
-    # ==================================================================
+    # ------------------------------------------------------------------
     # TAKE PROFIT (PLAN ORDER)
-    # ==================================================================
+    # ------------------------------------------------------------------
     async def place_take_profit(self, symbol: str, side: str, tp: float, qty: float) -> Dict[str, Any]:
         """
-        Place un TAKE PROFIT via plan order v2.
+        place_take_profit(symbol, side, tp, qty)
 
-        - Pour un LONG → TP = SELL / close / reduceOnly
-        - Pour un SHORT → TP = BUY / close / reduceOnly
+        - Même logique que le SL : `qty` est une fraction de la taille d'entrée.
+        - Typiquement :
+            TP1 → qty = 0.5
+            TP2 → qty = 0.5
+          Avec base_size ~200/price, ça donne 50% / 50% de la position.
         """
+        base_size = self._entry_size.get(symbol)
+        if base_size is None:
+            base_size = self._compute_base_size(tp)
 
-        s = side.lower()
-        if s in ("long", "buy"):
-            order_side = "sell"
-        elif s in ("short", "sell"):
-            order_side = "buy"
-        else:
-            raise ValueError(f"Invalid side: {side}")
+        try:
+            fraction = float(qty)
+        except Exception:
+            fraction = 1.0
 
-        client_oid = f"tp-{symbol}-{int(time.time() * 1000)}"
+        size = max(base_size * fraction, 0.0)
 
-        data = {
-            "planType": "normal_plan",
-            "productType": self.PRODUCT_TYPE,
+        # Pour un long on vend au TP, pour un short on achète au TP
+        trigger_side = "sell" if side.lower() in ("buy", "long") else "buy"
+
+        body = {
+            "productType": PRODUCT_TYPE,
             "symbol": symbol,
-            "marginMode": self.MARGIN_MODE,
-            "marginCoin": self.MARGIN_COIN,
-            "size": str(qty),
-            "price": str(tp),
-            "triggerPrice": str(tp),
-            "triggerType": "mark_price",
-            "side": order_side,
-            "tradeSide": "close",
+            "marginMode": MARGIN_MODE,
+            "marginCoin": MARGIN_COIN,
+            "size": str(size),
             "orderType": "limit",
+            "side": trigger_side,
+            "tradeSide": "close",
+            "triggerType": "mark_price",
+            "triggerPrice": str(tp),
+            "executePrice": str(tp),
             "reduceOnly": "YES",
-            "clientOid": client_oid,
+            "clientOid": f"tp-{symbol}-{int(time.time() * 1000)}",
         }
 
-        LOGGER.info(f"[TRADER] place_take_profit {symbol} side={order_side} tp={tp} size={qty}")
-        res = await self._request("POST", "/api/v2/mix/order/place-plan-order", data=data)
+        LOGGER.info(
+            "[TRADER] place_take_profit %s side=%s tp=%s size=%.8f (fraction=%.3f)",
+            symbol,
+            trigger_side,
+            tp,
+            size,
+            fraction,
+        )
 
-        ok = res.get("code") == "00000"
+        res = await self._request("POST", "/api/v2/mix/order/place-plan-order", data=body)
+        ok = isinstance(res, dict) and res.get("code") == "00000"
+
         if not ok:
-            LOGGER.error(f"[TRADER] TP ERROR {symbol} → {json.dumps(res)}")
+            LOGGER.error("[TRADER] ❌ place_take_profit FAILED %s → %s", symbol, res)
 
-        return {"ok": ok, "raw": res, "clientOid": client_oid}
+        return {"ok": ok, "raw": res, "size": size}
