@@ -1,37 +1,39 @@
 # =====================================================================
-# structure_utils.py — Desk Lead Structure Engine
-# Institutional-grade BOS / CHOCH / Liquidity / Trend + HTF alignment
+# structure_utils.py — Institutional Structure Engine ++
+# BOS / CHOCH / Internal vs External / Liquidity / OB / FVG / HTF
 # =====================================================================
 
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 
 
 # =====================================================================
-# SWINGS
+# SWINGS (pivot highs / lows)
 # =====================================================================
 
-def find_swings(df: pd.DataFrame, left: int = 3, right: int = 3) -> Dict[str, List[tuple]]:
+def find_swings(df: pd.DataFrame, left: int = 3, right: int = 3) -> Dict[str, List[Tuple[int, float]]]:
     """
-    Détection basique mais robuste des swings (pivot highs / lows).
+    Detect basic swing highs / lows (pivot highs / lows).
 
-    On scanne chaque point i et on vérifie :
-      - pivot high : high[i] est le max du voisinage [i-left, i+right]
-      - pivot low  : low[i]  est le min du voisinage [i-left, i+right]
+    A pivot high at index i is where high[i] is the max of [i-left, i+right].
+    A pivot low  at index i is where low[i]  is the min of [i-left, i+right].
 
-    Retourne :
-      {"highs": [(index, price), ...], "lows": [(index, price), ...]}
+    Returns:
+        {
+          "highs": [(idx, price), ...],
+          "lows" : [(idx, price), ...],
+        }
     """
+    highs: List[Tuple[int, float]] = []
+    lows: List[Tuple[int, float]] = []
+
     if df is None or len(df) < left + right + 3:
-        return {"highs": [], "lows": []}
+        return {"highs": highs, "lows": lows}
 
-    highs: List[tuple] = []
-    lows: List[tuple] = []
-
-    h = df["high"].values
-    l = df["low"].values
+    h = df["high"].to_numpy(dtype=float)
+    l = df["low"].to_numpy(dtype=float)
 
     for i in range(left, len(df) - right):
         window_h = h[i - left : i + right + 1]
@@ -39,38 +41,47 @@ def find_swings(df: pd.DataFrame, left: int = 3, right: int = 3) -> Dict[str, Li
         hi = h[i]
         lo = l[i]
 
-        if hi == window_h.max():
-            highs.append((int(i), float(hi)))
-        if lo == window_l.min():
-            lows.append((int(i), float(lo)))
+        if hi >= window_h.max():
+            highs.append((i, float(hi)))
+        if lo <= window_l.min():
+            lows.append((i, float(lo)))
 
     return {"highs": highs, "lows": lows}
 
 
 # =====================================================================
-# LIQUIDITY LEVELS (Equal Highs / Equal Lows)
+# LIQUIDITY (equal highs / equal lows)
 # =====================================================================
 
 def _cluster_levels(levels: List[float], tolerance: float) -> List[float]:
     """
-    Regroupe des niveaux proches (equal highs / lows).
-    tolerance : distance absolue max pour les considérer "égaux".
+    Groups nearby price levels into liquidity clusters.
+
+    Args:
+        levels: list of raw high/low prices.
+        tolerance: max absolute distance between prices to group them.
+
+    Returns:
+        List of cluster representative prices (mean of each cluster)
+        with at least 2 contributing points.
     """
     if not levels:
         return []
 
-    levels_sorted = sorted(levels)
-    clusters: List[List[float]] = [[levels_sorted[0]]]
+    lv_sorted = sorted(levels)
+    clusters: List[List[float]] = [[lv_sorted[0]]]
 
-    for lv in levels_sorted[1:]:
-        if abs(lv - clusters[-1][-1]) <= tolerance:
-            clusters[-1].append(lv)
+    for p in lv_sorted[1:]:
+        if abs(p - clusters[-1][-1]) <= tolerance:
+            clusters[-1].append(p)
         else:
-            clusters.append([lv])
+            clusters.append([p])
 
-    # Retourne la moyenne de chaque cluster avec au moins 2 points
-    result = [float(np.mean(c)) for c in clusters if len(c) >= 2]
-    return result
+    out: List[float] = []
+    for c in clusters:
+        if len(c) >= 2:
+            out.append(float(np.mean(c)))
+    return out
 
 
 def detect_equal_levels(
@@ -80,18 +91,16 @@ def detect_equal_levels(
     max_window: int = 200,
 ) -> Dict[str, List[float]]:
     """
-    Détecte les equal highs / equal lows à partir des swings.
+    Detect institutional liquidity pools (equal highs / equal lows) using swings.
 
-    - On limite l'analyse aux derniers max_window points pour rester pertinent
-      sur le contexte local.
-    - La tolérance en prix est basée sur la volatilité récente :
-        tolerance ≈ 15% de la médiane des ranges (high-low).
+    - Restricts to last `max_window` bars.
+    - Tolerance is based on recent volatility (median range * factor).
 
-    Retourne :
-      {
-        "eq_highs": [prix_niveau1, prix_niveau2, ...],
-        "eq_lows":  [ ... ]
-      }
+    Returns:
+        {
+          "eq_highs": [price1, price2, ...],
+          "eq_lows" : [price1, price2, ...],
+        }
     """
     if df is None or len(df) < left + right + 3:
         return {"eq_highs": [], "eq_lows": []}
@@ -99,49 +108,55 @@ def detect_equal_levels(
     sub = df.tail(max_window).reset_index(drop=True)
     swings = find_swings(sub, left=left, right=right)
 
-    high_levels = [p for (_, p) in swings["highs"]]
-    low_levels = [p for (_, p) in swings["lows"]]
+    high_prices = [p for _, p in swings["highs"]]
+    low_prices = [p for _, p in swings["lows"]]
 
-    ranges = sub["high"] - sub["low"]
+    ranges = (sub["high"] - sub["low"]).astype(float)
     if ranges.dropna().empty:
         base_range = np.nan
     else:
         base_range = float(np.nanmedian(ranges))
 
+    # tolerances: ~10-20% of typical bar range, or ~0.1% of price as fallback
     if not np.isfinite(base_range) or base_range <= 0:
-        # fallback : tolérance fixe
-        tolerance = float(sub["close"].iloc[-1]) * 0.001  # 0.1%
+        last_price = float(sub["close"].iloc[-1])
+        tolerance = last_price * 0.001
     else:
         tolerance = base_range * 0.15
 
-    eq_highs = _cluster_levels(high_levels, tolerance)
-    eq_lows = _cluster_levels(low_levels, tolerance)
+    eq_highs = _cluster_levels(high_prices, tolerance)
+    eq_lows = _cluster_levels(low_prices, tolerance)
+
+    # sort ascending for convenience
+    eq_highs = sorted(eq_highs)
+    eq_lows = sorted(eq_lows)
 
     return {"eq_highs": eq_highs, "eq_lows": eq_lows}
 
 
 # =====================================================================
-# TREND DETECTION (EMA 20 / 50)
+# TREND via EMA 20/50 (LTF & HTF)
 # =====================================================================
 
 def _trend_from_ema(close: pd.Series, fast: int = 20, slow: int = 50) -> str:
     """
-    Détecte le biais principal à partir des EMA 20 / 50 :
-      - LONG  : ema20 > ema50 et ema20 en pente ascendante
-      - SHORT : ema20 < ema50 et ema20 en pente descendante
-      - RANGE : sinon
+    Simple institutional bias from EMA20/EMA50 and slope:
+
+      - LONG  : ema_fast > ema_slow and ema_fast rising
+      - SHORT : ema_fast < ema_slow and ema_fast falling
+      - RANGE : otherwise
     """
     if close is None or len(close) < slow + 5:
         return "RANGE"
 
-    ema_fast = close.ewm(span=fast, adjust=False).mean()
-    ema_slow = close.ewm(span=slow, adjust=False).mean()
-
-    if len(ema_fast) < 5 or len(ema_slow) < 5:
-        return "RANGE"
+    c = close.astype(float)
+    ema_fast = c.ewm(span=fast, adjust=False).mean()
+    ema_slow = c.ewm(span=slow, adjust=False).mean()
 
     ef = ema_fast.iloc[-5:]
     es = ema_slow.iloc[-5:]
+    if len(ef) < 5 or len(es) < 5:
+        return "RANGE"
 
     slope_fast = ef.iloc[-1] - ef.iloc[0]
 
@@ -153,95 +168,154 @@ def _trend_from_ema(close: pd.Series, fast: int = 20, slow: int = 50) -> str:
 
 
 # =====================================================================
-# BOS / CHOCH DETECTION
+# BOS / CHOCH : external vs internal
 # =====================================================================
 
-def _detect_bos_or_choch(df: pd.DataFrame) -> Dict[str, Any]:
+def _classify_bos(
+    swings: Dict[str, List[Tuple[int, float]]],
+    last_close: float,
+) -> Dict[str, Any]:
     """
-    Détection simple mais efficace :
-      - BOS = break of structure dans la direction du trend EMA.
-      - CHOCH = break dans la direction opposée au trend EMA.
-      - COS = continuation of structure (BOS aligné avec le trend établi).
+    Classifies the most recent break as BOS/CHOCH/COS and internal vs external.
 
-    Retourne :
-      {
-        "bos": bool,
-        "choch": bool,
-        "cos": bool,
-        "direction": "UP" | "DOWN" | None
-      }
+    We use the last 3-4 swing highs/lows to define:
+      - "external" structure = outermost high/low in the recent window
+      - "internal" structure = intermediate highs/lows inside that range
     """
-    if df is None or len(df) < 30:
-        return {"bos": False, "choch": False, "cos": False, "direction": None}
+    highs = swings.get("highs", []) or []
+    lows = swings.get("lows", []) or []
 
-    close = df["close"]
-    trend = _trend_from_ema(close)
-
-    swings = find_swings(df)
-    highs = swings["highs"]
-    lows = swings["lows"]
+    res = {
+        "bos": False,
+        "choch": False,
+        "cos": False,
+        "direction": None,          # "UP" / "DOWN"
+        "bos_type": None,           # "INTERNAL" / "EXTERNAL"
+        "broken_level": None,
+    }
 
     if len(highs) < 2 and len(lows) < 2:
-        return {"bos": False, "choch": False, "cos": False, "direction": None}
+        return res
 
+    # Determine potential upside / downside levels
+    last_hi_level = None
+    ext_hi_level = None
+    if len(highs) >= 2:
+        # external high = max of last 3 highs
+        hi_prices = [p for _, p in highs[-3:]]
+        ext_hi_level = max(hi_prices)
+        # nearest recent high
+        last_hi_level = highs[-1][1]
+
+    last_lo_level = None
+    ext_lo_level = None
+    if len(lows) >= 2:
+        lo_prices = [p for _, p in lows[-3:]]
+        ext_lo_level = min(lo_prices)
+        last_lo_level = lows[-1][1]
+
+    # BOS up?
+    bos_up = False
+    broken_up_level = None
+    if last_hi_level is not None and last_close > last_hi_level:
+        bos_up = True
+        broken_up_level = last_hi_level
+        # if we also broke the external high, mark as EXTERNAL
+        bos_type = "EXTERNAL" if ext_hi_level is not None and last_close > ext_hi_level else "INTERNAL"
+    else:
+        bos_type = None
+
+    # BOS down?
+    bos_dn = False
+    broken_dn_level = None
+    if last_lo_level is not None and last_close < last_lo_level:
+        bos_dn = True
+        broken_dn_level = last_lo_level
+        bos_type_dn = "EXTERNAL" if ext_lo_level is not None and last_close < ext_lo_level else "INTERNAL"
+    else:
+        bos_type_dn = None
+
+    if bos_up and not bos_dn:
+        res["bos"] = True
+        res["direction"] = "UP"
+        res["bos_type"] = bos_type
+        res["broken_level"] = broken_up_level
+    elif bos_dn and not bos_up:
+        res["bos"] = True
+        res["direction"] = "DOWN"
+        res["bos_type"] = bos_type_dn
+        res["broken_level"] = broken_dn_level
+
+    return res
+
+
+def _detect_bos_choch_cos(df: pd.DataFrame) -> Dict[str, Any]:
+    """
+    High-level BOS / CHOCH / COS classification.
+
+    - BOS : last close breaks a significant swing high or low.
+    - CHOCH : BOS in the opposite direction of EMA trend.
+    - COS : BOS in the same direction as EMA trend.
+    - INTERNAL vs EXTERNAL: based on which swing was broken.
+    """
+    if df is None or len(df) < 40:
+        return {
+            "bos": False,
+            "choch": False,
+            "cos": False,
+            "direction": None,
+            "bos_type": None,
+            "broken_level": None,
+        }
+
+    close = df["close"].astype(float)
     last_close = float(close.iloc[-1])
 
-    bos = False
+    swings = find_swings(df)
+    bos_info = _classify_bos(swings, last_close)
+    if not bos_info["bos"]:
+        return bos_info
+
+    trend = _trend_from_ema(close)
+    direction = bos_info["direction"]
+
+    bos = True
     choch = False
     cos = False
-    direction: Optional[str] = None
 
-    # BOS UP : le prix casse le dernier swing high significatif
-    if len(highs) >= 2:
-        _, last_hi = highs[-1]
-        _, prev_hi = highs[-2]
-        level_up = max(last_hi, prev_hi)
-        if last_close > level_up:
-            bos = True
-            direction = "UP"
-
-    # BOS DOWN : le prix casse le dernier swing low significatif
-    if not bos and len(lows) >= 2:
-        _, last_lo = lows[-1]
-        _, prev_lo = lows[-2]
-        level_down = min(last_lo, prev_lo)
-        if last_close < level_down:
-            bos = True
-            direction = "DOWN"
-
-    if not bos:
-        return {"bos": False, "choch": False, "cos": False, "direction": None}
-
-    # CHOCH vs COS selon accord/désaccord avec le trend EMA
     if direction == "UP":
         if trend == "SHORT":
             choch = True
-        else:
+        elif trend == "LONG":
             cos = True
     elif direction == "DOWN":
         if trend == "LONG":
             choch = True
-        else:
+        elif trend == "SHORT":
             cos = True
 
-    return {"bos": bos, "choch": choch, "cos": cos, "direction": direction}
+    bos_info["bos"] = bos
+    bos_info["choch"] = choch
+    bos_info["cos"] = cos
+
+    return bos_info
 
 
 # =====================================================================
-# HTF TREND ALIGNMENT
+# HTF trend alignment (H4 vs H1)
 # =====================================================================
 
 def htf_trend_ok(df_htf: pd.DataFrame, bias: str) -> bool:
     """
-    Vérifie que la tendance H4 (EMA20/EMA50) ne contredit pas le biais H1.
+    Ensures H4 trend does not contradict H1 bias.
 
-    Règles :
-      - Si H4 est LONG, un biais SHORT est rejeté.
-      - Si H4 est SHORT, un biais LONG est rejeté.
-      - Si H4 est RANGE, on tolère les deux (pas de veto).
+    Rules:
+      - If H4 is LONG, a SHORT bias is vetoed.
+      - If H4 is SHORT, a LONG bias is vetoed.
+      - If H4 is RANGE, both are allowed.
     """
-    if df_htf is None or len(df_htf) < 60:
-        return True  # manque de données => on ne bloque pas
+    if df_htf is None or len(df_htf) < 40:
+        return True
 
     bias = (bias or "").upper()
     trend_htf = _trend_from_ema(df_htf["close"])
@@ -254,7 +328,7 @@ def htf_trend_ok(df_htf: pd.DataFrame, bias: str) -> bool:
 
 
 # =====================================================================
-# BOS QUALITY (Volume / OI / Liquidity sweep)
+# BOS QUALITY (volume / OI / liquidity sweep)
 # =====================================================================
 
 def bos_quality_details(
@@ -269,31 +343,33 @@ def bos_quality_details(
     tick: float = 0.1,
 ) -> Dict[str, Any]:
     """
-    Evalue la "qualité" d'un BOS récent à partir de :
+    Evaluate BOS quality using multiple institutional signals:
 
-      - Volume relatif (dernier volume vs moyenne)
-      - Corps de bougie (body / range)
-      - Variation d'Open Interest autour du move
-      - Eventuelle chasse de liquidité (equal highs/lows cassés)
+      - Volume factor: last volume vs mean(volume[lookback])
+      - Body ratio: |close-open| / (high-low)
+      - OI slope: trend in open interest over last ~N bars
+      - Liquidity sweep: did we sweep an equal high/low?
+      - Close position in range (upper/lower quartile)
 
-    Retourne un dict contenant :
-      {
-        "ok": bool,
-        "volume_factor": float,
-        "body_ratio": float,
-        "oi_slope": float,
-        "liquidity_sweep": bool,
-        "reasons": [ ... ]
-      }
+    Returns:
+        {
+          "ok": bool,
+          "volume_factor": float,
+          "body_ratio": float,
+          "oi_slope": float,
+          "liquidity_sweep": bool,
+          "range_pos": float,
+          "reasons": [ ... ],
+        }
     """
     if df is None or len(df) < max(vol_lookback, 20):
         return {"ok": True, "reason": "not_enough_data"}
 
-    closes = df["close"]
-    opens = df["open"]
-    highs = df["high"]
-    lows = df["low"]
-    vols = df["volume"]
+    closes = df["close"].astype(float)
+    opens = df["open"].astype(float)
+    highs = df["high"].astype(float)
+    lows = df["low"].astype(float)
+    vols = df["volume"].astype(float)
 
     last_close = float(closes.iloc[-1])
     last_open = float(opens.iloc[-1])
@@ -309,45 +385,59 @@ def bos_quality_details(
     body = abs(last_close - last_open)
     body_ratio = body / rng if rng > 0 else 0.0
 
-    # OI slope sur ~10 dernières barres si dispo
+    # position of close inside the bar range (0=low, 1=high)
+    if rng > 0:
+        range_pos = (last_close - last_low) / rng
+    else:
+        range_pos = 0.5
+
+    # OI slope (relative) over last 10 bars if available
     oi_slope = 0.0
     if oi_series is not None:
         try:
             s = pd.Series(oi_series).astype(float)
             if len(s) >= 10:
-                oi_slope = float(s.iloc[-1] - s.iloc[-10]) / max(abs(s.iloc[-10]), 1e-8)
+                base = float(s.iloc[-10])
+                if abs(base) > 1e-12:
+                    oi_slope = float(s.iloc[-1] - base) / abs(base)
         except Exception:
             oi_slope = 0.0
 
-    # Liquidity sweep : on regarde si un niveau d'égal highs/lows a été dépassé
+    # liquidity sweep detection
     liquidity_sweep = False
-    if df_liq is not None:
+    if df_liq is None:
+        df_liq = df
+    try:
         levels = detect_equal_levels(df_liq.tail(200))
-        eq_highs = levels.get("eq_highs", [])
-        eq_lows = levels.get("eq_lows", [])
+        eq_highs = levels.get("eq_highs", []) or []
+        eq_lows = levels.get("eq_lows", []) or []
+        ref_price = float(price) if price is not None else last_close
 
-        if price is None:
-            price = last_close
-
+        # if we close above an eq_high or below an eq_low, we consider it swept
         for lvl in eq_highs:
-            if last_close > lvl:
+            if ref_price > lvl:
                 liquidity_sweep = True
                 break
         if not liquidity_sweep:
             for lvl in eq_lows:
-                if last_close < lvl:
+                if ref_price < lvl:
                     liquidity_sweep = True
                     break
+    except Exception:
+        liquidity_sweep = False
 
     reasons: List[str] = []
 
-    if volume_factor < 1.0 + vol_pct:
+    # volume threshold: want at least vol_pct * avg_vol more than average
+    if volume_factor < (1.0 + vol_pct):
         reasons.append("low_volume")
 
+    # want a decent body (no doji-style BOS)
     if body_ratio < 0.35:
         reasons.append("small_body")
 
-    if oi_series is not None and abs(oi_slope) < oi_min_trend:
+    # OI slope: if too small in absolute value, no real commitment
+    if abs(oi_slope) < oi_min_trend:
         reasons.append("weak_oi")
 
     ok = len(reasons) == 0
@@ -358,8 +448,115 @@ def bos_quality_details(
         "body_ratio": float(body_ratio),
         "oi_slope": float(oi_slope),
         "liquidity_sweep": bool(liquidity_sweep),
+        "range_pos": float(range_pos),
         "reasons": reasons,
     }
+
+
+# =====================================================================
+# ORDER BLOCKS & FAIR VALUE GAPS (lightweight)
+# =====================================================================
+
+def _detect_order_blocks(df: pd.DataFrame, lookback: int = 80) -> Dict[str, Any]:
+    """Very lightweight last-impulse order block detection.
+
+    - Bullish OB: last bearish candle before an impulsive move up.
+    - Bearish OB: last bullish candle before an impulsive move down.
+
+    Returns:
+        {
+          "bullish": {"index": int, "low": float, "high": float} or None,
+          "bearish": {...} or None,
+        }
+    """
+    if df is None or len(df) < 20:
+        return {"bullish": None, "bearish": None}
+
+    sub = df.tail(lookback)
+    o = sub["open"].astype(float).to_numpy()
+    c = sub["close"].astype(float).to_numpy()
+    h = sub["high"].astype(float).to_numpy()
+    l = sub["low"].astype(float).to_numpy()
+
+    # Impulsive up move: strong close-to-close change over N bars
+    closes = c
+    if closes.size < 10:
+        return {"bullish": None, "bearish": None}
+
+    # Define recent impulse window ~ last 5 bars
+    N = min(5, closes.size - 1)
+    impulse_ret = (closes[-1] - closes[-1 - N]) / max(abs(closes[-1 - N]), 1e-8)
+
+    bullish_ob = None
+    bearish_ob = None
+
+    idx_offset = len(df) - len(sub)
+
+    if impulse_ret > 0.03:  # > 3% up move
+        # last bearish candle in the impulse window
+        for i in range(len(sub) - N - 1, len(sub) - 1):
+            if c[i] < o[i]:  # bearish
+                bullish_ob = {
+                    "index": int(idx_offset + i),
+                    "low": float(min(o[i], c[i])),
+                    "high": float(max(o[i], c[i])),
+                }
+    elif impulse_ret < -0.03:  # > 3% down move
+        for i in range(len(sub) - N - 1, len(sub) - 1):
+            if c[i] > o[i]:  # bullish
+                bearish_ob = {
+                    "index": int(idx_offset + i),
+                    "low": float(min(o[i], c[i])),
+                    "high": float(max(o[i], c[i])),
+                }
+
+    return {"bullish": bullish_ob, "bearish": bearish_ob}
+
+
+def _detect_fvg(df: pd.DataFrame, lookback: int = 80) -> List[Dict[str, Any]]:
+    """Detects simple Fair Value Gaps (FVG) on last `lookback` bars.
+
+    A bullish FVG (3-candle) example:
+        low[1] > high[0]  AND  low[1] > high[2]
+    A bearish FVG:
+        high[1] < low[0] AND   high[1] < low[2]
+
+    Returns a list of zones:
+        [
+          {"type": "bullish"/"bearish", "start": float, "end": float, "index": int},
+          ...
+        ]
+    """
+    zones: List[Dict[str, Any]] = []
+
+    if df is None or len(df) < 5:
+        return zones
+
+    sub = df.tail(lookback)
+    h = sub["high"].astype(float).to_numpy()
+    l = sub["low"].astype(float).to_numpy()
+
+    idx_offset = len(df) - len(sub)
+
+    for i in range(1, len(sub) - 1):
+        # bullish gap
+        if l[i] > h[i - 1] and l[i] > h[i + 1]:
+            zones.append({
+                "type": "bullish",
+                "start": float(h[i - 1]),
+                "end": float(l[i]),
+                "index": int(idx_offset + i),
+            })
+        # bearish gap
+        if h[i] < l[i - 1] and h[i] < l[i + 1]:
+            zones.append({
+                "type": "bearish",
+                "start": float(h[i]),
+                "end": float(l[i - 1]),
+                "index": int(idx_offset + i),
+            })
+
+    return zones
 
 
 # =====================================================================
@@ -368,13 +565,23 @@ def bos_quality_details(
 
 def analyze_structure(df: pd.DataFrame) -> Dict[str, Any]:
     """
-    Analyse de structure principale pour H1 :
+    Main structure analysis entrypoint for H1.
 
-      - trend : biais EMA20/EMA50 ("LONG" / "SHORT" / "RANGE")
-      - swings : dict de pivot highs / lows
-      - liquidity : equal highs / equal lows
-      - bos / choch / cos : bloc de structure récent
-      - oi_series : si une colonne 'oi' est présente dans df
+    Returns a rich structure context:
+
+        {
+          "trend": "LONG" / "SHORT" / "RANGE",
+          "swings": {"highs": [...], "lows": [...]},
+          "liquidity": {"eq_highs": [...], "eq_lows": [...]},
+          "bos": bool,
+          "choch": bool,
+          "cos": bool,
+          "bos_type": "INTERNAL" / "EXTERNAL" / None,
+          "bos_direction": "UP" / "DOWN" / None,
+          "order_blocks": {"bullish": {...} or None, "bearish": {...} or None},
+          "fvg_zones": [ {...}, ... ],
+          "oi_series": pd.Series or None,
+        }
     """
     if df is None or len(df) < 30:
         return {
@@ -384,13 +591,19 @@ def analyze_structure(df: pd.DataFrame) -> Dict[str, Any]:
             "bos": False,
             "choch": False,
             "cos": False,
+            "bos_type": None,
+            "bos_direction": None,
+            "order_blocks": {"bullish": None, "bearish": None},
+            "fvg_zones": [],
             "oi_series": None,
         }
 
     trend = _trend_from_ema(df["close"])
     swings = find_swings(df)
     levels = detect_equal_levels(df)
-    bos_block = _detect_bos_or_choch(df)
+    bos_block = _detect_bos_choch_cos(df)
+    ob = _detect_order_blocks(df)
+    fvg_zones = _detect_fvg(df)
 
     oi_series = df["oi"] if "oi" in df.columns else None
 
@@ -398,15 +611,19 @@ def analyze_structure(df: pd.DataFrame) -> Dict[str, Any]:
         "trend": trend,
         "swings": swings,
         "liquidity": levels,
-        "bos": bos_block["bos"],
-        "cos": bos_block["cos"],
-        "choch": bos_block["choch"],
+        "bos": bool(bos_block.get("bos")),
+        "choch": bool(bos_block.get("choch")),
+        "cos": bool(bos_block.get("cos")),
+        "bos_type": bos_block.get("bos_type"),
+        "bos_direction": bos_block.get("direction"),
+        "order_blocks": ob,
+        "fvg_zones": fvg_zones,
         "oi_series": oi_series,
     }
 
 
 # =====================================================================
-# COMMITMENT SCORE (optionnel)
+# COMMITMENT SCORE (OI + CVD)
 # =====================================================================
 
 def commitment_score(
@@ -415,13 +632,17 @@ def commitment_score(
     cvd_series: Optional[pd.Series] = None,
 ) -> float:
     """
-    Mesure synthétique de "commitment" insti :
-      - Si OI monte + CVD monte → engagement acheteurs
-      - Si OI monte + CVD baisse → short build
-      - etc.
+    Very lightweight commitment proxy combining OI & CVD behaviours.
 
-    Ici on renvoie juste un score normalisé (~[-1, 1]) basé sur
-    la dérivée d'oi et de cvd sur ~10 barres.
+    - If OI rising + CVD rising → strong long commitment.
+    - If OI rising + CVD falling → strong short build.
+    - If OI flat / falling → weaker conviction.
+
+    Returns:
+        score in [-1, +1] where:
+          +1  ~ strong long build
+          -1  ~ strong short build
+           0  ~ neutral / unclear
     """
     try:
         if oi_series is None or cvd_series is None:
@@ -433,10 +654,14 @@ def commitment_score(
         if len(oi) < 10 or len(cvd) < 10:
             return 0.0
 
-        d_oi = oi.iloc[-1] - oi.iloc[-10]
-        d_cvd = cvd.iloc[-1] - cvd.iloc[-10]
+        d_oi = float(oi.iloc[-1] - oi.iloc[-10])
+        d_cvd = float(cvd.iloc[-1] - cvd.iloc[-10])
 
-        score = 0.5 * float(np.tanh(d_oi * 10.0)) + 0.5 * float(np.tanh(d_cvd * 10.0))
-        return float(score)
+        # Normalize via tanh to keep in [-1, 1]
+        score_oi = float(np.tanh(d_oi * 10.0))
+        score_cvd = float(np.tanh(d_cvd * 10.0))
+
+        score = 0.6 * score_oi + 0.4 * score_cvd
+        return float(max(-1.0, min(1.0, score)))
     except Exception:
         return 0.0
