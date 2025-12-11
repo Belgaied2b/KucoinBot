@@ -16,6 +16,9 @@ from bitget_client import get_client
 from bitget_trader import BitgetTrader
 from analyze_signal import SignalAnalyzer
 from telegram.ext import Application
+from duplicate_guard import DuplicateGuard
+from risk_manager import RiskManager
+from retry_utils import retry_async
 
 LOGGER = logging.getLogger(__name__)
 
@@ -24,6 +27,10 @@ LOGGER = logging.getLogger(__name__)
 # =====================================================================
 
 TELEGRAM_APP: Application | None = None
+
+# Anti-doublons et Risk Manager globaux
+DUP_GUARD = DuplicateGuard(ttl_seconds=3600)
+RISK_MANAGER = RiskManager()
 
 
 async def init_telegram():
@@ -74,8 +81,14 @@ async def process_symbol(symbol: str, analyzer: SignalAnalyzer, trader: BitgetTr
     """
     try:
         # ====== MARKETDATA H1 / H4 ======
-        df_h1 = await client.get_klines_df(symbol, "1H", 200)
-        df_h4 = await client.get_klines_df(symbol, "4H", 200)
+        async def _fetch_h1():
+            return await client.get_klines_df(symbol, "1H", 200)
+
+        async def _fetch_h4():
+            return await client.get_klines_df(symbol, "4H", 200)
+
+        df_h1 = await retry_async(_fetch_h1)
+        df_h4 = await retry_async(_fetch_h4)
 
         if df_h1.empty or df_h4.empty or len(df_h1) < 80:
             return
@@ -97,6 +110,23 @@ async def process_symbol(symbol: str, analyzer: SignalAnalyzer, trader: BitgetTr
         qty = float(result["qty"])
         inst_score = result.get("institutional_score", None)
         rr = result.get("rr")
+
+        # Normalisation LONG/SHORT pour RiskManager / DuplicateGuard
+        side_upper = str(side).upper()
+        direction = "LONG" if side_upper in ("BUY", "LONG") else "SHORT"
+
+        # Anti-doublon : même symbole / même direction / même zone (entry/SL/TP1)
+        fp_tp1 = tp1 if tp1 is not None else 0.0
+        fingerprint = f"{symbol}-{direction}-{round(entry, 4)}-{round(sl, 4)}-{round(float(fp_tp1), 4)}"
+        if DUP_GUARD.seen(fingerprint):
+            LOGGER.info(f"[DUP] Skip {symbol} {direction} — déjà envoyé récemment")
+            return
+
+        # Risk manager : filtre institutionnel global
+        can_trade, reason = RISK_MANAGER.can_trade(direction)
+        if not can_trade:
+            LOGGER.info(f"[RISK] REJECT {symbol} {direction} → {reason}")
+            return
 
         LOGGER.warning(f"🎯 SIGNAL {symbol} → {side} @ {entry} (RR={rr})")
 
@@ -124,6 +154,9 @@ async def process_symbol(symbol: str, analyzer: SignalAnalyzer, trader: BitgetTr
         if not entry_res.get("ok", False):
             LOGGER.error(f"Entry error {symbol}: {entry_res}")
             return
+
+        # On enregistre la position ouverte dans le RiskManager
+        RISK_MANAGER.register_trade(direction)
 
         # Stop loss
         sl_res = await trader.place_stop_loss(symbol, side, sl, qty)
