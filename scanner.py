@@ -4,7 +4,6 @@
 
 import asyncio
 import logging
-import time
 import pandas as pd
 
 from settings import (
@@ -28,6 +27,7 @@ TELEGRAM_APP: Application | None = None
 
 
 async def init_telegram():
+    """Initialise l'Application Telegram une seule fois."""
     global TELEGRAM_APP
     if TELEGRAM_APP is None:
         TELEGRAM_APP = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
@@ -36,6 +36,7 @@ async def init_telegram():
 
 
 async def send_telegram(text: str):
+    """Envoie un message Telegram, avec gestion d'erreurs soft."""
     try:
         await init_telegram()
         await TELEGRAM_APP.bot.send_message(
@@ -48,16 +49,13 @@ async def send_telegram(text: str):
 
 
 # =====================================================================
-# OHLCV normalisation (pas vraiment utilisé ici, mais on garde)
+# OHLCV normalisation (optionnel, si besoin ailleurs)
 # =====================================================================
 
 def to_df(raw):
     if not raw:
         return pd.DataFrame()
-    df = pd.DataFrame(
-        raw,
-        columns=["time", "open", "high", "low", "close", "volume"],
-    )
+    df = pd.DataFrame(raw, columns=["time", "open", "high", "low", "close", "volume"])
     df = df.astype(float)
     return df.sort_values("time").reset_index(drop=True)
 
@@ -67,64 +65,80 @@ def to_df(raw):
 # =====================================================================
 
 async def process_symbol(symbol: str, analyzer: SignalAnalyzer, trader: BitgetTrader, client):
+    """
+    Pipeline complet pour un symbole :
+      - Récup H1 / H4
+      - Analyse structure + insti (analyze_signal.SignalAnalyzer)
+      - Envoi Telegram
+      - Placement LIMIT + TP / SL sur Bitget
+    """
     try:
-        # Fetch TF H1 + H4 (séquentiel déjà à ce niveau)
+        # ====== MARKETDATA H1 / H4 ======
         df_h1 = await client.get_klines_df(symbol, "1H", 200)
         df_h4 = await client.get_klines_df(symbol, "4H", 200)
 
         if df_h1.empty or df_h4.empty or len(df_h1) < 80:
             return
 
-        macro = {}  # placeholder futur BTC / TOTAL etc.
+        macro = {}  # placeholder : BTC / TOTAL / DOMINANCE plus tard
 
-        # === Analyse principale ===
+        # ====== ANALYSE INSTITUTIONNELLE + STRUCTURE ======
         result = await analyzer.analyze(symbol, df_h1, df_h4, macro)
 
-        # analyze_signal renvoie directement un dict de signal
+        # analyze_signal 2025 renvoie un dict avec "valid": True si signal OK
         if not result or not result.get("valid"):
             return
 
-        side = result["side"]          # "BUY" ou "SELL"
+        side = result["side"]
         entry = float(result["entry"])
         sl = float(result["sl"])
         tp1 = result.get("tp1")
         tp2 = result.get("tp2")
         qty = float(result["qty"])
+        inst_score = result.get("institutional_score", None)
+        rr = result.get("rr")
 
-        LOGGER.warning(f"🎯 SIGNAL {symbol} → {side} @ {entry}")
+        LOGGER.warning(f"🎯 SIGNAL {symbol} → {side} @ {entry} (RR={rr})")
 
-        # === Telegram ===
-        await send_telegram(
-            f"🚀 *Signal détecté*\n"
+        # ====== TELEGRAM ======
+        msg = (
+            "🚀 *Signal détecté*\n"
             f"• **{symbol}**\n"
             f"• Direction: *{side}*\n"
             f"• Entrée: `{entry}`\n"
             f"• SL: `{sl}`\n"
-            f"• TP1: `{tp1}` | TP2: `{tp2}`\n"
-            f"• Qty: `{qty}`\n"
-            f"• Inst Score: `{result.get('institutional_score')}`\n"
         )
+        if tp1 is not None or tp2 is not None:
+            msg += f"• TP1: `{tp1}` | TP2: `{tp2}`\n"
+        msg += f"• Qty: `{qty}`\n"
+        if inst_score is not None:
+            msg += f"• Inst Score: `{inst_score}`\n"
+        if rr is not None:
+            msg += f"• RR: `{round(rr, 3)}`\n"
 
-        # === EXECUTION ENTRY ===
+        await send_telegram(msg)
+
+        # ====== EXÉCUTION ORDRES BITGET ======
+        # Entrée
         entry_res = await trader.place_limit(symbol, side, entry, qty)
-        if str(entry_res.get("code")) != "00000":
+        if not entry_res.get("ok", False):
             LOGGER.error(f"Entry error {symbol}: {entry_res}")
             return
 
-        # === STOP LOSS ===
+        # Stop loss
         sl_res = await trader.place_stop_loss(symbol, side, sl, qty)
-        if str(sl_res.get("code")) != "00000":
+        if not sl_res.get("ok", False):
             LOGGER.error(f"SL error {symbol}: {sl_res}")
 
-        # === TAKE PROFITS ===
+        # Take profits
         if tp1 is not None:
             tp1_res = await trader.place_take_profit(symbol, side, float(tp1), qty * 0.5)
-            if str(tp1_res.get("code")) != "00000":
+            if not tp1_res.get("ok", False):
                 LOGGER.error(f"TP1 error {symbol}: {tp1_res}")
 
         if tp2 is not None:
             tp2_res = await trader.place_take_profit(symbol, side, float(tp2), qty * 0.5)
-            if str(tp2_res.get("code")) != "00000":
+            if not tp2_res.get("ok", False):
                 LOGGER.error(f"TP2 error {symbol}: {tp2_res}")
 
     except Exception as e:
@@ -132,51 +146,54 @@ async def process_symbol(symbol: str, analyzer: SignalAnalyzer, trader: BitgetTr
 
 
 # =====================================================================
-# MAIN SCAN LOOP — SÉQUENTIEL (pour respecter le rate limit)
+# MAIN SCAN LOOP
 # =====================================================================
 
 async def run_scanner():
+    """
+    Boucle principale :
+      - Récupère la liste des contrats USDT-FUTURES
+      - Scan H1/H4 pour chaque symbole avec une concurrence limitée
+      - Pause entre deux scans selon SCAN_INTERVAL_MIN
+    """
     client = await get_client(API_KEY, API_SECRET, API_PASSPHRASE)
     trader = BitgetTrader(API_KEY, API_SECRET, API_PASSPHRASE)
     analyzer = SignalAnalyzer(API_KEY, API_SECRET, API_PASSPHRASE)
 
+    # Limite la pression sur l'API Bitget (429)
+    MAX_CONCURRENT = 8
+    semaphore = asyncio.Semaphore(MAX_CONCURRENT)
+
     while True:
-        start_time = time.time()
         try:
             LOGGER.info("=== START SCAN ===")
 
             symbols = await client.get_contracts_list()
-
             if not symbols:
                 LOGGER.warning("⚠️ Aucun symbole récupéré → pause 60s")
                 await asyncio.sleep(60)
                 continue
 
-            total = len(symbols)
-            LOGGER.info(f"📊 Nombre de symboles à scanner : {total}")
+            LOGGER.info(f"📊 Nombre de symboles à scanner : {len(symbols)}")
 
-            # SCAN SÉQUENTIEL
-            for idx, sym in enumerate(symbols, start=1):
-                LOGGER.debug(f"[SCAN {idx}/{total}] {sym}")
-                await process_symbol(sym, analyzer, trader, client)
+            async def _worker(sym: str):
+                async with semaphore:
+                    await process_symbol(sym, analyzer, trader, client)
 
-                # petit throttle pour ne pas saturer l'API
-                await asyncio.sleep(0.05)
+            tasks = [_worker(sym) for sym in symbols]
+            await asyncio.gather(*tasks)
 
             LOGGER.info("=== END SCAN ===")
 
         except Exception as e:
             LOGGER.error(f"SCAN ERROR: {e}")
 
-        # on respecte SCAN_INTERVAL_MIN entre 2 débuts de scan
-        elapsed = time.time() - start_time
-        wait = SCAN_INTERVAL_MIN * 60 - elapsed
-        if wait > 0:
-            await asyncio.sleep(wait)
+        # Pause globale entre 2 scans
+        await asyncio.sleep(SCAN_INTERVAL_MIN * 60)
 
 
 # =====================================================================
-# EXPORT MAIN
+# EXPORT MAIN (pour main.py)
 # =====================================================================
 
 async def start_scanner():
@@ -184,13 +201,14 @@ async def start_scanner():
 
 
 # =====================================================================
-# MODE LOCAL
+# MODE LOCAL (standalone)
 # =====================================================================
 
 if __name__ == "__main__":
     try:
         asyncio.run(start_scanner())
     except RuntimeError:
+        # Compatibilité environnements où un event loop existe déjà
         loop = asyncio.get_event_loop()
         loop.create_task(start_scanner())
         loop.run_forever()
