@@ -12,7 +12,7 @@
 
 import time
 import logging
-from typing import Dict, Any, Optional
+from typing import Dict, Any
 
 from settings import MARGIN_USDT, LEVERAGE
 from bitget_client import BitgetClient
@@ -95,6 +95,18 @@ class BitgetTrader(BitgetClient):
         o = (str(open_side) or "").lower()
         return "sell" if o == "buy" else "buy"
 
+    @staticmethod
+    def _round_size(size: float, decimals: int = 2) -> float:
+        """
+        Bitget renvoie des erreurs type :
+          code=40808 size checkBDScale ... checkScale=2
+
+        Pour rester safe sur tous les contrats USDT-FUTURES,
+        on limite la taille à 2 décimales.
+        """
+        factor = 10 ** decimals
+        return int(size * factor) / factor
+
     # ------------------------------------------------------------------
     # ORDRES
     # ------------------------------------------------------------------
@@ -123,22 +135,22 @@ class BitgetTrader(BitgetClient):
         except Exception:
             multiple = 1.0
 
-        size = base_size * multiple
+        raw_size = base_size * multiple
+        size = self._round_size(raw_size, decimals=2)
 
-        # On mémorise la taille d'entrée pour ce symbole
+        # On mémorise la taille d'entrée pour ce symbole (arrondie)
         self._entry_size[symbol] = size
 
         approx_notional = size * price_f
         LOGGER.info(
             "[TRADER] place_limit %s %s price=%s size=%.8f  "
-            "(notional≈%.2f USDT, marge≈%.2f USDT, levier=%.1fx)",
+            "(notional≈%.2f USDT, marge≈%.2f USDT, levier=10.0x)",
             symbol,
             side_open,
             price_f,
             size,
             approx_notional,
             self.margin_usdt,
-            self.leverage,
         )
 
         body = {
@@ -146,11 +158,11 @@ class BitgetTrader(BitgetClient):
             "symbol": symbol,
             "marginMode": MARGIN_MODE,
             "marginCoin": MARGIN_COIN,
-            "size": f"{size:.10f}",
-            "price": f"{price_f:.10f}",
+            "size": f"{size:.2f}",           # <= 2 décimales max
+            "price": f"{price_f:.10f}",      # prix : on laisse 10 décimales (Bitget tolère)
             "orderType": "limit",
             "side": side_open,
-            "tradeSide": "open",     # hedge-mode compatible
+            "tradeSide": "open",             # hedge-mode compatible
             "force": "gtc",
             "reduceOnly": "NO",
             "clientOid": f"entry-{symbol}-{int(time.time() * 1000)}",
@@ -200,18 +212,18 @@ class BitgetTrader(BitgetClient):
         """
         trigger_price = float(sl)
 
-        # Taille d'entrée mémorisée
+        # Taille d'entrée mémorisée (arrondie à 2 décimales)
         entry_size = self._entry_size.get(symbol)
         if entry_size is None:
-            # Fallback défensif (ne devrait pas arriver si place_limit a été appelé avant)
-            entry_size = self._compute_base_size(trigger_price)
+            entry_size = self._round_size(self._compute_base_size(trigger_price), 2)
 
         try:
             fraction = float(qty)
         except Exception:
             fraction = 1.0
 
-        size = max(entry_size * fraction, 0.0)
+        raw_size = max(entry_size * fraction, 0.0)
+        size = self._round_size(raw_size, 2)
 
         trigger_side = self._close_side_for_open(side)
 
@@ -232,7 +244,7 @@ class BitgetTrader(BitgetClient):
             "symbol": symbol,
             "marginMode": MARGIN_MODE,
             "marginCoin": MARGIN_COIN,
-            "size": f"{size:.10f}",
+            "size": f"{size:.2f}",               # <= 2 décimales
             "price": f"{trigger_price:.10f}",
             "triggerPrice": f"{trigger_price:.10f}",
             "triggerType": "mark_price",
@@ -282,14 +294,15 @@ class BitgetTrader(BitgetClient):
 
         entry_size = self._entry_size.get(symbol)
         if entry_size is None:
-            entry_size = self._compute_base_size(trigger_price)
+            entry_size = self._round_size(self._compute_base_size(trigger_price), 2)
 
         try:
             fraction = float(qty)
         except Exception:
             fraction = 1.0
 
-        size = max(entry_size * fraction, 0.0)
+        raw_size = max(entry_size * fraction, 0.0)
+        size = self._round_size(raw_size, 2)
 
         trigger_side = self._close_side_for_open(side)
 
@@ -310,7 +323,7 @@ class BitgetTrader(BitgetClient):
             "symbol": symbol,
             "marginMode": MARGIN_MODE,
             "marginCoin": MARGIN_COIN,
-            "size": f"{size:.10f}",
+            "size": f"{size:.2f}",               # <= 2 décimales
             "price": f"{trigger_price:.10f}",
             "triggerPrice": f"{trigger_price:.10f}",
             "triggerType": "mark_price",
