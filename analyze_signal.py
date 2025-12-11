@@ -1,4 +1,3 @@
-print("🔥 analyze_signal.py LOADED (VERSION DEBUG)")
 # =====================================================================
 # analyze_signal.py — VERSION DIAGNOSTIC (2025)
 # Ajout de logs pour comprendre où le signal est rejeté.
@@ -26,11 +25,12 @@ from indicators import (
 )
 
 from stops import protective_stop_long, protective_stop_short
-from tp_clamp import compute_tp1
+from tp_clamp import compute_tp1, compute_tp2
 
 from institutional_data import compute_full_institutional_analysis
 
 LOGGER = logging.getLogger(__name__)
+
 
 def compute_premium_discount(df, lookback=80):
     if len(df) < lookback:
@@ -58,13 +58,27 @@ def _safe_rr(entry, sl, tp1, bias):
 
 
 def _compute_exits(df, entry, bias, tick):
+    """
+    Calcule SL institutionnel + TP1/TP2 desk lead:
+      - SL via protective_stop_long/short (structure + liquidité + ATR)
+      - TP1 via compute_tp1 (RR dynamique)
+      - TP2 via compute_tp2 (runner)
+    """
     if bias == "LONG":
         sl, meta = protective_stop_long(df, entry, tick, return_meta=True)
     else:
         sl, meta = protective_stop_short(df, entry, tick, return_meta=True)
 
     tp1, rr_used = compute_tp1(entry, sl, bias, df=df, tick=tick)
-    return {"sl": sl, "tp1": tp1, "rr_used": rr_used, "sl_meta": meta}
+    tp2 = compute_tp2(entry, sl, bias, df=df, tick=tick, rr1=rr_used)
+
+    return {
+        "sl": sl,
+        "tp1": tp1,
+        "tp2": tp2,
+        "rr_used": rr_used,
+        "sl_meta": meta,
+    }
 
 
 # =====================================================================
@@ -74,6 +88,7 @@ def _compute_exits(df, entry, bias, tick):
 class SignalAnalyzer:
 
     def __init__(self, api_key, api_secret, api_passphrase):
+        # RR minimum pour validation institutionnelle
         self.rr_min_inst = 1.3
 
     async def analyze(self, symbol, df_h1, df_h4, macro=None):
@@ -109,7 +124,7 @@ class SignalAnalyzer:
             oi_min_squeeze=-0.005,
             df_liq=df_h1,
             price=entry,
-            tick=0.1,
+            tick=0.1,  # TODO: remplacer par le vrai tick Bitget par symbole
         )
         LOGGER.info(f"[EVAL_PRE] BOS_QUALITY={bos_q}")
 
@@ -144,7 +159,10 @@ class SignalAnalyzer:
         # 7 — RR / SL / TP
         exits = _compute_exits(df_h1, entry, bias, tick=0.1)
         rr = _safe_rr(entry, exits["sl"], exits["tp1"], bias)
-        LOGGER.info(f"[EVAL_PRE] RR={rr} raw_rr={exits['rr_used']} sl={exits['sl']} tp1={exits['tp1']}")
+        LOGGER.info(
+            f"[EVAL_PRE] RR={rr} raw_rr={exits['rr_used']} "
+            f"sl={exits['sl']} tp1={exits['tp1']} tp2={exits['tp2']}"
+        )
 
         if rr is None or rr < self.rr_min_inst:
             LOGGER.info("[EVAL_REJECT] RR < minimum")
@@ -154,16 +172,16 @@ class SignalAnalyzer:
         LOGGER.info(f"[EVAL] VALID {symbol} RR={rr}")
 
         return {
-            "valid": True,
             "symbol": symbol,
-            "side": "BUY" if bias == "LONG" else "SELL",
+            "valid": True,
+            "side": "buy" if bias == "LONG" else "sell",
             "bias": bias,
             "entry": entry,
             "sl": exits["sl"],
             "tp1": exits["tp1"],
-            "tp2": None,
+            "tp2": exits["tp2"],
             "rr": rr,
-            "qty": 1,
+            "qty": 1,  # la taille finale est gérée côté trader / sizing
 
             "structure": struct,
             "bos_quality": bos_q,
@@ -171,4 +189,6 @@ class SignalAnalyzer:
             "momentum": mom,
             "premium": premium,
             "discount": discount,
+            "sl_meta": exits.get("sl_meta"),
+            "rr_raw": exits.get("rr_used"),
         }
